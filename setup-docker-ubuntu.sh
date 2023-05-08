@@ -10,56 +10,7 @@ else
   non_interactive=false
 fi
 
-zsh_installed=false
-
-echo " ############# zsh setup ############# "
-if [ "$non_interactive" = true ]; then
-  Answer="y"
-else
-  printf "Do you want to install zsh? (Y/n) [y]: "
-  read Answer < /dev/tty
-  Answer=${Answer:-y}
-fi
-
-case ${Answer} in
-  y|Y) 
-
-    echo "Install zsh..."
-
-    apt install zsh -y
-
-    zsh_installed=true
-    echo "Successfully installed!!"
-
-    if [ "$non_interactive" = true ]; then
-      Answer="y"
-    else
-      printf "Do you want to set zsh as the default shell? (Y/n) [y]: "
-      read Answer < /dev/tty
-      Answer=${Answer:-y}
-    fi
-
-    case ${Answer} in
-      y|Y) 
-
-        echo "Setting zsh as the default shell..."
-        chsh -s $(which zsh)
-
-        echo "Successfully set!!" ;;
-
-      n|N)
-
-        echo "Skipped setting." ;;
-
-    esac ;;
-
-  n|N)
-    echo "Skipped installation." ;;
-
-esac
-
-
-echo " ############# zsh setup finish! ############# "
+clear
 
 echo " ############# neovim setup ############# "
 if [ "$non_interactive" = true ]; then
@@ -87,6 +38,8 @@ esac
 
 echo " ############# neovim setup finish! ############# "
 
+clear
+
 echo " ############# deno setup ############# "
 if [ "$non_interactive" = true ]; then
   Answer="y"
@@ -100,20 +53,12 @@ case ${Answer} in
   y|Y) 
 
     echo "Install deno..."
-    apt-get install unzip -y
+    apt install unzip -y
     curl -fsSL https://deno.land/x/install/install.sh | sh
 
-    if [ "$zsh_installed" = true ]; then
-      echo 'export DENO_INSTALL="/home/$USER/.deno"' >> ~/.zshrc
-      echo 'export PATH="$DENO_INSTALL/bin:$PATH"' >> ~/.zshrc
-
-      source ~/.zshrc
-    else
-      echo 'export DENO_INSTALL="/home/$USER/.deno"' >> ~/.bashrc
-      echo 'export PATH="$DENO_INSTALL/bin:$PATH"' >> ~/.bashrc
-
-      source ~/.bashrc
-    fi
+    
+    echo 'export DENO_INSTALL="/home/$USER/.deno"' >> ~/.bashrc
+    echo 'export PATH="$DENO_INSTALL/bin:$PATH"' >> ~/.bashrc
 
     echo "Successfully installed!!" ;;
   n|N)
@@ -122,3 +67,4 @@ case ${Answer} in
 esac
 
 echo " ############# deno setup finish! ############# "
+
