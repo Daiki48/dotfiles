@@ -27,7 +27,7 @@ case ${Answer} in
     echo "Install neovim..."
     wget https://github.com/neovim/neovim/releases/download/v0.9.0/nvim.appimage
     chmod a+x nvim.appimage
-    apt-get install fuse -y
+#    apt install fuse -y
     mv nvim.appimage /usr/local/bin/nvim
 
     echo "Successfully installed!!" ;;
