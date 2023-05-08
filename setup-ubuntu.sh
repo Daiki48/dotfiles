@@ -28,25 +28,27 @@ case ${Answer} in
     echo "Successfully installed!!"
     zsh_installed=true
 
-    if [ "$non_interactive" = true ]; then
-      Answer="y"
-    else
-      printf "Do you want to set zsh as the default shell? (Y/n) [y]: "
-      read Answer < /dev/tty
-      Answer=${Answer:-y}
-    fi
+#    if [ "$non_interactive" = true ]; then
+#      Answer="y"
+#    else
+#      printf "Do you want to set zsh as the default shell? (Y/n) [y]: "
+#      read Answer < /dev/tty
+#      Answer=${Answer:-y}
+#    fi
 
-    case ${Answer} in
-      y|Y) 
+#    case ${Answer} in
+#      y|Y) 
 
-        echo "Setting zsh as the default shell..."
-        chsh -s $(which zsh)
+#        echo "Setting zsh as the default shell..."
+#        chsh -s $(which zsh)
 
-        echo "Successfully set!!" ;;
-      n|N)
-        echo "Skipped setting." ;;
+#        echo "Successfully set!!" ;;
 
-    esac
+#      n|N)
+
+#        echo "Skipped setting." ;;
+
+#    esac
 
   n|N)
     echo "Skipped installation." ;;
