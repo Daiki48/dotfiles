@@ -1,1 +1,3 @@
 # My Setup
+
+- wsl2
