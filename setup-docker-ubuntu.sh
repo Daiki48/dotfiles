@@ -1,8 +1,3 @@
-#!/bin/sh
-
-echo "apt update & install wget curl... "
-apt-get update && apt-get install -y wget curl
-
 # Check arg 
 if [ "$1" = "-y" ]; then
   non_interactive=true
@@ -10,9 +5,25 @@ else
   non_interactive=false
 fi
 
-clear
+echo " -------------------------------------- "
+echo " ############# init setup ############# "
+echo " -------------------------------------- "
 
+printf "Install curl & wget & git & ripgrep & unzip & vim ..."
+
+apt update
+apt-get update
+apt install -y curl git ripgrep unzip vim wget
+
+printf "Successfully installed curl & wget & git & ripgrep & unzip & vim !!"
+
+echo " --------------------------------------------- "
+echo " ############# init setup finish ############# "
+echo " --------------------------------------------- "
+echo ""
+echo " ---------------------------------------- "
 echo " ############# neovim setup ############# "
+echo " ---------------------------------------- "
 if [ "$non_interactive" = true ]; then
   Answer="y"
 else
@@ -25,10 +36,10 @@ case ${Answer} in
   y|Y) 
 
     echo "Install neovim..."
-    wget https://github.com/neovim/neovim/releases/download/v0.9.0/nvim.appimage
-    chmod a+x nvim.appimage
-#    apt install fuse -y
-    mv nvim.appimage /usr/local/bin/nvim
+
+    wget https://github.com/neovim/neovim/releases/download/v0.8.2/nvim-linux64.deb
+    apt install ./nvim-linux64.deb
+    rm ./nvim-linux64.deb
 
     echo "Successfully installed!!" ;;
   n|N)
@@ -36,11 +47,13 @@ case ${Answer} in
 
 esac
 
+echo " ------------------------------------------------ "
 echo " ############# neovim setup finish! ############# "
-
-clear
-
+echo " ------------------------------------------------ "
+echo ""
+echo " -------------------------------------- "
 echo " ############# deno setup ############# "
+echo " -------------------------------------- "
 if [ "$non_interactive" = true ]; then
   Answer="y"
 else
@@ -53,12 +66,8 @@ case ${Answer} in
   y|Y) 
 
     echo "Install deno..."
-    apt install unzip -y
-    curl -fsSL https://deno.land/x/install/install.sh | sh
 
-    
-    echo 'export DENO_INSTALL="/home/$USER/.deno"' >> ~/.bashrc
-    echo 'export PATH="$DENO_INSTALL/bin:$PATH"' >> ~/.bashrc
+    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
     echo "Successfully installed!!" ;;
   n|N)
@@ -66,5 +75,7 @@ case ${Answer} in
 
 esac
 
+echo " ---------------------------------------------- "
 echo " ############# deno setup finish! ############# "
+echo " ---------------------------------------------- "
 
