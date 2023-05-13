@@ -1,0 +1,21 @@
+## ---------------------------------- ##
+##           noice config             ##
+## ---------------------------------- ##
+[[plugins]]
+repo = 'folke/noice.nvim'
+on_event = 'VimEnter'
+depends = ['nui.nvim', 'nvim-notify']
+lua_source = '''require('modules.noice')'''
+
+[[plugins]]
+repo = 'MunifTanjim/nui.nvim'
+
+[[plugins]]
+repo = 'rcarriga/nvim-notify'
+# depends = 'impatient.nvim'
+on_event = 'VimEnter'
+on_lua = 'notify'
+lua_source = '''require('modules.nvim-notify')'''
+
+[[plugins]]
+repo = 'lewis6991/impatient.nvim'

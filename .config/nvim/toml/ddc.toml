@@ -1,0 +1,131 @@
+## ---------------------------------- ##
+##             ddc config             ##
+## ---------------------------------- ##
+
+## ++++++++++++++++++++++++++++++++++ ##
+##   denops.vim reads in lazy.toml    ##
+## ++++++++++++++++++++++++++++++++++ ##
+
+[[plugins]]
+repo = 'Shougo/ddc.vim'
+depends = ['denops.vim', 'pum.vim']
+on_event = ['InsertEnter']
+lua_source = '''require("modules.ddc")'''
+
+## ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ##
+##               ddc ui               ##
+## ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ##
+
+[[plugins]]
+repo = 'Shougo/ddc-ui-native'
+on_source = 'ddc.vim'
+
+[[plugins]]
+repo = 'Shougo/ddc-ui-pum'
+on_source = 'ddc.vim'
+depends = ['pum.vim']
+
+[[plugins]]
+repo = 'Shougo/pum.vim'
+on_source = 'ddc.vim'
+
+## ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ##
+##             ddc source             ##
+## ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ##
+
+[[plugins]]
+repo = 'Shougo/ddc-source-around'
+on_source = 'ddc.vim'
+
+[[plugins]]
+repo = 'Shougo/ddc-source-nvim-lsp'
+on_source = 'nvim-lspconfig'
+
+[[plugins]]
+repo = 'matsui54/ddc-buffer'
+on_source = 'ddc.vim'
+
+[[plugins]]
+repo = 'Shougo/ddc-source-cmdline'
+on_source = 'ddc.vim'
+
+[[plugins]]
+repo = 'Shougo/ddc-source-cmdline-history'
+on_source = 'ddc.vim'
+
+# [[plugins]]
+# repo = 'vim-skk/skkeleton'
+# on_source = 'ddc.vim'
+
+[[plugins]]
+repo = 'LumaKernel/ddc-source-file'
+on_source = 'ddc.vim'
+
+[[plugins]]
+repo = 'Shougo/ddc-source-input'
+on_source = 'ddc.vim'
+
+[[plugins]]
+repo = 'Shougo/ddc-source-nvim-lua'
+on_source = 'ddc.vim'
+
+# [[plugins]]
+# repo = 'tani/ddc-path'
+# on_source = 'ddc.vim'
+
+# [[plugins]]
+# repo = 'LumaKernel/ddc-tabnine'
+# depends = 'denops.vim'
+# on_source = 'ddc.vim'
+# hook_source = 'call denops#server#start()'
+
+## ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ##
+##             ddc filter             ##
+## ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ##
+
+[[plugins]]
+repo = 'Shougo/ddc-matcher_head'
+on_source = 'ddc.vim'
+
+[[plugins]]
+repo = 'tani/ddc-fuzzy'
+on_source = 'ddc.vim'
+
+[[plugins]]
+repo = 'Shougo/ddc-sorter_rank'
+on_source = 'ddc.vim'
+
+## ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ##
+##      ddc doc/help preview          ##
+## ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ##
+
+# [[plugins]]
+# repo = 'matsui54/denops-popup-preview.vim'
+# depends = ['denops.vim']
+# on_source = 'ddc.vim'
+# hook_source = '''
+# call popup_preview#enable()
+# '''
+
+# [[plugins]]
+# repo = 'matsui54/denops-signature_help'
+# on_source = 'ddc.vim'
+# hook_source = '''
+# call signature_help#enable()
+# '''
+
+## ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ##
+##             ddc snippet            ##
+## ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ##
+
+[[plugins]]
+repo = 'Shougo/neosnippet.vim'
+on_source = 'ddc.vim'
+depends = ['neosnippet-snippets']
+hook_add = '''
+let g:neosnippet#enable_snipmate_compatibility = 1
+let g:neosnippet#snippets_directory = expand('$HOME/AppData/Local/nvim/snippets')
+'''
+
+[[plugins]]
+repo = 'Shougo/neosnippet-snippets'

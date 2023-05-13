@@ -1,0 +1,73 @@
+## *************************** ## 
+##         lazy plugin         ##
+## *************************** ##
+[[plugins]]
+repo = 'j-hui/fidget.nvim'
+on_event = ['BufRead']
+lua_source = '''require('modules.fidget')'''
+
+[[plugins]]
+repo = 'ray-x/lsp_signature.nvim'
+on_event = ['InsertEnter']
+on_source = 'neovim/nvim-lspconfig'
+lua_source = '''require('modules.lsp_signature')'''
+
+[[plugins]]
+repo = 'glepnir/lspsaga.nvim'
+on_event = ['BufRead']
+lua_source = '''require('modules.lspsaga')'''
+
+[[plugins]]
+repo = 'lewis6991/gitsigns.nvim'
+on_event = ['BufRead']
+lua_source = '''require('modules.gitsigns')'''
+
+[[plugins]]
+repo = 'windwp/nvim-autopairs'
+on_event = ['InsertEnter']
+lua_source = '''require('modules.nvim-autopairs')'''
+
+[[plugins]]
+repo = 'windwp/nvim-ts-autotag'
+# on_event = ['InsertEnter']
+# on_source = 'nvim-treesitter'
+lua_source = '''require('modules.nvim-ts-autotag')'''
+
+[[plugins]]
+repo = 'nvim-treesitter/nvim-treesitter'
+on_event = ['BufRead']
+hook_post_update = 'TSUpdate'
+lua_source = '''require('modules.treesitter')'''
+
+[[plugins]]
+repo = 'norcalli/nvim-colorizer.lua'
+on_event = ['FileType']
+lua_source = '''require('modules.colorizer')'''
+
+[[plugins]]
+repo = 'jlcrochet/vim-razor'
+on_ft = ['razor']
+
+[[plugins]]
+repo = 'vim-denops/denops.vim'
+on_event = ['VimEnter']
+# on_func = 'denops#server#start'
+# hook_source = 'call denops#server#start()'
+
+[[plugins]]
+repo = 'vim-denops/denops-helloworld.vim'
+on_cmd = 'DenopsHello'
+
+[[plugins]]
+repo = 'skanehira/denops-silicon.vim'
+depends = 'denops.vim'
+hook_source = '''
+let g:silicon_options = {
+\  'background_color': '#aaaaaa',
+\  'theme': 'Solarized (light)',
+\  }
+'''
+
+[[plugins]]
+repo = 'dstein64/vim-startuptime'
+on_cmd = 'StartupTime'
