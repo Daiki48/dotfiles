@@ -90,9 +90,17 @@ case ${Answer} in
     apt install -y nodejs
     npm install -g vim-language-server
 
+    # Create Symbolic Link
     rm ~/.bashrc
     rm ~/.config/nvim/init.vim
     ln -s ~/dotfiles/.config/nvim ~/.config/
+
+    # https://github.com/neovim/neovim/wiki/FAQ#how-to-use-the-windows-clipboard-from-wsl
+    # copy/paste between WSL and Windows
+    curl -sLo/tmp/win32yank.zip https://github.com/equalsraf/win32yank/releases/download/v0.0.4/win32yank-x64.zip
+    unzip -p /tmp/win32yank.zip win32yank.exe > /tmp/win32yank.exe
+    chmod +x /tmp/win32yank.exe
+    sudo mv /tmp/win32yank.exe /usr/local/bin/
 
     echo "Successfully installed!!" ;;
   n|N)
