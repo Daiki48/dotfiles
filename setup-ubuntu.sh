@@ -1,4 +1,9 @@
-#!/bin/sh
+echo "Setup Start!!"
+sudo apt update
+apt-get update
+apt install -y curl git ripgrep unzip vim wget
+apt install -y locales locale-gen ja_JP.UTF-8
+apt install build-essential # C compiler
 
 # Check arg 
 if [ "$1" = "-y" ]; then
@@ -23,7 +28,7 @@ case ${Answer} in
 
     echo "Install zsh..."
 
-    sudo apt install zsh -y
+    apt install zsh -y
 
     zsh_installed=true
     echo "Successfully installed!!"
@@ -41,7 +46,7 @@ case ${Answer} in
 
         echo "Setting zsh as the default shell..."
         chsh -s $(which zsh)
-
+        ln -s ~/dotfiles/.zshrc ~/
         echo "Successfully set!!" ;;
 
       n|N)
@@ -71,10 +76,23 @@ case ${Answer} in
   y|Y) 
 
     echo "Install neovim..."
-    wget https://github.com/neovim/neovim/releases/download/v0.9.0/nvim.appimage
-    chmod a+x nvim.appimage
-    sudo apt-get install fuse -y
-    sudo mv nvim.appimage /usr/local/bin/nvim
+
+    wget https://github.com/neovim/neovim/releases/download/v0.8.2/nvim-linux64.deb
+    apt install ./nvim-linux64.deb
+    rm ./nvim-linux64.deb
+
+
+    wget https://raw.githubusercontent.com/Shougo/dein-installer.vim/master/installer.sh
+    sh installer.sh '~/.cache/dein' --use-neovim-config
+    rm installer.sh
+
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash
+    apt install -y nodejs
+    npm install -g vim-language-server
+
+    rm ~/.bashrc
+    rm ~/.config/nvim/init.vim
+    ln -s ~/dotfiles/.config/nvim ~/.config/
 
     echo "Successfully installed!!" ;;
   n|N)
@@ -97,20 +115,7 @@ case ${Answer} in
   y|Y) 
 
     echo "Install deno..."
-    sudo apt-get install unzip -y
-    curl -fsSL https://deno.land/x/install/install.sh | sh
-
-    if [ "$zsh_installed" = true ]; then
-      echo 'export DENO_INSTALL="/home/$USER/.deno"' >> ~/.zshrc
-      echo 'export PATH="$DENO_INSTALL/bin:$PATH"' >> ~/.zshrc
-
-      source ~/.zshrc
-    else
-      echo 'export DENO_INSTALL="/home/$USER/.deno"' >> ~/.bashrc
-      echo 'export PATH="$DENO_INSTALL/bin:$PATH"' >> ~/.bashrc
-
-      source ~/.bashrc
-    fi
+    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
     echo "Successfully installed!!" ;;
   n|N)
