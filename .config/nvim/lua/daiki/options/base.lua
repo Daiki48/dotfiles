@@ -10,7 +10,7 @@ vim.wo.number = true
 vim.wo.relativenumber = true
 vim.wo.signcolumn = 'yes'
 
-vim.o.shell = 'pwsh'
+vim.o.shell = 'zsh'
 vim.o.scrolloff = 10
 vim.o.cmdheight = 1
 vim.o.inccommand = 'split'
@@ -39,3 +39,20 @@ vim.o.background = "dark" -- "dark" or "light" for light mode
 -- vim.cmd 'syntax enable'
 -- vim.cmd 'syntax on'
 vim.cmd 'set wildoptions=pum'
+
+-- copy/paste between WSL and Windows
+-- https://github.com/neovim/neovim/wiki/FAQ#how-to-use-the-windows-clipboard-from-wsl
+if vim.fn.has('wsl') == 1 then
+    vim.g.clipboard = {
+        name = 'win32yank.exe',
+        copy = {
+           ['+'] = { 'win32yank.exe', '-i', '--crlf' },
+           ['*'] = {'win32yank.exe', '-i', '--crlf' },
+        },
+        paste = {
+           ['+'] = {'win32yank.exe', '-o', '--lf' },
+           ['*'] = {'win32yank.exe', '-o', '--lf' },
+        },
+        cache_enabled  = 1,
+    }
+end
