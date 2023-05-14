@@ -17,30 +17,33 @@ ddu.patch_global({
 	ui = "ff",
 	uiParams = {
 		ff = {
-			displaySourceName = "no",
+			-- displaySourceName = "no",
 			prompt = "> ",
-			split = "floating",
-			floatingBorder = "rounded",
-			previewFloating = true,
-			previewFloatingBorder = "rounded",
-			filterSplitDirection = "floating",
-			filterFloatingPosition = "top",
+			-- split = "floating",
+			-- floatingBorder = "rounded",
+			--       floatingTitle = {
+			--         {'title', 'Blue'}
+			--       },
+			-- previewFloating = true,
+			-- previewFloatingBorder = "rounded",
+			-- filterSplitDirection = "floating",
+			-- filterFloatingPosition = "top",
 			startFilter = true,
-			highlights = {
-				floating = "DduUiFfFloating",
-				prompt = "DduUiFfPrompt",
-				selected = "DduUiFfSelected",
-			},
+			-- highlights = {
+			-- 	floating = "DduUiFfFloating",
+			-- 	prompt = "DduUiFfPrompt",
+			-- 	selected = "DduUiFfSelected",
+			-- },
 		},
 		filer = {
-			split = "floating",
+			-- split = "floating",
 			sort = "filename",
 			sortTreesFirst = true,
 			toggle = true,
-			highlights = {
-				floating = "DduUiFilerFloating",
-				selected = "DduUiFilerSelected"
-			},
+			-- highlights = {
+			-- 	floating = "DduUiFilerFloating",
+			-- 	selected = "DduUiFilerSelected"
+			-- },
 		},
 	},
 	uiOptions = {
@@ -50,7 +53,7 @@ ddu.patch_global({
 	},
 	sourceOptions = {
 		['_'] = {
-			matchers = {"matcher_substring"}
+			matchers = {"matcher_substring"},
 		},
 		file = {
 			columns = {"icon_filename"},
@@ -80,7 +83,8 @@ ddu.patch_global({
 	},
 	filterParams = {
 		matcher_substring = {
-			highlightMatched = "DduUiFfFilterMatch",
+			-- highlightMatched = "DduUiFfFilterMatch",
+			highlightMatched = "Search",
 		}
 	},
 })

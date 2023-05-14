@@ -25,10 +25,10 @@ M.filer = function ()
 				name = "file",
 			},
 		},
-		sourceOptions = {
-			path = vim.fn["getcwd"](),
-			columns = { "filename" }
-		}
+		-- sourceOptions = {
+		-- 	path = vim.fn["getcwd"](),
+		-- 	columns = { "filename" }
+		-- },
 	})
 end
 
