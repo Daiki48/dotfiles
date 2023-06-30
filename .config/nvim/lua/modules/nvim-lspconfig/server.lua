@@ -31,6 +31,13 @@ lspconfig['denols'].setup{
 	init_options = {},
 }
 
+lspconfig['svelte'].setup{
+	root_dir = lspconfig.util.root_pattern("package.json"),
+	on_attach = tools.on_attach,
+	flags = tools.lsp_flags,
+	init_options = {},
+}
+
 lspconfig['rust_analyzer'].setup{
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
@@ -46,14 +53,7 @@ lspconfig['clangd'].setup{
 	init_options = {},
 }
 
--- lspconfig['csharp_ls'].setup{
--- 	on_attach = tools.on_attach,
--- 	flags = tools.lsp_flags,
---   cmd = { 'csharp-ls' },
--- 	filetypes = { "cs" },
--- }
-
-local omnisharp_path = vim.fn.glob(vim.fn.stdpath('data') .. '/mason/') .. 'packages/omnisharp/OmniSharp.dll'
+local omnisharp_path = vim.fn.expand('~/.local/share/omnisharp/run')
 lspconfig['omnisharp'].setup{
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
@@ -61,7 +61,7 @@ lspconfig['omnisharp'].setup{
 	enable_editorconfig_support = true,
 	enable_ms_build_load_projects_on_demand = false,
 	enable_roslyn_analyzers = false,
-	filetypes = { "cs", "vb", "cshtml" },
+	filetypes = { "cs", "vb", "cshtml", "razor" },
 	organize_imports_on_format = false,
 	enable_import_completion = false,
 	sdk_include_prereleases = true,

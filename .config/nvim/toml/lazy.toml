@@ -3,6 +3,7 @@
 ## *************************** ##
 [[plugins]]
 repo = 'j-hui/fidget.nvim'
+rev = 'legacy'
 on_event = ['BufRead']
 lua_source = '''require('modules.fidget')'''
 
@@ -29,8 +30,8 @@ lua_source = '''require('modules.nvim-autopairs')'''
 
 [[plugins]]
 repo = 'windwp/nvim-ts-autotag'
-# on_event = ['InsertEnter']
-# on_source = 'nvim-treesitter'
+on_event = ['InsertEnter']
+depends = 'nvim-treesitter'
 lua_source = '''require('modules.nvim-ts-autotag')'''
 
 [[plugins]]
@@ -47,6 +48,14 @@ lua_source = '''require('modules.colorizer')'''
 [[plugins]]
 repo = 'jlcrochet/vim-razor'
 on_ft = ['razor']
+
+[[plugins]]
+repo = 'leafOfTree/vim-svelte-plugin'
+on_ft = ['svelte']
+hook_source='''
+let g:vim_svelte_plugin_use_typescript = 1
+'''
+
 
 [[plugins]]
 repo = 'vim-denops/denops.vim'
@@ -71,3 +80,7 @@ let g:silicon_options = {
 [[plugins]]
 repo = 'dstein64/vim-startuptime'
 on_cmd = 'StartupTime'
+
+[[plugins]]
+repo = 'jlcrochet/vim-razor'
+on_ft = ['razor', 'cshtml']

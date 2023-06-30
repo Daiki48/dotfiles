@@ -14,6 +14,8 @@ treesitter.setup {
 		"json",
 		"yaml",
 		"markdown",
+    "markdown_inline",
+		"svelte",
 	},
 	autotag = {
 		enable = true,
@@ -30,6 +32,7 @@ treesitter.setup {
 			"jsx",
 			"rescript",
 			"markdown",
+      "markdown_inline",
 			"cs",
 			"rust",
 			"razor",
