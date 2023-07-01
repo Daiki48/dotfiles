@@ -25,6 +25,7 @@ local dein_toml_lspconfig = dein_toml_dir .. '/lspconfig.toml'
 local dein_toml_noice = dein_toml_dir .. '/noice.toml'
 local dein_toml_ddu = dein_toml_dir .. '/ddu.toml'
 local dein_toml_ddc = dein_toml_dir .. '/ddc.toml'
+local dein_toml_git = dein_toml_dir .. '/git.toml'
 
 vim.call('dein#begin', dein_dir)
 
@@ -36,6 +37,7 @@ vim.call('dein#load_toml', dein_toml_lspconfig, { lazy = 1 })
 vim.call('dein#load_toml', dein_toml_noice, { lazy = 1 })
 vim.call('dein#load_toml', dein_toml_ddu, { lazy = 1 })
 vim.call('dein#load_toml', dein_toml_ddc, { lazy = 1 })
+vim.call('dein#load_toml', dein_toml_git, { lazy = 1 })
 
 vim.call('dein#end')
 vim.call('dein#save_state')

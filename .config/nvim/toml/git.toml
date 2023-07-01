@@ -1,0 +1,16 @@
+## *************************** ## 
+##          git plugin         ##
+## *************************** ##
+[[plugins]]
+repo = 'nvim-lua/plenary.nvim'
+on_event=['BufRead']
+
+[[plugins]]
+repo = 'sindrets/diffview.nvim'
+on_event=['BufRead']
+
+[[plugins]]
+repo = 'TimUntersberger/neogit'
+depends=['plenary.nvim', 'diffview.nvim']
+lua_source = '''require('modules.neogit')'''
+
