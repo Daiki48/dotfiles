@@ -4,13 +4,6 @@ local ddu = {
 	alias = vim.fn["ddu#custom#alias"];
 }
 
--- local lines = vim.o.lines
--- local win_height = math.floor(lines / 4)
--- local win_row = math.floor(lines - win_height)
--- local win_col = math.floor(vim.o.columns)
--- local win_between = 3
--- local win_width = math.floor((vim.o.columns - win_col * 2 - win_between) / 2)
-
 ddu.alias("source", "directory_rec", "file_external")
 
 ddu.patch_global({
@@ -19,7 +12,7 @@ ddu.patch_global({
 		ff = {
 			-- displaySourceName = "no",
 			prompt = "> ",
-			-- split = "floating",
+			split = "horizontal",
 			-- floatingBorder = "rounded",
 			--       floatingTitle = {
 			--         {'title', 'Blue'}
@@ -29,21 +22,21 @@ ddu.patch_global({
 			-- filterSplitDirection = "floating",
 			-- filterFloatingPosition = "top",
 			startFilter = true,
-			-- highlights = {
-			-- 	floating = "DduUiFfFloating",
-			-- 	prompt = "DduUiFfPrompt",
-			-- 	selected = "DduUiFfSelected",
-			-- },
+			highlights = {
+				floating = "DduUiFfFloating",
+				prompt = "DduUiFfPrompt",
+				selected = "DduUiFfSelected",
+			},
 		},
 		filer = {
 			-- split = "floating",
 			sort = "filename",
 			sortTreesFirst = true,
 			toggle = true,
-			-- highlights = {
-			-- 	floating = "DduUiFilerFloating",
-			-- 	selected = "DduUiFilerSelected"
-			-- },
+			highlights = {
+				floating = "DduUiFilerFloating",
+				selected = "DduUiFilerSelected"
+			},
 		},
 	},
 	uiOptions = {
@@ -83,8 +76,7 @@ ddu.patch_global({
 	},
 	filterParams = {
 		matcher_substring = {
-			-- highlightMatched = "DduUiFfFilterMatch",
-			highlightMatched = "Search",
+			highlightMatched = "DduUiFfFilterMatch",
 		}
 	},
 })

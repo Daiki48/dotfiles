@@ -27,6 +27,11 @@ depends = ['nvim-tree/nvim-web-devicons']
 lua_add = '''require('modules.lualine')'''
 
 [[plugins]]
+repo = 'akinsho/bufferline.nvim'
+depends = 'nvim-web-devicons'
+lua_add = '''require('modules.bufferline')'''
+
+[[plugins]]
 repo = 'terrortylor/nvim-comment'
 lua_add = '''require('modules.nvim-comment')'''
 
@@ -40,3 +45,7 @@ on_source = 'williamboman/mason.nvim'
 
 # [[plugins]]
 # repo = 'vim-denops/denops.vim'
+
+[[plugins]]
+repo = 'Daiki48/quote-bracketeer.nvim'
+lua_add = '''require('modules.quote-bracketeer')'''

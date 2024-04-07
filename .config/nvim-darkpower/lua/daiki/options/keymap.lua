@@ -3,14 +3,14 @@ local keymap = vim.api.nvim_set_keymap
 -- buffer moving
 keymap('n', '<C-l>', '<cmd>bnext<cr>', { noremap = true, silent = true })
 keymap('n', '<C-h>', '<cmd>bprevious<cr>', { noremap = true, silent = true })
-keymap('n', '<C-q>', '<cmd>bd<cr>', { noremap = true })
+keymap('n', '<C-q>', '<cmd>bd<cr>', { noremap = true, silent = true })
 
 -- packer command
-keymap('n', 'ps', '<cmd>PackerSync<cr>', { noremap = true, silent = true })
-keymap('n', 'pi', '<cmd>PackerInstall<cr>', { noremap = true, silent = true })
+-- keymap('n', 'ps', '<cmd>PackerSync<cr>', { noremap = true, silent = true })
+-- keymap('n', 'pi', '<cmd>PackerInstall<cr>', { noremap = true, silent = true })
 
 -- lsp keymaps
-local set = vim.keymap.set
+-- local set = vim.keymap.set
 -- set("n", "gd", "<cmd>lua vim.lsp.buf.definition()<CR>")
 -- set("n", "<leader>K", "<cmd>lua vim.lsp.buf.hover()<CR>")
 -- set("n", "<C-m>", "<cmd>lua vim.lsp.buf.signature_help()<CR>")
@@ -23,4 +23,12 @@ local set = vim.keymap.set
 -- set("n", "]d", "<cmd>lua vim.lsp.diagnostic.goto_next()<CR>")
 
 -- fern
-set("n", ";fj", "<cmd>Fern .<CR>")
+-- set("n", ";fj", "<cmd>Fern .<CR>")
+
+keymap('n', '<Leader>v', ':vsplit<CR>', { noremap = true, silent = true })
+keymap('n', '<Leader>s', ':split<CR>', { noremap = true, silent = true })
+keymap('n', '<Leader>h', '<C-w>h', { noremap = true, silent = true })
+keymap('n', '<Leader>l', '<C-w>l', { noremap = true, silent = true })
+keymap('n', '<Leader>j', '<C-w>j', { noremap = true, silent = true })
+keymap('n', '<Leader>k', '<C-w>k', { noremap = true, silent = true })
+keymap('n', '<Leader>q', '<cmd>quit<CR>', { noremap = true, silent = true })

@@ -1,11 +1,12 @@
 ## *************************** ## 
 ##         lazy plugin         ##
 ## *************************** ##
-[[plugins]]
-repo = 'j-hui/fidget.nvim'
-rev = 'legacy'
-on_event = ['BufRead']
-lua_source = '''require('modules.fidget')'''
+
+# [[plugins]]
+# repo = 'j-hui/fidget.nvim'
+# rev = 'legacy'
+# on_event = ['BufRead']
+# lua_source = '''require('modules.fidget')'''
 
 [[plugins]]
 repo = 'ray-x/lsp_signature.nvim'
@@ -46,10 +47,6 @@ on_event = ['FileType']
 lua_source = '''require('modules.colorizer')'''
 
 [[plugins]]
-repo = 'jlcrochet/vim-razor'
-on_ft = ['razor']
-
-[[plugins]]
 repo = 'leafOfTree/vim-svelte-plugin'
 on_ft = ['svelte']
 hook_source='''
@@ -81,6 +78,3 @@ let g:silicon_options = {
 repo = 'dstein64/vim-startuptime'
 on_cmd = 'StartupTime'
 
-[[plugins]]
-repo = 'jlcrochet/vim-razor'
-on_ft = ['razor', 'cshtml']

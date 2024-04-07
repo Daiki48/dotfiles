@@ -14,3 +14,6 @@ repo = 'TimUntersberger/neogit'
 depends=['plenary.nvim', 'diffview.nvim']
 lua_source = '''require('modules.neogit')'''
 
+[[plugin]]
+repo = 'tpope/vim-fugitive'
+on_cmd=['Gstatus', 'Gwrite', 'Gread', 'Gcommit', 'Gdiff', 'Gvdiff']

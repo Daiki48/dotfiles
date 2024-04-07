@@ -45,6 +45,8 @@ vim.api.nvim_create_autocmd("FileType", {
 
 		vim.keymap.set("n", "N", function() return do_action("itemAction", { name = "newFile" }) end, { buffer = 0 })
 		vim.keymap.set("n", "K", function() return do_action("itemAction", { name = "newDirectory" }) end, { buffer = 0 })
+		vim.keymap.set("n", "Y", function() return do_action("itemAction", { name = "copy" }) end, { buffer = 0 })
+		vim.keymap.set("n", "P", function() return do_action("itemAction", { name = "paste" }) end, { buffer = 0 })
 		vim.keymap.set("n", "R", function() return do_action("itemAction", { name = "rename" }) end, { buffer = 0 })
 		vim.keymap.set("n", "D", function() return do_action("itemAction", { name = "delete" }) end, { buffer = 0 })
 

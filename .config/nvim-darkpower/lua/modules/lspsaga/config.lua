@@ -82,11 +82,11 @@ saga.setup({
     },
   },
   symbol_in_winbar = {
-    enable = true,
-    separator = ' ',
-    hide_keyword = true,
-    show_file = true,
-    folder_level = 2,
+    enable = false,
+    -- separator = ' ',
+    -- hide_keyword = true,
+    -- show_file = true,
+    -- folder_level = 2,
   },
   ui = {
     -- currently only round theme
@@ -128,4 +128,3 @@ saga.setup({
 	-- }
 -- }
 
-vim.wo.winbar = require('lspsaga.symbolwinbar'):get_winbar()
