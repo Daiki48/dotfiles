@@ -2,6 +2,7 @@ return {
   -- colorsheme
   {
   'Daiki48/coolnessFlair.vim',
+	lazy = false,
   config = function()
     vim.cmd([[colorscheme coolnessFlair]])
   end
@@ -9,6 +10,7 @@ return {
   'editorconfig/editorconfig-vim',
   {
     'nvim-lualine/lualine.nvim',
+		lazy = false,
     dependencies = { 'nvim-tree/nvim-web-devicons' },
     config = function()
 			require("daiki.plugins.lualine")
@@ -16,6 +18,7 @@ return {
   },
   {
     'lewis6991/gitsigns.nvim',
+		lazy = false,
     config = function()
       require('gitsigns').setup()
     end
@@ -30,6 +33,7 @@ return {
   },
   {
     'nvim-tree/nvim-tree.lua',
+		lazy = false,
     dependencies = {
       'nvim-tree/nvim-web-devicons',
     },

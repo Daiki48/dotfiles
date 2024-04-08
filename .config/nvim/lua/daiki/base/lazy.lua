@@ -14,6 +14,9 @@ vim.opt.rtp:prepend(lazypath)
 plugins = require('daiki.plugins')
 
 local opts = {
+	defaults = {
+		lazy = true
+	},
 	performance = {
 		cache = {
 			enabled = true
