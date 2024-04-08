@@ -49,5 +49,15 @@ return {
 	{
 		'dstein64/vim-startuptime',
 		cmd = 'StartupTime'
+	},
+	{
+		'nvim-telescope/telescope.nvim', tag = '0.1.6',
+		lazy = false,
+		dependencies = {
+			'nvim-lua/plenary.nvim',
+		},
+    config = function()
+			require('daiki.plugins.telescope')
+	  end
 	}
 }
