@@ -3,6 +3,7 @@ return {
   {
   'Daiki48/coolnessFlair.vim',
 	lazy = false,
+	branch = 'develop',
   config = function()
     vim.cmd([[colorscheme coolnessFlair]])
   end
@@ -60,6 +61,9 @@ return {
 			require('daiki.plugins.telescope')
 	  end
 	},
+
+	-- Git
+
 	{
 		'NeogitOrg/neogit',
 		cmd = 'Neogit',
@@ -70,6 +74,17 @@ return {
 		},
 		config = function()
 			require('neogit').setup()
+		end
+	},
+
+	-- LSP
+
+	'williamboman/mason.nvim',
+	'neovim/nvim-lspconfig',
+	{
+		'williamboman/mason-lspconfig.nvim',
+		config = function()
+			require('daiki.plugins.mason')
 		end
 	}
 }
