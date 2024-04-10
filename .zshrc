@@ -1,9 +1,15 @@
 setopt print_eight_bit
 setopt no_beep
 
-# git
+# git 
 # curl -o .git-completion.sh https://raw.githubusercontent.com/git/git/master/contrib/completion/git-completion.bash
 # curl -o .git-prompt.sh https://raw.githubusercontent.com/git/git/master/contrib/completion/git-prompt.sh
+# source ~/.zsh/git-prompt.sh fpath=(~/.zsh $fpath)
+# zstyle ':completion:*:*:git:*' script ~/.zsh/git-completion.zsh
+# autoload -Uz compinit && compinit
+# autoload -Uz vcs_info setopt prompt_subst
+# zstyle ':vcs_info:git:*' check-for-changes true
+
 source ~/.zsh/git-prompt.sh
 fpath=(~/.zsh $fpath)
 zstyle ':completion:*:*:git:*' script ~/.zsh/git-completion.zsh
@@ -20,6 +26,9 @@ PROMPT='[%B%F{red}%n:%F{green}%~%f]%F{cyan}$vcs_info_msg_0_%f
 %F{yellow}$%f '
 # PROMPT='[%B%F{red}%n@%m%f%b:%F{green}%~%f]%F{cyan}$vcs_info_msg_0_%f
 # %F{yellow}$%f '
+
+# Default work dir
+cd /mnt/sabrent
 
 # Created by newuser for 5.8.1
 export DENO_INSTALL="/home/daiki/.deno"
