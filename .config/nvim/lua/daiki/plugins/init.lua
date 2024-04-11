@@ -91,5 +91,15 @@ return {
 		'leafOfTree/vim-svelte-plugin',
 		ft = 'svelte',
 		config = true
+	},
+
+	-- treesitter
+	{
+		'nvim-treesitter/nvim-treesitter',
+		build = ':TSUpdate',
+		lazy = false,
+		config = function ()
+			require('daiki.plugins.treesitter')
+		end
 	}
 }
