@@ -1,4 +1,5 @@
 return {
+
   -- colorsheme
   {
   'Daiki48/coolnessFlair.vim',
@@ -26,6 +27,7 @@ return {
   },
   {
     'numToStr/Comment.nvim',
+		lazy = false,
     config = function()
         require('Comment').setup()
         vim.api.nvim_set_keymap('n', '<C-_>', 'gcc', {})
@@ -63,7 +65,6 @@ return {
 	},
 
 	-- Git
-
 	{
 		'NeogitOrg/neogit',
 		cmd = 'Neogit',
@@ -76,15 +77,19 @@ return {
 			require('neogit').setup()
 		end
 	},
-
-	-- LSP
-
-	'williamboman/mason.nvim',
-	'neovim/nvim-lspconfig',
+	
+	-- coc
 	{
-		'williamboman/mason-lspconfig.nvim',
-		config = function()
-			require('daiki.plugins.mason')
+		'neoclide/coc.nvim',
+		branch = 'release',
+		lazy = false,
+		config = function ()
+			require('daiki.plugins.coc')
 		end
+	},
+	{
+		'leafOfTree/vim-svelte-plugin',
+		ft = 'svelte',
+		config = true
 	}
 }
