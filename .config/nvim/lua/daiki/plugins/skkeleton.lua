@@ -18,9 +18,10 @@ vim.api.nvim_create_autocmd("User", {
 			registerConvertResult = true,
 			globalDictionaries = skk_files,
 			usePopup = true,
-			keepState = true,
+			keepState = false,
 			immediatelyCancel = true,
 			selectCandidateKeys = "asdfjkl",
+			setUndoPoint = true,
 		})
 	end,
 })
