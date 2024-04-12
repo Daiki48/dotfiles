@@ -77,16 +77,17 @@ return {
 			require('neogit').setup()
 		end
 	},
-	
+
 	-- coc
-	{
-		'neoclide/coc.nvim',
-		branch = 'release',
-		lazy = false,
-		config = function ()
-			require('daiki.plugins.coc')
-		end
-	},
+	-- {
+	-- 	'neoclide/coc.nvim',
+	-- 	branch = 'release',
+	-- 	lazy = false,
+	-- 	config = function ()
+	-- 		require('daiki.plugins.coc')
+	-- 	end
+	-- },
+
 	{
 		'leafOfTree/vim-svelte-plugin',
 		ft = 'svelte',
@@ -108,5 +109,93 @@ return {
 		dependencies = {
 			'nvim-treesitter/nvim-treesitter',
 		}
-	}
+	},
+
+	-- skkeleton
+	{
+		'vim-skk/skkeleton',
+		dependencies = {
+			'vim-denops/denops.vim',
+			'Shougo/ddc.vim',
+		},
+		event = 'VimEnter',
+		config = function ()
+			require('daiki.plugins.skkeleton')
+		end
+	},
+	'delphinus/skkeleton_indicator.nvim',
+
+	-- ddc
+	{
+		'Shougo/ddc.vim',
+		event = "InsertEnter",
+		dependencies = {
+			'vim-denops/denops.vim',
+			'vim-skk/skkeleton',
+			'Shougo/pum.vim',
+			'Shougo/ddc-ui-pum',
+			'Shougo/ddc-source-around',
+			'Shougo/ddc-source-lsp',
+			'matsui54/ddc-buffer',
+			'Shougo/ddc-source-cmdline',
+			'Shougo/ddc-source-cmdline-history',
+			'LumaKernel/ddc-source-file',
+			'Shougo/ddc-source-input',
+			'Shougo/ddc-source-nvim-lua',
+			'Shougo/ddc-matcher_head',
+			'Shougo/ddc-sorter_rank',
+			'tani/ddc-fuzzy',
+		},
+		config = function ()
+			require('daiki.plugins.ddc')
+		end
+	},
+
+	-- ddc UI
+	'Shougo/ddc-ui-pum',
+	'Shougo/pum.vim',
+
+	-- ddc source
+	'Shougo/ddc-source-around',
+	{
+		'Shougo/ddc-source-lsp',
+		dependencies = {
+			'neovim/nvim-lspconfig',
+			'Shougo/ddc.vim'
+		},
+	},
+	'matsui54/ddc-buffer',
+	'Shougo/ddc-source-cmdline',
+	'Shougo/ddc-source-cmdline-history',
+	'LumaKernel/ddc-source-file',
+	'Shougo/ddc-source-input',
+	'Shougo/ddc-source-nvim-lua',
+
+	-- ddc filter
+	'Shougo/ddc-matcher_head',
+	'Shougo/ddc-sorter_rank',
+	'tani/ddc-fuzzy',
+
+	-- lspconfig
+	{
+		'neovim/nvim-lspconfig',
+		lazy = false,
+		event = 'BufRead',
+		config = function ()
+			require('daiki.plugins.nvim-lspconfig')
+		end
+	},
+	{
+		'williamboman/mason.nvim',
+		lazy = false,
+		config = function ()
+			require('daiki.plugins.mason')
+		end
+	},
+	{
+		'williamboman/mason-lspconfig.nvim',
+		dependencies = {
+			'williamboman/mason.nvim',
+		}
+	},
 }
