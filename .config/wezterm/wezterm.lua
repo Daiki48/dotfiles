@@ -22,4 +22,20 @@ config.keys = {
   { key = 'v', mods = 'CTRL', action = wezterm.action.PasteFrom 'PrimarySelection' },
 }
 
+-- You can specify some parameters to influence the font selection;
+-- for example, this selects a Bold, Italic font variant.
+config.font = wezterm.font('JetBrains Mono', { weight = 'Bold', italic = false })
+-- config.font = wezterm.font('Source Han Sans JP', { weight = 'Bold', italic = false })
+-- config.font = wezterm.font_with_fallback {
+--   'Noto Sans CJK JP',
+--   'Source Han Sans JP',
+-- }
+
+-- Font problem
+-- No fonts contain glyphs for these codepoints: \u{e6b4}.
+-- Placeholder glyphs are being displayed instead.
+-- You may wish to install additional fonts, or adjust
+-- your configuration so that it can find them.
+config.warn_about_missing_glyphs = false
+
 return config
