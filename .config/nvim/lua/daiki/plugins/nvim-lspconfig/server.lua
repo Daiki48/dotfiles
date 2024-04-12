@@ -1,6 +1,13 @@
 local tools = require("daiki.plugins.nvim-lspconfig.tools")
 local lspconfig = require('lspconfig')
 
+lspconfig['cssls'].setup {
+	root_dir = lspconfig.util.root_pattern("package.json"),
+	on_attach = tools.on_attach,
+	flags = tools.lsp_flags,
+	init_options = {},
+}
+
 lspconfig['lua_ls'].setup{
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
