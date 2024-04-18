@@ -8,7 +8,12 @@ local skk = {
 }
 
 local skk_files = {}
+table.insert(skk_files, vim.env.HOME .. "/.skk/SKK-JISYO.fullname")
+table.insert(skk_files, vim.env.HOME .. "/.skk/SKK-JISYO.geo")
 table.insert(skk_files, vim.env.HOME .. "/.skk/SKK-JISYO.L")
+table.insert(skk_files, vim.env.HOME .. "/.skk/SKK-JISYO.ML")
+table.insert(skk_files, vim.env.HOME .. "/.skk/SKK-JISYO.station")
+table.insert(skk_files, vim.env.HOME .. "/.skk/SKK-JISYO.wrong")
 
 vim.api.nvim_create_autocmd("User", {
 	pattern = "skkeleton-initialize-pre",
