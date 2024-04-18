@@ -32,7 +32,7 @@ $ ln -s ~/dotfiles/.zsh ~/.zsh
 ### .skk
 
 ```shell
-$ ln -s ~/dotfiles/.skk ~/
+$ git clone https://github.com/Daiki48/skk.git
 ```
 
 # Setup Documentation
