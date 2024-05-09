@@ -210,7 +210,7 @@ return {
 				title = "",
 				code_font_family = "CaskaydiaCove Nerd Font",
 				watermark_font_family = "Pacifico",
-				watermark = "Dnfolio",
+				watermark = "",
 				bg_theme = "bamboo",
 				breadcrumbs_separator = "/",
 				has_breadcrumbs = false,
