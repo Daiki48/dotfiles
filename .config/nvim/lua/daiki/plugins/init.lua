@@ -1,5 +1,4 @@
 return {
-
   -- colorsheme
   {
   'Daiki48/coolnessFlair.vim',
@@ -79,14 +78,14 @@ return {
 	},
 
 	-- coc
-	-- {
-	-- 	'neoclide/coc.nvim',
-	-- 	branch = 'release',
-	-- 	lazy = false,
-	-- 	config = function ()
-	-- 		require('daiki.plugins.coc')
-	-- 	end
-	-- },
+	{
+		'neoclide/coc.nvim',
+		branch = 'release',
+		lazy = false,
+		config = function ()
+			require('daiki.plugins.coc')
+		end
+	},
 
 	{
 		'leafOfTree/vim-svelte-plugin',
@@ -112,69 +111,97 @@ return {
 	},
 
 	-- skkeleton
-	{
-		'vim-skk/skkeleton',
-		dependencies = {
-			'vim-denops/denops.vim',
-			'Shougo/ddc.vim',
-		},
-		event = 'VimEnter',
-		config = function ()
-			require('daiki.plugins.skkeleton')
-		end
-	},
-	'delphinus/skkeleton_indicator.nvim',
+	-- {
+	-- 	'vim-skk/skkeleton',
+	-- 	dependencies = {
+	-- 		'vim-denops/denops.vim',
+	-- 		'Shougo/ddc.vim',
+	-- 	},
+	-- 	event = 'VimEnter',
+	-- 	config = function ()
+	-- 		require('daiki.plugins.skkeleton')
+	-- 	end
+	-- },
+	-- 'delphinus/skkeleton_indicator.nvim',
+	-- {
+	-- 	'rinx/cmp-skkeleton',
+	-- 	dependencies = {
+	-- 		'hrsh7th/nvim-cmp',
+	-- 		'vim-skk/skkeleton',
+	-- 	},
+	-- 	config = true
+	-- },
 
-	-- ddc
-	{
-		'Shougo/ddc.vim',
-		event = "InsertEnter",
-		dependencies = {
-			'vim-denops/denops.vim',
-			'vim-skk/skkeleton',
-			'Shougo/pum.vim',
-			'Shougo/ddc-ui-pum',
-			'Shougo/ddc-source-around',
-			'Shougo/ddc-source-lsp',
-			'matsui54/ddc-buffer',
-			'Shougo/ddc-source-cmdline',
-			'Shougo/ddc-source-cmdline-history',
-			'LumaKernel/ddc-source-file',
-			'Shougo/ddc-source-input',
-			'Shougo/ddc-source-nvim-lua',
-			'Shougo/ddc-matcher_head',
-			'Shougo/ddc-sorter_rank',
-			'tani/ddc-fuzzy',
-		},
-		config = function ()
-			require('daiki.plugins.ddc')
-		end
-	},
+	-- completion
+	-- {
+	-- 	'hrsh7th/nvim-cmp',
+	-- 	event="InsertEnter",
+	-- 	dependencies = {
+	-- 		"hrsh7th/cmp-nvim-lsp",
+	-- 		"hrsh7th/cmp-buffer",
+	-- 		"hrsh7th/cmp-path",
+	-- 		"hrsh7th/cmp-vsnip",
+	-- 		"hrsh7th/vim-vsnip",
+	-- 		-- "onsails/lspkind.nvim",
+	-- 		"hrsh7th/cmp-nvim-lsp-signature-help",
+	-- 		{ "hrsh7th/cmp-cmdline", event = { "CmdlineEnter" } },
+	-- 		-- { "uga-rosa/cmp-skkeleton", dependencies = { "vim-skk/skkeleton" } },
+	-- 	},
+	-- 	config = function ()
+	-- 		require('daiki.plugins.cmp')
+	-- 	end
+	-- },
 
-	-- ddc UI
-	'Shougo/ddc-ui-pum',
-	'Shougo/pum.vim',
-
-	-- ddc source
-	'Shougo/ddc-source-around',
-	{
-		'Shougo/ddc-source-lsp',
-		dependencies = {
-			'neovim/nvim-lspconfig',
-			'Shougo/ddc.vim'
-		},
-	},
-	'matsui54/ddc-buffer',
-	'Shougo/ddc-source-cmdline',
-	'Shougo/ddc-source-cmdline-history',
-	'LumaKernel/ddc-source-file',
-	'Shougo/ddc-source-input',
-	'Shougo/ddc-source-nvim-lua',
-
-	-- ddc filter
-	'Shougo/ddc-matcher_head',
-	'Shougo/ddc-sorter_rank',
-	'tani/ddc-fuzzy',
+	-- -- ddc
+	-- {
+	-- 	'Shougo/ddc.vim',
+	-- 	event = "InsertEnter",
+	-- 	dependencies = {
+	-- 		'vim-denops/denops.vim',
+	-- 		'vim-skk/skkeleton',
+	-- 		'Shougo/pum.vim',
+	-- 		'Shougo/ddc-ui-pum',
+	-- 		'Shougo/ddc-source-around',
+	-- 		'Shougo/ddc-source-lsp',
+	-- 		'matsui54/ddc-buffer',
+	-- 		'Shougo/ddc-source-cmdline',
+	-- 		'Shougo/ddc-source-cmdline-history',
+	-- 		'LumaKernel/ddc-source-file',
+	-- 		'Shougo/ddc-source-input',
+	-- 		'Shougo/ddc-source-nvim-lua',
+	-- 		'Shougo/ddc-matcher_head',
+	-- 		'Shougo/ddc-sorter_rank',
+	-- 		'tani/ddc-fuzzy',
+	-- 	},
+	-- 	config = function ()
+	-- 		require('daiki.plugins.ddc')
+	-- 	end
+	-- },
+	--
+	-- -- ddc UI
+	-- 'Shougo/ddc-ui-pum',
+	-- 'Shougo/pum.vim',
+	--
+	-- -- ddc source
+	-- 'Shougo/ddc-source-around',
+	-- {
+	-- 	'Shougo/ddc-source-lsp',
+	-- 	dependencies = {
+	-- 		'neovim/nvim-lspconfig',
+	-- 		'Shougo/ddc.vim'
+	-- 	},
+	-- },
+	-- 'matsui54/ddc-buffer',
+	-- 'Shougo/ddc-source-cmdline',
+	-- 'Shougo/ddc-source-cmdline-history',
+	-- 'LumaKernel/ddc-source-file',
+	-- 'Shougo/ddc-source-input',
+	-- 'Shougo/ddc-source-nvim-lua',
+	--
+	-- -- ddc filter
+	-- 'Shougo/ddc-matcher_head',
+	-- 'Shougo/ddc-sorter_rank',
+	-- 'tani/ddc-fuzzy',
 
 	-- lspconfig
 	{
