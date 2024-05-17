@@ -4,5 +4,7 @@
   "Lua.diagnostics.globals": [
     "vim"
   ],
-  "svelte.enable-ts-plugin": true
+  "svelte.enable-ts-plugin": true,
+	"tsserver.enable": false,
+	"deno.enable": false
 }

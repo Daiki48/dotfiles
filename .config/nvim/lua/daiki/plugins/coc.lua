@@ -133,15 +133,15 @@ keyset("o", "ac", "<Plug>(coc-classobj-a)", opts)
 
 -- Remap <C-f> and <C-b> to scroll float windows/popups
 ---@diagnostic disable-next-line: redefined-local
-local opts = {silent = true, nowait = true, expr = true}
-keyset("n", "<C-f>", 'coc#float#has_scroll() ? coc#float#scroll(1) : "<C-f>"', opts)
-keyset("n", "<C-b>", 'coc#float#has_scroll() ? coc#float#scroll(0) : "<C-b>"', opts)
-keyset("i", "<C-f>",
-       'coc#float#has_scroll() ? "<c-r>=coc#float#scroll(1)<cr>" : "<Right>"', opts)
-keyset("i", "<C-b>",
-       'coc#float#has_scroll() ? "<c-r>=coc#float#scroll(0)<cr>" : "<Left>"', opts)
-keyset("v", "<C-f>", 'coc#float#has_scroll() ? coc#float#scroll(1) : "<C-f>"', opts)
-keyset("v", "<C-b>", 'coc#float#has_scroll() ? coc#float#scroll(0) : "<C-b>"', opts)
+-- local opts = {silent = true, nowait = true, expr = true}
+-- keyset("n", "<C-f>", 'coc#float#has_scroll() ? coc#float#scroll(1) : "<C-f>"', opts)
+-- keyset("n", "<C-b>", 'coc#float#has_scroll() ? coc#float#scroll(0) : "<C-b>"', opts)
+-- keyset("i", "<C-f>",
+--        'coc#float#has_scroll() ? "<c-r>=coc#float#scroll(1)<cr>" : "<Right>"', opts)
+-- keyset("i", "<C-b>",
+--        'coc#float#has_scroll() ? "<c-r>=coc#float#scroll(0)<cr>" : "<Left>"', opts)
+-- keyset("v", "<C-f>", 'coc#float#has_scroll() ? coc#float#scroll(1) : "<C-f>"', opts)
+-- keyset("v", "<C-b>", 'coc#float#has_scroll() ? coc#float#scroll(0) : "<C-b>"', opts)
 
 
 -- Use CTRL-S for selections ranges
@@ -171,7 +171,7 @@ local opts = {silent = true, nowait = true}
 -- Show all diagnostics
 keyset("n", "<space>a", ":<C-u>CocList diagnostics<cr>", opts)
 -- Manage extensions
-keyset("n", "<space>e", ":<C-u>CocList extensions<cr>", opts)
+keyset("n", "<space>l", ":<C-u>CocList extensions<cr>", opts)
 -- Show commands
 keyset("n", "<space>c", ":<C-u>CocList commands<cr>", opts)
 -- Find symbol of current document
@@ -185,3 +185,24 @@ keyset("n", "<space>k", ":<C-u>CocPrev<cr>", opts)
 -- Resume latest coc list
 keyset("n", "<space>p", ":<C-u>CocListResume<cr>", opts)
 
+local function switch_coc_ts()
+	local path = vim.fn.expand('%:p:h')
+	if path == '' then path = '.' end
+
+	if vim.fn.empty(vim.fn.finddir('node_modules', path .. ';')) == 1 then
+		vim.fn['coc#config']('deno.enable', true)
+		vim.fn['coc#config']('tsserver.enable', false)
+	else
+		vim.fn['coc#config']('deno.enable', false)
+		vim.fn['coc#config']('tsserver.enable', true)
+	end
+end
+
+vim.api.nvim_create_autocmd('FileType', {
+	pattern = { 'typescript', 'typescript.tsx' },
+	callback = switch_coc_ts,
+	once = true
+})
+
+-- Show diagnostics in a floating window
+vim.keymap.set("n", "<space>e", ":<C-u>CocCommand document.showIncomingCalls<CR>", {silent = true, noremap = true})
