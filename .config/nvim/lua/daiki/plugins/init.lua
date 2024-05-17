@@ -204,27 +204,27 @@ return {
 	-- 'tani/ddc-fuzzy',
 
 	-- lspconfig
-	{
-		'neovim/nvim-lspconfig',
-		lazy = false,
-		event = 'BufRead',
-		config = function ()
-			require('daiki.plugins.nvim-lspconfig')
-		end
-	},
-	{
-		'williamboman/mason.nvim',
-		lazy = false,
-		config = function ()
-			require('daiki.plugins.mason')
-		end
-	},
-	{
-		'williamboman/mason-lspconfig.nvim',
-		dependencies = {
-			'williamboman/mason.nvim',
-		}
-	},
+	-- {
+	-- 	'neovim/nvim-lspconfig',
+	-- 	lazy = false,
+	-- 	event = 'BufRead',
+	-- 	config = function ()
+	-- 		require('daiki.plugins.nvim-lspconfig')
+	-- 	end
+	-- },
+	-- {
+	-- 	'williamboman/mason.nvim',
+	-- 	lazy = false,
+	-- 	config = function ()
+	-- 		require('daiki.plugins.mason')
+	-- 	end
+	-- },
+	-- {
+	-- 	'williamboman/mason-lspconfig.nvim',
+	-- 	dependencies = {
+	-- 		'williamboman/mason.nvim',
+	-- 	}
+	-- },
 
 	-- codesnap
 	{
