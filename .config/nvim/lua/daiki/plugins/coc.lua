@@ -206,3 +206,8 @@ vim.api.nvim_create_autocmd('FileType', {
 
 -- Show diagnostics in a floating window
 vim.keymap.set("n", "<space>e", ":<C-u>CocCommand document.showIncomingCalls<CR>", {silent = true, noremap = true})
+
+-- prettier
+vim.api.nvim_create_user_command('Prettier', function()
+  vim.fn.CocAction('runCommand', 'prettier.formatFile')
+end, {})

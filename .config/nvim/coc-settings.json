@@ -6,5 +6,5 @@
   ],
   "svelte.enable-ts-plugin": true,
 	"tsserver.enable": false,
-	"deno.enable": false
+	"deno.enable": false,
 }
