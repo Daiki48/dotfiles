@@ -107,7 +107,10 @@ return {
 		lazy = false,
 		dependencies = {
 			'nvim-treesitter/nvim-treesitter',
-		}
+		},
+		config = function ()
+			require('daiki.plugins.nvim-ts-autotag')
+		end
 	},
 
 	-- skkeleton
