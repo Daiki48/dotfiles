@@ -248,4 +248,17 @@ return {
 			})
 		end
 	},
+
+	-- hop
+	{
+		"smoka7/hop.nvim",
+		version = "*",
+		event = "VimEnter",
+		opts = {
+			keys = 'etvxqdygfblzhcksurn'
+		},
+		config = function ()
+			require('daiki.plugins.hop')
+		end
+	},
 }
