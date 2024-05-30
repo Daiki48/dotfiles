@@ -11,17 +11,25 @@ if not vim.loop.fs_stat(lazypath) then
 end
 vim.opt.rtp:prepend(lazypath)
 
-local plugins = require('daiki.plugins')
+local plugins = require("daiki.plugins")
 
 local opts = {
 	defaults = {
-		lazy = true
+		lazy = true,
 	},
 	performance = {
 		cache = {
-			enabled = true
+			enabled = true,
 		},
 	},
+	dev = {
+		path = "/mnt/sabrent/dev/nvim-plugin-dev/Daiki48",
+		-- patterns = {'Daiki48'},
+		-- fallback = true,
+	},
+	-- install = {
+	-- 	colorscheme = { 'sakurajima' }
+	-- }
 }
 
-require('lazy').setup(plugins, opts)
+require("lazy").setup(plugins, opts)

@@ -1,116 +1,126 @@
 return {
-  -- colorsheme
-  {
-  'Daiki48/coolnessFlair.vim',
-	lazy = false,
-	branch = 'develop',
-  config = function()
-    vim.cmd([[colorscheme coolnessFlair]])
-  end
-  },
-  'editorconfig/editorconfig-vim',
-  {
-    'nvim-lualine/lualine.nvim',
+	-- colorsheme
+	--  {
+	--  'Daiki48/coolnessFlair.vim',
+	-- lazy = false,
+	-- branch = 'develop',
+	--  config = function()
+	--    vim.cmd([[colorscheme coolnessFlair]])
+	--  end
+	--  },
+	{
+		"Daiki48/sakurajima.nvim",
 		lazy = false,
-    dependencies = { 'nvim-tree/nvim-web-devicons' },
-    config = function()
+		branch = "develop",
+		dev = true,
+		config = function()
+			vim.cmd([[colorscheme sakurajima]])
+		end,
+	},
+	"editorconfig/editorconfig-vim",
+	{
+		"nvim-lualine/lualine.nvim",
+		lazy = false,
+		dependencies = { "nvim-tree/nvim-web-devicons" },
+		config = function()
 			require("daiki.plugins.lualine")
-    end
-  },
-  {
-    'lewis6991/gitsigns.nvim',
-		lazy = false,
-    config = function()
-      require('gitsigns').setup()
-    end
-  },
-  {
-    'numToStr/Comment.nvim',
-		lazy = false,
-    config = function()
-        require('Comment').setup()
-        vim.api.nvim_set_keymap('n', '<C-_>', 'gcc', {})
-        vim.api.nvim_set_keymap('v', '<C-_>', 'gc', {})
-    end
-  },
-  {
-    'nvim-tree/nvim-tree.lua',
-		lazy = false,
-    dependencies = {
-      'nvim-tree/nvim-web-devicons',
-    },
-    config = function()
-			require('daiki.plugins.nvim-tree')
-     end
-  },
-	{
-		'windwp/nvim-autopairs',
-		event = 'InsertEnter',
-		config = true
+		end,
 	},
 	{
-		'dstein64/vim-startuptime',
-		cmd = 'StartupTime'
+		"lewis6991/gitsigns.nvim",
+		lazy = false,
+		config = function()
+			require("gitsigns").setup()
+		end,
 	},
 	{
-		'nvim-telescope/telescope.nvim', tag = '0.1.6',
+		"numToStr/Comment.nvim",
+		lazy = false,
+		config = function()
+			require("Comment").setup()
+			vim.api.nvim_set_keymap("n", "<C-_>", "gcc", {})
+			vim.api.nvim_set_keymap("v", "<C-_>", "gc", {})
+		end,
+	},
+	{
+		"nvim-tree/nvim-tree.lua",
 		lazy = false,
 		dependencies = {
-			'nvim-lua/plenary.nvim',
+			"nvim-tree/nvim-web-devicons",
 		},
-    config = function()
-			require('daiki.plugins.telescope')
-	  end
+		config = function()
+			require("daiki.plugins.nvim-tree")
+		end,
+	},
+	{
+		"windwp/nvim-autopairs",
+		event = "InsertEnter",
+		config = true,
+	},
+	{
+		"dstein64/vim-startuptime",
+		cmd = "StartupTime",
+	},
+	{
+		"nvim-telescope/telescope.nvim",
+		tag = "0.1.6",
+		lazy = false,
+		dependencies = {
+			"nvim-lua/plenary.nvim",
+		},
+		config = function()
+			require("daiki.plugins.telescope")
+		end,
 	},
 
 	-- Git
 	{
-		'NeogitOrg/neogit',
-		cmd = 'Neogit',
+		"NeogitOrg/neogit",
+		cmd = "Neogit",
 		dependencies = {
-			'nvim-lua/plenary.nvim',
-			'sindrets/diffview.nvim',
-			'nvim-telescope/telescope.nvim',
+			"nvim-lua/plenary.nvim",
+			"sindrets/diffview.nvim",
+			"nvim-telescope/telescope.nvim",
 		},
 		config = function()
-			require('neogit').setup()
-		end
+			require("neogit").setup()
+		end,
 	},
 
 	-- coc
 	{
-		'neoclide/coc.nvim',
-		branch = 'release',
+		"neoclide/coc.nvim",
+		branch = "release",
 		lazy = false,
-		config = function ()
-			require('daiki.plugins.coc')
-		end
+		config = function()
+			require("daiki.plugins.coc")
+		end,
 	},
 
 	{
-		'leafOfTree/vim-svelte-plugin',
-		ft = 'svelte',
-		config = true
+		"leafOfTree/vim-svelte-plugin",
+		ft = "svelte",
+		config = true,
 	},
 
 	-- treesitter
 	{
-		'nvim-treesitter/nvim-treesitter',
-		build = ':TSUpdate',
+		"nvim-treesitter/nvim-treesitter",
+		build = ":TSUpdate",
 		lazy = false,
-		config = function ()
-			require('daiki.plugins.treesitter')
-		end
+		config = function()
+			require("daiki.plugins.treesitter")
+		end,
 	},
 	{
-		'windwp/nvim-ts-autotag',
+		"windwp/nvim-ts-autotag",
 		lazy = false,
 		dependencies = {
-			'nvim-treesitter/nvim-treesitter',
+			"nvim-treesitter/nvim-treesitter",
 		},
-		config = function ()
-			require('daiki.plugins.nvim-ts-autotag')
-		end
+		config = function()
+			require("daiki.plugins.nvim-ts-autotag")
+		end,
 	},
 
 	-- skkeleton
@@ -233,8 +243,8 @@ return {
 	{
 		"mistricky/codesnap.nvim",
 		build = "make",
-		cmd = {'CodeSnap', 'CodeSnapSave'},
-		config = function ()
+		cmd = { "CodeSnap", "CodeSnapSave" },
+		config = function()
 			require("codesnap").setup({
 				mac_window_bar = true,
 				title = "",
@@ -244,9 +254,9 @@ return {
 				bg_theme = "bamboo",
 				breadcrumbs_separator = "/",
 				has_breadcrumbs = false,
-				save_path = "~/codesnap/out.png"
+				save_path = "~/codesnap/out.png",
 			})
-		end
+		end,
 	},
 
 	-- hop
@@ -255,10 +265,10 @@ return {
 		version = "*",
 		event = "VimEnter",
 		opts = {
-			keys = 'etvxqdygfblzhcksurn'
+			keys = "etvxqdygfblzhcksurn",
 		},
-		config = function ()
-			require('daiki.plugins.hop')
-		end
+		config = function()
+			require("daiki.plugins.hop")
+		end,
 	},
 }
