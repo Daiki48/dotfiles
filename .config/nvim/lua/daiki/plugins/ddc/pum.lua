@@ -1,5 +1,5 @@
 local pum = {
-	set_option = vim.fn["pum#set_option"];
+	set_option = vim.fn["pum#set_option"],
 }
 
 pum.set_option({
@@ -22,6 +22,5 @@ pum.set_option({
 	item_orders = { "abbr", "space", "kind", "space", "space", "menu" },
 	padding = true,
 	scrollbar_char = "⇳",
-	min_width = 40
+	min_width = 40,
 })
-

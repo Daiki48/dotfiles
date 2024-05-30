@@ -26,36 +26,36 @@ local function border(hl_name)
 end
 
 local icons = {
-	Text          = ' ',
-	Method        = ' ',
-	Function      = ' ',
-	Constructor   = ' ',
-	Field         = 'ﰠ ',
-	Variable      = ' ',
-	Class         = ' ',
-	Interface     = ' ',
-	Module        = ' ',
-	Property      = ' ',
-	Unit          = ' ',
-	Value         = ' ',
-	Enum          = ' ',
-	Keyword       = ' ',
-	Snippet       = '﬌ ',
-	Color         = ' ',
-	File          = ' ',
-	Reference     = ' ',
-	Folder        = ' ',
-	EnumMember    = ' ',
-	Constant      = ' ',
-	Struct        = ' ',
-	Event         = ' ',
-	Operator      = 'ﬦ ',
-	TypeParameter = ' ',
+	Text = " ",
+	Method = " ",
+	Function = " ",
+	Constructor = " ",
+	Field = "ﰠ ",
+	Variable = " ",
+	Class = " ",
+	Interface = " ",
+	Module = " ",
+	Property = " ",
+	Unit = " ",
+	Value = " ",
+	Enum = " ",
+	Keyword = " ",
+	Snippet = "﬌ ",
+	Color = " ",
+	File = " ",
+	Reference = " ",
+	Folder = " ",
+	EnumMember = " ",
+	Constant = " ",
+	Struct = " ",
+	Event = " ",
+	Operator = "ﬦ ",
+	TypeParameter = " ",
 }
 
-local compare = require "cmp.config.compare"
+local compare = require("cmp.config.compare")
 
-local cmp_window = require "cmp.utils.window"
+local cmp_window = require("cmp.utils.window")
 
 cmp_window.info_ = cmp_window.info
 cmp_window.info = function(self)
@@ -67,11 +67,11 @@ end
 local options = {
 	window = {
 		completion = {
-			border = border "CmpBorder",
+			border = border("CmpBorder"),
 			winhighlight = "Normal:CmpPmenu,CursorLine:PmenuSel,Search:None",
 		},
 		documentation = {
-			border = border "CmpDocBorder",
+			border = border("CmpDocBorder"),
 			winhighlight = "NormalFloat:Pmenu,NormalFloat:Pmenu,CursorLine:PmenuSel,Search:None",
 		},
 	},
@@ -87,7 +87,7 @@ local options = {
 		["<C-d>"] = cmp.mapping.scroll_docs(4),
 		["<C-Space>"] = cmp.mapping.complete(),
 		["<C-e>"] = cmp.mapping.close(),
-		["<CR>"] = cmp.mapping.confirm { select = true },
+		["<CR>"] = cmp.mapping.confirm({ select = true }),
 		["<Down>"] = cmp.mapping(function(fallback)
 			if cmp.visible() then
 				cmp.select_next_item()
@@ -130,7 +130,8 @@ local options = {
 		end, { "i", "s" }),
 	}),
 	sources = {
-		{ name = "nvim_lsp",
+		{
+			name = "nvim_lsp",
 			filter = function(entry, ctx)
 				local kind = require("cmp.types.lsp").CompletionItemKind[entry:get_kind()]
 				if kind == "Snippet" and ctx.prev_context.filetype == "java" then
@@ -141,7 +142,8 @@ local options = {
 					return false
 				end
 			end,
-			group_index = 2 },
+			group_index = 2,
+		},
 		{ name = "luasnip", option = { use_show_condition = false }, group_index = 2 },
 		{ name = "nvim_lua", group_index = 2 },
 		{ name = "buffer", group_index = 2 },
@@ -162,7 +164,7 @@ local options = {
 		},
 	},
 	completion = {
-		completeopt = 'menu,menuone,noinsert',
+		completeopt = "menu,menuone,noinsert",
 	},
 	formatting = {
 		fields = { "kind", "abbr", "menu" },
@@ -191,31 +193,31 @@ local options = {
 cmp.setup(options)
 
 -- `/` cmdline setup.
-cmp.setup.cmdline('/', {
+cmp.setup.cmdline("/", {
 	mapping = cmp.mapping.preset.cmdline(),
 	sources = {
-		{ name = 'buffer' }
-	}
+		{ name = "buffer" },
+	},
 })
 
 -- `:` cmdline setup.
-cmp.setup.cmdline(':', {
+cmp.setup.cmdline(":", {
 	mapping = cmp.mapping.preset.cmdline(),
 	sources = cmp.config.sources({
-		{ name = 'path' }
+		{ name = "path" },
 	}, {
 		{
-			name = 'cmdline',
+			name = "cmdline",
 			option = {
-				ignore_cmds = { 'Man', '!' }
-			}
-		}
-	})
+				ignore_cmds = { "Man", "!" },
+			},
+		},
+	}),
 })
 
 -- Set up lspconfig.
-local capabilities = require('cmp_nvim_lsp').default_capabilities()
+local capabilities = require("cmp_nvim_lsp").default_capabilities()
 -- Replace <YOUR_LSP_SERVER> with each lsp server you've enabled.
-require('lspconfig')['<YOUR_LSP_SERVER>'].setup {
-	capabilities = capabilities
-}
+require("lspconfig")["<YOUR_LSP_SERVER>"].setup({
+	capabilities = capabilities,
+})

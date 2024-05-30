@@ -1,62 +1,61 @@
+local lspconfig = require("lspconfig")
 local tools = require("daiki.plugins.nvim-lspconfig.tools")
-local lspconfig = require('lspconfig')
 
-lspconfig['cssls'].setup {
+lspconfig["cssls"].setup({
 	root_dir = lspconfig.util.root_pattern("package.json"),
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
 	init_options = {},
-}
+})
 
-lspconfig['lua_ls'].setup{
+lspconfig["lua_ls"].setup({
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
 	settings = {
 		Lua = {
 			runtime = {
-				version = 'LuaJIT',
-				path = vim.split(package.path, ';')
+				version = "LuaJIT",
+				path = vim.split(package.path, ";"),
 			},
 			diagnostics = {
-				globals = {'vim'}
+				globals = { "vim" },
 			},
-		}
-	}
-}
+		},
+	},
+})
 
-lspconfig['tsserver'].setup{
+lspconfig["tsserver"].setup({
 	root_dir = lspconfig.util.root_pattern("package.json"),
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
 	init_options = {},
-}
+})
 
-lspconfig['denols'].setup{
+lspconfig["denols"].setup({
 	root_dir = lspconfig.util.root_pattern("deno.json"),
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
 	init_options = {},
-}
+})
 
-lspconfig['svelte'].setup{
+lspconfig["svelte"].setup({
 	root_dir = lspconfig.util.root_pattern("package.json"),
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
 	init_options = {},
-}
+})
 
-lspconfig['rust_analyzer'].setup{
+lspconfig["rust_analyzer"].setup({
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
 	-- Server-specific settings...
 	settings = {
-		["rust-analyzer"] = {}
-	}
-}
+		["rust-analyzer"] = {},
+	},
+})
 
-lspconfig['clangd'].setup{
+lspconfig["clangd"].setup({
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
 	init_options = {},
-}
-
+})
