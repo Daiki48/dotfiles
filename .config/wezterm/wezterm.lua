@@ -15,7 +15,7 @@ config.window_padding = {
 config.window_background_opacity = 0.9
 config.use_ime = true
 config.initial_cols = 140
-config.initial_rows = 30 
+config.initial_rows = 30
 config.keys = {
   { key = 'c', mods = 'CTRL', action = wezterm.action.CopyTo 'ClipboardAndPrimarySelection' },
   { key = 'v', mods = 'CTRL', action = wezterm.action.PasteFrom 'Clipboard' },
@@ -37,5 +37,9 @@ config.font = wezterm.font('JetBrains Mono', { weight = 'Bold', italic = false }
 -- You may wish to install additional fonts, or adjust
 -- your configuration so that it can find them.
 config.warn_about_missing_glyphs = false
+
+config.set_environment_variables = {
+	LANG = "en_US.UTF-8"
+}
 
 return config
