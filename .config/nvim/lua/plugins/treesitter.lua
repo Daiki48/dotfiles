@@ -16,7 +16,8 @@ require("nvim-treesitter.configs").setup({
 	-- parser_install_dir = "/some/path/to/store/parsers", -- Remember to run vim.opt.runtimepath:append("/some/path/to/store/parsers")!
 
 	highlight = {
-		enable = true,
+		-- disable = true,
+		-- enable = true,
 
 		-- Setting this to true will run `:h syntax` and tree-sitter at the same time.
 		-- Set this to `true` if you depend on 'syntax' being enabled (like for indentation).
@@ -24,6 +25,9 @@ require("nvim-treesitter.configs").setup({
 		-- Instead of true it can also be a list of languages
 		additional_vim_regex_highlighting = false,
 	},
+
+	-- https://github.com/windwp/nvim-ts-autotag/commit/6e9742a006ae69c015e6dc1ed9b477033193778b
+	-- "If you are setting up via nvim-treesitter.configs it has been deprecated! Please migrate to the new way. It will be removed in 1.0.0."
 	-- autotag = {
 	-- 	enable = true
 	-- }

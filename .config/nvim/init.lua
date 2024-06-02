@@ -1,3 +1,3 @@
-require("daiki.base.options")
-require("daiki.base.keymap")
-require("daiki.base.lazy")
+require("daiki.options")
+require("daiki.keymap")
+require("daiki.lazy")

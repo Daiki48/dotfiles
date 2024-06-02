@@ -23,7 +23,7 @@ return {
 		lazy = false,
 		dependencies = { "nvim-tree/nvim-web-devicons" },
 		config = function()
-			require("daiki.plugins.lualine")
+			require("plugins.lualine")
 		end,
 	},
 	{
@@ -49,7 +49,7 @@ return {
 			"nvim-tree/nvim-web-devicons",
 		},
 		config = function()
-			require("daiki.plugins.nvim-tree")
+			require("plugins.nvim-tree")
 		end,
 	},
 	{
@@ -69,7 +69,7 @@ return {
 			"nvim-lua/plenary.nvim",
 		},
 		config = function()
-			require("daiki.plugins.telescope")
+			require("plugins.telescope")
 		end,
 	},
 
@@ -93,7 +93,7 @@ return {
 		branch = "release",
 		lazy = false,
 		config = function()
-			require("daiki.plugins.coc")
+			require("plugins.coc")
 		end,
 	},
 
@@ -109,7 +109,7 @@ return {
 		build = ":TSUpdate",
 		lazy = false,
 		config = function()
-			require("daiki.plugins.treesitter")
+			require("plugins.treesitter")
 		end,
 	},
 	{
@@ -119,7 +119,7 @@ return {
 			"nvim-treesitter/nvim-treesitter",
 		},
 		config = function()
-			require("daiki.plugins.nvim-ts-autotag")
+			require("plugins.nvim-ts-autotag")
 		end,
 	},
 
@@ -132,7 +132,7 @@ return {
 	-- 	},
 	-- 	event = 'VimEnter',
 	-- 	config = function ()
-	-- 		require('daiki.plugins.skkeleton')
+	-- 		require('plugins.skkeleton')
 	-- 	end
 	-- },
 	-- 'delphinus/skkeleton_indicator.nvim',
@@ -161,7 +161,7 @@ return {
 	-- 		-- { "uga-rosa/cmp-skkeleton", dependencies = { "vim-skk/skkeleton" } },
 	-- 	},
 	-- 	config = function ()
-	-- 		require('daiki.plugins.cmp')
+	-- 		require('plugins.cmp')
 	-- 	end
 	-- },
 
@@ -187,7 +187,7 @@ return {
 	-- 		'tani/ddc-fuzzy',
 	-- 	},
 	-- 	config = function ()
-	-- 		require('daiki.plugins.ddc')
+	-- 		require('plugins.ddc')
 	-- 	end
 	-- },
 	--
@@ -222,14 +222,14 @@ return {
 	-- 	lazy = false,
 	-- 	event = 'BufRead',
 	-- 	config = function ()
-	-- 		require('daiki.plugins.nvim-lspconfig')
+	-- 		require('plugins.nvim-lspconfig')
 	-- 	end
 	-- },
 	-- {
 	-- 	'williamboman/mason.nvim',
 	-- 	lazy = false,
 	-- 	config = function ()
-	-- 		require('daiki.plugins.mason')
+	-- 		require('plugins.mason')
 	-- 	end
 	-- },
 	-- {
@@ -268,7 +268,16 @@ return {
 			keys = "etvxqdygfblzhcksurn",
 		},
 		config = function()
-			require("daiki.plugins.hop")
+			require("plugins.hop")
 		end,
 	},
+	{
+		"Daiki48/bootime.nvim",
+		lazy = false,
+		dev = true,
+		cmd = "TestBuf",
+		config = function ()
+			require("bootime").setup()
+		end
+	}
 }
