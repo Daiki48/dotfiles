@@ -1,22 +1,20 @@
 {
-	"suggest.noselect": true,
-	"suggest.preferCompleteThanJumpPlaceholder": true,
-	"suggest.floatConfig": {
-		"border": true
-	},
-	"diagnostic.floatConfig": {
-		"border": true
-	},
-	"signature.floatConfig": {
-		"border": true
-	},
-	"hover.floatConfig": {
-		"border": true
-	},
-  "Lua.diagnostics.globals": [
-    "vim"
-  ],
+  "suggest.noselect": true,
+  "suggest.preferCompleteThanJumpPlaceholder": true,
+  "suggest.floatConfig": {
+    "border": true
+  },
+  "diagnostic.floatConfig": {
+    "border": true
+  },
+  "signature.floatConfig": {
+    "border": true
+  },
+  "hover.floatConfig": {
+    "border": true
+  },
+  "Lua.diagnostics.globals": ["vim"],
   "svelte.enable-ts-plugin": true,
-	"tsserver.enable": false,
-	"deno.enable": false
+  "tsserver.enable": false,
+  "deno.enable": false
 }
