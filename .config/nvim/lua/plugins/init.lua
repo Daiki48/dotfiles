@@ -11,6 +11,7 @@ return {
 	{
 		"Daiki48/sakurajima.nvim",
 		lazy = false,
+		-- branch = "main",
 		branch = "develop",
 		dev = true,
 		config = function()
