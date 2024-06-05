@@ -4,7 +4,7 @@ vim.g.loaded_netrwPlugin = 1
 
 require("nvim-tree").setup({
 	view = {
-		width = 35,
+		width = 40,
 		relativenumber = true,
 		float = {
 			enable = false,
@@ -47,7 +47,7 @@ require("nvim-tree").setup({
 		custom = { ".DS_Store" },
 	},
 	git = {
-		ignore = false,
+		ignore = true,
 	},
 })
 
