@@ -279,8 +279,8 @@ return {
 		lazy = false,
 		dev = true,
 		cmd = "TestBuf",
-		config = function ()
+		config = function()
 			require("bootime").setup()
-		end
-	}
+		end,
+	},
 }

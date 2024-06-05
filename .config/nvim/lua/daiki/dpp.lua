@@ -8,7 +8,7 @@ local dpp_url = "https://github.com/Shougo/dpp.vim"
 local dpp_ext_installer_url = "https://github.com/Shougo/dpp-ext-installer"
 local dpp_protocol_git_url = "https://github.com/Shougo/dpp-protocol-git"
 
-local repo_clone = function (url, branch, src)
+local repo_clone = function(url, branch, src)
 	if not vim.loop.fs_stat(src) then
 		vim.fn.system({
 			"git",
@@ -16,7 +16,7 @@ local repo_clone = function (url, branch, src)
 			url,
 			"--filter=blob:none",
 			"--branch=" .. branch,
-			src
+			src,
 		})
 		vim.notify("Successfull clone " .. url)
 	end
@@ -37,24 +37,24 @@ local dpp_config = vim.fn.stdpath("config") .. "/dpp/config.ts"
 vim.g["denops#debug"] = 1
 
 if dpp.load_state(dpp_base) then
-  vim.opt.runtimepath:prepend(denops_src)
+	vim.opt.runtimepath:prepend(denops_src)
 	vim.opt.runtimepath:prepend(dpp_ext_installer_src)
 	vim.opt.runtimepath:prepend(dpp_protocol_git_src)
 
-  vim.api.nvim_create_autocmd("User", {
-    pattern = "DenopsReady",
-    callback = function()
-      vim.notify("dpp load_state() is failed")
-      dpp.make_state(dpp_base, dpp_config)
-    end,
-  })
+	vim.api.nvim_create_autocmd("User", {
+		pattern = "DenopsReady",
+		callback = function()
+			vim.notify("dpp load_state() is failed")
+			dpp.make_state(dpp_base, dpp_config)
+		end,
+	})
 end
 
 vim.api.nvim_create_autocmd("User", {
-  pattern = "Dpp:makeStatePost",
-  callback = function()
-    vim.notify("dpp make_state() is done")
-  end,
+	pattern = "Dpp:makeStatePost",
+	callback = function()
+		vim.notify("dpp make_state() is done")
+	end,
 })
 
 vim.api.nvim_create_user_command("DppInstall", "call dpp#async_ext_action('installer', 'install)", { nargs = 0 })
