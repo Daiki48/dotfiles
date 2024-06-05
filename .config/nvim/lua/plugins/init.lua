@@ -101,7 +101,9 @@ return {
 	{
 		"leafOfTree/vim-svelte-plugin",
 		ft = "svelte",
-		config = true,
+		config = function()
+			require("plugins.vim-svelte-plugin")
+		end,
 	},
 
 	-- treesitter
