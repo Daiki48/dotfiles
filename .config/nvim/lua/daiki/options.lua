@@ -29,6 +29,7 @@ vim.o.pumblend = 20
 vim.o.clipboard = "unnamedplus"
 vim.o.swapfile = false
 vim.o.backup = false
+vim.o.wrap = false
 
 vim.bo.expandtab = true
 vim.bo.autoindent = false
