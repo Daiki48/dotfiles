@@ -24,12 +24,7 @@ local opts = {
 	},
 	dev = {
 		path = "/mnt/sabrent/dev/nvim-plugin-dev/Daiki48",
-		-- patterns = {'Daiki48'},
-		-- fallback = true,
 	},
-	-- install = {
-	-- 	colorscheme = { 'sakurajima' }
-	-- }
 }
 
 require("lazy").setup(plugins, opts)
