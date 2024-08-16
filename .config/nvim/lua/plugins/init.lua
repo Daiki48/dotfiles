@@ -11,9 +11,9 @@ return {
 	{
 		"Daiki48/sakurajima.nvim",
 		lazy = false,
-		-- branch = "main",
-		branch = "develop",
-		dev = true,
+		branch = "main",
+		-- branch = "develop",
+		-- dev = true,
 		config = function()
 			vim.cmd([[colorscheme sakurajima]])
 		end,
@@ -274,13 +274,13 @@ return {
 			require("plugins.hop")
 		end,
 	},
-	{
-		"Daiki48/bootime.nvim",
-		lazy = false,
-		dev = true,
-		cmd = "TestBuf",
-		config = function()
-			require("bootime").setup()
-		end,
-	},
+	-- {
+	-- 	"Daiki48/bootime.nvim",
+	-- 	lazy = false,
+	-- 	dev = true,
+	-- 	cmd = "TestBuf",
+	-- 	config = function()
+	-- 		require("bootime").setup()
+	-- 	end,
+	-- },
 }
