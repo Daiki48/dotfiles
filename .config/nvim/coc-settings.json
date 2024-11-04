@@ -17,8 +17,8 @@
   "svelte.enable-ts-plugin": true,
   "tsserver.enable": false,
   "deno.enable": false,
-	"markdownlint.config": {
-		"line_length": false,
-		"MD033": false
-	}
+  "markdownlint.config": {
+    "line_length": false,
+    "MD033": false
+  }
 }
