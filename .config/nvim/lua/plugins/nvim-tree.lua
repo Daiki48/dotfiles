@@ -52,9 +52,9 @@ require("nvim-tree").setup({
 })
 
 -- set keymaps
-local keymap = vim.keymap -- for conciseness
+-- local keymap = vim.keymap -- for conciseness
 
-keymap.set("n", ";ee", "<cmd>NvimTreeToggle<CR>", { desc = "Toggle file explorer" }) -- toggle file explorer
-keymap.set("n", ";ef", "<cmd>NvimTreeFindFileToggle<CR>", { desc = "Toggle file explorer on current file" }) -- toggle file explorer on current file
-keymap.set("n", ";ec", "<cmd>NvimTreeCollapse<CR>", { desc = "Collapse file explorer" }) -- collapse file explorer
-keymap.set("n", ";er", "<cmd>NvimTreeRefresh<CR>", { desc = "Refresh file explorer" }) -- refresh file explorer
+-- keymap.set("n", ";ee", "<cmd>NvimTreeToggle<CR>", { desc = "Toggle file explorer" }) -- toggle file explorer
+-- keymap.set("n", ";ef", "<cmd>NvimTreeFindFileToggle<CR>", { desc = "Toggle file explorer on current file" }) -- toggle file explorer on current file
+-- keymap.set("n", ";ec", "<cmd>NvimTreeCollapse<CR>", { desc = "Collapse file explorer" }) -- collapse file explorer
+-- keymap.set("n", ";er", "<cmd>NvimTreeRefresh<CR>", { desc = "Refresh file explorer" }) -- refresh file explorer

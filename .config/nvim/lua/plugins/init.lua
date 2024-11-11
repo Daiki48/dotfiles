@@ -44,15 +44,28 @@ return {
 		end,
 	},
 	{
-		"nvim-tree/nvim-tree.lua",
+		"stevearc/oil.nvim",
 		lazy = false,
-		dependencies = {
-			"nvim-tree/nvim-web-devicons",
-		},
+		---@module 'oil'
+		---@type oil.SetupOpts
+		opts = {},
+		-- Optional dependencies
+		dependencies = { { "echasnovski/mini.icons", opts = {} } },
+		dependencies = { "nvim-tree/nvim-web-devicons" }, -- use if prefer nvim-web-devicons
 		config = function()
-			require("plugins.nvim-tree")
+			require("plugins.oil")
 		end,
 	},
+	-- {
+	-- 	"nvim-tree/nvim-tree.lua",
+	-- 	lazy = false,
+	-- 	dependencies = {
+	-- 		"nvim-tree/nvim-web-devicons",
+	-- 	},
+	-- 	config = function()
+	-- 		require("plugins.nvim-tree")
+	-- 	end,
+	-- },
 	{
 		"windwp/nvim-autopairs",
 		event = "InsertEnter",
