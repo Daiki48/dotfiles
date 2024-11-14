@@ -56,6 +56,18 @@ return {
 			require("plugins.oil")
 		end,
 	},
+	{
+		"SirZenith/oil-vcs-status",
+		-- event = "VimEnter",
+		lazy = false,
+		dependencies = {
+			"stevearc/oil.nvim",
+		},
+		config = function()
+			require("plugins.oil-vcs-status")
+		end,
+		-- config = true,
+	},
 	-- {
 	-- 	"nvim-tree/nvim-tree.lua",
 	-- 	lazy = false,
