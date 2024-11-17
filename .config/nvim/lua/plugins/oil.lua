@@ -6,8 +6,8 @@ require("oil").setup({
   -- See :help oil-columns
   columns = {
     "icon",
-    -- "permissions",
-    -- "size",
+    "permissions",
+    "size",
     -- "mtime",
   },
   -- Buffer-local options to use for oil buffers
@@ -118,8 +118,8 @@ require("oil").setup({
   -- Configuration for the floating window in oil.open_float
   float = {
     -- Padding around the floating window
-    padding = 8,
-    max_width = 100,
+    padding = 4,
+    max_width = 200,
     max_height = 0,
     border = "rounded",
     win_options = {
@@ -191,5 +191,6 @@ require("oil").setup({
 local keymap = vim.keymap -- for conciseness
 
 keymap.set("n", ";ee", "<cmd>Oil --float .<CR>", { desc = "Open file explorer" }) -- open file explorer
+-- keymap.set("n", ";ee", "<cmd>Oil --float .<CR>", { desc = "Open file explorer" }) -- open file explorer
 -- keymap.set("n", ";ef", "<cmd>Oil .<CR>", { desc = "Toggle file explorer on current file" }) -- toggle file explorer on current file
 -- keymap.set("n", ";ec", "<cmd>Oil<CR>", { desc = "Open parent directory" }) -- open parent directory
