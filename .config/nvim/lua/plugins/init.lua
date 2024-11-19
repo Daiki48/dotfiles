@@ -1,13 +1,12 @@
 return {
-	-- colorsheme
-	--  {
-	--  'Daiki48/coolnessFlair.vim',
-	-- lazy = false,
-	-- branch = 'develop',
-	--  config = function()
-	--    vim.cmd([[colorscheme coolnessFlair]])
-	--  end
-	--  },
+	{
+		"folke/snacks.nvim",
+		priority = 1000,
+		lazy = false,
+		config = function()
+			require("plugins.snacks")
+		end,
+	},
 	{
 		"Daiki48/sakurajima.nvim",
 		lazy = false,
