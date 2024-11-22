@@ -7,7 +7,7 @@ vim.o.fileencoding = "utf-8"
 vim.g.mapleader = "<Space>"
 
 vim.wo.number = true
-vim.wo.relativenumber = true
+vim.wo.relativenumber = false
 vim.wo.signcolumn = "yes"
 
 vim.o.shell = "zsh"
