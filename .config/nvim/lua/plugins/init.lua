@@ -304,17 +304,17 @@ return {
 		end,
 	},
 	-- hop
-	{
-		"smoka7/hop.nvim",
-		version = "*",
-		event = "VimEnter",
-		opts = {
-			keys = "etvxqdygfblzhcksurn",
-		},
-		config = function()
-			require("plugins.hop")
-		end,
-	},
+	-- {
+	-- 	"smoka7/hop.nvim",
+	-- 	version = "*",
+	-- 	event = "VimEnter",
+	-- 	opts = {
+	-- 		keys = "etvxqdygfblzhcksurn",
+	-- 	},
+	-- 	config = function()
+	-- 		require("plugins.hop")
+	-- 	end,
+	-- },
 	-- {
 	-- 	"Daiki48/bootime.nvim",
 	-- 	lazy = false,
