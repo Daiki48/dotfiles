@@ -48,7 +48,7 @@ return {
 	{
 		"stevearc/oil.nvim",
 		cmd = "Oil",
-    event = { "VimEnter */*,.*", "BufNew */*,.*" },
+		event = { "VimEnter */*,.*", "BufNew */*,.*" },
 		-- event = "VimEnter",
 		-- lazy = false,
 		---@module 'oil'
