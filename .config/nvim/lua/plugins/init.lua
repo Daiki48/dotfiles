@@ -9,6 +9,7 @@ return {
 	},
 	{
 		"Daiki48/sakurajima.nvim",
+		priority = 1000,
 		lazy = false,
 		branch = "main",
 		-- branch = "develop",
@@ -28,14 +29,16 @@ return {
 	},
 	{
 		"lewis6991/gitsigns.nvim",
-		lazy = false,
+		event = "BufRead",
+		-- lazy = false,
 		config = function()
 			require("gitsigns").setup()
 		end,
 	},
 	{
 		"numToStr/Comment.nvim",
-		lazy = false,
+		-- lazy = false,
+		event = "BufRead",
 		config = function()
 			require("Comment").setup()
 			vim.api.nvim_set_keymap("n", "<C-_>", "gcc", {})
@@ -44,21 +47,23 @@ return {
 	},
 	{
 		"stevearc/oil.nvim",
-		lazy = false,
+		cmd = "Oil",
+    event = { "VimEnter */*,.*", "BufNew */*,.*" },
+		-- event = "VimEnter",
+		-- lazy = false,
 		---@module 'oil'
 		---@type oil.SetupOpts
 		opts = {},
 		-- Optional dependencies
-		dependencies = { { "echasnovski/mini.icons", opts = {} } },
-		dependencies = { "nvim-tree/nvim-web-devicons" }, -- use if prefer nvim-web-devicons
+		dependencies = { "nvim-tree/nvim-web-devicons", { "echasnovski/mini.icons", opts = {} } }, -- use if prefer nvim-web-devicons
 		config = function()
 			require("plugins.oil")
 		end,
 	},
 	{
 		"SirZenith/oil-vcs-status",
-		-- event = "VimEnter",
-		lazy = false,
+		event = "VimEnter",
+		-- lazy = false,
 		dependencies = {
 			"stevearc/oil.nvim",
 		},
@@ -134,14 +139,16 @@ return {
 	{
 		"nvim-treesitter/nvim-treesitter",
 		build = ":TSUpdate",
-		lazy = false,
+		event = "BufRead",
+		-- lazy = false,
 		config = function()
 			require("plugins.treesitter")
 		end,
 	},
 	{
 		"windwp/nvim-ts-autotag",
-		lazy = false,
+		event = "InsertEnter",
+		-- lazy = false,
 		dependencies = {
 			"nvim-treesitter/nvim-treesitter",
 		},
@@ -153,7 +160,8 @@ return {
 	-- blink-cmp
 	{
 		"saghen/blink.cmp",
-		lazy = false, -- lazy loading handled internally
+		event = "InsertEnter",
+		-- lazy = false, -- lazy loading handled internally
 		-- optional: provides snippets for the snippet source
 		dependencies = "rafamadriz/friendly-snippets",
 
@@ -267,7 +275,7 @@ return {
 	-- lspconfig
 	{
 		"neovim/nvim-lspconfig",
-		lazy = false,
+		-- lazy = false,
 		event = "BufRead",
 		dependencies = { "saghen/blink.cmp" },
 		config = function()
@@ -276,7 +284,8 @@ return {
 	},
 	{
 		"williamboman/mason.nvim",
-		lazy = false,
+		cmd = "Mason",
+		lazy = true,
 		config = function()
 			require("plugins.mason")
 		end,
@@ -310,7 +319,8 @@ return {
 
 	{
 		"folke/flash.nvim",
-		event = "VeryLazy",
+		event = "BufRead",
+		-- event = "VeryLazy",
 		---@type Flash.Config
 		opts = {},
 		-- stylua: ignore
