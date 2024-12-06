@@ -1,2 +1,2 @@
-require("daiki.plugins.nvim-lspconfig.server")
-require("daiki.plugins.nvim-lspconfig.keymap")
+require("plugins.nvim-lspconfig.server")
+require("plugins.nvim-lspconfig.keymap")
