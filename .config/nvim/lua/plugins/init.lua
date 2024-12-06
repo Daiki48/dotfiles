@@ -284,7 +284,14 @@ return {
 	},
 	{
 		"williamboman/mason.nvim",
-		cmd = "Mason",
+		cmd = {
+			"Mason",
+			"MasonInstall",
+			"MasonUninstall",
+			"MasonUninstallAll",
+			"MasonLog",
+			"MasonUpdate",
+		},
 		lazy = true,
 		config = function()
 			require("plugins.mason")
