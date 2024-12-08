@@ -284,6 +284,10 @@ return {
 	},
 	{
 		"williamboman/mason.nvim",
+		dependencies = {
+			"saghen/blink.cmp",
+			"williamboman/mason-lspconfig.nvim",
+		},
 		cmd = {
 			"Mason",
 			"MasonInstall",
@@ -294,14 +298,20 @@ return {
 		},
 		lazy = true,
 		config = function()
-			require("plugins.mason")
+			require("mason").setup()
 		end,
 	},
 	{
 		"williamboman/mason-lspconfig.nvim",
-		dependencies = {
-			"williamboman/mason.nvim",
-		},
+		event = "BufRead",
+		config = function()
+			require("plugins.mason-config")
+		end,
+
+		-- dependencies = {
+		-- 	"williamboman/mason.nvim",
+		-- 	"neovim/nvim-lspconfig",
+		-- },
 	},
 
 	-- codesnap

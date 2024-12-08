@@ -3,6 +3,10 @@ local util = require("lspconfig.util")
 
 local tools = require("plugins.nvim-lspconfig.tools")
 
+-- local ts_ls_path = vim.env.USERPROFILE .. "\\scoop\\apps\\nvm\\current\\nodejs\\nodejs\\typescript-language-server"
+-- local mason_ts_lsp_path= vim.fn.stdpath("data") .. "/mason/packages/typescript-language-server"
+-- local mason_lsp_path = path.concat { vim.fn.stdpath "data", "mason" }
+
 lspconfig["cssls"].setup({
 	root_dir = util.root_pattern("package.json"),
 	on_attach = tools.on_attach,
@@ -27,10 +31,22 @@ lspconfig["lua_ls"].setup({
 })
 
 lspconfig["ts_ls"].setup({
+	filetypes = {
+		"typescript",
+		"typescriptreact",
+		"typescript.tsx",
+		"javascript",
+		"javascriptreact",
+		"javascript.jsx",
+		"vue",
+	},
 	root_dir = util.root_pattern("package.json", "tsconfig.json"),
 	on_attach = tools.on_attach,
 	flags = tools.lsp_flags,
-	init_options = {},
+	cmd = { "typescript-language-server", "--stdio" },
+	init_options = {
+		-- cmd = { ts_ls_path, "--stdio" },
+	},
 })
 
 lspconfig["denols"].setup({
