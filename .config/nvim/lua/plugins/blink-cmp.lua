@@ -38,11 +38,17 @@ blink.setup({
 	-- completion = { accept = { auto_brackets = { enabled = true } } }
 
 	-- experimental signature help support
-	signature = { enabled = true },
+	signature = {
+		enabled = true,
+		window = {
+			border = "rounded",
+		},
+	},
 
 	completion = {
 		menu = {
 			min_width = 40,
+			border = "rounded",
 			draw = {
 				padding = 3,
 				gap = 2,
@@ -52,6 +58,9 @@ blink.setup({
 		},
 		documentation = {
 			auto_show = true,
+			window = {
+				border = "rounded",
+			},
 		},
 	},
 	-- allows extending the enabled_providers array elsewhere in your config
