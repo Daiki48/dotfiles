@@ -1,9 +1,8 @@
 M = {}
 
-M.setup = function(config)
+M.rust_setup = function(config)
 	config.on_attach = function(client, bufnr)
 		if client.server_capabilities.documentFormattingProvider then
-			-- formatterのキーマップ設定
 			vim.api.nvim_buf_set_keymap(
 				bufnr,
 				"n",
