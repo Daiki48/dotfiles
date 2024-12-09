@@ -46,9 +46,13 @@ blink.setup({
 	},
 
 	completion = {
+		trigger = {
+			show_on_insert_on_trigger_character = false,
+		},
 		menu = {
 			min_width = 40,
 			border = "rounded",
+			auto_show = true,
 			draw = {
 				padding = 3,
 				gap = 2,
