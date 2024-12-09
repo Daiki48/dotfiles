@@ -13,7 +13,8 @@ local config = {
 }
 
 local server_setup = {
-	rust_analyzer = require("plugins.mason-config.rust_analyzer").setup(config),
+	rust_analyzer = require("plugins.mason-config.rust_analyzer").rust_setup(config),
+	lua_ls = require("lua.plugins.mason-config.lua_ls").lua_setup(config),
 }
 
 mason.setup({
