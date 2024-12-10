@@ -1,6 +1,6 @@
 M = {}
 
-M.rust_setup = function(config)
+M.setup = function(config)
 	config.on_attach = function(client, bufnr)
 		if client.server_capabilities.documentFormattingProvider then
 			vim.api.nvim_buf_set_keymap(

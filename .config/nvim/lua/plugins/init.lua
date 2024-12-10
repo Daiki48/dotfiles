@@ -27,6 +27,33 @@ return {
 			require("plugins.lualine")
 		end,
 	},
+	-- {
+	-- 	"nvimdev/lspsaga.nvim",
+	-- 	event = "LspAttach",
+	-- 	config = function()
+	-- 		require("lspsaga").setup({})
+	-- 		vim.keymap.set("n", "K", "<cmd>Lspsaga hover_doc")
+	-- 	end,
+	-- 	dependencies = {
+	-- 		"nvim-treesitter/nvim-treesitter", -- optional
+	-- 		"nvim-tree/nvim-web-devicons", -- optional
+	-- 	},
+	-- },
+	-- {
+	-- 	"linrongbin16/lsp-progress.nvim",
+	-- 	event = "LspAttach",
+	-- 	config = function()
+	-- 		require("lsp-progress").setup()
+	-- 	end,
+	-- },
+	-- {
+	-- 	"j-hui/fidget.nvim",
+	-- 	event = "LspAttach",
+	-- 	opts = {
+	-- 		require("plugins.fidget")
+	-- 	},
+	--    config = true
+	-- },
 	{
 		"lewis6991/gitsigns.nvim",
 		event = "BufRead",
@@ -104,28 +131,29 @@ return {
 	},
 
 	-- Git
-	{
-		"NeogitOrg/neogit",
-		cmd = "Neogit",
-		dependencies = {
-			"nvim-lua/plenary.nvim",
-			"sindrets/diffview.nvim",
-			"nvim-telescope/telescope.nvim",
-		},
-		config = function()
-			require("neogit").setup()
-		end,
-	},
-
-	-- coc
 	-- {
-	-- 	"neoclide/coc.nvim",
-	-- 	branch = "release",
-	-- 	lazy = false,
+	-- 	"NeogitOrg/neogit",
+	-- 	cmd = "Neogit",
+	-- 	dependencies = {
+	-- 		"nvim-lua/plenary.nvim",
+	-- 		"sindrets/diffview.nvim",
+	-- 		"nvim-telescope/telescope.nvim",
+	-- 	},
 	-- 	config = function()
-	-- 		require("plugins.coc")
+	-- 		require("neogit").setup()
 	-- 	end,
 	-- },
+
+	-- coc
+	{
+		"neoclide/coc.nvim",
+		branch = "release",
+		-- event = "LspAttach",
+		lazy = false,
+		config = function()
+			require("plugins.coc")
+		end,
+	},
 
 	{
 		"leafOfTree/vim-svelte-plugin",
@@ -158,26 +186,26 @@ return {
 	},
 
 	-- blink-cmp
-	{
-		"saghen/blink.cmp",
-		event = "InsertEnter",
-		-- lazy = false, -- lazy loading handled internally
-		-- optional: provides snippets for the snippet source
-		dependencies = "rafamadriz/friendly-snippets",
-
-		-- use a release tag to download pre-built binaries
-		version = "v0.*",
-		-- OR build from source, requires nightly: https://rust-lang.github.io/rustup/concepts/channels.html#working-with-nightly-rust
-		-- build = 'cargo build --release',
-		-- If you use nix, you can build from source using latest nightly rust with:
-		-- build = 'nix run .#build-plugin',
-
-		---@module 'blink.cmp'
-		---@type blink.cmp.Config
-		config = function()
-			require("plugins.blink-cmp")
-		end,
-	},
+	-- {
+	-- 	"saghen/blink.cmp",
+	-- 	event = "InsertEnter",
+	-- 	-- lazy = false, -- lazy loading handled internally
+	-- 	-- optional: provides snippets for the snippet source
+	-- 	dependencies = "rafamadriz/friendly-snippets",
+	--
+	-- 	-- use a release tag to download pre-built binaries
+	-- 	version = "v0.*",
+	-- 	-- OR build from source, requires nightly: https://rust-lang.github.io/rustup/concepts/channels.html#working-with-nightly-rust
+	-- 	-- build = 'cargo build --release',
+	-- 	-- If you use nix, you can build from source using latest nightly rust with:
+	-- 	-- build = 'nix run .#build-plugin',
+	--
+	-- 	---@module 'blink.cmp'
+	-- 	---@type blink.cmp.Config
+	-- 	config = function()
+	-- 		require("plugins.blink-cmp")
+	-- 	end,
+	-- },
 
 	-- skkeleton
 	-- {
@@ -273,46 +301,91 @@ return {
 	-- 'tani/ddc-fuzzy',
 
 	-- lspconfig
-	{
-		"neovim/nvim-lspconfig",
-		-- lazy = false,
-		event = "BufRead",
-		dependencies = { "saghen/blink.cmp" },
-		config = function()
-			require("plugins.nvim-lspconfig")
-		end,
-	},
-	{
-		"williamboman/mason.nvim",
-		dependencies = {
-			"saghen/blink.cmp",
-			"williamboman/mason-lspconfig.nvim",
-		},
-		cmd = {
-			"Mason",
-			"MasonInstall",
-			"MasonUninstall",
-			"MasonUninstallAll",
-			"MasonLog",
-			"MasonUpdate",
-		},
-		lazy = true,
-		config = function()
-			require("mason").setup()
-		end,
-	},
-	{
-		"williamboman/mason-lspconfig.nvim",
-		event = "BufRead",
-		config = function()
-			require("plugins.mason-config")
-		end,
+	-- {
+	-- 	"neovim/nvim-lspconfig",
+	-- 	-- lazy = false,
+	-- 	event = "BufRead",
+	-- 	dependencies = { "saghen/blink.cmp" },
+	-- 	config = function()
+	-- 		require("plugins.nvim-lspconfig")
+	-- 	end,
+	-- },
+	-- {
+	-- 	"williamboman/mason.nvim",
+	-- 	dependencies = {
+	-- 		"saghen/blink.cmp",
+	-- 		"williamboman/mason-lspconfig.nvim",
+	-- 	},
+	-- 	cmd = {
+	-- 		"Mason",
+	-- 		"MasonInstall",
+	-- 		"MasonUninstall",
+	-- 		"MasonUninstallAll",
+	-- 		"MasonLog",
+	-- 		"MasonUpdate",
+	-- 	},
+	-- 	lazy = true,
+	-- 	config = function()
+	-- 		require("mason").setup()
+	-- 	end,
+	-- },
+	-- {
+	-- 	"williamboman/mason-lspconfig.nvim",
+	-- 	event = "BufRead",
+	-- 	config = function()
+	-- 		require("plugins.mason-config")
+	-- 	end,
+	--
+	-- 	-- dependencies = {
+	-- 	-- 	"williamboman/mason.nvim",
+	-- 	-- 	"neovim/nvim-lspconfig",
+	-- 	-- },
+	-- },
 
-		-- dependencies = {
-		-- 	"williamboman/mason.nvim",
-		-- 	"neovim/nvim-lspconfig",
+	-- {
+	-- 	"seblj/roslyn.nvim",
+	-- 	ft = "cs",
+	-- 	event = { "BufReadPre", "BufNewFile" },
+		-- opts = {
+		-- 	require("plugins.roslyn"),
 		-- },
-	},
+ --    opts = {
+ --        filewatching = false,
+ --        broad_search = true,
+ --        ignore_sln = function(sln)
+ --            return string.match(sln, "SmartDok.sln") ~= nil
+ --        end,
+ --    },
+	-- 	init = function()
+ --        vim.keymap.set("n", "<leader>ds", function()
+ --            if not vim.g.roslyn_nvim_selected_solution then
+ --                return vim.notify("No solution file found")
+ --            end
+	--
+ --            local projects = require("roslyn.sln.api").projects(vim.g.roslyn_nvim_selected_solution)
+ --            local files = vim.iter(projects)
+ --                :map(function(it)
+ --                    return vim.fs.dirname(it)
+ --                end)
+ --                :totable()
+	--
+ --            local root = vim.fs.root(0, ".git") or vim.fs.dirname(vim.g.roslyn_nvim_selected_solution)
+	--
+ --            require("telescope.pickers")
+ --                .new({}, {
+ --                    cwd = root,
+ --                    prompt_title = "Find solution files",
+ --                    finder = require("telescope.finders").new_oneshot_job(
+ --                        vim.list_extend({ "fd", "--type", "f", "." }, files),
+ --                        { entry_maker = require("telescope.make_entry").gen_from_file({ cwd = root }) }
+ --                    ),
+ --                    sorter = require("telescope.config").values.file_sorter({}),
+ --                    previewer = require("telescope.config").values.grep_previewer({}),
+ --                })
+ --                :find()
+ --        end)
+ --    end,
+	-- },
 
 	-- codesnap
 	{

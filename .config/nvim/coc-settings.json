@@ -13,12 +13,19 @@
   "hover.floatConfig": {
     "border": true
   },
-  "Lua.diagnostics.globals": ["vim"],
+  "Lua.diagnostics.globals": ["vim", "coc"],
   "svelte.enable-ts-plugin": true,
   "tsserver.enable": false,
   "deno.enable": false,
   "markdownlint.config": {
     "line_length": false,
     "MD033": false
+  },
+  "languageserver": {
+    "csharp-ls": {
+      "command": "csharp-ls",
+      "filetypes": ["cs"],
+      "rootPatterns": ["*.csproj", ".vim/", ".git/", ".hg/"]
+    }
   }
 }

@@ -1,26 +1,32 @@
-local mason_status, mason = pcall(require, "mason")
-if not mason_status then
-	return
-end
-
-local mason_lspconfig_status, mason_lspconfig = pcall(require, "mason-lspconfig")
-if not mason_lspconfig_status then
-	return
-end
+local mason = require("mason")
+local mason_lspconfig = require("mason-lspconfig")
 
 local config = {
 	capabilities = require("blink.cmp").get_lsp_capabilities(),
 }
 
+local denols_setup = require("plugins.mason-config.denols").setup(config)
+local lua_setup = require("plugins.mason-config.lua_ls").setup(config)
+local rust_setup = require("plugins.mason-config.rust_analyzer").setup(config)
+local svelte_setup = require("plugins.mason-config.svelte").setup(config)
+local ts_ls_setup = require("plugins.mason-config.ts_ls").setup(config)
+
 local server_setup = {
-	rust_analyzer = require("plugins.mason-config.rust_analyzer").rust_setup(config),
-	lua_ls = require("lua.plugins.mason-config.lua_ls").lua_setup(config),
+	rust_analyzer = rust_setup,
+	lua_ls = lua_setup,
+	ts_ls = ts_ls_setup,
+	denols = denols_setup,
+	svelte = svelte_setup,
 }
+
+local function default_setup(config)
+	config.on_attach = require("plugins.mason-config.utils").on_attach
+end
 
 mason.setup({
 	PATH = "prepend",
 	ui = {
-		border = "rounded",
+		border = "double",
 	},
 })
 
@@ -32,7 +38,10 @@ mason_lspconfig.setup({
 		"denols",
 		"cssls",
 		"svelte",
-		-- "omnisharp",
+		"lemminx",
+		"taplo",
+		"jsonls",
+		"omnisharp",
 	},
 })
 
@@ -40,6 +49,8 @@ mason_lspconfig.setup_handlers({
 	function(server_name)
 		if server_setup[server_name] then
 			server_setup[server_name](config)
+		else
+			default_setup(config)
 		end
 
 		require("lspconfig")[server_name].setup(config)
