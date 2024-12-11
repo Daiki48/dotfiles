@@ -21,6 +21,7 @@
     "line_length": false,
     "MD033": false
   },
+  "workspace.ignoredFolders": ["$HOME", "$HOME/.cargo/**", "$HOME/.rustup/**"],
   "languageserver": {
     "csharp-ls": {
       "command": "csharp-ls",
