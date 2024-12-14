@@ -148,8 +148,8 @@ return {
 	{
 		"neoclide/coc.nvim",
 		branch = "release",
-		-- event = "LspAttach",
-		lazy = false,
+		event = {"BufReadPre", "BufNewFile"},
+		-- lazy = false,
 		config = function()
 			require("plugins.coc")
 		end,
