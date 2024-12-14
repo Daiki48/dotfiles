@@ -25,7 +25,7 @@
   "languageserver": {
     "csharp-ls": {
       "command": "csharp-ls",
-      "filetypes": ["cs"],
+      "filetypes": ["cs", "xaml"],
       "rootPatterns": ["*.csproj", ".vim/", ".git/", ".hg/"]
     }
   }
