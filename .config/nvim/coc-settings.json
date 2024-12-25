@@ -22,6 +22,7 @@
     "MD033": false
   },
   "workspace.ignoredFolders": ["$HOME", "$HOME/.cargo/**", "$HOME/.rustup/**"],
+	"rust-analyzer.check.command": "clippy",
   "languageserver": {
     "csharp-ls": {
       "command": "csharp-ls",
