@@ -105,7 +105,7 @@ local config = {
 			{
 				"filename",
 				path = 1,
-			}
+			},
 		},
 		lualine_x = { "encoding", "filetype" },
 		lualine_y = { "progress" },

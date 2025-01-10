@@ -72,6 +72,24 @@ return {
 			vim.api.nvim_set_keymap("v", "<C-_>", "gc", {})
 		end,
 	},
+	-- {
+	-- 	"Daiki48/oil.nvim",
+	--    dir = "D:\\dev\\fork\\oil.nvim",
+	-- 	cmd = "Oil",
+	-- 	branch = "master",
+	-- 	dev = true,
+	-- 	event = { "VimEnter */*,.*", "BufNew */*,.*" },
+	-- 	-- event = "VimEnter",
+	-- 	-- lazy = false,
+	-- 	---@module 'oil'
+	-- 	---@type oil.SetupOpts
+	-- 	opts = {},
+	-- 	-- Optional dependencies
+	-- 	dependencies = { "nvim-tree/nvim-web-devicons", { "echasnovski/mini.icons", opts = {} } }, -- use if prefer nvim-web-devicons
+	-- 	config = function()
+	-- 		require("plugins.oil")
+	-- 	end,
+	-- },
 	{
 		"stevearc/oil.nvim",
 		cmd = "Oil",
@@ -148,7 +166,7 @@ return {
 	{
 		"neoclide/coc.nvim",
 		branch = "release",
-		event = {"BufReadPre", "BufNewFile"},
+		event = { "BufReadPre", "BufNewFile" },
 		-- lazy = false,
 		config = function()
 			require("plugins.coc")
@@ -346,45 +364,45 @@ return {
 	-- 	"seblj/roslyn.nvim",
 	-- 	ft = "cs",
 	-- 	event = { "BufReadPre", "BufNewFile" },
-		-- opts = {
-		-- 	require("plugins.roslyn"),
-		-- },
- --    opts = {
- --        filewatching = false,
- --        broad_search = true,
- --        ignore_sln = function(sln)
- --            return string.match(sln, "SmartDok.sln") ~= nil
- --        end,
- --    },
+	-- opts = {
+	-- 	require("plugins.roslyn"),
+	-- },
+	--    opts = {
+	--        filewatching = false,
+	--        broad_search = true,
+	--        ignore_sln = function(sln)
+	--            return string.match(sln, "SmartDok.sln") ~= nil
+	--        end,
+	--    },
 	-- 	init = function()
- --        vim.keymap.set("n", "<leader>ds", function()
- --            if not vim.g.roslyn_nvim_selected_solution then
- --                return vim.notify("No solution file found")
- --            end
+	--        vim.keymap.set("n", "<leader>ds", function()
+	--            if not vim.g.roslyn_nvim_selected_solution then
+	--                return vim.notify("No solution file found")
+	--            end
 	--
- --            local projects = require("roslyn.sln.api").projects(vim.g.roslyn_nvim_selected_solution)
- --            local files = vim.iter(projects)
- --                :map(function(it)
- --                    return vim.fs.dirname(it)
- --                end)
- --                :totable()
+	--            local projects = require("roslyn.sln.api").projects(vim.g.roslyn_nvim_selected_solution)
+	--            local files = vim.iter(projects)
+	--                :map(function(it)
+	--                    return vim.fs.dirname(it)
+	--                end)
+	--                :totable()
 	--
- --            local root = vim.fs.root(0, ".git") or vim.fs.dirname(vim.g.roslyn_nvim_selected_solution)
+	--            local root = vim.fs.root(0, ".git") or vim.fs.dirname(vim.g.roslyn_nvim_selected_solution)
 	--
- --            require("telescope.pickers")
- --                .new({}, {
- --                    cwd = root,
- --                    prompt_title = "Find solution files",
- --                    finder = require("telescope.finders").new_oneshot_job(
- --                        vim.list_extend({ "fd", "--type", "f", "." }, files),
- --                        { entry_maker = require("telescope.make_entry").gen_from_file({ cwd = root }) }
- --                    ),
- --                    sorter = require("telescope.config").values.file_sorter({}),
- --                    previewer = require("telescope.config").values.grep_previewer({}),
- --                })
- --                :find()
- --        end)
- --    end,
+	--            require("telescope.pickers")
+	--                .new({}, {
+	--                    cwd = root,
+	--                    prompt_title = "Find solution files",
+	--                    finder = require("telescope.finders").new_oneshot_job(
+	--                        vim.list_extend({ "fd", "--type", "f", "." }, files),
+	--                        { entry_maker = require("telescope.make_entry").gen_from_file({ cwd = root }) }
+	--                    ),
+	--                    sorter = require("telescope.config").values.file_sorter({}),
+	--                    previewer = require("telescope.config").values.grep_previewer({}),
+	--                })
+	--                :find()
+	--        end)
+	--    end,
 	-- },
 
 	-- codesnap
