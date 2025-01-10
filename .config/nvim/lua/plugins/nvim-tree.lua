@@ -3,52 +3,52 @@ vim.g.loaded_netrw = 1
 vim.g.loaded_netrwPlugin = 1
 
 require("nvim-tree").setup({
-	view = {
-		width = 40,
-		relativenumber = true,
-		float = {
-			enable = false,
-			quit_on_focus_loss = true,
-			open_win_config = {
-				relative = "editor",
-				border = "rounded",
-				width = 30,
-				height = 30,
-				row = 1,
-				col = 1,
-			},
-		},
-	},
-	-- change folder arrow icons
-	renderer = {
-		indent_markers = {
-			enable = true,
-		},
-		icons = {
-			glyphs = {
-				folder = {
-					arrow_closed = "",
-					arrow_open = "",
-				},
-			},
-		},
-	},
-	-- disable window_picker for
-	-- explorer to work well with
-	-- window splits
-	actions = {
-		open_file = {
-			window_picker = {
-				enable = false,
-			},
-		},
-	},
-	filters = {
-		custom = { ".DS_Store" },
-	},
-	git = {
-		ignore = false,
-	},
+  view = {
+    width = 40,
+    relativenumber = true,
+    float = {
+      enable = false,
+      quit_on_focus_loss = true,
+      open_win_config = {
+        relative = "editor",
+        border = "rounded",
+        width = 30,
+        height = 30,
+        row = 1,
+        col = 1,
+      },
+    },
+  },
+  -- change folder arrow icons
+  renderer = {
+    indent_markers = {
+      enable = true,
+    },
+    icons = {
+      glyphs = {
+        folder = {
+          arrow_closed = "",
+          arrow_open = "",
+        },
+      },
+    },
+  },
+  -- disable window_picker for
+  -- explorer to work well with
+  -- window splits
+  actions = {
+    open_file = {
+      window_picker = {
+        enable = false,
+      },
+    },
+  },
+  filters = {
+    custom = { ".DS_Store" },
+  },
+  git = {
+    ignore = false,
+  },
 })
 
 -- set keymaps

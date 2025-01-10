@@ -3,21 +3,21 @@ M = {}
 local util = require("lspconfig.util")
 
 M.setup = function(config)
-	-- config.filetypes = {
-	-- 	"typescript",
-	-- 	"typescriptreact",
-	-- 	"typescript.tsx",
-	-- 	"javascript",
-	-- 	"javascriptreact",
-	-- 	"javascript.jsx",
-	-- 	"vue",
-	-- }
-	config.root_dir = util.root_pattern("package.json", "tsconfig.json")
-	config.flags = require("plugins.mason-config.utils").lsp_flags
-	config.cmd = { "typescript-language-server", "--stdio" }
+  -- config.filetypes = {
+  -- 	"typescript",
+  -- 	"typescriptreact",
+  -- 	"typescript.tsx",
+  -- 	"javascript",
+  -- 	"javascriptreact",
+  -- 	"javascript.jsx",
+  -- 	"vue",
+  -- }
+  config.root_dir = util.root_pattern("package.json", "tsconfig.json")
+  config.flags = require("plugins.mason-config.utils").lsp_flags
+  config.cmd = { "typescript-language-server", "--stdio" }
 
-	config.on_attach = require("plugins.mason-config.utils").on_attach
-	config.settings = {}
+  config.on_attach = require("plugins.mason-config.utils").on_attach
+  config.settings = {}
 end
 
 return M

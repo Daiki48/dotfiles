@@ -44,16 +44,16 @@ vim.cmd("set wildoptions=pum")
 -- copy/paste between WSL and Windows
 -- https://github.com/neovim/neovim/wiki/FAQ#how-to-use-the-windows-clipboard-from-wsl
 if vim.fn.has("wsl") == 1 then
-	vim.g.clipboard = {
-		name = "win32yank.exe",
-		copy = {
-			["+"] = { "win32yank.exe", "-i", "--crlf" },
-			["*"] = { "win32yank.exe", "-i", "--crlf" },
-		},
-		paste = {
-			["+"] = { "win32yank.exe", "-o", "--lf" },
-			["*"] = { "win32yank.exe", "-o", "--lf" },
-		},
-		cache_enabled = 1,
-	}
+  vim.g.clipboard = {
+    name = "win32yank.exe",
+    copy = {
+      ["+"] = { "win32yank.exe", "-i", "--crlf" },
+      ["*"] = { "win32yank.exe", "-i", "--crlf" },
+    },
+    paste = {
+      ["+"] = { "win32yank.exe", "-o", "--lf" },
+      ["*"] = { "win32yank.exe", "-o", "--lf" },
+    },
+    cache_enabled = 1,
+  }
 end
