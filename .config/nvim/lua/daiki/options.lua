@@ -7,6 +7,7 @@ vim.o.fileencoding = "utf-8"
 vim.g.mapleader = "<Space>"
 
 vim.wo.number = true
+vim.wo.numberwidth = 8
 vim.wo.relativenumber = false
 vim.wo.signcolumn = "yes"
 
