@@ -23,7 +23,7 @@ local opts = {
     },
   },
   dev = {
-    path = "/mnt/sabrent/dev/nvim-plugin-dev/Daiki48",
+    path = "D:/dev/vim-plugins/",
   },
 }
 

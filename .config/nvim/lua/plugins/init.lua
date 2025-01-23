@@ -1,4 +1,12 @@
 return {
+  -- {
+  -- 	"nvim-faira",
+  --    lazy = false,
+  --    dev = true,
+  -- config = function()
+  -- 	print(require("foo")) -- prints `42`
+  -- end,
+  -- },
   {
     "folke/snacks.nvim",
     priority = 1000,
