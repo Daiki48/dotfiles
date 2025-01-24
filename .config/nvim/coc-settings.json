@@ -13,6 +13,7 @@
   "hover.floatConfig": {
     "border": true
   },
+	"powershell.integratedConsole.showOnStartup": false,
   "Lua.diagnostics.globals": ["vim", "coc"],
   "svelte.enable-ts-plugin": true,
   "tsserver.enable": false,
