@@ -2,42 +2,20 @@
 
 ## Font
 
-- [JetBrains Mono](https://www.jetbrains.com/lp/mono/)
+- [JetBrains Mono](https://www.jetbrains.com/lp/mono/) for Programming
+- [BIZ UDPGothic](https://fonts.google.com/specimen/BIZ+UDPGothic) for Japanese
 
-## Symbolic Link
+## Setup script
 
-### nvim
+### For Windows
 
-```shell
-ln -s ~/dotfiles/.config/nvim ~/.config/
+```sh
+.\setup_windows.ps1
 ```
 
-or powershell
+### For Unix
 
-```shell
-New-Item -ItemType SymbolicLink -Path $env:USERPROFILE\AppData\Local\nvim -Target $env:USERPROFILE\dotfiles\.config\nvim
-```
-
-### wezterm
-
-```shell
-ln -s ~/dotfiles/.config/nvim ~/.config/ 
-```
-
-### .zshrc
-
-Backup and create existing `.zshrc` .
-
-```shell
-mv .zshrc .zshrc_backup
-ln -s ~/dotfiles/.zshrc ~/
-```
-
-### .zsh
-
-```shell
-ln -s ~/dotfiles/.zsh ~/.zsh
-```
+Coming soon ...
 
 ### .skk
 
