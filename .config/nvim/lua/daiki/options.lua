@@ -11,7 +11,7 @@ vim.wo.numberwidth = 8
 vim.wo.relativenumber = false
 vim.wo.signcolumn = "yes"
 
-vim.o.shell = "zsh"
+-- vim.o.shell = "zsh"
 vim.o.scrolloff = 10
 vim.o.cmdheight = 1
 vim.o.inccommand = "split"
@@ -58,3 +58,15 @@ if vim.fn.has("wsl") == 1 then
     cache_enabled = 1,
   }
 end
+
+-- Terminal config
+vim.api.nvim_create_user_command("T", function(opts)
+  vim.cmd("split")
+  vim.cmd("wincmd j")
+  vim.cmd("resize 20")
+  if opts.args == "" and vim.fn.has("win64") == 1 then
+    vim.cmd('terminal "C:\\Program Files\\PowerShell\\7\\pwsh.exe"')
+  else
+    vim.cmd("terminal " .. opts.args)
+  end
+end, { nargs = "*" })
