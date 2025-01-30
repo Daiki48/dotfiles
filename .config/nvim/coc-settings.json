@@ -29,6 +29,14 @@
       "command": "csharp-ls",
       "filetypes": ["cs", "xaml"],
       "rootPatterns": ["*.csproj", ".vim/", ".git/", ".hg/"]
+    },
+    "golang": {
+      "command": "gopls",
+      "rootPatterns": ["go.work", "go.mod", ".vim/", ".git/", ".hg/"],
+      "filetypes": ["go"],
+      "initializationOptions": {
+        "usePlaceholders": true
+      }
     }
   }
 }
