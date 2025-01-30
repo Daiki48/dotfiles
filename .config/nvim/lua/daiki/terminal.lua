@@ -10,5 +10,5 @@ vim.api.nvim_create_user_command("T", function(opts)
   else
     vim.cmd("terminal " .. opts.args)
   end
-	vim.cmd("autocmd TermOpen * startinsert")
+  vim.cmd("autocmd TermOpen * startinsert")
 end, { nargs = "*" })
