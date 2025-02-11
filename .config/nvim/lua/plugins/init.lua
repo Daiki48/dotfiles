@@ -15,4 +15,5 @@ return {
   require("plugins.nvim-ts-autotag"),
   require("plugins.codesnap"),
   require("plugins.flash"),
+  require("plugins.which-key"),
 }
