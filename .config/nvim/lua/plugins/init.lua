@@ -8,7 +8,7 @@ return {
   require("plugins.oil-vcs-status"),
   require("plugins.nvim-autopairs"),
   require("plugins.vim-startuptime"),
-  require("plugins.telescope"),
+  -- require("plugins.telescope"),
   require("plugins.coc"),
   require("plugins.vim-svelte-plugin"),
   require("plugins.treesitter"),
