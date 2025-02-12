@@ -28,6 +28,7 @@ return {
     quickfile = { enabled = true },
     statuscolumn = { enabled = true },
     words = { enabled = true },
+    scroll = { enable = true },
     styles = {
       notification = {
         wo = { wrap = true }, -- Wrap notifications
