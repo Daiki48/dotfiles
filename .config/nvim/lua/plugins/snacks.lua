@@ -5,9 +5,6 @@ return {
   priority = 1000,
   lazy = false,
   opts = {
-    -- your configuration comes here
-    -- or leave it empty to use the default settings
-    -- refer to the configuration section below
     dashboard = {
       enabled = true,
       preset = {
@@ -31,7 +28,7 @@ return {
     scroll = { enabled = false },
     styles = {
       notification = {
-        wo = { wrap = true }, -- Wrap notifications
+        wo = { wrap = true },
       },
     },
     picker = {
@@ -49,7 +46,7 @@ return {
       },
       previewers = {
         git = {
-          native = true, -- use native (terminal) or Neovim for previewing git diffs and commits
+          native = true,
         },
       },
     },
@@ -68,13 +65,13 @@ return {
   },
   keys = {
     -- Using oil.nvim
-    -- {
-    --   ";ee",
-    --   function()
-    --     Snacks.picker.explorer()
-    --   end,
-    --   desc = "explorer",
-    -- },
+    {
+      ";se",
+      function()
+        Snacks.picker.explorer()
+      end,
+      desc = "explorer",
+    },
     {
       ";sm",
       function()
