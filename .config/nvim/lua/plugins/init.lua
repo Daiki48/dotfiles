@@ -19,4 +19,5 @@ return {
   require("plugins.blink-cmp"),
   require("plugins.nvim-lspconfig"),
   require("plugins.trouble"),
+  require("plugins.fidget"),
 }
