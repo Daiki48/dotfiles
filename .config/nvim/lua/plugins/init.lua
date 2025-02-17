@@ -18,4 +18,5 @@ return {
   require("plugins.which-key"),
   require("plugins.blink-cmp"),
   require("plugins.nvim-lspconfig"),
+  require("plugins.trouble"),
 }

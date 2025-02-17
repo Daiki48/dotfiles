@@ -16,7 +16,8 @@
   "oil-vcs-status": { "branch": "main", "commit": "e0dd01a19f521b2393018e8466d46120a8ffba71" },
   "oil.nvim": { "branch": "master", "commit": "975a77cce3c8cb742bc1b3629f4328f5ca977dad" },
   "sakurajima.nvim": { "branch": "main", "commit": "467e787c6f9c5a48ef94a48c5b925632130bef28" },
-  "snacks.nvim": { "branch": "main", "commit": "20e5b0fdbff6c113e989538408f15ef2fcdc1986" },
+  "snacks.nvim": { "branch": "main", "commit": "acedb16ad76ba0b5d4761372ca71057aa9486adb" },
+  "trouble.nvim": { "branch": "main", "commit": "85bedb7eb7fa331a2ccbecb9202d8abba64d37b3" },
   "vim-startuptime": { "branch": "master", "commit": "9aaa3c0880e63a8934ba58a430c6139225bba238" },
   "vim-svelte-plugin": { "branch": "master", "commit": "e0f65b79d1d990cda764bf190cb142fed4835d14" },
   "which-key.nvim": { "branch": "main", "commit": "5bf7a73fe851896d5ac26d313db849bf00f45b78" }
