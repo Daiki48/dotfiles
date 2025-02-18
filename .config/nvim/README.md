@@ -16,6 +16,8 @@
   - npm: `npm install -g svelte-language-server`
 - [taplo](https://github.com/neovim/nvim-lspconfig/blob/master/doc/configs.md#taplo)
   - cargo: `cargo install --features lsp --locked taplo-cli`
+- [tailwindcss](https://github.com/neovim/nvim-lspconfig/blob/master/doc/configs.md#tailwindcss)
+  - npm: `npm install -g @tailwindcss/language-server`
 
 ## clipboard for Arch Linux
 
