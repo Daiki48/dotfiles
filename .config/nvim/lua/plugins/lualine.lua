@@ -9,6 +9,23 @@ return {
       return
     end
 
+    -- Active LSP name
+    -- LSP clients attached to buffer
+    local clients_lsp = function()
+      local bufnr = vim.api.nvim_get_current_buf()
+
+      local clients = vim.lsp.buf_get_clients(bufnr)
+      if next(clients) == nil then
+        return ""
+      end
+
+      local c = {}
+      for _, client in pairs(clients) do
+        table.insert(c, client.name)
+      end
+      return "\u{f085} " .. table.concat(c, "|")
+    end
+
     -- vim_mode select function
     local function vim_mode()
       local map = {
@@ -69,6 +86,7 @@ return {
         lualine_a = {
           { vim_mode },
           "g:coc_status",
+          clients_lsp,
         },
         lualine_b = {
           "g:coc_git_status",
