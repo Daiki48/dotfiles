@@ -39,15 +39,114 @@ return {
           },
         },
       },
-      taplo = {},
-      ts_ls = {},
+      taplo = {
+        settings = {
+          ["taplo"] = {
+            cmd = {
+              "taplo",
+              "lsp",
+              "stdio",
+            },
+            filetypes = {
+              "toml",
+            },
+            single_file_support = true,
+          },
+        },
+      },
+      ts_ls = {
+        settings = {
+          ["ts_ls"] = {
+            cmd = {
+              "typescript-language-server",
+              "--stdio",
+            },
+            filetypes = {
+              "javascript",
+              "javascriptreact",
+              "javascript.jsx",
+              "typescript",
+              "typescriptreact",
+              "typescript.tsx",
+            },
+            init_options = {
+              hostInfo = "neovim",
+            },
+            single_file_support = true,
+          },
+        },
+      },
+      denols = {
+        settings = {
+          ["denols"] = {},
+        },
+      },
+      svelte = {
+        settings = {
+          ["svelte"] = {
+            cmd = {
+              "svelteserver",
+              "--stdio",
+            },
+            filetypes = {
+              "svelte",
+            },
+          },
+        },
+      },
+      html = {
+        settings = {
+          ["html"] = {
+            cmd = {
+              "vscode-html-language-server",
+              "--stdio",
+            },
+            filetypes = {
+              "html",
+              "templ",
+            },
+          },
+        },
+      },
+      cssls = {
+        settings = {
+          ["cssls"] = {
+            cmd = {
+              "vscode-css-language-server",
+              "--stdio",
+            },
+            filetypes = {
+              "css",
+              "scss",
+              "less",
+            },
+            init_options = {
+              provideFormatter = true,
+            },
+          },
+        },
+      },
     },
   },
   config = function(_, opts)
     local lspconfig = require("lspconfig")
+    local root_pattern = require("lspconfig").util.root_pattern
+
     for server, config in pairs(opts.servers) do
       config.capabilities = require("blink.cmp").get_lsp_capabilities(config.capabilities)
-      lspconfig[server].setup(config)
+
+      local is_ts = root_pattern("package.json", "tsconfig.json")()
+      local is_deno = root_pattern("deno.json", "deno.jsonc")()
+
+      if server == "ts_ls" and is_ts then
+        config.root_dir = root_pattern("package.json", "tsconfig.json")
+        lspconfig[server].setup(config)
+      elseif server == "denols" and is_deno then
+        config.root_dir = root_pattern("deno.json", "deno.jsonc")
+        lspconfig[server].setup(config)
+      elseif server ~= "ts_ls" and server ~= "denols" then
+        lspconfig[server].setup(config)
+      end
     end
   end,
 }
