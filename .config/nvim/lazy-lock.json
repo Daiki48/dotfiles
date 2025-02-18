@@ -19,7 +19,7 @@
   "sakurajima.nvim": { "branch": "main", "commit": "467e787c6f9c5a48ef94a48c5b925632130bef28" },
   "snacks.nvim": { "branch": "main", "commit": "2b52d89508a448a1ca0c500afbd325e77023afc1" },
   "trouble.nvim": { "branch": "main", "commit": "85bedb7eb7fa331a2ccbecb9202d8abba64d37b3" },
-  "vim-startuptime": { "branch": "master", "commit": "9aaa3c0880e63a8934ba58a430c6139225bba238" },
+  "vim-startuptime": { "branch": "master", "commit": "b6f0d93f6b8cf6eee0b4c94450198ba2d6a05ff6" },
   "vim-svelte-plugin": { "branch": "master", "commit": "e0f65b79d1d990cda764bf190cb142fed4835d14" },
   "which-key.nvim": { "branch": "main", "commit": "5bf7a73fe851896d5ac26d313db849bf00f45b78" }
 }
