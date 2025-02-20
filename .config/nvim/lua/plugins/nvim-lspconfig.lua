@@ -10,6 +10,15 @@ return {
             runtime = {
               version = "LuaJIT",
             },
+            workspace = {
+              checkThirdParty = false,
+              library = {
+                vim.env.VIMRUNTIME,
+              },
+            },
+            hint = {
+              enable = true,
+            },
             diagnostics = {
               globals = { "vim" },
             },

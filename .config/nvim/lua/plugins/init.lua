@@ -22,4 +22,5 @@ return {
   require("plugins.trouble"),
   require("plugins.fidget"),
   require("plugins.none-ls"),
+  -- require("plugins.neoformat"),
 }
