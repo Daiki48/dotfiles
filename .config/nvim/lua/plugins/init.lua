@@ -1,4 +1,5 @@
 return {
+  -- require("plugins.ale"),
   require("plugins.snacks"),
   require("plugins.sakurajima"),
   require("plugins.editorconfig-vim"),
@@ -20,4 +21,5 @@ return {
   require("plugins.nvim-lspconfig"),
   require("plugins.trouble"),
   require("plugins.fidget"),
+  require("plugins.none-ls"),
 }
