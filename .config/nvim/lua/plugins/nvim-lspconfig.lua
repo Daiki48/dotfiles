@@ -192,8 +192,14 @@ return {
     local lspconfig = require("lspconfig")
     local root_pattern = require("lspconfig").util.root_pattern
 
+    local handlers = {
+      ["textDocument/hover"] = vim.lsp.with(vim.lsp.handlers.hover, { border = "rounded" }),
+      ["textDocument/signatureHelp"] = vim.lsp.with(vim.lsp.handlers.signature_help, { border = "rounded" }),
+    }
+
     for server, config in pairs(opts.servers) do
       config.capabilities = require("blink.cmp").get_lsp_capabilities(config.capabilities)
+      config.handlers = handlers
 
       local is_ts = root_pattern("package.json", "tsconfig.json")()
       local is_deno = root_pattern("deno.json", "deno.jsonc")()
