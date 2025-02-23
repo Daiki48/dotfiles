@@ -1,3 +1,5 @@
+# Add deno completions to search path
+if [[ ":$FPATH:" != *":/home/daiki48/.zsh/completions:"* ]]; then export FPATH="/home/daiki48/.zsh/completions:$FPATH"; fi
 setopt print_eight_bit
 setopt no_beep
 
@@ -28,14 +30,14 @@ PROMPT='[%B%F{red}%n:%F{green}%~%f]%F{cyan}$vcs_info_msg_0_%f
 # %F{yellow}$%f '
 
 # Default work dir
-cd /mnt/sabrent
+# cd /mnt/sabrent
 
 # Add write, read permissions
 umask 000
 
 # Created by newuser for 5.8.1
-export DENO_INSTALL="/home/daiki/.deno"
-export PATH="$DENO_INSTALL/bin:$PATH"
+# export DENO_INSTALL="/home/daiki/.deno"
+# export PATH="$DENO_INSTALL/bin:$PATH"
 
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
@@ -43,8 +45,11 @@ export NVM_DIR="$HOME/.nvm"
 
 
 # bun completions
-[ -s "/home/daiki/.bun/_bun" ] && source "/home/daiki/.bun/_bun"
+# [ -s "/home/daiki/.bun/_bun" ] && source "/home/daiki/.bun/_bun"
 
 # bun
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
+# export BUN_INSTALL="$HOME/.bun"
+# export PATH="$BUN_INSTALL/bin:$PATH"
+. "/home/daiki48/.deno/env"
+
+export PATH="$PATH:/snap/bin"
