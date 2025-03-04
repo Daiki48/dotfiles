@@ -1,7 +1,34 @@
+# Base options
+setopt always_last_prompt
+setopt auto_list
+setopt auto_menu
+setopt auto_cd
+setopt auto_param_keys
+setopt correct_all
+setopt extended_glob
+setopt list_types
+setopt cdable_vars
+setopt extended_history
+setopt hist_ignore_dups
+setopt hist_reduce_blanks
+setopt hist_ignore_space
+setopt auto_name_dirs
+setopt auto_remove_slash
+setopt ignore_eof
+setopt no_beep
+setopt multios
+setopt numeric_glob_sort
+setopt prompt_subst
+setopt sh_word_split
+setopt noclobber
+zstyle ':completion:*' list-colors 'di=36' 'ex=31' 'ln=35'
+zstyle ':completion:*:default' menu select=1
+zstyle ':completion:*:*:make:*' tag-order 'targets'
+export WORDCHARS='*?_.[];!#$%^{}<>'
+
 # Add deno completions to search path
 if [[ ":$FPATH:" != *":/home/daiki48/.zsh/completions:"* ]]; then export FPATH="/home/daiki48/.zsh/completions:$FPATH"; fi
 setopt print_eight_bit
-setopt no_beep
 
 # git 
 # curl -o .git-completion.sh https://raw.githubusercontent.com/git/git/master/contrib/completion/git-completion.bash
@@ -34,9 +61,6 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
 
-# bun
-# export BUN_INSTALL="$HOME/.bun"
-# export PATH="$BUN_INSTALL/bin:$PATH"
 . "/home/daiki48/.deno/env"
 
 export PATH="$PATH:/snap/bin"
