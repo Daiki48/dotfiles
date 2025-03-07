@@ -72,3 +72,10 @@ eval "$(pyenv init --path)"
 
 # pip3
 source ~/.local/bin/pymyenv/bin/activate
+
+# bun completions
+[ -s "/home/daiki48/.bun/_bun" ] && source "/home/daiki48/.bun/_bun"
+
+# bun
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
