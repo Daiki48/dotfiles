@@ -79,3 +79,10 @@ source ~/.local/bin/pymyenv/bin/activate
 # bun
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
+
+# Resolve "wl-clipboard not found, clipboard integration won't work"
+# Check ".config/nvim/lua/daiki/options.lua"
+# sudo apt install wl-clipboard
+if [ ! -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
+  ln -s /mnt/wslg/runtime-dir/wayland-0* "$XDG_RUNTIME_DIR"
+fi
