@@ -1,5 +1,5 @@
 {
-  "blink.cmp": { "branch": "main", "commit": "1c8d8e45d6fba3d11512f4762b1fdf906bffca42" },
+  "blink.cmp": { "branch": "main", "commit": "4607923f60029f8cb28e6950a078f93fd33e1288" },
   "codesnap.nvim": { "branch": "main", "commit": "6400480aa6cc366cbd931146c429aaa64680dab9" },
   "editorconfig-vim": { "branch": "master", "commit": "91bd0b0a2c6a72a110ab9feae335e1224480c233" },
   "fidget.nvim": { "branch": "main", "commit": "3fa10de61546fd0a98faac3084a6c0db612adaf8" },
@@ -12,7 +12,7 @@
   "none-ls.nvim": { "branch": "main", "commit": "a117163db44c256d53c3be8717f3e1a2a28e6299" },
   "nvim-autopairs": { "branch": "master", "commit": "6522027785b305269fa17088395dfc0f456cedd2" },
   "nvim-lspconfig": { "branch": "master", "commit": "fb733ac734249ccf293e5c8018981d4d8f59fa8f" },
-  "nvim-treesitter": { "branch": "master", "commit": "b10436b9fb29d3c3c406c07ce813f70245f9bc7b" },
+  "nvim-treesitter": { "branch": "master", "commit": "d26ce0126694283cf32bf1f4192ef37ef404c037" },
   "nvim-ts-autotag": { "branch": "main", "commit": "a1d526af391f6aebb25a8795cbc05351ed3620b5" },
   "nvim-web-devicons": { "branch": "master", "commit": "4c3a5848ee0b09ecdea73adcd2a689190aeb728c" },
   "oil-vcs-status": { "branch": "main", "commit": "e0dd01a19f521b2393018e8466d46120a8ffba71" },
