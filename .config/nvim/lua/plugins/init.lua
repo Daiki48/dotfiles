@@ -18,7 +18,7 @@ return {
   require("plugins.flash"),
   require("plugins.which-key"),
   require("plugins.blink-cmp"),
-  require("plugins.nvim-lspconfig"),
+  -- require("plugins.nvim-lspconfig"),
   require("plugins.trouble"),
   require("plugins.fidget"),
   require("plugins.none-ls"),
