@@ -35,27 +35,27 @@ echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
 
 
 # Snap インストールとバージョン確認
-echo ""
-echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
-echo "Checking snap installation..."
-echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
-if ! command -v snap >/dev/null 2>&1; then
-  echo "snap is not installed. Installing snap..."
-  sudo apt update
-  sudo apt install -U -y snapd # snap をインストール (未インストール時のみ)
-  if ! command -v snap >/dev/null 2>&1; then
-    echo "Failed to install snap. Please check the installation manually."
-    exit 1
-  fi
-  echo "snap installed successfully."
-else
-	snapVersion=$(snap --version)
-  echo "snap is already installed. Version: ${snapVersion}"
-fi
+# echo ""
+# echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
+# echo "Checking snap installation..."
+# echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
+# if ! command -v snap >/dev/null 2>&1; then
+#   echo "snap is not installed. Installing snap..."
+#   sudo apt update
+#   sudo apt install -U -y snapd # snap をインストール (未インストール時のみ)
+#   if ! command -v snap >/dev/null 2>&1; then
+#     echo "Failed to install snap. Please check the installation manually."
+#     exit 1
+#   fi
+#   echo "snap installed successfully."
+# else
+# 	snapVersion=$(snap --version)
+#   echo "snap is already installed. Version: ${snapVersion}"
+# fi
 
 
 # Neovim (snap) インストールとバージョン確認
-source scripts/setup_neovim.sh
+# source scripts/setup_neovim.sh
 
 echo ""
 echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
@@ -98,8 +98,8 @@ echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
 echo ""
 echo "Installed:"
 echo "- zsh (Version: ${zshVersion})"
-echo "- snap (Version: ${snapVersion})"
-echo "- Neovim (snap) (Version: ${nvimVersion})"
+# echo "- snap (Version: ${snapVersion})"
+# echo "- Neovim (snap) (Version: ${nvimVersion})"
 echo ""
 echo "Neovim config symbolic link created from:"
 echo "- Source:       ${sourcePath}"
