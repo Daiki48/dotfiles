@@ -67,7 +67,7 @@ Start building.
 Add `$PATH` in `.zshrc`.  
 
 ```sh
-export PATH="$PATH:$HOME/lua-language-server/bin"
+export PATH="$PATH:$HOME/lsp/lua-language-server/bin"
 ```
 
 ### Installing a language server using `cargo`
