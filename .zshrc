@@ -86,3 +86,5 @@ export PATH="$BUN_INSTALL/bin:$PATH"
 if [ ! -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
   ln -s /mnt/wslg/runtime-dir/wayland-0* "$XDG_RUNTIME_DIR"
 fi
+
+export PATH="$PATH:$HOME/lsp/lua-language-server/bin"

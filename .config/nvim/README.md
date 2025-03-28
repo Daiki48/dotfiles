@@ -30,6 +30,46 @@ npm install -g prettier typescript typescript-language-server svelte-language-se
 scoop install lua-language-server
 ```
 
+#### Using lua-language-server in Ubuntu
+
+For Ubuntu, build the `lua-language-server` source code.  
+See: https://luals.github.io/wiki/build/
+
+```sh
+sudo apt install ninja-build
+```
+
+Make `lsp` directory in root `~`.
+
+```sh
+cd
+mkdir lsp
+```
+
+Clone from GitHub
+
+```sh
+git clone https://github.com/LuaLS/lua-language-server
+```
+
+Change directory.
+
+```sh
+cd lua-language-server
+```
+
+Start building.
+
+```sh
+./make.sh
+```
+
+Add `$PATH` in `.zshrc`.  
+
+```sh
+export PATH="$PATH:$HOME/lua-language-server/bin"
+```
+
 ### Installing a language server using `cargo`
 
 - [taplo](https://github.com/neovim/nvim-lspconfig/blob/master/doc/configs.md#taplo)
