@@ -96,60 +96,60 @@ export PATH="$PATH:$HOME/lsp/lua-language-server/bin"
 # Load .node-version or .nvmrc for Volta
 autoload -Uz add-zsh-hook
 function chpwd_volta_install() {
-  # .node-versionが存在するかチェック
+  # Checking .node-version
   if [[ -e ".node-version" ]]; then
-    # .node-versionから内容を読み取る
+    # Loading .node-version, and get content
     content=$(cat .node-version)
     volta install node@$content --quiet
   fi
 
   # .nvmrcが存在するかチェック
   if [[ -e ".nvmrc" ]]; then
-    # .nvmrcから内容を読み取る
+    # Loading .nvmrc, and get content
     content=$(cat .nvmrc)
 
     case $content in
-    # lts/argonの場合
+    # Case of lts/argon
     "lts/argon")
       volta install node@4 --quiet
       ;;
-    # lts/boronの場合
+    # Case of lts/boron
     "lts/boron")
       volta install node@6 --quiet
       ;;
-    # lts/carbonの場合
+    # Case of lts/carbon
     "lts/carbon")
       volta install node@8 --quiet
       ;;
-    # lts/dubniumの場合
+    # Case of lts/dubnium
     "lts/dubnium")
       volta install node@10 --quiet
       ;;
-    # lts/erbiumの場合
+    # Case of lts/erbium
     "lts/erbium")
       volta install node@12 --quiet
       ;;
-    # lts/fermiumの場合
+    # Case of lts/fermium
     "lts/fermium")
       volta install node@14 --quiet
       ;;
-    # lts/galliumの場合
+    # Case of lts/gallium
     "lts/gallium")
       volta install node@16 --quiet
       ;;
-    # lts/hydrogenの場合
+    # Case of lts/hydrogen
     "lts/hydrogen")
       volta install node@18 --quiet
       ;;
-    # lts/*の場合
+    # Case of lts/*
     "lts/*")
       volta install node@lts --quiet
       ;;
-    # latest,current,node,*の場合
+    # Case of latest,current,node,*
     "latest" | "current" | "node" | "*")
       volta install node@latest --quiet
       ;;
-    # それ以外の場合
+    # Other
     *)
       volta install node@$content --quiet
       ;;
