@@ -22,6 +22,6 @@
   "trouble.nvim": { "branch": "main", "commit": "85bedb7eb7fa331a2ccbecb9202d8abba64d37b3" },
   "vim-startuptime": { "branch": "master", "commit": "b6f0d93f6b8cf6eee0b4c94450198ba2d6a05ff6" },
   "vim-svelte-plugin": { "branch": "master", "commit": "3939edd26188685ca496759641b7f8209d0e2e0e" },
-  "vim-test": { "branch": "master", "commit": "0f50a546aef59efe5f1301de8fa9819ecb9fd482" },
+  "vim-test": { "branch": "master", "commit": "b0c3e13249699a522c8b472ff79eff40d2935476" },
   "which-key.nvim": { "branch": "main", "commit": "370ec46f710e058c9c1646273e6b225acf47cbed" }
 }

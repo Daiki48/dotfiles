@@ -15,6 +15,7 @@ return {
         "query",
         "rust",
         "typescript",
+        "javascript",
         "svelte",
         "markdown",
         "go",
@@ -23,6 +24,8 @@ return {
         "vue",
         "yaml",
         "xml",
+        "html",
+        "css",
       },
 
       -- Install parsers synchronously (only applied to `ensure_installed`)
@@ -33,20 +36,20 @@ return {
       auto_install = true,
 
       -- List of parsers to ignore installing (or "all")
-      ignore_install = { "javascript" },
+      ignore_install = {},
 
       ---- If you need to change the installation directory of the parsers (see -> Advanced Setup)
       -- parser_install_dir = "/some/path/to/store/parsers", -- Remember to run vim.opt.runtimepath:append("/some/path/to/store/parsers")!
 
       highlight = {
         -- disable = true,
-        -- enable = true,
+        enable = true,
 
         -- Setting this to true will run `:h syntax` and tree-sitter at the same time.
         -- Set this to `true` if you depend on 'syntax' being enabled (like for indentation).
         -- Using this option may slow down your editor, and you may see some duplicate highlights.
         -- Instead of true it can also be a list of languages
-        additional_vim_regex_highlighting = false,
+        -- additional_vim_regex_highlighting = false,
       },
 
       -- https://github.com/windwp/nvim-ts-autotag/commit/6e9742a006ae69c015e6dc1ed9b477033193778b
