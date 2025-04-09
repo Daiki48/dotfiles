@@ -157,3 +157,6 @@ function chpwd_volta_install() {
   fi
 }
 add-zsh-hook chpwd chpwd_volta_install
+
+# Turso
+export PATH="$PATH:/home/daiki48/.turso"
