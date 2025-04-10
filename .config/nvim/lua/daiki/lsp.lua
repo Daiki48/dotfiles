@@ -68,6 +68,14 @@ vim.lsp.config["rust-analyzer"] = {
 }
 vim.lsp.enable("rust-analyzer")
 
+-- C, C++
+vim.lsp.config["clangd"] = {
+  cmd = { "clangd", "--background-index" },
+  root_markers = { "compile_commands.json", "compile_flags.txt" },
+  filetypes = { "c", "cpp" },
+}
+vim.lsp.enable("clangd")
+
 -- TypeScript (Node.js)
 vim.lsp.config.ts_ls = {
   cmd = {

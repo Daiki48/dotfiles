@@ -8,6 +8,7 @@ return {
       -- A list of parser names, or "all" (the five listed parsers should always be installed)
       ensure_installed = {
         "c",
+        "cpp",
         "c_sharp",
         "lua",
         "vim",
