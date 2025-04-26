@@ -76,6 +76,14 @@ vim.lsp.config["clangd"] = {
 }
 vim.lsp.enable("clangd")
 
+-- Go
+vim.lsp.config["gopls"] = {
+	cmd = { "gopls" },
+	root_markers = { "go.work", "go.mod", ".git/" },
+	filetypes = { "go", "gomod", "gowork", "gotmpl" },
+}
+vim.lsp.enable("gopls")
+
 -- TypeScript (Node.js)
 vim.lsp.config.ts_ls = {
   cmd = {
