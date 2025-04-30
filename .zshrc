@@ -27,7 +27,7 @@ zstyle ':completion:*:*:make:*' tag-order 'targets'
 export WORDCHARS='*?_.[];!#$%^{}<>'
 
 # Add deno completions to search path
-if [[ ":$FPATH:" != *":/home/daiki48/.zsh/completions:"* ]]; then export FPATH="/home/daiki48/.zsh/completions:$FPATH"; fi
+if [[ ":$FPATH:" != *":$HOME/.zsh/completions:"* ]]; then export FPATH="$HOME/.zsh/completions:$FPATH"; fi
 setopt print_eight_bit
 
 # git 
@@ -64,7 +64,7 @@ umask 000
 export VOLTA_HOME="$HOME/.volta"
 export PATH="$VOLTA_HOME/bin:$PATH"
 
-. "/home/daiki48/.deno/env"
+. "$HOME/.deno/env"
 
 export PATH="$PATH:/snap/bin"
 
@@ -77,7 +77,7 @@ eval "$(pyenv init --path)"
 source ~/.local/bin/pymyenv/bin/activate
 
 # bun completions
-[ -s "/home/daiki48/.bun/_bun" ] && source "/home/daiki48/.bun/_bun"
+[ -s "$HOME/.bun/_bun" ] && source "$HOME/.bun/_bun"
 
 # bun
 export BUN_INSTALL="$HOME/.bun"
@@ -159,4 +159,4 @@ function chpwd_volta_install() {
 add-zsh-hook chpwd chpwd_volta_install
 
 # Turso
-export PATH="$PATH:/home/daiki48/.turso"
+export PATH="$PATH:$HOME/.turso"
