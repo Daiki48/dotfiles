@@ -160,3 +160,6 @@ add-zsh-hook chpwd chpwd_volta_install
 
 # Turso
 export PATH="$PATH:$HOME/.turso"
+
+# Zig
+export PATH="/usr/local/zig:$PATH"
