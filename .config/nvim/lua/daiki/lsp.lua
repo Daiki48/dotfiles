@@ -1,3 +1,5 @@
+vim.lsp.set_log_level("DEBUG")
+
 -- #############################################
 -- LSP utils
 -- #############################################
@@ -19,143 +21,20 @@ vim.api.nvim_create_autocmd("CursorHold", {
 })
 
 -- #############################################
--- LSP config
+-- LSP enable
 -- #############################################
--- Lua
-vim.lsp.config.lua_ls = {
-  cmd = { "lua-language-server" },
-  filetypes = { "lua" },
-  root_markers = { ".luarc.json" },
-  settings = {
-    Lua = {
-      runtime = {
-        version = "LuaJIT",
-      },
-      diagnostics = {
-        globals = { "vim" },
-      },
-    },
-  },
+local lsp_name = {
+  "lua_ls",
+  "rust_analyzer",
+  "clangd",
+  "gopls",
+  "ts_ls",
+  "deno_ls",
+  "svelte_ls",
+  "html_ls",
+  "css_ls",
 }
-vim.lsp.enable("lua_ls")
-
--- Rust
-vim.lsp.config["rust-analyzer"] = {
-  cmd = { "rust-analyzer" },
-  filetypes = { "rust" },
-  root_markers = { "Cargo.toml" },
-  settings = {
-    ["rust-analyzer"] = {
-      check = {
-        command = "clippy",
-      },
-      imports = {
-        granularity = {
-          group = "module",
-        },
-        prefix = "self",
-      },
-      cargo = {
-        buildScripts = {
-          enable = true,
-        },
-      },
-      procMacro = {
-        enable = true,
-      },
-    },
-  },
-}
-vim.lsp.enable("rust-analyzer")
-
--- C, C++
-vim.lsp.config["clangd"] = {
-  cmd = { "clangd", "--background-index" },
-  root_markers = { "compile_commands.json", "compile_flags.txt" },
-  filetypes = { "c", "cpp" },
-}
-vim.lsp.enable("clangd")
-
--- Go
-vim.lsp.config["gopls"] = {
-	cmd = { "gopls" },
-	root_markers = { "go.work", "go.mod", ".git/" },
-	filetypes = { "go", "gomod", "gowork", "gotmpl" },
-}
-vim.lsp.enable("gopls")
-
--- TypeScript (Node.js)
-vim.lsp.config.ts_ls = {
-  cmd = {
-    "typescript-language-server",
-    "--stdio",
-  },
-  filetypes = {
-    "javascript",
-    "javascriptreact",
-    "javascript.jsx",
-    "typescript",
-    "typescriptreact",
-    "typescript.tsx",
-  },
-  root_markers = { "package.json", "tsconfig.json" },
-  single_file_support = true,
-}
-vim.lsp.enable("ts_ls")
-
--- TypeScript (Deno)
-vim.lsp.config.deno_ls = {
-  cmd = {},
-  filetypes = {},
-  root_markers = { "deno.json", "deno.jsonc" },
-  single_file_support = true,
-}
-vim.lsp.enable("deno_ls")
-
--- Svelte
-vim.lsp.config.svelte = {
-  cmd = {
-    "svelteserver",
-    "--stdio",
-  },
-  filetypes = {
-    "svelte",
-  },
-}
-vim.lsp.enable("svelte")
-
--- HTML
-vim.lsp.config.html_ls = {
-  cmd = {
-    "vscode-html-language-server",
-    "--stdio",
-  },
-  filetypes = {
-    "html",
-  },
-}
-vim.lsp.enable("html_ls")
-
--- CSS
-vim.lsp.config.css_ls = {
-  cmd = {
-    "vscode-css-language-server",
-    "--stdio",
-  },
-  filetypes = {
-    "css",
-    "scss",
-    "less",
-  },
-  settings = {
-    ["cssls"] = {
-      init_options = {
-        provideFormatter = true,
-      },
-    },
-  },
-}
-vim.lsp.enable("css_ls")
+vim.lsp.enable(lsp_name)
 
 -- #############################################
 -- LSP completion
