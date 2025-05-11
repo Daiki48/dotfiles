@@ -1,5 +1,7 @@
 # Neovim setup
 
+Need setup for LSP.
+
 ## LSP
 
 Install the respective language servers.
