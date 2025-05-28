@@ -51,20 +51,10 @@ If it prints `usr/bin/zsh` , it success.
 
 ### 2. Neovim
 
-```sh
-chmod +x setup_ubuntu.sh
-```
-
-Execute `setup_ubuntu.sh` script.
+Required [Rust](https://www.rust-lang.org/) .
 
 ```sh
-./setup_ubuntu.sh
-```
-
-Checking `nvim` command.
-
-```sh
-nvim --version
+cargo run -- neovim
 ```
 
 ### .skk
