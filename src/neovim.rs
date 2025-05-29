@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use std::env;
 use std::fs;
-// use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const NEOVIM_REPO_URL: &str = "https://github.com/neovim/neovim.git";
