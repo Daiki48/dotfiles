@@ -15,32 +15,11 @@
 
 ### 1. zsh
 
-Grant execution authority.
-
 ```sh
-chmod +x setup_zsh.sh
+cargo run -- zsh
 ```
 
-Execute `setup_zsh.sh` script.
-
-```sh
-./setup_zsh.sh
-```
-
-Checking current Shell.
-
-```sh
-echo $SHELL
-```
-
-Change `bash` to `zsh` .
-
-```sh
-chsh -s $(which zsh)
-```
-
-Restart terminal.
-
+Restart terminal.  
 Checking current Shell.
 
 ```sh
