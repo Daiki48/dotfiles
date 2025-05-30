@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::env;
 use std::fs;
 use std::process::Command;
-// use std::path::PathBuf;
 
 /// Create symbolic link to "~/.config/nvim"
 pub fn create_symlink(source: &str, destination: &str) -> Result<()> {
