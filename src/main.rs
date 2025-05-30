@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 mod neovim;
+mod utils;
+mod zsh;
 
 /// Command line tool for dotfiles setup
 #[derive(Parser, Debug)]
@@ -13,6 +15,8 @@ struct Cli {
 enum Commands {
     /// Setup for Neovim
     Neovim,
+    /// Setup for Zsh
+    Zsh,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -23,6 +27,11 @@ fn main() -> anyhow::Result<()> {
             println!("🚀 Starting Neovim setup...");
             neovim::setup()?;
             println!("\n✅ Neovim setup completed successfully!");
+        }
+        Commands::Zsh => {
+            println!("🚀 Starting Zsh setup...");
+            zsh::setup()?;
+            println!("\n✅ Zsh setup completed successfully!");
         }
     }
     Ok(())

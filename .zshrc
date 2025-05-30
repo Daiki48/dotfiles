@@ -21,6 +21,7 @@ setopt numeric_glob_sort
 setopt prompt_subst
 setopt sh_word_split
 setopt noclobber
+setopt nocorrect
 zstyle ':completion:*' list-colors 'di=36' 'ex=31' 'ln=35'
 zstyle ':completion:*:default' menu select=1
 zstyle ':completion:*:*:make:*' tag-order 'targets'
