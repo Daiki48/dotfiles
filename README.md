@@ -2,7 +2,7 @@
 
 ## Font
 
-- [JetBrains Mono](https://www.jetbrains.com/lp/mono/) for Programming
+- [JetBrains Mono](https://www.nerdfonts.com/font-downloads) for Programming
 - [BIZ UDPGothic](https://fonts.google.com/specimen/BIZ+UDPGothic) for Japanese
 
 ## For Windows setup
@@ -13,10 +13,26 @@
 
 ## For WSL2 (Ubuntu) setup
 
+```sh
+wsl.exe --install --no-distribution
+```
+
+Reboot PC.
+
+```sh
+wsl --install
+```
+
 The first step is to install [Rust](https://www.rust-lang.org/tools/install) .
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Required `C` compiler.
+
+```sh
+sudo apt install -y build-essential
 ```
 
 ### 1. zsh
