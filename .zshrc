@@ -164,3 +164,6 @@ export PATH="$PATH:$HOME/.turso"
 
 # Zig
 export PATH="/usr/local/zig:$PATH"
+
+# Cargo
+. "$HOME/.cargo/env"
