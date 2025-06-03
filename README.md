@@ -70,6 +70,10 @@ Dictionary.
 git clone https://github.com/Daiki48/skk.git
 ```
 
+Config for CorvusSKK.
+
+[CorvusSKK config](https://github.com/Daiki48/dotfiles/blob/main/docs/corvusskk.ja.md)
+
 ## Setup Documentation
 
 - [skk](https://github.com/Daiki48/dotfiles/blob/main/docs/setup-skk.md)
