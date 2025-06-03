@@ -29,13 +29,13 @@ The first step is to install [Rust](https://www.rust-lang.org/tools/install) .
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Required `C` compiler.
-
 ```sh
-sudo apt install -y build-essential
+sudo apt install -y build-essential x11-apps wl-clipboard
 ```
 
 ### 1. zsh
+
+Required [Rust](https://www.rust-lang.org/) .
 
 ```sh
 cargo run -- zsh
@@ -52,13 +52,19 @@ If it prints `usr/bin/zsh` , it success.
 
 ### 2. Neovim
 
-Required [Rust](https://www.rust-lang.org/) .
-
 ```sh
 cargo run -- neovim
 ```
 
 ### .skk
+
+[CorvusSKK](https://nathancorvussolis.github.io/)
+
+```sh
+winget install -h corvusskk -s winget
+```
+
+Dictionary.
 
 ```shell
 git clone https://github.com/Daiki48/skk.git
