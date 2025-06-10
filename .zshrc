@@ -167,3 +167,9 @@ export PATH="/usr/local/zig:$PATH"
 
 # Cargo
 . "$HOME/.cargo/env"
+
+# https://dioxuslabs.com/learn/0.6/getting_started/#wsl
+export DISPLAY=:0
+
+# Support JavaScript heap out of memory on WSL2
+export NODE_OPTIONS="--max-old-space-size=8192"
