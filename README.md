@@ -11,7 +11,9 @@
 .\setup_windows.ps1
 ```
 
-## For WSL2 (Ubuntu) setup
+## Setup script
+
+### For Ubuntu
 
 ```sh
 wsl.exe --install --no-distribution
@@ -41,6 +43,12 @@ Required [Rust](https://www.rust-lang.org/) .
 cargo run -- zsh
 ```
 
+For Fedora.
+
+```sh
+cargo run -- --distro fedora zsh
+```
+
 Restart terminal.  
 Checking current Shell.
 
@@ -54,6 +62,12 @@ If it prints `usr/bin/zsh` , it success.
 
 ```sh
 cargo run -- neovim
+```
+
+For Fedora.
+
+```sh
+cargo run -- --distro fedora neovim
 ```
 
 ### .skk
