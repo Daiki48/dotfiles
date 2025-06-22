@@ -1,17 +1,18 @@
 use anyhow::{Context, Result};
 use std::process::{Command, Stdio};
 
+use crate::common::Distro;
 use crate::utils::{create_symlink, run_command};
 
 const NEOVIM_REPO_URL: &str = "https://github.com/neovim/neovim.git";
 const NEOVIM_BRANCH: &str = "release-0.11";
 
 /// Execute setup for Neovim
-pub fn setup() -> Result<()> {
+pub fn setup(distro: &Distro) -> Result<()> {
     if !is_nvim_installed() {
         println!("Neovim is not found.");
         println!("Cloning and building Neovim from source...");
-        build_from_source()?;
+        build_from_source(distro)?;
     } else {
         println!("Neovim is already installed.");
         println!("\n------ Current Neovim Version ------");
@@ -47,24 +48,49 @@ fn is_nvim_installed() -> bool {
 }
 
 /// Building Neovim from source
-fn build_from_source() -> Result<()> {
+fn build_from_source(distro: &Distro) -> Result<()> {
     println!("Installing build dependencies...");
-    let deps = [
-        "ninja-build",
-        "gettext",
-        "libtool",
-        "libtool-bin",
-        "autoconf",
-        "automake",
-        "cmake",
-        "g++",
-        "pkg-config",
-        "unzip",
-        "curl",
-        "doxygen",
-    ];
-    let mut cmd = Command::new("sudo");
-    cmd.arg("apt").arg("install").arg("-y").args(deps);
+
+    let (mut cmd, deps) = match distro {
+        Distro::Ubuntu => {
+            let mut cmd = Command::new("sudo");
+            cmd.arg("apt").arg("install").arg("-y");
+            let deps = vec![
+                "ninja-build",
+                "gettext",
+                "libtool",
+                "libtool-bin",
+                "autoconf",
+                "automake",
+                "cmake",
+                "g++",
+                "pkg-config",
+                "unzip",
+                "curl",
+                "doxygen",
+            ];
+            (cmd, deps)
+        }
+        Distro::Fedora => {
+            let mut cmd = Command::new("sudo");
+            cmd.arg("dnf").arg("install").arg("-y");
+            let deps = vec![
+                "ninja-build",
+                "libtool",
+                "autoconf",
+                "automake",
+                "cmake",
+                "gcc-c++",
+                "gettext",
+                "doxygen",
+                "unzip",
+                "curl",
+                "pkg-config",
+            ];
+            (cmd, deps)
+        }
+    };
+    cmd.args(&deps);
     run_command(cmd, "Failed to install dependencies.")?;
 
     let home_dir = home::home_dir().context("Failed to get home directory")?;

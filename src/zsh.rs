@@ -3,14 +3,15 @@ use std::env;
 use std::process::{Command, Stdio};
 use std::str;
 
+use crate::common::Distro;
 use crate::utils::{create_symlink, run_command};
 
 /// Execute setup for Zsh
-pub fn setup() -> Result<()> {
+pub fn setup(distro: &Distro) -> Result<()> {
     if !is_zsh_installed() {
         println!("Zsh is not found.");
         println!("Starting zsh install...");
-        zsh_install()?;
+        zsh_install(distro)?;
     } else {
         println!("Zsh is already installed.");
     }
@@ -57,9 +58,17 @@ fn is_zsh_installed() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn zsh_install() -> Result<()> {
+fn zsh_install(distro: &Distro) -> Result<()> {
     let mut cmd = Command::new("sudo");
-    cmd.arg("apt").arg("install").arg("-y").arg("zsh");
+
+    match distro {
+        Distro::Ubuntu => {
+            cmd.arg("apt").arg("install").arg("-y").arg("zsh");
+        }
+        Distro::Fedora => {
+            cmd.arg("dnf").arg("install").arg("-y").arg("zsh");
+        }
+    }
     run_command(cmd, "Failed to install zsh.")?;
     Ok(())
 }
