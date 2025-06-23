@@ -1,3 +1,5 @@
+# Add deno completions to search path
+if [[ ":$FPATH:" != *":/home/daiki/.zsh/completions:"* ]]; then export FPATH="/home/daiki/.zsh/completions:$FPATH"; fi
 # Base options
 setopt always_last_prompt
 setopt auto_list
@@ -173,3 +175,4 @@ export DISPLAY=:0
 
 # Support JavaScript heap out of memory on WSL2
 export NODE_OPTIONS="--max-old-space-size=8192"
+. "/home/daiki/.deno/env"

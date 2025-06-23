@@ -1,6 +1,7 @@
 mod common;
 mod neovim;
 mod utils;
+mod wezterm;
 mod zsh;
 
 use crate::common::Distro;
@@ -28,6 +29,8 @@ enum Commands {
     Neovim,
     /// Setup for Zsh
     Zsh,
+    /// Setup for Wezterm
+    Wezterm,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -42,6 +45,11 @@ fn main() -> anyhow::Result<()> {
         Commands::Zsh => {
             println!("🚀 Starting Zsh setup for {:?} ...", cli.distro);
             zsh::setup(&cli.distro)?;
+            println!("\n✅ Zsh setup completed successfully!");
+        }
+        Commands::Wezterm => {
+            println!("🚀 Starting Wezterm setup for {:?} ...", cli.distro);
+            wezterm::setup(&cli.distro)?;
             println!("\n✅ Zsh setup completed successfully!");
         }
     }
