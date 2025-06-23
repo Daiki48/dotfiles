@@ -175,4 +175,3 @@ export DISPLAY=:0
 
 # Support JavaScript heap out of memory on WSL2
 export NODE_OPTIONS="--max-old-space-size=8192"
-. "/home/daiki/.deno/env"
