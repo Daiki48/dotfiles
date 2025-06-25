@@ -36,19 +36,19 @@ fn wezterm_install(distro: &Distro) -> Result<()> {
 
     match distro {
         Distro::Ubuntu => {
-            cmd.arg("curl")
-                .arg("-fsSL")
-                .arg("https://apt.fury.io/wez/gpg.key");
-            cmd.arg("gpg")
-                .arg("--yes")
-                .arg("--dearmor")
-                .arg("-o")
-                .arg("/usr/share/keyrings/wezterm-fury.gpg");
-            cmd.arg("echo").arg("'deb [signed-by=/usr/share/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *'");
-            cmd.arg("tee").arg("/etc/apt/sources.list.d/wezterm.list");
-            cmd.arg("chmod")
-                .arg("644")
-                .arg("/usr/share/keyrings/wezterm-fury.gpg");
+            // cmd.arg("curl")
+            //     .arg("-fsSL")
+            //     .arg("https://apt.fury.io/wez/gpg.key");
+            // cmd.arg("gpg")
+            //     .arg("--yes")
+            //     .arg("--dearmor")
+            //     .arg("-o")
+            //     .arg("/usr/share/keyrings/wezterm-fury.gpg");
+            // cmd.arg("echo").arg("'deb [signed-by=/usr/share/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *'");
+            // cmd.arg("tee").arg("/etc/apt/sources.list.d/wezterm.list");
+            // cmd.arg("chmod")
+            //     .arg("644")
+            //     .arg("/usr/share/keyrings/wezterm-fury.gpg");
             cmd.arg("apt").arg("update");
             cmd.arg("apt").arg("install").arg("wezterm");
         }
