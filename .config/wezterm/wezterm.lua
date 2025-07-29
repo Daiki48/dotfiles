@@ -1,30 +1,42 @@
-local wezterm = require 'wezterm'
+local wezterm = require("wezterm")
 local config = {}
 
 if wezterm.config_builder then
-  config = wezterm.config_builder()
+	config = wezterm.config_builder()
 end
 
-config.color_scheme = 'Whimsy'
+config.color_scheme = "Whimsy"
 config.window_padding = {
-    left = 0,
-    right = 0,
-    top = 0,
-    bottom = 0,
+	left = 0,
+	right = 0,
+	top = 0,
+	bottom = 0,
 }
 config.window_background_opacity = 0.9
 config.use_ime = true
 config.initial_cols = 140
 config.initial_rows = 30
 config.keys = {
-  { key = 'c', mods = 'CTRL', action = wezterm.action.CopyTo 'ClipboardAndPrimarySelection' },
-  { key = 'v', mods = 'CTRL', action = wezterm.action.PasteFrom 'Clipboard' },
-  { key = 'v', mods = 'CTRL', action = wezterm.action.PasteFrom 'PrimarySelection' },
+	{
+		key = "c",
+		mods = "CTRL",
+		action = wezterm.action_callback(function(window, pane)
+			local has_selection = window:get_selection_text_for_pane(pane) ~= ""
+			if has_selection then
+				window:perform_action(wezterm.action.CopyTo("ClipboardAndPrimarySelection"), pane)
+				window:perform_action(wezterm.action.ClearSelection, pane)
+			else
+				window:perform_action(wezterm.action.SendKey({ key = "c", mods = "CTRL" }), pane)
+			end
+		end),
+	},
+	{ key = "v", mods = "CTRL", action = wezterm.action.PasteFrom("Clipboard") },
+	{ key = "v", mods = "CTRL", action = wezterm.action.PasteFrom("PrimarySelection") },
 }
 
 -- You can specify some parameters to influence the font selection;
 -- for example, this selects a Bold, Italic font variant.
-config.font = wezterm.font('JetBrains Mono', { weight = 'Bold', italic = false })
+config.font = wezterm.font("JetBrains Mono", { weight = "Bold", italic = false })
 -- config.font = wezterm.font('Source Han Sans JP', { weight = 'Bold', italic = false })
 -- config.font = wezterm.font_with_fallback {
 --   'Noto Sans CJK JP',
@@ -39,7 +51,7 @@ config.font = wezterm.font('JetBrains Mono', { weight = 'Bold', italic = false }
 config.warn_about_missing_glyphs = false
 
 config.set_environment_variables = {
-	LANG = "en_US.UTF-8"
+	LANG = "en_US.UTF-8",
 }
 
 return config
