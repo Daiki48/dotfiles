@@ -18,6 +18,8 @@ Install the respective language servers.
   - npm: `npm install -g svelte-language-server`
 - [tailwindcss](https://github.com/neovim/nvim-lspconfig/blob/master/doc/configs.md#tailwindcss)
   - npm: `npm install -g @tailwindcss/language-server`
+- [json](https://github.com/neovim/nvim-lspconfig/blob/master/doc/configs.md#jsonls)
+  - npm: `npm install -g vscode-langservers-extracted`
 
 ```sh
 npm install -g prettier typescript typescript-language-server svelte-language-server @tailwindcss/language-server vscode-langservers-extracted
