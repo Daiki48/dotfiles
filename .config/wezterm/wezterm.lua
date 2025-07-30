@@ -43,6 +43,8 @@ config.font = wezterm.font("JetBrains Mono", { weight = "Bold", italic = false }
 --   'Source Han Sans JP',
 -- }
 
+config.font_size = 10
+
 -- Font problem
 -- No fonts contain glyphs for these codepoints: \u{e6b4}.
 -- Placeholder glyphs are being displayed instead.
