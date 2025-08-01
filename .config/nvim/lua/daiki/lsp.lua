@@ -1,4 +1,4 @@
-vim.lsp.set_log_level("DEBUG")
+vim.lsp.set_log_level("OFF")
 
 -- #############################################
 -- LSP utils
@@ -33,6 +33,7 @@ local lsp_name = {
   "svelte_ls",
   "html_ls",
   "css_ls",
+	"jsonls",
 }
 vim.lsp.enable(lsp_name)
 
