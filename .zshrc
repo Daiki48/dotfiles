@@ -72,12 +72,20 @@ export PATH="$VOLTA_HOME/bin:$PATH"
 export PATH="$PATH:/snap/bin"
 
 # python for WSL2 (Ubuntu)
-export PYENV_ROOT="$HOME/.pyenv"
-export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init --path)"
+# pyenvが存在する場合のみ実行
+if [ -d "$HOME/.pyenv" ]; then
+    export PYENV_ROOT="$HOME/.pyenv"
+    export PATH="$PYENV_ROOT/bin:$PATH"
+    if command -v pyenv >/dev/null 2>&1; then
+        eval "$(pyenv init --path)"
+    fi
+fi
 
 # pip3
-source ~/.local/bin/pymyenv/bin/activate
+# pymyenvが存在する場合のみ実行
+if [ -f "$HOME/.local/bin/pymyenv/bin/activate" ]; then
+    source ~/.local/bin/pymyenv/bin/activate
+fi
 
 # bun completions
 [ -s "$HOME/.bun/_bun" ] && source "$HOME/.bun/_bun"
@@ -89,8 +97,18 @@ export PATH="$BUN_INSTALL/bin:$PATH"
 # Resolve "wl-clipboard not found, clipboard integration won't work"
 # Check ".config/nvim/lua/daiki/options.lua"
 # sudo apt install wl-clipboard
-if [ ! -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
-  ln -s /mnt/wslg/runtime-dir/wayland-0* "$XDG_RUNTIME_DIR"
+if [ -n "$XDG_RUNTIME_DIR" ] && [ ! -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
+    # zshのnullglobオプションを一時的に有効にしてワイルドカード展開を安全に処理
+    setopt local_options null_glob
+    wayland_files=(/mnt/wslg/runtime-dir/wayland-0*)
+    if [ ${#wayland_files[@]} -gt 0 ]; then
+        for wayland_file in "${wayland_files[@]}"; do
+            if [ -e "$wayland_file" ]; then
+                ln -s "$wayland_file" "$XDG_RUNTIME_DIR/" 2>/dev/null || true
+                break
+            fi
+        done
+    fi
 fi
 
 # Setup lua-language-server
