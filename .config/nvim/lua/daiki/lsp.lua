@@ -33,7 +33,7 @@ local lsp_name = {
   "svelte_ls",
   "html_ls",
   "css_ls",
-	"jsonls",
+  "jsonls",
 }
 vim.lsp.enable(lsp_name)
 
