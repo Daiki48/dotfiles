@@ -1,9 +1,13 @@
-[package]
-name = "dotfiles"
-version = "0.1.0"
+[workspace]
+resolver = "3"
+members = [
+	"packages/cli", "packages/nvim-config",
+]
+
+[workspace.package]
+authors = ["Daiki48"]
+description = "My dotfiles"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0.98"
-clap = { version = "4.5.39", features = ["derive"] }
-home = "0.5.11"
