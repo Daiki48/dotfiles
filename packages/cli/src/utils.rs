@@ -14,21 +14,20 @@ pub fn create_symlink(source: &str, destination: &str) -> Result<()> {
     println!("- Source: {}", source_path.display());
     println!("- Destination: {}", destination_path.display());
 
-    if let Some(parent) = destination_path.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create parent directory: {}", parent.display())
-            })?;
-        }
+    if let Some(parent) = destination_path.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
     }
 
     if destination_path.exists() || destination_path.symlink_metadata().is_ok() {
-        if let Ok(existing_target) = fs::read_link(&destination_path) {
-            if existing_target == source_path {
-                println!("symbolic link already exists and is correct. Skipping.");
-                return Ok(());
-            }
-        }
+        if let Ok(existing_target) = fs::read_link(&destination_path)
+            && existing_target == source_path
+        {
+            println!("symbolic link already exists and is correct. Skipping.");
+            return Ok(());
+        };
         println!(
             "Destination path '{}' already exists. Please back it up or remove it first.",
             destination_path.display()

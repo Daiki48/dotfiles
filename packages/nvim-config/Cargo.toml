@@ -1,0 +1,10 @@
+[package]
+name = "nvim-config"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nvim-oxi = { version = "0.6.0", features = ["neovim-0-11"] }
