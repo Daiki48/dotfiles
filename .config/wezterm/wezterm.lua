@@ -14,6 +14,7 @@ config.window_padding = {
 }
 config.window_background_opacity = 0.9
 config.use_ime = true
+config.ime_preedit_rendering = "Builtin"
 config.initial_cols = 140
 config.initial_rows = 30
 config.keys = {
@@ -53,7 +54,8 @@ config.font_size = 10
 config.warn_about_missing_glyphs = false
 
 config.set_environment_variables = {
-	LANG = "en_US.UTF-8",
+	LANG = "ja_JP.UTF-8",
+  LC_ALL = "ja_JP.UTF-8",
 }
 
 return config
