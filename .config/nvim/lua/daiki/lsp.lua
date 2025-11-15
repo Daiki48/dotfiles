@@ -20,6 +20,14 @@ vim.api.nvim_create_autocmd("CursorHold", {
   end,
 })
 
+vim.api.nvim_create_autocmd("BufWritePre", {
+  pattern = { "*.tf", "*.tfvars" },
+  callback = function()
+    print("Formatting Terraform file...")
+    vim.lsp.buf.format({ async = false })
+  end,
+})
+
 -- #############################################
 -- LSP enable
 -- #############################################
@@ -34,6 +42,7 @@ local lsp_name = {
   "html_ls",
   "css_ls",
   "jsonls",
+  "terraform_ls"
 }
 vim.lsp.enable(lsp_name)
 
