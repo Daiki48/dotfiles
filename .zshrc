@@ -199,3 +199,8 @@ if [ -f '/home/daiki/google-cloud-sdk/path.zsh.inc' ]; then . '/home/daiki/googl
 
 # The next line enables shell command completion for gcloud.
 if [ -f '/home/daiki/google-cloud-sdk/completion.zsh.inc' ]; then . '/home/daiki/google-cloud-sdk/completion.zsh.inc'; fi
+
+# Fcitx5 boot for Linux Mint
+export GTK_IM_MODULE=fcitx5
+export QT_IM_MODULE=fcitx5
+export XMODIFIERS=@im=fcitx5
