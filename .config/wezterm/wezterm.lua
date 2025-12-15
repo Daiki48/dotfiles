@@ -5,7 +5,7 @@ if wezterm.config_builder then
 	config = wezterm.config_builder()
 end
 
-config.color_scheme = "Whimsy"
+config.color_scheme = "GitHub Dark"
 config.window_padding = {
 	left = 0,
 	right = 0,
@@ -31,8 +31,9 @@ config.keys = {
 			end
 		end),
 	},
+	-- { key = "v", mods = "CTRL", action = wezterm.action.PasteFrom("ClipboardAndPrimarySelection") },
 	{ key = "v", mods = "CTRL", action = wezterm.action.PasteFrom("Clipboard") },
-	{ key = "v", mods = "CTRL", action = wezterm.action.PasteFrom("PrimarySelection") },
+	-- { key = "v", mods = "CTRL", action = wezterm.action.PasteFrom("PrimarySelection") },
 }
 
 -- You can specify some parameters to influence the font selection;
