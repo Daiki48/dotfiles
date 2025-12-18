@@ -9,8 +9,15 @@ vim.diagnostic.config({
   underline = true,
 })
 
--- InlayHintsを有効化
-vim.lsp.inlay_hint.enable(true)
+-- InlayHintsはデフォルトOFF（;ihでトグル）
+vim.lsp.inlay_hint.enable(false)
+
+-- InlayHintsトグル
+vim.keymap.set("n", ";ih", function()
+  local enabled = vim.lsp.inlay_hint.is_enabled()
+  vim.lsp.inlay_hint.enable(not enabled)
+  vim.notify("InlayHints: " .. (enabled and "OFF" or "ON"), vim.log.levels.INFO)
+end, { desc = "Toggle InlayHints" })
 
 vim.api.nvim_create_autocmd("CursorHold", {
   callback = function()
