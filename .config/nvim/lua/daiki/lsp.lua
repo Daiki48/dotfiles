@@ -33,7 +33,7 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 -- #############################################
 local lsp_name = {
   "lua_ls",
-  "rust_analyzer",
+  -- "rust_analyzer",
   "clangd",
   "gopls",
   "ts_ls",

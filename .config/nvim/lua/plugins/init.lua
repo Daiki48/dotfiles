@@ -23,5 +23,6 @@ return {
   require("plugins.fidget"),
   require("plugins.none-ls"),
   require("plugins.nvim-window-picker"),
+  require("plugins.rustaceanvim"),
   -- require("plugins.neoformat"),
 }
