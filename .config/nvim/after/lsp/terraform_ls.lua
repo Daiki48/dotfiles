@@ -5,11 +5,11 @@ return {
   },
   filetypes = {
     "terraform",
-    'terraform-vars',
+    "terraform-vars",
   },
   root_markers = {
     ".terraform",
     "*.tf",
     ".git",
-  }
+  },
 }
