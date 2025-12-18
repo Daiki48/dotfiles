@@ -99,14 +99,6 @@ return {
     },
 
     {
-      ";di",
-      function()
-        Snacks.picker.diagnostics()
-      end,
-      desc = "diagnostics",
-    },
-
-    {
       ";sf",
       function()
         Snacks.picker.files()

@@ -25,5 +25,6 @@ return {
   require("plugins.nvim-window-picker"),
   require("plugins.rustaceanvim"),
   require("plugins.crates"),
+  require("plugins.nvim-dap"),
   -- require("plugins.neoformat"),
 }
