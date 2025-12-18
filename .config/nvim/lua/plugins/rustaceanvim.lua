@@ -55,13 +55,69 @@ return {
     }
   end,
   keys = {
-    { ";rm", function() vim.cmd.RustLsp("expandMacro") end, desc = "Expand Macro", ft = "rust" },
-    { ";rc", function() vim.cmd.RustLsp("openCargo") end, desc = "Open Cargo.toml", ft = "rust" },
-    { ";rp", function() vim.cmd.RustLsp("parentModule") end, desc = "Parent Module", ft = "rust" },
-    { ";rd", function() vim.cmd.RustLsp("renderDiagnostic") end, desc = "Render Diagnostic", ft = "rust" },
-    { ";rr", function() vim.cmd.RustLsp("runnables") end, desc = "Runnables", ft = "rust" },
-    { ";rt", function() vim.cmd.RustLsp("testables") end, desc = "Testables", ft = "rust" },
-    { "K", function() vim.cmd.RustLsp({ "hover", "actions" }) end, desc = "Hover Actions", ft = "rust" },
-    { "J", function() vim.cmd.RustLsp("joinLines") end, desc = "Join Lines", ft = "rust" },
+    {
+      ";rm",
+      function()
+        vim.cmd.RustLsp("expandMacro")
+      end,
+      desc = "Expand Macro",
+      ft = "rust",
+    },
+    {
+      ";rc",
+      function()
+        vim.cmd.RustLsp("openCargo")
+      end,
+      desc = "Open Cargo.toml",
+      ft = "rust",
+    },
+    {
+      ";rp",
+      function()
+        vim.cmd.RustLsp("parentModule")
+      end,
+      desc = "Parent Module",
+      ft = "rust",
+    },
+    {
+      ";rd",
+      function()
+        vim.cmd.RustLsp("renderDiagnostic")
+      end,
+      desc = "Render Diagnostic",
+      ft = "rust",
+    },
+    {
+      ";rr",
+      function()
+        vim.cmd.RustLsp("runnables")
+      end,
+      desc = "Runnables",
+      ft = "rust",
+    },
+    {
+      ";rt",
+      function()
+        vim.cmd.RustLsp("testables")
+      end,
+      desc = "Testables",
+      ft = "rust",
+    },
+    {
+      "K",
+      function()
+        vim.cmd.RustLsp({ "hover", "actions" })
+      end,
+      desc = "Hover Actions",
+      ft = "rust",
+    },
+    {
+      "J",
+      function()
+        vim.cmd.RustLsp("joinLines")
+      end,
+      desc = "Join Lines",
+      ft = "rust",
+    },
   },
 }
