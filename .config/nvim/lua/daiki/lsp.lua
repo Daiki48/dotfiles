@@ -42,7 +42,7 @@ local lsp_name = {
   "html_ls",
   "css_ls",
   "jsonls",
-  "terraform_ls"
+  "terraform_ls",
 }
 vim.lsp.enable(lsp_name)
 
