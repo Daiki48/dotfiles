@@ -1,0 +1,822 @@
+{
+  "Leptos Component": {
+    "prefix": "lcomp",
+    "body": [
+      "#[component]",
+      "pub fn ${1:ComponentName}(${2}) -> impl IntoView {",
+      "    view! {",
+      "        $0",
+      "    }",
+      "}"
+    ],
+    "description": "Leptos component"
+  },
+  "Leptos Component with Props": {
+    "prefix": "lcompp",
+    "body": [
+      "#[component]",
+      "pub fn ${1:ComponentName}(",
+      "    ${2:prop}: ${3:String},",
+      ") -> impl IntoView {",
+      "    view! {",
+      "        $0",
+      "    }",
+      "}"
+    ],
+    "description": "Leptos component with props"
+  },
+  "Leptos Component with Children": {
+    "prefix": "lcompc",
+    "body": [
+      "#[component]",
+      "pub fn ${1:ComponentName}(",
+      "    children: Children,",
+      ") -> impl IntoView {",
+      "    view! {",
+      "        <div>",
+      "            {children()}",
+      "        </div>",
+      "    }",
+      "}"
+    ],
+    "description": "Leptos component with children"
+  },
+  "Leptos Signal": {
+    "prefix": "lsig",
+    "body": [
+      "let (${1:value}, ${2:set_value}) = signal(${3:initial_value});"
+    ],
+    "description": "Leptos signal"
+  },
+  "Leptos RwSignal": {
+    "prefix": "lrw",
+    "body": [
+      "let ${1:value} = RwSignal::new(${2:initial_value});"
+    ],
+    "description": "Leptos RwSignal"
+  },
+  "Leptos Effect": {
+    "prefix": "leff",
+    "body": [
+      "Effect::new(move |_| {",
+      "    $0",
+      "});"
+    ],
+    "description": "Leptos Effect"
+  },
+  "Leptos Memo": {
+    "prefix": "lmemo",
+    "body": [
+      "let ${1:computed} = Memo::new(move |_| ${2:value}.get()$0);"
+    ],
+    "description": "Leptos Memo (derived signal)"
+  },
+  "Leptos Resource": {
+    "prefix": "lres",
+    "body": [
+      "let ${1:data} = Resource::new(",
+      "    move || ${2:dependency}.get(),",
+      "    |${3:dep}| async move {",
+      "        $0",
+      "    }",
+      ");"
+    ],
+    "description": "Leptos Resource"
+  },
+  "Leptos Resource Simple": {
+    "prefix": "lress",
+    "body": [
+      "let ${1:data} = Resource::new(",
+      "    || (),",
+      "    |_| async move {",
+      "        $0",
+      "    }",
+      ");"
+    ],
+    "description": "Leptos Resource without dependency"
+  },
+  "Leptos Action": {
+    "prefix": "lact",
+    "body": [
+      "let ${1:action} = Action::new(|${2:input}: &${3:InputType}| {",
+      "    let ${2:input} = ${2:input}.clone();",
+      "    async move {",
+      "        $0",
+      "    }",
+      "});"
+    ],
+    "description": "Leptos Action"
+  },
+  "Leptos Show": {
+    "prefix": "lshow",
+    "body": [
+      "<Show",
+      "    when=move || ${1:condition}",
+      "    fallback=|| view! { ${2:<p>\"Fallback\"</p>} }",
+      ">",
+      "    $0",
+      "</Show>"
+    ],
+    "description": "Leptos Show component"
+  },
+  "Leptos For": {
+    "prefix": "lfor",
+    "body": [
+      "<For",
+      "    each=move || ${1:items}.get()",
+      "    key=|${2:item}| ${2:item}.${3:id}",
+      "    children=|${2:item}| view! { $0 }",
+      "/>"
+    ],
+    "description": "Leptos For loop"
+  },
+  "Leptos Suspense": {
+    "prefix": "lsusp",
+    "body": [
+      "<Suspense fallback=move || view! { <p>\"Loading...\"</p> }>",
+      "    {move || ${1:resource}.get().map(|${2:data}| view! {",
+      "        $0",
+      "    })}",
+      "</Suspense>"
+    ],
+    "description": "Leptos Suspense"
+  },
+  "Leptos Transition": {
+    "prefix": "ltrans",
+    "body": [
+      "<Transition fallback=move || view! { <p>\"Loading...\"</p> }>",
+      "    {move || ${1:resource}.get().map(|${2:data}| view! {",
+      "        $0",
+      "    })}",
+      "</Transition>"
+    ],
+    "description": "Leptos Transition"
+  },
+  "Leptos Context Provider": {
+    "prefix": "lctxp",
+    "body": [
+      "provide_context(${1:value});"
+    ],
+    "description": "Leptos provide_context"
+  },
+  "Leptos Context Consumer": {
+    "prefix": "lctxc",
+    "body": [
+      "let ${1:ctx} = expect_context::<${2:ContextType}>();"
+    ],
+    "description": "Leptos expect_context"
+  },
+  "Leptos on:click": {
+    "prefix": "lonclick",
+    "body": [
+      "on:click=move |_| ${1:set_value}.update(|n| *n += 1)"
+    ],
+    "description": "Leptos click handler"
+  },
+  "Leptos on:input": {
+    "prefix": "loninput",
+    "body": [
+      "on:input=move |ev| ${1:set_value}.set(event_target_value(&ev))"
+    ],
+    "description": "Leptos input handler"
+  },
+  "Leptos on:submit": {
+    "prefix": "lonsubmit",
+    "body": [
+      "on:submit=move |ev| {",
+      "    ev.prevent_default();",
+      "    $0",
+      "}"
+    ],
+    "description": "Leptos form submit handler"
+  },
+  "Leptos view!": {
+    "prefix": "lview",
+    "body": [
+      "view! {",
+      "    $0",
+      "}"
+    ],
+    "description": "Leptos view! macro"
+  },
+  "Leptos StoredValue": {
+    "prefix": "lstored",
+    "body": [
+      "let ${1:value} = StoredValue::new(${2:initial_value});"
+    ],
+    "description": "Leptos StoredValue"
+  },
+  "Leptos Callback": {
+    "prefix": "lcb",
+    "body": [
+      "let ${1:callback} = Callback::new(move |${2:arg}: ${3:ArgType}| {",
+      "    $0",
+      "});"
+    ],
+    "description": "Leptos Callback"
+  },
+
+  "Axum Handler": {
+    "prefix": "axhand",
+    "body": [
+      "async fn ${1:handler}() -> impl IntoResponse {",
+      "    $0",
+      "}"
+    ],
+    "description": "Axum basic handler"
+  },
+  "Axum Handler with State": {
+    "prefix": "axhands",
+    "body": [
+      "async fn ${1:handler}(",
+      "    State(${2:state}): State<${3:AppState}>,",
+      ") -> impl IntoResponse {",
+      "    $0",
+      "}"
+    ],
+    "description": "Axum handler with State"
+  },
+  "Axum Handler with Path": {
+    "prefix": "axhandp",
+    "body": [
+      "async fn ${1:handler}(",
+      "    Path(${2:id}): Path<${3:i32}>,",
+      ") -> impl IntoResponse {",
+      "    $0",
+      "}"
+    ],
+    "description": "Axum handler with Path extractor"
+  },
+  "Axum Handler with Json": {
+    "prefix": "axhandj",
+    "body": [
+      "async fn ${1:handler}(",
+      "    Json(${2:payload}): Json<${3:RequestBody}>,",
+      ") -> impl IntoResponse {",
+      "    $0",
+      "}"
+    ],
+    "description": "Axum handler with Json extractor"
+  },
+  "Axum Handler Full": {
+    "prefix": "axhandf",
+    "body": [
+      "async fn ${1:handler}(",
+      "    State(${2:pool}): State<${3:PgPool}>,",
+      "    Path(${4:id}): Path<${5:i32}>,",
+      ") -> Result<Json<${6:Response}>, AppError> {",
+      "    $0",
+      "    Ok(Json(response))",
+      "}"
+    ],
+    "description": "Axum handler with State, Path, and Result"
+  },
+  "Axum Handler Create": {
+    "prefix": "axhandc",
+    "body": [
+      "async fn ${1:create}(",
+      "    State(${2:pool}): State<${3:PgPool}>,",
+      "    Json(${4:payload}): Json<${5:CreateRequest}>,",
+      ") -> Result<(StatusCode, Json<${6:Response}>), AppError> {",
+      "    $0",
+      "    Ok((StatusCode::CREATED, Json(response)))",
+      "}"
+    ],
+    "description": "Axum create handler"
+  },
+  "Axum Router": {
+    "prefix": "axrouter",
+    "body": [
+      "fn ${1:app}() -> Router<${2:AppState}> {",
+      "    Router::new()",
+      "        .route(\"/${3:path}\", get(${4:handler}))",
+      "        $0",
+      "        .with_state(state)",
+      "}"
+    ],
+    "description": "Axum Router"
+  },
+  "Axum Route": {
+    "prefix": "axroute",
+    "body": [
+      ".route(\"/${1:path}\", ${2:get}(${3:handler}))"
+    ],
+    "description": "Axum route"
+  },
+  "Axum Route CRUD": {
+    "prefix": "axroutecrud",
+    "body": [
+      ".route(\"/${1:resources}\", get(list_${1:resources}).post(create_${2:resource}))",
+      ".route(\"/${1:resources}/:id\", get(get_${2:resource}).put(update_${2:resource}).delete(delete_${2:resource}))"
+    ],
+    "description": "Axum CRUD routes"
+  },
+  "Axum Nest": {
+    "prefix": "axnest",
+    "body": [
+      ".nest(\"/${1:prefix}\", ${2:routes}())"
+    ],
+    "description": "Axum nested routes"
+  },
+  "Axum AppError": {
+    "prefix": "axerror",
+    "body": [
+      "pub struct AppError {",
+      "    pub code: StatusCode,",
+      "    pub message: String,",
+      "}",
+      "",
+      "impl IntoResponse for AppError {",
+      "    fn into_response(self) -> Response {",
+      "        let body = Json(serde_json::json!({",
+      "            \"error\": self.message",
+      "        }));",
+      "        (self.code, body).into_response()",
+      "    }",
+      "}",
+      "",
+      "impl AppError {",
+      "    pub fn new(code: StatusCode, message: impl Into<String>) -> Self {",
+      "        Self { code, message: message.into() }",
+      "    }",
+      "",
+      "    pub fn not_found(message: impl Into<String>) -> Self {",
+      "        Self::new(StatusCode::NOT_FOUND, message)",
+      "    }",
+      "",
+      "    pub fn bad_request(message: impl Into<String>) -> Self {",
+      "        Self::new(StatusCode::BAD_REQUEST, message)",
+      "    }",
+      "",
+      "    pub fn internal(message: impl Into<String>) -> Self {",
+      "        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)",
+      "    }",
+      "",
+      "    pub fn unauthorized(message: impl Into<String>) -> Self {",
+      "        Self::new(StatusCode::UNAUTHORIZED, message)",
+      "    }",
+      "}"
+    ],
+    "description": "Axum AppError struct"
+  },
+  "Axum From Error": {
+    "prefix": "axfromerr",
+    "body": [
+      "impl From<${1:sqlx::Error}> for AppError {",
+      "    fn from(err: ${1:sqlx::Error}) -> Self {",
+      "        match err {",
+      "            ${1:sqlx::Error}::RowNotFound => AppError::not_found(\"Resource not found\"),",
+      "            _ => AppError::internal(\"Database error\"),",
+      "        }",
+      "    }",
+      "}"
+    ],
+    "description": "Axum From impl for AppError"
+  },
+  "Axum Middleware": {
+    "prefix": "axmw",
+    "body": [
+      "async fn ${1:middleware}(",
+      "    req: Request,",
+      "    next: Next,",
+      ") -> Response {",
+      "    $0",
+      "    next.run(req).await",
+      "}"
+    ],
+    "description": "Axum middleware function"
+  },
+  "Axum Middleware with Extractor": {
+    "prefix": "axmwe",
+    "body": [
+      "async fn ${1:auth_middleware}(",
+      "    ${2:claims}: ${3:Claims},",
+      "    req: Request,",
+      "    next: Next,",
+      ") -> Response {",
+      "    $0",
+      "    next.run(req).await",
+      "}"
+    ],
+    "description": "Axum middleware with extractor"
+  },
+  "Axum Layer Middleware": {
+    "prefix": "axlayer",
+    "body": [
+      ".layer(middleware::from_fn(${1:middleware}))"
+    ],
+    "description": "Axum layer middleware"
+  },
+  "Axum Custom Extractor": {
+    "prefix": "axextract",
+    "body": [
+      "pub struct ${1:Claims} {",
+      "    pub ${2:user_id}: ${3:i32},",
+      "}",
+      "",
+      "#[async_trait]",
+      "impl<S> FromRequestParts<S> for ${1:Claims}",
+      "where",
+      "    S: Send + Sync,",
+      "{",
+      "    type Rejection = AppError;",
+      "",
+      "    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {",
+      "        $0",
+      "        Ok(Self { ${2:user_id} })",
+      "    }",
+      "}"
+    ],
+    "description": "Axum custom extractor"
+  },
+  "Axum CORS": {
+    "prefix": "axcors",
+    "body": [
+      "let cors = CorsLayer::new()",
+      "    .allow_origin(Any)",
+      "    .allow_methods(Any)",
+      "    .allow_headers(Any)",
+      "    .allow_credentials(true);"
+    ],
+    "description": "Axum CORS configuration"
+  },
+  "Axum Set Cookie": {
+    "prefix": "axcookie",
+    "body": [
+      "let cookie = format!(",
+      "    \"${1:token}={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={}\",",
+      "    ${2:value}, ${3:max_age}",
+      ");",
+      "([(header::SET_COOKIE, cookie)], Json(${4:response}))"
+    ],
+    "description": "Axum set cookie response"
+  },
+  "Axum Query": {
+    "prefix": "axquery",
+    "body": [
+      "Query(${1:params}): Query<${2:QueryParams}>"
+    ],
+    "description": "Axum Query extractor"
+  },
+  "Axum Multipart": {
+    "prefix": "axmulti",
+    "body": [
+      "async fn ${1:upload}(mut multipart: Multipart) -> Result<(), AppError> {",
+      "    while let Some(field) = multipart.next_field().await? {",
+      "        let name = field.name().unwrap_or_default().to_string();",
+      "        let data = field.bytes().await?;",
+      "        $0",
+      "    }",
+      "    Ok(())",
+      "}"
+    ],
+    "description": "Axum multipart upload handler"
+  },
+  "Axum Main": {
+    "prefix": "axmain",
+    "body": [
+      "#[tokio::main]",
+      "async fn main() -> anyhow::Result<()> {",
+      "    tracing_subscriber::init();",
+      "",
+      "    let app = Router::new()",
+      "        .route(\"/\", get(|| async { \"Hello, World!\" }))",
+      "        $0;",
+      "",
+      "    let listener = tokio::net::TcpListener::bind(\"0.0.0.0:3000\").await?;",
+      "    tracing::info!(\"listening on {}\", listener.local_addr()?);",
+      "    axum::serve(listener, app).await?;",
+      "",
+      "    Ok(())",
+      "}"
+    ],
+    "description": "Axum main function"
+  },
+
+  "SQLx query_as SELECT": {
+    "prefix": "sqlas",
+    "body": [
+      "let ${1:result} = sqlx::query_as!(",
+      "    ${2:Model},",
+      "    r#\"SELECT ${3:*} FROM ${4:table} WHERE ${5:id} = $$1\"#,",
+      "    ${6:id}",
+      ")",
+      ".fetch_one(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx query_as! SELECT"
+  },
+  "SQLx query_as SELECT Optional": {
+    "prefix": "sqlasopt",
+    "body": [
+      "let ${1:result} = sqlx::query_as!(",
+      "    ${2:Model},",
+      "    r#\"SELECT ${3:*} FROM ${4:table} WHERE ${5:id} = $$1\"#,",
+      "    ${6:id}",
+      ")",
+      ".fetch_optional(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx query_as! SELECT optional"
+  },
+  "SQLx query_as SELECT All": {
+    "prefix": "sqlasall",
+    "body": [
+      "let ${1:results} = sqlx::query_as!(",
+      "    ${2:Model},",
+      "    r#\"SELECT ${3:*} FROM ${4:table} ORDER BY ${5:id}\"#",
+      ")",
+      ".fetch_all(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx query_as! SELECT all"
+  },
+  "SQLx query_as with ENUM": {
+    "prefix": "sqlasenum",
+    "body": [
+      "let ${1:result} = sqlx::query_as!(",
+      "    ${2:Model},",
+      "    r#\"SELECT id, name, ${3:role} as \"${3:role}: ${4:RoleEnum}\" FROM ${5:table} WHERE id = $$1\"#,",
+      "    ${6:id}",
+      ")",
+      ".fetch_one(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx query_as! with ENUM cast"
+  },
+  "SQLx query INSERT": {
+    "prefix": "sqlins",
+    "body": [
+      "sqlx::query!(",
+      "    r#\"INSERT INTO ${1:table} (${2:name}, ${3:email}) VALUES ($$1, $$2)\"#,",
+      "    ${4:name},",
+      "    ${5:email}",
+      ")",
+      ".execute(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx query! INSERT"
+  },
+  "SQLx query INSERT RETURNING": {
+    "prefix": "sqlinsret",
+    "body": [
+      "let ${1:result} = sqlx::query_as!(",
+      "    ${2:Model},",
+      "    r#\"INSERT INTO ${3:table} (${4:name}, ${5:email}) VALUES ($$1, $$2) RETURNING *\"#,",
+      "    ${6:name},",
+      "    ${7:email}",
+      ")",
+      ".fetch_one(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx query_as! INSERT RETURNING"
+  },
+  "SQLx query UPDATE": {
+    "prefix": "sqlupd",
+    "body": [
+      "sqlx::query!(",
+      "    r#\"UPDATE ${1:table} SET ${2:name} = $$1, updated_at = NOW() WHERE id = $$2\"#,",
+      "    ${3:name},",
+      "    ${4:id}",
+      ")",
+      ".execute(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx query! UPDATE"
+  },
+  "SQLx query UPDATE RETURNING": {
+    "prefix": "sqlupdret",
+    "body": [
+      "let ${1:result} = sqlx::query_as!(",
+      "    ${2:Model},",
+      "    r#\"UPDATE ${3:table} SET ${4:name} = $$1, updated_at = NOW() WHERE id = $$2 RETURNING *\"#,",
+      "    ${5:name},",
+      "    ${6:id}",
+      ")",
+      ".fetch_one(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx query_as! UPDATE RETURNING"
+  },
+  "SQLx query DELETE": {
+    "prefix": "sqldel",
+    "body": [
+      "sqlx::query!(",
+      "    r#\"DELETE FROM ${1:table} WHERE id = $$1\"#,",
+      "    ${2:id}",
+      ")",
+      ".execute(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx query! DELETE"
+  },
+  "SQLx query_scalar COUNT": {
+    "prefix": "sqlcount",
+    "body": [
+      "let ${1:count} = sqlx::query_scalar!(",
+      "    r#\"SELECT COUNT(*) FROM ${2:table} WHERE ${3:active} = true\"#",
+      ")",
+      ".fetch_one(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx query_scalar! COUNT"
+  },
+  "SQLx Transaction": {
+    "prefix": "sqltx",
+    "body": [
+      "let mut tx = pool.begin().await?;",
+      "",
+      "sqlx::query!(",
+      "    r#\"${1:INSERT INTO table (name) VALUES ($$1)}\"#,",
+      "    ${2:value}",
+      ")",
+      ".execute(&mut *tx)",
+      ".await?;",
+      "",
+      "$0",
+      "",
+      "tx.commit().await?;"
+    ],
+    "description": "SQLx transaction"
+  },
+  "SQLx Transaction Function": {
+    "prefix": "sqltxfn",
+    "body": [
+      "async fn ${1:create_with_related}(",
+      "    pool: &PgPool,",
+      "    ${2:data}: ${3:CreateData},",
+      ") -> Result<${4:Model}, AppError> {",
+      "    let mut tx = pool.begin().await?;",
+      "",
+      "    let ${5:result} = sqlx::query_as!(",
+      "        ${4:Model},",
+      "        r#\"INSERT INTO ${6:table} (name) VALUES ($$1) RETURNING *\"#,",
+      "        ${2:data}.name",
+      "    )",
+      "    .fetch_one(&mut *tx)",
+      "    .await?;",
+      "",
+      "    $0",
+      "",
+      "    tx.commit().await?;",
+      "    Ok(${5:result})",
+      "}"
+    ],
+    "description": "SQLx transaction function"
+  },
+  "SQLx UPSERT": {
+    "prefix": "sqlupsert",
+    "body": [
+      "sqlx::query!(",
+      "    r#\"",
+      "    INSERT INTO ${1:table} (${2:key}, ${3:value})",
+      "    VALUES ($$1, $$2)",
+      "    ON CONFLICT (${2:key})",
+      "    DO UPDATE SET ${3:value} = EXCLUDED.${3:value}, updated_at = NOW()",
+      "    \"#,",
+      "    ${4:key_value},",
+      "    ${5:value}",
+      ")",
+      ".execute(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx UPSERT (ON CONFLICT)"
+  },
+  "SQLx Bulk INSERT UNNEST": {
+    "prefix": "sqlbulk",
+    "body": [
+      "let ${1:names}: Vec<String> = ${2:items}.iter().map(|i| i.name.clone()).collect();",
+      "let ${3:values}: Vec<i32> = ${2:items}.iter().map(|i| i.value).collect();",
+      "",
+      "sqlx::query!(",
+      "    r#\"",
+      "    INSERT INTO ${4:table} (name, value)",
+      "    SELECT * FROM UNNEST($$1::text[], $$2::int[])",
+      "    \"#,",
+      "    &${1:names},",
+      "    &${3:values}",
+      ")",
+      ".execute(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx bulk INSERT with UNNEST"
+  },
+  "SQLx QueryBuilder": {
+    "prefix": "sqlbuilder",
+    "body": [
+      "use sqlx::QueryBuilder;",
+      "",
+      "let mut builder = QueryBuilder::new(\"SELECT * FROM ${1:table} WHERE 1=1\");",
+      "",
+      "if let Some(${2:name}) = &filter.${2:name} {",
+      "    builder.push(\" AND ${2:name} ILIKE \");",
+      "    builder.push_bind(format!(\"%{}%\", ${2:name}));",
+      "}",
+      "",
+      "builder.push(\" ORDER BY id LIMIT \");",
+      "builder.push_bind(limit);",
+      "",
+      "let ${3:results} = builder",
+      "    .build_query_as::<${4:Model}>()",
+      "    .fetch_all(&pool)",
+      "    .await?;"
+    ],
+    "description": "SQLx QueryBuilder for dynamic queries"
+  },
+  "SQLx Pagination": {
+    "prefix": "sqlpage",
+    "body": [
+      "let ${1:results} = sqlx::query_as!(",
+      "    ${2:Model},",
+      "    r#\"SELECT * FROM ${3:table} ORDER BY id LIMIT $$1 OFFSET $$2\"#,",
+      "    pagination.per_page(),",
+      "    pagination.offset()",
+      ")",
+      ".fetch_all(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx paginated query"
+  },
+  "SQLx Pagination Struct": {
+    "prefix": "sqlpagestruct",
+    "body": [
+      "#[derive(Debug, Deserialize)]",
+      "pub struct Pagination {",
+      "    pub page: Option<i64>,",
+      "    pub per_page: Option<i64>,",
+      "}",
+      "",
+      "impl Pagination {",
+      "    pub fn offset(&self) -> i64 {",
+      "        (self.page.unwrap_or(1) - 1) * self.per_page()",
+      "    }",
+      "",
+      "    pub fn per_page(&self) -> i64 {",
+      "        self.per_page.unwrap_or(20).min(100)",
+      "    }",
+      "}"
+    ],
+    "description": "SQLx Pagination struct"
+  },
+  "SQLx ENUM Type": {
+    "prefix": "sqlenum",
+    "body": [
+      "#[derive(Debug, Clone, sqlx::Type, Serialize, Deserialize)]",
+      "#[sqlx(type_name = \"${1:enum_name}\", rename_all = \"PascalCase\")]",
+      "pub enum ${2:EnumName} {",
+      "    ${3:Variant1},",
+      "    ${4:Variant2},",
+      "}"
+    ],
+    "description": "SQLx PostgreSQL ENUM type"
+  },
+  "SQLx JSONB": {
+    "prefix": "sqljsonb",
+    "body": [
+      "sqlx::query!(",
+      "    r#\"INSERT INTO ${1:table} (name, metadata) VALUES ($$1, $$2)\"#,",
+      "    ${2:name},",
+      "    sqlx::types::Json(&${3:metadata}) as _",
+      ")",
+      ".execute(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx JSONB insert"
+  },
+  "SQLx JSONB Select": {
+    "prefix": "sqljsonbsel",
+    "body": [
+      "let ${1:result} = sqlx::query_as!(",
+      "    ${2:Model},",
+      "    r#\"SELECT id, name, metadata as \"metadata: Json<${3:Metadata}>\" FROM ${4:table} WHERE id = $$1\"#,",
+      "    ${5:id}",
+      ")",
+      ".fetch_one(&pool)",
+      ".await?;"
+    ],
+    "description": "SQLx JSONB select"
+  },
+  "SQLx Pool Create": {
+    "prefix": "sqlpool",
+    "body": [
+      "let pool = PgPoolOptions::new()",
+      "    .max_connections(${1:5})",
+      "    .connect(&std::env::var(\"DATABASE_URL\")?)",
+      "    .await?;"
+    ],
+    "description": "SQLx PgPool creation"
+  },
+  "SQLx Model Struct": {
+    "prefix": "sqlmodel",
+    "body": [
+      "#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]",
+      "pub struct ${1:Model} {",
+      "    pub id: i32,",
+      "    pub ${2:name}: String,",
+      "    pub created_at: chrono::DateTime<chrono::Utc>,",
+      "    pub updated_at: chrono::DateTime<chrono::Utc>,",
+      "}"
+    ],
+    "description": "SQLx model struct"
+  }
+}

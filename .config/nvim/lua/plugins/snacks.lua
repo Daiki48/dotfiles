@@ -247,5 +247,12 @@ return {
       end,
       desc = "LSP Workspace Symbols",
     },
+    {
+      ";sn",
+      function()
+        require("daiki.snippet_help").show()
+      end,
+      desc = "snippets help",
+    },
   },
 }
