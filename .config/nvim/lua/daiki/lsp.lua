@@ -9,6 +9,9 @@ vim.diagnostic.config({
   underline = true,
 })
 
+-- InlayHintsを有効化
+vim.lsp.inlay_hint.enable(true)
+
 vim.api.nvim_create_autocmd("CursorHold", {
   callback = function()
     local diagnostics = vim.diagnostic.get(0, { cursor = true })
