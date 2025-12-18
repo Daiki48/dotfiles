@@ -2,7 +2,7 @@
 return {
   "mrcjkb/rustaceanvim",
   version = "^7",
-  lazy = false,
+  ft = "rust",
   init = function()
     vim.g.rustaceanvim = {
       server = {

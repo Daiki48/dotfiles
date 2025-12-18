@@ -1,7 +1,6 @@
 return {
   "folke/flash.nvim",
-  event = "BufRead",
-  -- event = "VeryLazy",
+  -- keysで遅延ロード（キー押下時に初めてロード）
   ---@type Flash.Config
   opts = {},
 		-- stylua: ignore
