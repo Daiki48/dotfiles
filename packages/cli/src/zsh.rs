@@ -25,6 +25,12 @@ pub fn setup(distro: &Distro) -> Result<()> {
     println!("\nSetting up symbolic link for .zsh directory...");
     create_symlink(".zsh", ".zsh")?;
 
+    println!("\nSetting up symbolic link for .zprofile...");
+    create_symlink(".zprofile", ".zprofile")?;
+
+    println!("\nSetting up symbolic link for .profile...");
+    create_symlink(".profile", ".profile")?;
+
     println!("\nAttempting to change the default shell to Zsh...");
     match change_default_shell_to_zsh() {
         Ok(changed) => {
