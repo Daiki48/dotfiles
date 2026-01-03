@@ -26,5 +26,6 @@ return {
   require("plugins.rustaceanvim"),
   require("plugins.crates"),
   require("plugins.dap"),
+  require("plugins.tree-sitter-rstml"),
   -- require("plugins.neoformat"),
 }
