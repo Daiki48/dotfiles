@@ -3,10 +3,10 @@ program = "/usr/bin/zsh"
 args = ["-l"]
 
 [font]
-normal = { family = "JetBrains Mono", style = "Regular" }
-# bold = { family = "", style = "Bold" }
-# italic = { family = "", style = "Regular" }
-# bold_italic = { family = "", style = "Bold" }
+normal = { family = "JetBrainsMono Nerd Font", style = "Regular" }
+bold = { family = "JetBrainsMono Nerd Font", style = "Bold" }
+italic = { family = "JetBrainsMono Nerd Font", style = "Italic" }
+bold_italic = { family = "JetBrainsMono Nerd Font", style = "Bold Italic" }
 size = 12.0
 
 [colors.bright]
