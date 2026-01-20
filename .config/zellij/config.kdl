@@ -13,7 +13,7 @@ pane_frames false               // ペイン間の枠線を非表示（軽量化
 scrollback_lines_to_serialize 0 // スクロールバック保存無効（メモリ節約）
 
 // セッション設定
-session_serialization false     // セッション永続化は手動管理
+session_serialization true      // セッション永続化を有効化
 auto_layout false               // 自動レイアウト無効
 
 // マウス設定
@@ -94,6 +94,14 @@ keybinds clear-defaults=true {
     session {
         bind "Esc" "Ctrl g" { SwitchToMode "locked"; }
         bind "d" { Detach; }
+        // セッションマネージャーを開く
+        bind "w" {
+            LaunchOrFocusPlugin "session-manager" {
+                floating true
+                move_to_focused_tab true
+            }
+            SwitchToMode "locked"
+        }
     }
 
     // タブ名変更モード
