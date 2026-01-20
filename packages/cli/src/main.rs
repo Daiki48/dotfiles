@@ -1,7 +1,9 @@
+mod alacritty;
 mod common;
 mod neovim;
 mod utils;
 mod wezterm;
+mod zellij;
 mod zsh;
 
 use std::path::PathBuf;
@@ -35,6 +37,10 @@ enum Commands {
     Zsh,
     /// Setup for Wezterm
     Wezterm,
+    /// Setup for Alacritty
+    Alacritty,
+    /// Setup for Zellij
+    Zellij,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -90,7 +96,17 @@ fn main() -> anyhow::Result<()> {
         Commands::Wezterm => {
             println!("🚀 Starting Wezterm setup for {:?} ...", cli.distro);
             wezterm::setup(&cli.distro)?;
-            println!("\n✅ Zsh setup completed successfully!");
+            println!("\n✅ Wezterm setup completed successfully!");
+        }
+        Commands::Alacritty => {
+            println!("🚀 Starting Alacritty setup for {:?} ...", cli.distro);
+            alacritty::setup(&cli.distro)?;
+            println!("\n✅ Alacritty setup completed successfully!");
+        }
+        Commands::Zellij => {
+            println!("🚀 Starting Zellij setup for {:?} ...", cli.distro);
+            zellij::setup(&cli.distro)?;
+            println!("\n✅ Zellij setup completed successfully!");
         }
     }
     Ok(())
