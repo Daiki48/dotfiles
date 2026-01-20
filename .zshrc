@@ -188,6 +188,9 @@ export PATH="/usr/local/zig:$PATH"
 # Cargo
 . "$HOME/.cargo/env"
 
+# uv (Python package manager)
+export PATH="$HOME/.local/bin:$PATH"
+
 # https://dioxuslabs.com/learn/0.6/getting_started/#wsl
 export DISPLAY=:0
 
