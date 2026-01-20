@@ -23,7 +23,7 @@ local opts = {
     },
   },
   dev = {
-    path = "D:/dev/vim-plugins/",
+    path = "/media/develop/neovim-plugin/",
   },
 }
 
