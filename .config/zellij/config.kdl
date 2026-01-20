@@ -1,0 +1,119 @@
+// Zellij設定 - Daiki用
+// Wezterm互換のキーバインド + パフォーマンス重視
+
+// テーマ（Tokyo Night風）
+theme "tokyo-night"
+
+// デフォルトシェル
+default_shell "zsh"
+
+// パフォーマンス設定
+simplified_ui true              // UIを簡素化
+pane_frames false               // ペイン間の枠線を非表示（軽量化）
+scrollback_lines_to_serialize 0 // スクロールバック保存無効（メモリ節約）
+
+// セッション設定
+session_serialization false     // セッション永続化は手動管理
+auto_layout false               // 自動レイアウト無効
+
+// マウス設定
+mouse_mode true                 // マウス有効
+copy_on_select true             // 選択時に自動コピー
+
+// キーバインド設定
+keybinds clear-defaults=true {
+    // 全モード共通（常に有効）
+    shared {
+        // Shift+Tab: 次のタブへ（Wezterm互換）
+        bind "Shift Tab" { GoToNextTab; }
+        // Ctrl+Shift+T: 新規タブ（Wezterm互換）
+        bind "Ctrl Shift t" { NewTab; }
+        // Ctrl+g: Normalモードへ（高度な操作用）
+        bind "Ctrl g" { SwitchToMode "normal"; }
+    }
+
+    // Normalモード（Zellij操作モード）
+    normal {
+        // ESCでLockedモードへ戻る
+        bind "Esc" { SwitchToMode "locked"; }
+        // タブ操作
+        bind "t" { SwitchToMode "tab"; }
+        // ペイン操作
+        bind "p" { SwitchToMode "pane"; }
+        // スクロール
+        bind "s" { SwitchToMode "scroll"; }
+        // セッション操作
+        bind "o" { SwitchToMode "session"; }
+        // 終了
+        bind "q" { Quit; }
+    }
+
+    // Lockedモード（デフォルト - 全キーをアプリに渡す）
+    locked {
+        // Ctrl+gでNormalモードへ
+        bind "Ctrl g" { SwitchToMode "normal"; }
+    }
+
+    // タブ操作モード
+    tab {
+        bind "Esc" "Ctrl g" { SwitchToMode "locked"; }
+        bind "h" "Left" { GoToPreviousTab; }
+        bind "l" "Right" { GoToNextTab; }
+        bind "n" { NewTab; SwitchToMode "locked"; }
+        bind "x" { CloseTab; SwitchToMode "locked"; }
+        bind "r" { SwitchToMode "RenameTab"; TabNameInput 0; }
+        bind "1" { GoToTab 1; SwitchToMode "locked"; }
+        bind "2" { GoToTab 2; SwitchToMode "locked"; }
+        bind "3" { GoToTab 3; SwitchToMode "locked"; }
+    }
+
+    // ペイン操作モード
+    pane {
+        bind "Esc" "Ctrl g" { SwitchToMode "locked"; }
+        bind "h" "Left" { MoveFocus "Left"; }
+        bind "j" "Down" { MoveFocus "Down"; }
+        bind "k" "Up" { MoveFocus "Up"; }
+        bind "l" "Right" { MoveFocus "Right"; }
+        bind "n" { NewPane "Down"; SwitchToMode "locked"; }
+        bind "v" { NewPane "Right"; SwitchToMode "locked"; }
+        bind "x" { CloseFocus; SwitchToMode "locked"; }
+        bind "f" { ToggleFocusFullscreen; SwitchToMode "locked"; }
+    }
+
+    // スクロールモード
+    scroll {
+        bind "Esc" "Ctrl g" { SwitchToMode "locked"; }
+        bind "j" "Down" { ScrollDown; }
+        bind "k" "Up" { ScrollUp; }
+        bind "d" { HalfPageScrollDown; }
+        bind "u" { HalfPageScrollUp; }
+        bind "G" { ScrollToBottom; SwitchToMode "locked"; }
+    }
+
+    // セッション操作モード
+    session {
+        bind "Esc" "Ctrl g" { SwitchToMode "locked"; }
+        bind "d" { Detach; }
+    }
+
+    // タブ名変更モード
+    RenameTab {
+        bind "Esc" "Ctrl g" { SwitchToMode "locked"; }
+        bind "Enter" { SwitchToMode "locked"; }
+    }
+}
+
+// デフォルトモード（起動時はLockedモード）
+default_mode "locked"
+
+// プラグイン設定（ステータスバー最小化）
+plugins {
+    // ステータスバーを無効化（画面を広く使う）
+}
+
+// UIオプション
+ui {
+    pane_frames {
+        hide_session_name true
+    }
+}
