@@ -7,8 +7,13 @@ theme "tokyo-night"
 // デフォルトシェル
 default_shell "zsh"
 
+// TERM環境変数を明示的に設定（描画問題対策）
+env {
+    TERM "xterm-256color"
+}
+
 // パフォーマンス設定
-simplified_ui true              // UIを簡素化
+simplified_ui false             // 描画抜け対策のため無効化
 pane_frames false               // ペイン間の枠線を非表示（軽量化）
 scrollback_lines_to_serialize 0 // スクロールバック保存無効（メモリ節約）
 

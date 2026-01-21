@@ -1,6 +1,7 @@
 mod alacritty;
 mod common;
 mod neovim;
+mod tmux;
 mod utils;
 mod wezterm;
 mod zellij;
@@ -41,6 +42,8 @@ enum Commands {
     Alacritty,
     /// Setup for Zellij
     Zellij,
+    /// Setup for tmux
+    Tmux,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -107,6 +110,11 @@ fn main() -> anyhow::Result<()> {
             println!("🚀 Starting Zellij setup for {:?} ...", cli.distro);
             zellij::setup(&cli.distro)?;
             println!("\n✅ Zellij setup completed successfully!");
+        }
+        Commands::Tmux => {
+            println!("🚀 Starting tmux setup for {:?} ...", cli.distro);
+            tmux::setup(&cli.distro)?;
+            println!("\n✅ tmux setup completed successfully!");
         }
     }
     Ok(())

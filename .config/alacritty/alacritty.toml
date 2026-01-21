@@ -1,11 +1,11 @@
-# Alacritty起動時にZellijを自動起動
+# Alacritty起動時にtmuxを自動起動
 [terminal.shell]
-program = "zellij"
-args = ["attach", "--create", "main"]
+program = "tmux"
+args = ["new-session", "-A", "-s", "main"]
 
 # ウィンドウ設定
 [window]
-opacity = 0.85
+opacity = 1.0  # NVIDIA + X11での描画抜け対策
 decorations = "Full"
 dynamic_padding = true
 # 起動時のサイズ（Weztermと同程度）
@@ -41,3 +41,20 @@ yellow = "#e0af68"
 [colors.primary]
 background = "#1a1b26"
 foreground = "#a9b1d6"
+
+# tmux用キーバインド（Zellij互換）
+# Ctrl+G (プレフィックス) = \x07
+[[keyboard.bindings]]
+key = "T"
+mods = "Control|Shift"
+chars = "\u0007c"
+
+[[keyboard.bindings]]
+key = "H"
+mods = "Control|Shift"
+chars = "\u0007p"
+
+[[keyboard.bindings]]
+key = "L"
+mods = "Control|Shift"
+chars = "\u0007n"
