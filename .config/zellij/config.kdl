@@ -24,8 +24,9 @@ copy_on_select true             // 選択時に自動コピー
 keybinds clear-defaults=true {
     // 全モード共通（常に有効）
     shared {
-        // Shift+Tab: 次のタブへ（Wezterm互換）
-        bind "Shift Tab" { GoToNextTab; }
+        // Ctrl+Shift+h/l: タブ移動（Claude Codeとの衝突回避）
+        bind "Ctrl Shift h" { GoToPreviousTab; }
+        bind "Ctrl Shift l" { GoToNextTab; }
         // Ctrl+Shift+T: 新規タブ（Wezterm互換）
         bind "Ctrl Shift t" { NewTab; }
         // Ctrl+g: Normalモードへ（高度な操作用）
