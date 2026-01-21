@@ -30,6 +30,14 @@ keybinds clear-defaults=true {
         bind "Ctrl Shift t" { NewTab; }
         // Ctrl+g: Normalモードへ（高度な操作用）
         bind "Ctrl g" { SwitchToMode "normal"; }
+        // Alt+hjkl: ペイン間フォーカス移動（Vimライク）
+        bind "Alt h" { MoveFocus "Left"; }
+        bind "Alt j" { MoveFocus "Down"; }
+        bind "Alt k" { MoveFocus "Up"; }
+        bind "Alt l" { MoveFocus "Right"; }
+        // Alt+n/v: ペイン分割
+        bind "Alt n" { NewPane "Down"; }
+        bind "Alt v" { NewPane "Right"; }
     }
 
     // Normalモード（Zellij操作モード）
