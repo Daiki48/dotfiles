@@ -29,6 +29,8 @@ pub fn setup() -> Result<()> {
     api::set_option_value("smartcase", true, &opts)?;
     api::set_option_value("splitright", true, &opts)?;
     api::set_option_value("termguicolors", true, &opts)?;
+    // Zellij + Neovimの組み合わせで描画抜けが発生するため無効化
+    api::set_option_value("termsync", false, &opts)?;
     api::set_option_value("hidden", true, &opts)?;
     api::set_option_value("updatetime", 300, &opts)?;
     api::set_option_value("tabstop", 2, &opts)?;
