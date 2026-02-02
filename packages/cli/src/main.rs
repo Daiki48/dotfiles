@@ -1,5 +1,6 @@
 mod alacritty;
 mod common;
+mod ghostty;
 mod neovim;
 mod tmux;
 mod utils;
@@ -40,6 +41,8 @@ enum Commands {
     Wezterm,
     /// Setup for Alacritty
     Alacritty,
+    /// Setup for Ghostty
+    Ghostty,
     /// Setup for Zellij
     Zellij,
     /// Setup for tmux
@@ -105,6 +108,11 @@ fn main() -> anyhow::Result<()> {
             println!("🚀 Starting Alacritty setup for {:?} ...", cli.distro);
             alacritty::setup(&cli.distro)?;
             println!("\n✅ Alacritty setup completed successfully!");
+        }
+        Commands::Ghostty => {
+            println!("🚀 Starting Ghostty setup for {:?} ...", cli.distro);
+            ghostty::setup(&cli.distro)?;
+            println!("\n✅ Ghostty setup completed successfully!");
         }
         Commands::Zellij => {
             println!("🚀 Starting Zellij setup for {:?} ...", cli.distro);
