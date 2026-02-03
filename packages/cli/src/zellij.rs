@@ -43,10 +43,7 @@ fn zellij_install(distro: &Distro) -> Result<()> {
         Distro::Fedora => {
             // Fedora: dnfでインストール可能
             let mut cmd = Command::new("sudo");
-            cmd.arg("dnf")
-                .arg("install")
-                .arg("-y")
-                .arg("zellij");
+            cmd.arg("dnf").arg("install").arg("-y").arg("zellij");
             run_command(cmd, "Failed to install Zellij via dnf.")?;
         }
     }

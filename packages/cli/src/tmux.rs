@@ -47,18 +47,12 @@ fn tmux_install(distro: &Distro) -> Result<()> {
     match distro {
         Distro::Ubuntu => {
             let mut cmd = Command::new("sudo");
-            cmd.arg("apt")
-                .arg("install")
-                .arg("-y")
-                .arg("tmux");
+            cmd.arg("apt").arg("install").arg("-y").arg("tmux");
             run_command(cmd, "Failed to install tmux via apt.")?;
         }
         Distro::Fedora => {
             let mut cmd = Command::new("sudo");
-            cmd.arg("dnf")
-                .arg("install")
-                .arg("-y")
-                .arg("tmux");
+            cmd.arg("dnf").arg("install").arg("-y").arg("tmux");
             run_command(cmd, "Failed to install tmux via dnf.")?;
         }
     }
@@ -79,8 +73,12 @@ fn install_tpm() -> Result<()> {
 
     // 親ディレクトリを作成
     let plugins_dir = home_path.join(".config/tmux/plugins");
-    std::fs::create_dir_all(&plugins_dir)
-        .with_context(|| format!("Failed to create plugins directory: {}", plugins_dir.display()))?;
+    std::fs::create_dir_all(&plugins_dir).with_context(|| {
+        format!(
+            "Failed to create plugins directory: {}",
+            plugins_dir.display()
+        )
+    })?;
 
     // TPMをgit clone
     let mut cmd = Command::new("git");

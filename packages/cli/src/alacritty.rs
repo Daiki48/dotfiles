@@ -38,16 +38,10 @@ fn alacritty_install(distro: &Distro) -> Result<()> {
     match distro {
         Distro::Ubuntu => {
             // Ubuntu: PPAを追加してインストール
-            cmd.arg("apt")
-                .arg("install")
-                .arg("-y")
-                .arg("alacritty");
+            cmd.arg("apt").arg("install").arg("-y").arg("alacritty");
         }
         Distro::Fedora => {
-            cmd.arg("dnf")
-                .arg("install")
-                .arg("-y")
-                .arg("alacritty");
+            cmd.arg("dnf").arg("install").arg("-y").arg("alacritty");
         }
     }
     run_command(cmd, "Failed to install Alacritty.")?;
