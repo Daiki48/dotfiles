@@ -1,5 +1,7 @@
 mod alacritty;
+mod claude;
 mod common;
+mod gemini;
 mod ghostty;
 mod neovim;
 mod tmux;
@@ -47,6 +49,10 @@ enum Commands {
     Zellij,
     /// Setup for tmux
     Tmux,
+    /// Setup for Claude Code
+    Claude,
+    /// Setup for Gemini CLI
+    Gemini,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -123,6 +129,12 @@ fn main() -> anyhow::Result<()> {
             println!("🚀 Starting tmux setup for {:?} ...", cli.distro);
             tmux::setup(&cli.distro)?;
             println!("\n✅ tmux setup completed successfully!");
+        }
+        Commands::Claude => {
+            claude::setup()?;
+        }
+        Commands::Gemini => {
+            gemini::setup()?;
         }
     }
     Ok(())

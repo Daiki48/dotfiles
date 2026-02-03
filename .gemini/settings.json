@@ -1,0 +1,14 @@
+{
+  "theme": "Default",
+  "model": "gemini-3-flash-preview",
+  "selectedAuthType": "oauth-personal",
+  "vimMode": true,
+  "security": {
+    "auth": {
+      "selectedType": "oauth-personal"
+    }
+  },
+  "general": {
+    "previewFeatures": true
+  }
+}
