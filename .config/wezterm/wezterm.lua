@@ -36,14 +36,11 @@ config.keys = {
 	-- { key = "v", mods = "CTRL", action = wezterm.action.PasteFrom("PrimarySelection") },
 }
 
--- You can specify some parameters to influence the font selection;
--- for example, this selects a Bold, Italic font variant.
-config.font = wezterm.font("JetBrains Mono", { weight = "Bold", italic = false })
--- config.font = wezterm.font('Source Han Sans JP', { weight = 'Bold', italic = false })
--- config.font = wezterm.font_with_fallback {
---   'Noto Sans CJK JP',
---   'Source Han Sans JP',
--- }
+-- Ghosttyと同じフォント構成
+config.font = wezterm.font_with_fallback({
+	{ family = "JetBrainsMono Nerd Font", weight = "Medium" },
+	{ family = "Noto Sans Mono CJK JP" },
+})
 
 config.font_size = 10
 
