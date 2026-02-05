@@ -188,6 +188,12 @@ export PATH="/usr/local/zig:$PATH"
 # Cargo
 . "$HOME/.cargo/env"
 
+# Android SDK
+export JAVA_HOME="$HOME/Android/android-studio/jbr"
+export ANDROID_HOME="$HOME/Android/Sdk"
+export NDK_HOME="$ANDROID_HOME/ndk/$(ls -1 $ANDROID_HOME/ndk 2>/dev/null | sort -V | tail -1)"
+export PATH="$PATH:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin"
+
 # uv (Python package manager)
 export PATH="$HOME/.local/bin:$PATH"
 
