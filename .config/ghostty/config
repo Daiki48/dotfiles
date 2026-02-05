@@ -12,12 +12,40 @@ command = tmux new-session -A -s main
 # フォント設定
 # ==============================================================================
 
-font-family = JetBrainsMono Nerd Font
+# 英語フォント（プライマリ）- Mediumウェイトで少し太め
+font-family = JetBrainsMono NF Medium
+
+# 日本語フォント（フォールバック）
+font-family = Noto Sans Mono CJK JP
+
 font-size = 12
 
 # リガチャ有効（Alacrittyには無い機能）
 font-feature = calt
 font-feature = liga
+
+# 装飾的リガチャを無効化（日本語の「ます」「株式会社」問題回避）
+font-feature = -dlig
+
+# フォントを太くする
+font-thicken = true
+
+# ==============================================================================
+# シェル統合設定
+# ==============================================================================
+
+shell-integration = detect
+shell-integration-features = cursor,sudo,title,ssh-env,ssh-terminfo
+
+# ==============================================================================
+# Web開発向け設定
+# ==============================================================================
+
+# Unicode幅の計算方法（絵文字・日本語の表示幅）
+grapheme-width-method = unicode
+
+# スクロールバック行数（ログ出力用に増加）
+scrollback-limit = 50000
 
 # ==============================================================================
 # ウィンドウ設定
@@ -67,11 +95,18 @@ theme = TokyoNight
 # palette = 15=#acb0d0
 
 # ==============================================================================
-# キーバインド
+# キーバインド - tmux連携（Alacritty互換）
 # ==============================================================================
+# tmuxプレフィックス = Ctrl+G (\x07)
 
-# Ctrl+Shift+T: 新規タブ（tmuxのウィンドウ作成をトリガー）
-# Ghosttyはtmux内で動作するため、tmuxのキーバインドが優先される
+# Ctrl+Shift+T: tmux新規ウィンドウ（デフォルトの新規タブを上書き）
+keybind = ctrl+shift+t=text:\x07c
+
+# Ctrl+Shift+H: 前のウィンドウ
+keybind = ctrl+shift+h=text:\x07p
+
+# Ctrl+Shift+L: 次のウィンドウ
+keybind = ctrl+shift+l=text:\x07n
 
 # ==============================================================================
 # その他
