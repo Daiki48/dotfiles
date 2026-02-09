@@ -7,19 +7,14 @@ use crate::utils::{create_symlink, run_command};
 const CLAUDE_FILES: &[(&str, &str)] = &[
     (".claude/CLAUDE.md", ".claude/CLAUDE.md"),
     (".claude/settings.json", ".claude/settings.json"),
+    (".claude/settings.local.json", ".claude/settings.local.json"),
 ];
 
-const CLAUDE_SKILLS: &[&str] = &[
-    "axum-guide",
-    "dioxus-guide",
-    "leptos-guide",
-    "rusqlite-guide",
-    "rust-fullstack",
-    "snipmind-arch",
-    "sqlx-postgres",
+// skills/, agents/ はディレクトリ単位でsymlinkし、中身の個別管理を不要にする
+const CLAUDE_DIRS: &[(&str, &str)] = &[
+    (".claude/skills", ".claude/skills"),
+    (".claude/agents", ".claude/agents"),
 ];
-
-const CLAUDE_AGENTS: &[&str] = &["code-reviewer", "test-runner"];
 
 /// Claude Codeがインストールされているか確認
 fn is_claude_installed() -> bool {
@@ -70,21 +65,12 @@ pub fn setup() -> Result<()> {
     // 2. バージョン表示
     claude_check()?;
 
-    // 3. ディレクトリ作成
+    // 3. ~/.claude ディレクトリ作成
     let home = home::home_dir().context("Cannot find home directory")?;
     let claude_dir = home.join(".claude");
-    let skills_dir = claude_dir.join("skills");
-
     if !claude_dir.exists() {
         println!("\nCreating ~/.claude directory...");
         fs::create_dir_all(&claude_dir)?;
-    }
-    if !skills_dir.exists() {
-        fs::create_dir_all(&skills_dir)?;
-    }
-    let agents_dir = claude_dir.join("agents");
-    if !agents_dir.exists() {
-        fs::create_dir_all(&agents_dir)?;
     }
 
     // 4. 設定ファイルのsymlink作成
@@ -93,20 +79,10 @@ pub fn setup() -> Result<()> {
         create_symlink(source, dest)?;
     }
 
-    // 5. スキルのsymlink作成
-    println!("\nLinking skills...");
-    for skill in CLAUDE_SKILLS {
-        let source = format!(".claude/skills/{}", skill);
-        let dest = format!(".claude/skills/{}", skill);
-        create_symlink(&source, &dest)?;
-    }
-
-    // 6. エージェントのsymlink作成
-    println!("\nLinking agents...");
-    for agent in CLAUDE_AGENTS {
-        let source = format!(".claude/agents/{}.md", agent);
-        let dest = format!(".claude/agents/{}.md", agent);
-        create_symlink(&source, &dest)?;
+    // 5. ディレクトリのsymlink作成（skills/, agents/）
+    println!("\nLinking directories...");
+    for (source, dest) in CLAUDE_DIRS {
+        create_symlink(source, dest)?;
     }
 
     println!("\n✅ Claude Code setup completed!");

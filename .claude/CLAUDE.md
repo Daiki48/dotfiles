@@ -34,6 +34,14 @@
 - 教師モード: 調査・レビュー系エージェント（code-reviewer等）を活用し、結果を提案に反映
 - 自律モード: 全エージェントを活用し、コード編集→テスト→レビューを自律的に実行
 
+### コードレビューの2者合意プロセス
+大規模変更やセキュリティ関連コードのレビュー時:
+1. Opus が Read/Glob/Grep で独自にレビュー
+2. code-reviewer（Sonnet）に独立レビューを委任（Opusの結果は渡さない）
+3. 両者の結果を突き合わせ → 一致は採用、不一致は Opus が追加検証して判断
+4. 合意レポートを出力（検出者・確信度を明記）
+- 軽微な変更（数行・1-2ファイル）は code-reviewer 単体で十分
+
 ---
 
 ### 教師モード（デフォルト）
@@ -136,20 +144,9 @@ Daikiがエラーを報告した場合:
 ---
 
 ## AI 検索・検証コマンド
-
-以下のキーワードを含む指示を受けたら、対応する Skill を実行する。
-一言一句の一致は不要。ニュアンスで判断する。
-
-| キーワード | Skill | 動作 |
-|-----------|-------|------|
-| ファクトチェック（「クロス」を含まない） | `/fact-check` | Claude 内マルチモデル（Opus + Sonnet）で独立チェック→比較→合意レポート |
-| クロスファクトチェック / クロスチェック | `/cross-fact-check` | Claude Opus + Gemini Flash + Gemini Pro の3者で独立チェック→争点議論→合意レポート |
-| Gemini検索 / Geminiで検索 / Geminiで調べて | `/gemini-search` | Gemini CLI の grounding で Web 検索。**Claude の WebSearch は使用禁止** |
-
-**判定ルール**:
-- 「○○についてファクトチェックお願いします」→ `/fact-check`
-- 「○○をクロスファクトチェックして」→ `/cross-fact-check`
-- 「○○をGeminiで検索して」→ `/gemini-search`
+- 「ファクトチェック」（「クロス」を**含まない**）→ `/fact-check`
+- 「クロスファクトチェック / クロスチェック」→ `/cross-fact-check`
+- 「Gemini検索 / Geminiで検索 / Geminiで調べて」→ `/gemini-search`（WebSearch使用禁止）
 - 曖昧な場合は Daiki に確認する
 
 ---
