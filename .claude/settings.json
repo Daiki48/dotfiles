@@ -1,14 +1,24 @@
 {
-  "model": "opus",
-  "language": "japanese",
-  "enabledPlugins": {
-    "rust-analyzer-lsp@claude-plugins-official": true
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
   "permissions": {
     "allow": [
       "Bash(git *)",
       "Bash(cargo *)",
       "Bash(rustup *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(pnpm *)",
+      "Bash(yarn *)",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(pip *)",
+      "Bash(pip3 *)",
+      "Bash(uv *)",
+      "Bash(make *)",
+      "Bash(docker *)",
+      "Bash(docker-compose *)",
       "Bash(grep *)",
       "Bash(rg *)",
       "Bash(wc *)",
@@ -17,12 +27,20 @@
       "Bash(head *)",
       "Bash(tail *)",
       "Bash(cat *)",
-      "WebSearch"
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(touch *)",
+      "WebSearch",
+      "Edit",
+      "Write"
     ],
     "deny": [
       "Bash(rm -rf *)",
       "Bash(sudo *)",
-      "Bash(chmod 777 *)"
+      "Bash(chmod 777 *)",
+      "Bash(git push --force *)",
+      "Bash(git reset --hard *)"
     ]
   },
   "hooks": {
@@ -37,5 +55,9 @@
         ]
       }
     ]
-  }
+  },
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
+  "language": "japanese"
 }
