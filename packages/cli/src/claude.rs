@@ -19,6 +19,8 @@ const CLAUDE_SKILLS: &[&str] = &[
     "sqlx-postgres",
 ];
 
+const CLAUDE_AGENTS: &[&str] = &["code-reviewer", "test-runner"];
+
 /// Claude Codeがインストールされているか確認
 fn is_claude_installed() -> bool {
     Command::new("claude")
@@ -80,6 +82,10 @@ pub fn setup() -> Result<()> {
     if !skills_dir.exists() {
         fs::create_dir_all(&skills_dir)?;
     }
+    let agents_dir = claude_dir.join("agents");
+    if !agents_dir.exists() {
+        fs::create_dir_all(&agents_dir)?;
+    }
 
     // 4. 設定ファイルのsymlink作成
     println!("\nLinking configuration files...");
@@ -92,6 +98,14 @@ pub fn setup() -> Result<()> {
     for skill in CLAUDE_SKILLS {
         let source = format!(".claude/skills/{}", skill);
         let dest = format!(".claude/skills/{}", skill);
+        create_symlink(&source, &dest)?;
+    }
+
+    // 6. エージェントのsymlink作成
+    println!("\nLinking agents...");
+    for agent in CLAUDE_AGENTS {
+        let source = format!(".claude/agents/{}.md", agent);
+        let dest = format!(".claude/agents/{}.md", agent);
         create_symlink(&source, &dest)?;
     }
 
