@@ -59,5 +59,6 @@
   "enabledPlugins": {
     "rust-analyzer-lsp@claude-plugins-official": true
   },
-  "language": "japanese"
+  "language": "japanese",
+  "effortLevel": "medium"
 }
