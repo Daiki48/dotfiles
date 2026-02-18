@@ -31,9 +31,15 @@ config.keys = {
 			end
 		end),
 	},
-	-- { key = "v", mods = "CTRL", action = wezterm.action.PasteFrom("ClipboardAndPrimarySelection") },
 	{ key = "v", mods = "CTRL", action = wezterm.action.PasteFrom("Clipboard") },
-	-- { key = "v", mods = "CTRL", action = wezterm.action.PasteFrom("PrimarySelection") },
+	-- Ctrl+Shift+T: 新規タブで新しいtmuxセッションを起動
+	{
+		key = "t",
+		mods = "CTRL|SHIFT",
+		action = wezterm.action.SpawnCommandInNewTab({
+			args = { "tmux", "new-session" },
+		}),
+	},
 }
 
 -- Ghosttyと同じフォント構成
@@ -53,7 +59,30 @@ config.warn_about_missing_glyphs = false
 
 config.set_environment_variables = {
 	LANG = "ja_JP.UTF-8",
-  LC_ALL = "ja_JP.UTF-8",
+	LC_ALL = "ja_JP.UTF-8",
+}
+
+-- tmux自動起動: mainセッションにアタッチ（存在しなければ作成）
+config.default_prog = { "tmux", "new-session", "-A", "-s", "main" }
+
+-- ランチメニュー: 名前付きtmuxセッションをすぐ起動可能
+config.launch_menu = {
+	{
+		label = "tmux: main",
+		args = { "tmux", "new-session", "-A", "-s", "main" },
+	},
+	{
+		label = "tmux: code (コーディング)",
+		args = { "tmux", "new-session", "-A", "-s", "code" },
+	},
+	{
+		label = "tmux: test (テスト)",
+		args = { "tmux", "new-session", "-A", "-s", "test" },
+	},
+	{
+		label = "tmux: 新規セッション",
+		args = { "tmux", "new-session" },
+	},
 }
 
 return config
