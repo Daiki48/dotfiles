@@ -29,10 +29,24 @@
   - 自律モード: `> 🤖 自律モード`
 
 ### カスタムサブエージェントの活用（両モード共通）
-- code-reviewer / test-runner 等のカスタムエージェントは、Claudeが必要と判断した場合に**自動的に呼び出す**
+- code-reviewer / codex-reviewer / test-runner / codex-test-writer 等のカスタムエージェントは、Claudeが必要と判断した場合に**自動的に呼び出す**
 - Daikiからの明示的な指示は不要
 - 教師モード: 調査・レビュー系エージェント（code-reviewer等）を活用し、結果を提案に反映
 - 自律モード: 全エージェントを活用し、コード編集→テスト→レビューを自律的に実行
+
+### エージェント使い分け
+| エージェント | モデル | 用途 |
+|---|---|---|
+| `code-reviewer` | Sonnet | Claude 系コードレビュー |
+| `codex-reviewer` | Sonnet → Codex(GPT) | GPT 視点の独立レビュー |
+| `test-runner` | Haiku | テスト実行・結果分析 |
+| `codex-test-writer` | Sonnet → Codex(GPT) | テストコード生成 |
+
+### Codex MCP フォールバック
+- Codex MCP（codex-reviewer / codex-test-writer）が接続エラー・タイムアウト等で失敗した場合:
+  - レビュー: code-reviewer（Sonnet）にフォールバック
+  - テスト生成: Opus 自身が生成し、test-runner で実行検証
+- フォールバック時は Daiki に「Codex 利用不可のため〇〇で代替」と報告する
 
 ### コードレビューの2者合意プロセス
 大規模変更やセキュリティ関連コードのレビュー時:
@@ -41,6 +55,7 @@
 3. 両者の結果を突き合わせ → 一致は採用、不一致は Opus が追加検証して判断
 4. 合意レポートを出力（検出者・確信度を明記）
 - 軽微な変更（数行・1-2ファイル）は code-reviewer 単体で十分
+- codex-reviewer を加えた3者合意も可能（Opus が判断）
 
 ---
 

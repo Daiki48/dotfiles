@@ -33,7 +33,9 @@
       "Bash(touch *)",
       "WebSearch",
       "Edit",
-      "Write"
+      "Write",
+      "mcp__codex__codex",
+      "mcp__codex__codex-reply"
     ],
     "deny": [
       "Bash(rm -rf *)",
