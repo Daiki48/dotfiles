@@ -1,0 +1,22 @@
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+approval_policy = "untrusted"
+sandbox_mode = "read-only"
+
+[profiles.teacher]
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+approval_policy = "untrusted"
+sandbox_mode = "read-only"
+
+[profiles.autonomous]
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[projects."/home/daiki/dotfiles"]
+trust_level = "trusted"
+
+[notice.model_migrations]
+"gpt-5.2-codex" = "gpt-5.3-codex"

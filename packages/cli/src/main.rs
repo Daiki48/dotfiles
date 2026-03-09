@@ -1,6 +1,7 @@
 mod alacritty;
 mod claude;
 mod common;
+mod codex;
 mod gemini;
 mod ghostty;
 mod neovim;
@@ -51,6 +52,8 @@ enum Commands {
     Tmux,
     /// Setup for Claude Code
     Claude,
+    /// Setup for Codex CLI
+    Codex,
     /// Setup for Gemini CLI
     Gemini,
 }
@@ -132,6 +135,9 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Claude => {
             claude::setup()?;
+        }
+        Commands::Codex => {
+            codex::setup()?;
         }
         Commands::Gemini => {
             gemini::setup()?;
