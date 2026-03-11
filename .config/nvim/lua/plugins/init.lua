@@ -2,6 +2,7 @@ return {
   -- require("plugins.ale"),
   require("plugins.snacks"),
   require("plugins.sakurajima"),
+  require("plugins.gbv"),
   require("plugins.editorconfig-vim"),
   require("plugins.lualine"),
   require("plugins.gitsigns"),
