@@ -1,12 +1,12 @@
 model = "gpt-5.4"
-model_reasoning_effort = "medium"
-approval_policy = "unless-trusted"
+model_reasoning_effort = "high"
+approval_policy = "on-request"
 sandbox_mode = "read-only"
 
 [profiles.teacher]
 model = "gpt-5.4"
 model_reasoning_effort = "medium"
-approval_policy = "unless-trusted"
+approval_policy = "on-request"
 sandbox_mode = "read-only"
 
 [profiles.autonomous]
@@ -16,6 +16,9 @@ approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 
 [projects."/home/daiki/dotfiles"]
+trust_level = "trusted"
+
+[projects."/media/develop/neovim-plugin/gbv.nvim"]
 trust_level = "trusted"
 
 [notice.model_migrations]
