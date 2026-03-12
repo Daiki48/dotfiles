@@ -1,5 +1,5 @@
 return {
   "Daiki48/gbv.nvim",
-  dev = true,
+  -- dev = true,
   cmd = "GBV",
 }
