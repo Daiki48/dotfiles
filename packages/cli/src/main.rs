@@ -1,7 +1,7 @@
 mod alacritty;
 mod claude;
-mod common;
 mod codex;
+mod common;
 mod gemini;
 mod ghostty;
 mod neovim;
@@ -34,8 +34,18 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Setup for Neovim
-    Neovim,
+    /// Neovimのセットアップ（指定タグでビルド・インストール）
+    Neovim {
+        /// ビルドするGitタグ（例: v0.12.0）
+        #[arg(long)]
+        tag: String,
+    },
+    /// Neovimを指定タグにアップデート
+    NeovimUpdate {
+        /// アップデート先のGitタグ（例: v0.12.0）
+        #[arg(long)]
+        tag: String,
+    },
     /// Build and deploy the nvim-config Rust library
     BuildNvimConfig,
     /// Setup for Zsh
@@ -62,10 +72,21 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Neovim => {
-            println!("🚀 Starting Neovim setup for {:?} ...", cli.distro);
-            neovim::setup(&cli.distro)?;
-            println!("\n✅ Neovim setup completed successfully!");
+        Commands::Neovim { tag } => {
+            println!(
+                "🚀 Neovim ({}) のセットアップを開始します ({:?}) ...",
+                tag, cli.distro
+            );
+            neovim::setup(&cli.distro, &tag)?;
+            println!("\n✅ Neovimのセットアップが完了しました!");
+        }
+        Commands::NeovimUpdate { tag } => {
+            println!(
+                "🔄 Neovimをタグ {} にアップデートします ({:?}) ...",
+                tag, cli.distro
+            );
+            neovim::update(&cli.distro, &tag)?;
+            println!("\n✅ Neovimのアップデートが完了しました!");
         }
         Commands::BuildNvimConfig => {
             println!("🦀 Building nvim-config library...");
