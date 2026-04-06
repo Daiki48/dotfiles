@@ -34,15 +34,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Neovimのセットアップ（指定タグでビルド・インストール）
+    /// Setup for Neovim (build and install from a specific tag)
     Neovim {
-        /// ビルドするGitタグ（例: v0.12.0）
+        /// Git tag to build (e.g. v0.12.0)
         #[arg(long)]
         tag: String,
     },
-    /// Neovimを指定タグにアップデート
+    /// Update Neovim to a specific tag version
     NeovimUpdate {
-        /// アップデート先のGitタグ（例: v0.12.0）
+        /// Git tag to update to (e.g. v0.12.0)
         #[arg(long)]
         tag: String,
     },
