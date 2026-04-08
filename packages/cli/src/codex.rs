@@ -2,12 +2,11 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::process::{Command, Stdio};
 
-use crate::utils::{create_symlink, run_command};
+use crate::utils::{copy_if_not_exists, create_symlink, run_command};
 
-const CODEX_FILES: &[(&str, &str)] = &[
-    (".codex/AGENTS.md", ".codex/AGENTS.md"),
-    (".codex/config.toml", ".codex/config.toml"),
-];
+const CODEX_FILES: &[(&str, &str)] = &[(".codex/AGENTS.md", ".codex/AGENTS.md")];
+
+const CODEX_COPY_FILES: &[(&str, &str)] = &[(".codex/config.toml", ".codex/config.toml")];
 
 fn is_codex_installed() -> bool {
     Command::new("codex")
@@ -64,6 +63,11 @@ pub fn setup() -> Result<()> {
     println!("\nLinking configuration files...");
     for (source, dest) in CODEX_FILES {
         create_symlink(source, dest)?;
+    }
+
+    println!("\nCopying configuration files...");
+    for (source, dest) in CODEX_COPY_FILES {
+        copy_if_not_exists(source, dest)?;
     }
 
     println!("\n✅ Codex CLI setup completed!");

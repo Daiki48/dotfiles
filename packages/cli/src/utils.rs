@@ -64,3 +64,38 @@ pub fn run_command(mut command: Command, error_message: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Copy to file from dotfiles (When CopyTo not found)
+pub fn copy_if_not_exists(source: &str, destination: &str) -> Result<()> {
+    let dotfiles_path = env::current_dir().context("Failed to get current directory")?;
+    let source_path = dotfiles_path.join(source);
+
+    let home_path = home::home_dir().context("Failed to get home directory")?;
+    let destination_path = home_path.join(destination);
+
+    println!("- Source: {}", source_path.display());
+    println!("- Destination: {}", destination_path.display());
+
+    if let Some(parent) = destination_path.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
+    }
+
+    if destination_path.exists() {
+        println!("File already exists. Skipping copy.");
+        return Ok(());
+    }
+
+    fs::copy(&source_path, &destination_path).with_context(|| {
+        format!(
+            "Failed to copy from {} to {}",
+            source_path.display(),
+            destination_path.display()
+        )
+    })?;
+    println!("Successfully copied file.");
+
+    Ok(())
+}
