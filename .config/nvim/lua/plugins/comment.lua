@@ -4,7 +4,7 @@ return {
   event = "BufRead",
   config = function()
     require("Comment").setup()
-    vim.api.nvim_set_keymap("n", "<C-_>", "gcc", {})
-    vim.api.nvim_set_keymap("v", "<C-_>", "gc", {})
+    vim.keymap.set("n", "<C-_>", "gcc", { remap = true })
+    vim.keymap.set("v", "<C-_>", "gc", { remap = true })
   end,
 }

@@ -1,4 +1,4 @@
-vim.lsp.set_log_level("OFF")
+vim.lsp.log.set_level("OFF")
 
 -- #############################################
 -- LSP utils
@@ -72,7 +72,7 @@ vim.lsp.enable(lsp_name)
 -- #############################################
 -- LSP keymap
 -- #############################################
-vim.keymap.set("n", "g]", "<cmd>lua vim.diagnostic.goto_next()<CR>")
-vim.keymap.set("n", "g[", "<cmd>lua vim.diagnostic.goto_prev()<CR>")
+vim.keymap.set("n", "g]", function() vim.diagnostic.jump({ count = 1 }) end)
+vim.keymap.set("n", "g[", function() vim.diagnostic.jump({ count = -1 }) end)
 vim.keymap.set("i", "<Tab>", [[pumvisible() ? "\<C-n>" : "\<Tab>"]], { expr = true })
 vim.keymap.set("i", "<S-Tab>", [[pumvisible() ? "\<C-p>" : "\<S-Tab>"]], { expr = true })
