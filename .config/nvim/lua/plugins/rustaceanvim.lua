@@ -33,7 +33,7 @@ return {
               },
             },
             check = {
-              command = "clippy",
+              command = "check",
             },
             imports = {
               granularity = {
