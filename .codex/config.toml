@@ -18,14 +18,5 @@ sandbox_mode = "workspace-write"
 [sandbox_workspace_write]
 network_access = true
 
-[projects."/home/daiki/dotfiles"]
-trust_level = "trusted"
-
-[projects."/media/develop/neovim-plugin/gbv.nvim"]
-trust_level = "trusted"
-
-[projects."/media/develop/personal/dnfolio"]
-trust_level = "trusted"
-
 [notice.model_migrations]
 "gpt-5.2-codex" = "gpt-5.3-codex"
