@@ -12,7 +12,7 @@ pub fn setup() -> Result<()> {
 
     api::exec2("autocmd!", &exec_opts)?;
 
-    api::set_var("mapleader", "<Space>")?;
+    api::set_var("mapleader", " ")?;
 
     api::set_option_value("encoding", "utf-8", &opts)?;
     api::set_option_value("fileencoding", "utf-8", &opts)?;

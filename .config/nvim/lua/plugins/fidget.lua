@@ -1,6 +1,6 @@
 return {
   "j-hui/fidget.nvim",
-  event = { "BufReadPre", "BufNewFile" },
+  event = "LspAttach",
   tag = "v1.6.0",
   opts = {},
 }

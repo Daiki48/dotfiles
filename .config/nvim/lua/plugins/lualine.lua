@@ -68,11 +68,9 @@ return {
       sections = {
         lualine_a = {
           { vim_mode },
-          "g:coc_status",
           "lsp_status",
         },
         lualine_b = {
-          "g:coc_git_status",
           "branch",
           {
             "diff",
@@ -90,7 +88,6 @@ return {
           },
           {
             "diagnostics",
-            source = { coc, "require.lsp-status.status()" },
             diagnostics_color = {
               error = {
                 fg = "#8f3231",

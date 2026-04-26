@@ -7,6 +7,10 @@ vim.diagnostic.config({
   virtual_text = false,
   virtual_lines = false,
   underline = true,
+  float = {
+    border = "rounded",
+    source = true,
+  },
 })
 
 -- InlayHintsはデフォルトOFF（;ihでトグル）
@@ -21,12 +25,7 @@ end, { desc = "Toggle InlayHints" })
 
 vim.api.nvim_create_autocmd("CursorHold", {
   callback = function()
-    local diagnostics = vim.diagnostic.get(0, { cursor = true })
-    if #diagnostics > 0 then
-      vim.diagnostic.open_float({
-        border = "rounded",
-      })
-    end
+    vim.diagnostic.open_float({ focus = false, scope = "cursor" })
   end,
 })
 

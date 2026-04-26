@@ -16,15 +16,17 @@ pub fn setup() -> Result<()> {
 
         let command_args = args.args.unwrap_or_default();
 
-        if command_args.is_empty() && api::call_function::<_, i64>("has", ("win64",))? == 1 {
-            let cmd = r#"terminal "C:\\Program Files\\PowerShell\\7\\pwsh.exe""#;
-            api::exec2(cmd, &exec_opts)?;
+        if command_args.is_empty() {
+            if api::call_function::<_, i64>("has", ("win64",))? == 1 {
+                let cmd = r#"terminal "C:\\Program Files\\PowerShell\\7\\pwsh.exe""#;
+                api::exec2(cmd, &exec_opts)?;
+            } else {
+                api::exec2("terminal", &exec_opts)?;
+            }
         } else {
-            api::exec2("terminal", &exec_opts)?;
+            let cmd = format!("terminal {}", command_args);
+            api::exec2(&cmd, &exec_opts)?;
         }
-
-        let cmd = format!("terminal {}", command_args);
-        api::exec2(&cmd, &exec_opts)?;
 
         Ok(())
     };
