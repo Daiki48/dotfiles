@@ -32,31 +32,26 @@ fn is_wezterm_installed() -> bool {
 }
 
 fn wezterm_install(distro: &Distro) -> Result<()> {
-    let mut cmd = Command::new("sudo");
-
     match distro {
         Distro::Ubuntu => {
-            // cmd.arg("curl")
-            //     .arg("-fsSL")
-            //     .arg("https://apt.fury.io/wez/gpg.key");
-            // cmd.arg("gpg")
-            //     .arg("--yes")
-            //     .arg("--dearmor")
-            //     .arg("-o")
-            //     .arg("/usr/share/keyrings/wezterm-fury.gpg");
-            // cmd.arg("echo").arg("'deb [signed-by=/usr/share/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *'");
-            // cmd.arg("tee").arg("/etc/apt/sources.list.d/wezterm.list");
-            // cmd.arg("chmod")
-            //     .arg("644")
-            //     .arg("/usr/share/keyrings/wezterm-fury.gpg");
-            cmd.arg("apt").arg("update");
-            cmd.arg("apt").arg("install").arg("wezterm");
+            let mut update_cmd = Command::new("sudo");
+            update_cmd.arg("apt").arg("update");
+            run_command(update_cmd, "Failed to run apt update.")?;
+
+            let mut install_cmd = Command::new("sudo");
+            install_cmd
+                .arg("apt")
+                .arg("install")
+                .arg("-y")
+                .arg("wezterm");
+            run_command(install_cmd, "Failed to install wezterm.")?;
         }
         Distro::Fedora => {
+            let mut cmd = Command::new("sudo");
             cmd.arg("dnf").arg("install").arg("-y").arg("https://github.com/wezterm/wezterm/releases/download/20240203-110809-5046fc22/wezterm-20240203_110809_5046fc22-1.fedora42.x86_64.rpm");
+            run_command(cmd, "Failed to install wezterm.")?;
         }
     }
-    run_command(cmd, "Failed to install wezterm.")?;
     Ok(())
 }
 
