@@ -18,10 +18,13 @@ return {
     },
     sources = {
       default = { "lsp", "path", "snippets", "buffer" },
+      per_filetype = {
+        rust = { "lsp", "path", "snippets" },
+      },
     },
     completion = {
       keyword = {
-        range = "full",
+        range = "prefix",
       },
       list = {
         selection = {
@@ -40,10 +43,10 @@ return {
         window = {
           border = "single",
         },
-        auto_show = true,
+        auto_show = false,
         auto_show_delay_ms = 500,
       },
-      ghost_text = { enabled = true },
+      ghost_text = { enabled = false },
     },
     signature = {
       window = {
