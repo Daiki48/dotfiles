@@ -1,63 +1,95 @@
+local parsers = {
+  "c",
+  "cpp",
+  "c_sharp",
+  "lua",
+  "vim",
+  "vimdoc",
+  "query",
+  "rust",
+  "typescript",
+  "javascript",
+  "svelte",
+  "markdown",
+  "markdown_inline",
+  "go",
+  "json",
+  "toml",
+  "vue",
+  "yaml",
+  "xml",
+  "html",
+  "css",
+}
+
+local filetypes = {
+  "c",
+  "cpp",
+  "cs",
+  "css",
+  "go",
+  "html",
+  "javascript",
+  "json",
+  "lua",
+  "markdown",
+  "rust",
+  "svelte",
+  "toml",
+  "typescript",
+  "vim",
+  "vue",
+  "xml",
+  "yaml",
+}
+
 return {
   "nvim-treesitter/nvim-treesitter",
-  build = ":TSUpdate",
-  event = "BufRead",
-  -- lazy = false,
+  branch = "main",
+  build = function()
+    local ok, treesitter = pcall(require, "nvim-treesitter")
+    if not ok or type(treesitter.update) ~= "function" then
+      return
+    end
+
+    treesitter.update(parsers):wait(300000)
+  end,
+  lazy = false,
   config = function()
-    require("nvim-treesitter.configs").setup({
-      -- A list of parser names, or "all" (the five listed parsers should always be installed)
-      ensure_installed = {
-        "c",
-        "cpp",
-        "c_sharp",
-        "lua",
-        "vim",
-        "vimdoc",
-        "query",
-        "rust",
-        "typescript",
-        "javascript",
-        "svelte",
-        "markdown",
-        "go",
-        "json",
-        "toml",
-        "vue",
-        "yaml",
-        "xml",
-        "html",
-        "css",
-      },
+    local treesitter = require("nvim-treesitter")
 
-      -- Install parsers synchronously (only applied to `ensure_installed`)
-      sync_install = false,
+    if type(treesitter.install) ~= "function" then
+      vim.notify(
+        "nvim-treesitter is still on the old master branch. Run :Lazy sync to switch it to main.",
+        vim.log.levels.WARN
+      )
+      return
+    end
 
-      -- Automatically install missing parsers when entering buffer
-      -- Recommendation: set to false if you don't have `tree-sitter` CLI installed locally
-      auto_install = true,
+    treesitter.setup()
+    vim.treesitter.language.register("c_sharp", "cs")
+    treesitter.install(parsers)
 
-      -- List of parsers to ignore installing (or "all")
-      ignore_install = {},
+    vim.api.nvim_create_autocmd("FileType", {
+      pattern = filetypes,
+      callback = function(args)
+        vim.schedule(function()
+          if not vim.api.nvim_buf_is_valid(args.buf) then
+            return
+          end
 
-      ---- If you need to change the installation directory of the parsers (see -> Advanced Setup)
-      -- parser_install_dir = "/some/path/to/store/parsers", -- Remember to run vim.opt.runtimepath:append("/some/path/to/store/parsers")!
+          -- FileType で遅延読み込みされるカスタムパーサー登録後に開始する
+          if not pcall(vim.treesitter.start, args.buf) then
+            return
+          end
 
-      highlight = {
-        -- disable = true,
-        enable = true,
-
-        -- Setting this to true will run `:h syntax` and tree-sitter at the same time.
-        -- Set this to `true` if you depend on 'syntax' being enabled (like for indentation).
-        -- Using this option may slow down your editor, and you may see some duplicate highlights.
-        -- Instead of true it can also be a list of languages
-        -- additional_vim_regex_highlighting = false,
-      },
-
-      -- https://github.com/windwp/nvim-ts-autotag/commit/6e9742a006ae69c015e6dc1ed9b477033193778b
-      -- "If you are setting up via nvim-treesitter.configs it has been deprecated! Please migrate to the new way. It will be removed in 1.0.0."
-      -- autotag = {
-      -- 	enable = true
-      -- }
+          for _, win in ipairs(vim.fn.win_findbuf(args.buf)) do
+            vim.wo[win].foldexpr = "v:lua.vim.treesitter.foldexpr()"
+            vim.wo[win].foldmethod = "expr"
+            vim.wo[win].foldlevel = 99
+          end
+        end)
+      end,
     })
   end,
 }
