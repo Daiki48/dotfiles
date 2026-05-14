@@ -1,0 +1,33 @@
+# Gemini CLI Policy Engine rules.
+# 読み取り系 shell コマンドは確認なしで実行できるようにする。
+# リダイレクトは許可しないため、`cat > file` のような書き込みには自動許可されない。
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '[;&|`$<>]'
+decision = "ask_user"
+priority = 900
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^find\b.*\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b'
+decision = "ask_user"
+priority = 800
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^sed\s+-n\b.*\s-i(\b|\S)'
+decision = "ask_user"
+priority = 800
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^(pwd|ls|rg|grep|cat|head|tail|wc|diff|date)(\s|$)|^find(\s|$)|^sed\s+-n(\s|$)|^git\s+(status|diff|log|show|rev-parse)(\s|$)|^git\s+remote\s+-v(\s|$)'
+decision = "allow"
+priority = 300
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^git\s+branch(\s+(-a|-r|-vv|-v|--all|--remotes|--verbose|--list))*\s*$'
+decision = "allow"
+priority = 300

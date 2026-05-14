@@ -9,6 +9,8 @@ const GEMINI_FILES: &[(&str, &str)] = &[
     (".gemini/GEMINI.md", ".gemini/GEMINI.md"),
 ];
 
+const GEMINI_DIRS: &[(&str, &str)] = &[(".gemini/policies", ".gemini/policies")];
+
 /// Gemini CLIがインストールされているか確認
 fn is_gemini_installed() -> bool {
     Command::new("gemini")
@@ -67,9 +69,12 @@ pub fn setup() -> Result<()> {
         fs::create_dir_all(&gemini_dir)?;
     }
 
-    // 4. 設定ファイルのsymlink作成
+    // 4. 設定ファイルとPolicy Engineルールのsymlink作成
     println!("\nLinking configuration files...");
     for (source, dest) in GEMINI_FILES {
+        create_symlink(source, dest)?;
+    }
+    for (source, dest) in GEMINI_DIRS {
         create_symlink(source, dest)?;
     }
 
