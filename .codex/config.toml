@@ -3,18 +3,6 @@ model_reasoning_effort = "high"
 approval_policy = "on-request"
 sandbox_mode = "read-only"
 
-[profiles.teacher]
-model = "gpt-5.4"
-model_reasoning_effort = "high"
-approval_policy = "on-request"
-sandbox_mode = "read-only"
-
-[profiles.autonomous]
-model = "gpt-5.4"
-model_reasoning_effort = "high"
-approval_policy = "never"
-sandbox_mode = "workspace-write"
-
 [sandbox_workspace_write]
 network_access = true
 
