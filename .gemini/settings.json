@@ -11,10 +11,10 @@
     }
   },
   "general": {
-    "previewFeatures": true
+    "previewFeatures": true,
+    "defaultApprovalMode": "default"
   },
   "tools": {
-    "approvalMode": "default",
     "allowed": [
       "read_file",
       "list_directory",
