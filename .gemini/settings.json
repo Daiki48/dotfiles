@@ -12,5 +12,32 @@
   },
   "general": {
     "previewFeatures": true
+  },
+  "tools": {
+    "approvalMode": "default",
+    "allowed": [
+      "read_file",
+      "list_directory",
+      "glob",
+      "grep_search",
+      "run_shell_command(pwd)",
+      "run_shell_command(ls)",
+      "run_shell_command(find)",
+      "run_shell_command(rg)",
+      "run_shell_command(grep)",
+      "run_shell_command(sed -n)",
+      "run_shell_command(cat)",
+      "run_shell_command(head)",
+      "run_shell_command(tail)",
+      "run_shell_command(wc)",
+      "run_shell_command(diff)",
+      "run_shell_command(git status)",
+      "run_shell_command(git diff)",
+      "run_shell_command(git log)",
+      "run_shell_command(git show)",
+      "run_shell_command(git branch)",
+      "run_shell_command(git rev-parse)",
+      "run_shell_command(git remote -v)"
+    ]
   }
 }
