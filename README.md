@@ -65,7 +65,23 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `tmux` | Install tmux via apt/dnf, clone [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager) into `~/.config/tmux/plugins/tpm`, and symlink `~/.config/tmux/tmux.conf`. After setup, press `Ctrl+g` then `I` (capital i) inside tmux to install plugins. | yes |
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
 | `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks `~/.codex/AGENTS.md` and copies `config.toml` (only if it does not already exist, so local edits are preserved). | no |
-| `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`. Requires `GEMINI_API_KEY` exported in your shell. | no |
+| `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json` and `~/.gemini/GEMINI.md`. Requires `GEMINI_API_KEY` exported in your shell. | no |
+
+#### AI CLI configuration policy
+
+Codex, Claude, and Gemini share the same operating-mode policy:
+
+- Teacher mode is for guided implementation. The assistant explains the reason, impact, and minimal code proposal, but does not edit files.
+- Autonomous mode is for delegated implementation. The assistant may inspect, edit, test, and verify by itself, except for dangerous commands or external-state-changing operations.
+- Read-only commands do not require confirmation in any mode. Examples include `ls`, `find`, `rg`, `grep`, `sed -n`, `cat`, `head`, `tail`, `wc`, `pwd`, and read-only Git commands.
+
+`~/.codex/AGENTS.md` is managed by this repository as a symlink.
+`~/.codex/config.toml` is copied only when it does not already exist, then managed locally.
+
+Keep machine-specific Codex settings such as `profiles.teacher`,
+`profiles.autonomous`, project trust levels, local model preferences, and TUI
+state in the local `~/.codex/config.toml` instead of committing them to this
+repository.
 
 #### Examples
 
