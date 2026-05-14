@@ -4,6 +4,11 @@ use std::process::{Command, Stdio};
 
 use crate::utils::{create_symlink, run_command};
 
+const GEMINI_FILES: &[(&str, &str)] = &[
+    (".gemini/settings.json", ".gemini/settings.json"),
+    (".gemini/GEMINI.md", ".gemini/GEMINI.md"),
+];
+
 /// Gemini CLIがインストールされているか確認
 fn is_gemini_installed() -> bool {
     Command::new("gemini")
@@ -64,7 +69,9 @@ pub fn setup() -> Result<()> {
 
     // 4. 設定ファイルのsymlink作成
     println!("\nLinking configuration files...");
-    create_symlink(".gemini/settings.json", ".gemini/settings.json")?;
+    for (source, dest) in GEMINI_FILES {
+        create_symlink(source, dest)?;
+    }
 
     println!("\n✅ Gemini CLI setup completed!");
     println!("\n💡 Next steps:");
