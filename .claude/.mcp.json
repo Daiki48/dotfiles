@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "codex": {
-      "command": "/home/daiki/.volta/bin/codex",
+      "command": "/home/daiki/.local/share/mise/shims/codex",
       "args": ["mcp-server"]
     }
   }

@@ -64,8 +64,9 @@ umask 022
 # [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
 # [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
 
-export VOLTA_HOME="$HOME/.volta"
-export PATH="$VOLTA_HOME/bin:$PATH"
+# Voltaからmiseへ移行するため、継承済みのVolta設定を無効化
+unset VOLTA_HOME
+path=("${(@)path:#$HOME/.volta/bin}")
 
 . "$HOME/.deno/env"
 
@@ -114,71 +115,6 @@ fi
 # Setup lua-language-server
 export PATH="$PATH:$HOME/lsp/lua-language-server/bin"
 
-# Load .node-version or .nvmrc for Volta
-autoload -Uz add-zsh-hook
-function chpwd_volta_install() {
-  # Checking .node-version
-  if [[ -e ".node-version" ]]; then
-    # Loading .node-version, and get content
-    content=$(cat .node-version)
-    volta install node@$content --quiet
-  fi
-
-  # .nvmrcが存在するかチェック
-  if [[ -e ".nvmrc" ]]; then
-    # Loading .nvmrc, and get content
-    content=$(cat .nvmrc)
-
-    case $content in
-    # Case of lts/argon
-    "lts/argon")
-      volta install node@4 --quiet
-      ;;
-    # Case of lts/boron
-    "lts/boron")
-      volta install node@6 --quiet
-      ;;
-    # Case of lts/carbon
-    "lts/carbon")
-      volta install node@8 --quiet
-      ;;
-    # Case of lts/dubnium
-    "lts/dubnium")
-      volta install node@10 --quiet
-      ;;
-    # Case of lts/erbium
-    "lts/erbium")
-      volta install node@12 --quiet
-      ;;
-    # Case of lts/fermium
-    "lts/fermium")
-      volta install node@14 --quiet
-      ;;
-    # Case of lts/gallium
-    "lts/gallium")
-      volta install node@16 --quiet
-      ;;
-    # Case of lts/hydrogen
-    "lts/hydrogen")
-      volta install node@18 --quiet
-      ;;
-    # Case of lts/*
-    "lts/*")
-      volta install node@lts --quiet
-      ;;
-    # Case of latest,current,node,*
-    "latest" | "current" | "node" | "*")
-      volta install node@latest --quiet
-      ;;
-    # Other
-    *)
-      volta install node@$content --quiet
-      ;;
-    esac
-  fi
-}
-add-zsh-hook chpwd chpwd_volta_install
-
 # Turso
 export PATH="$PATH:$HOME/.turso"
 
@@ -209,3 +145,7 @@ if [ -f '/home/daiki/google-cloud-sdk/path.zsh.inc' ]; then . '/home/daiki/googl
 # The next line enables shell command completion for gcloud.
 if [ -f '/home/daiki/google-cloud-sdk/completion.zsh.inc' ]; then . '/home/daiki/google-cloud-sdk/completion.zsh.inc'; fi
 
+# mise
+if command -v mise >/dev/null 2>&1; then
+    eval "$(mise activate zsh)"
+fi
