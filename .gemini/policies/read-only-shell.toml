@@ -3,31 +3,38 @@
 # リダイレクトは許可しないため、`cat > file` のような書き込みには自動許可されない。
 
 [[rule]]
-toolName = "run_shell_command"
+toolName = "run_command"
 commandRegex = '[;&|`$<>]'
 decision = "ask_user"
 priority = 900
 
 [[rule]]
-toolName = "run_shell_command"
+toolName = "run_command"
 commandRegex = '^find\b.*\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b'
 decision = "ask_user"
 priority = 800
 
 [[rule]]
-toolName = "run_shell_command"
+toolName = "run_command"
 commandRegex = '^sed\s+-n\b.*\s-i(\b|\S)'
 decision = "ask_user"
 priority = 800
 
 [[rule]]
-toolName = "run_shell_command"
-commandRegex = '^(pwd|ls|rg|grep|cat|head|tail|wc|diff|date)(\s|$)|^find(\s|$)|^sed\s+-n(\s|$)|^git\s+(status|diff|log|show|rev-parse)(\s|$)|^git\s+remote\s+-v(\s|$)'
+toolName = "run_command"
+commandRegex = '^(pwd|ls|rg|grep|cat|head|tail|wc|diff|date|echo)(\s|$)|^find(\s|$)|^sed\s+-n(\s|$)|^git\s+(status|diff|log|show|rev-parse)(\s|$)|^git\s+remote\s+-v(\s|$)'
 decision = "allow"
 priority = 300
 
 [[rule]]
-toolName = "run_shell_command"
+toolName = "run_command"
 commandRegex = '^git\s+branch(\s+(-a|-r|-vv|-v|--all|--remotes|--verbose|--list))*\s*$'
 decision = "allow"
 priority = 300
+
+# Git 書き込み系コマンドは常に確認を求める
+[[rule]]
+toolName = "run_command"
+commandRegex = '^git\s+(push|commit|add|checkout|switch|merge|rebase|reset|stash|pull|fetch|cherry-pick)\b'
+decision = "ask_user"
+priority = 500

@@ -149,3 +149,7 @@ if [ -f '/home/daiki/google-cloud-sdk/completion.zsh.inc' ]; then . '/home/daiki
 if command -v mise >/dev/null 2>&1; then
     eval "$(mise activate zsh)"
 fi
+
+
+# Added by Antigravity CLI installer
+export PATH="/home/daiki/.local/bin:$PATH"

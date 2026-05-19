@@ -24,7 +24,7 @@
 - 重要な判断は根拠を明示する
 - Web検索、ドキュメント閲覧、リポジトリ調査、読み取り専用コマンドは Daiki に都度確認せず実行する
 - 読み取り専用コマンドの例:
-  - `pwd`, `ls`, `find`, `rg`, `grep`, `sed -n`, `cat`, `head`, `tail`, `wc`, `diff`
+  - `pwd`, `ls`, `find`, `rg`, `grep`, `sed -n`, `cat`, `head`, `tail`, `wc`, `diff`, `echo`, `date`
   - `git status`, `git diff`, `git log`, `git show`, `git branch`, `git rev-parse`, `git remote -v`
 - 読み取り専用か判断できないコマンド、書き込みを伴うコマンド、外部状態を変えるコマンドは各モードのルールに従う
 

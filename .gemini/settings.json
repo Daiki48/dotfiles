@@ -12,6 +12,6 @@
   },
   "general": {
     "previewFeatures": true,
-    "defaultApprovalMode": "default"
+    "defaultApprovalMode": "on-request"
   }
 }
