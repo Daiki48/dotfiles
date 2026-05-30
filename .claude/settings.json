@@ -69,8 +69,10 @@
     ]
   },
   "enabledPlugins": {
-    "rust-analyzer-lsp@claude-plugins-official": true
+    "rust-analyzer-lsp@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": true
   },
   "language": "japanese",
-  "effortLevel": "high"
+  "effortLevel": "xhigh",
+  "skipAutoPermissionPrompt": true
 }
