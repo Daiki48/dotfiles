@@ -1,0 +1,7 @@
+# 教師モード（profile v2 / 端末非依存・dotfiles 管理）
+# 起動: codex --profile teacher
+# 読み取り専用で先生役に徹する。編集は Daiki が行う。
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+approval_policy = "on-request"
+sandbox_mode = "read-only"

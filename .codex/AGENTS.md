@@ -24,11 +24,17 @@
 デフォルト: 教師モード
 
 ### モード切り替え
-- `teacher` profile は教師モードとして扱う
-- `autonomous` profile は自律モードとして扱う
-- Daiki が明示的に `自律モード` と指示したときだけ、自律モードとして扱う
-- `自律モード` の明示がない依頼は、すべて教師モードとして扱う
-- モードは profile を切り替えるまで維持される
+- モードは **sandbox mode** で判定する
+  - モデルは起動 profile 名を認識できない（environment_context に profile 名は含まれない）。
+    一方 sandbox mode は environment/システム情報から確実に認識できるため、これを判定材料にする。
+  - プロンプトでの「教師モード」「自律モード」明示は不要
+- sandbox mode が `read-only` のとき → 教師モード（Teacher Mode を参照）
+  - 物理的に編集できない。提案・設計・調査・レビューに徹する
+- sandbox mode が `workspace-write` / `danger-full-access` のとき → 自律モード（Autonomous Mode を参照）
+  - 依頼内に「自律モード」の明示がなくても、危険な操作を除き自律的に編集・実行する
+  - 危険・破壊的・外部状態を変える操作は事前確認する（Dangerous Commands / Git Rules を参照）
+- 起動: 教師モード = `codex --profile teacher`（read-only） / 自律モード = `codex --profile autonomous`（workspace-write）
+- モードは起動中は維持される
 - 応答の冒頭に現在のモードを表示する:
   - 教師モード: `> 教師モード`
   - 自律モード: `> 自律モード`

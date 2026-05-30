@@ -1,0 +1,41 @@
+# Codex base config の新端末用テンプレート（端末非依存）。
+#
+# install CLI（packages/cli）が ~/.codex/config.toml が存在しない場合のみ、
+# このファイルを ~/.codex/config.toml へコピーする（copy_if_not_exists）。
+# コピー後はローカル管理: 端末依存の設定（下記）は ~/.codex/config.toml 側に追記し、
+# このテンプレートには含めない。
+#   - [projects.*]            … プロジェクト trust（パスが端末ごとに異なる）
+#   - [hooks.state]           … hook の trusted_hash（/hooks で信頼登録した結果）
+#   - [tui.*]                 … TUI 状態
+#
+# ※ ファイル名を config.base.toml としているのは、Codex が project config として読むのは
+#    `.codex/config.toml` のみで、`.codex/config.base.toml` は読まないため。
+#    Codex の設定優先順位は CLI flags > project config (.codex/config.toml) > profile > user config。
+#    dotfiles は trusted project なので、もし dotfiles 配下に .codex/config.toml を置くと
+#    project config が profile より高優先で評価され、--profile teacher/autonomous が無効化される。
+#    テンプレートを別名にしておくことで project config として読まれず、profile がそのまま効く。
+#
+# profile は v2 形式（~/.codex/<name>.config.toml, dotfiles へ symlink）:
+#   教師モード: codex --profile teacher    （read-only）
+#   自律モード: codex --profile autonomous （workspace-write）
+
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+approval_policy = "on-request"
+sandbox_mode = "read-only"
+
+[sandbox_workspace_write]
+network_access = true
+
+# Git 書き込み系を approval 設定に依存せず確実にブロックするガードレール（全 profile 共通）。
+# rules の forbidden は approval=never（exec 等）では評価されないため、hook で固める。
+# ⚠️ 新端末ではこの hook の trust 登録が必須: 対話 `codex` を起動し `/hooks` で信頼登録すること。
+#    信頼登録するまで hook はスキップされる。
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$HOME/dotfiles/.codex/hooks/block_git_write.py"'
+timeout = 10
+statusMessage = "Git 書き込みガードを確認中"

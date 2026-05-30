@@ -1,0 +1,51 @@
+# ============================================================
+# Git: 書き込み系は全面禁止（Daiki が手動で実施する）
+#   読み取り用法を持たない破壊・変更系サブコマンドのみ forbidden
+# ============================================================
+prefix_rule(pattern=["git", "add"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "commit"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "push"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "pull"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "fetch"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "merge"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "rebase"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "reset"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "stash"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "cherry-pick"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "checkout"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "switch"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "restore"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "clean"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "revert"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "rm"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "mv"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "apply"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+prefix_rule(pattern=["git", "am"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
+
+# ============================================================
+# Git: 読み取り系は確認なしで実行可
+#   読み書き両用の branch/remote/tag/config は意図的に除外し、
+#   ベースポリシー（on-request）の確認に委ねる
+# ============================================================
+prefix_rule(pattern=["git", ["status", "log", "diff", "show", "rev-parse", "blame", "shortlog", "describe", "reflog", "ls-files", "ls-tree", "cat-file", "rev-list", "merge-base", "name-rev", "grep"]], decision="allow", justification="読み取り専用 Git 操作は安全")
+
+# ============================================================
+# 破壊的コマンド: 実行前に必ず確認
+# ============================================================
+prefix_rule(pattern=["rm"], decision="prompt", justification="削除は確認を取る")
+prefix_rule(pattern=["rmdir"], decision="prompt", justification="ディレクトリ削除は確認を取る")
+prefix_rule(pattern=["mv"], decision="prompt", justification="移動・リネームは確認を取る")
+
+# ============================================================
+# 既存の許可コマンド（維持）
+# ============================================================
+prefix_rule(pattern=["curl"], decision="allow")
+prefix_rule(pattern=["gh", "api"], decision="allow")
+prefix_rule(pattern=["rg", "-n", "javascript:|vbscript:|on[a-z]+\\s*=|<iframe|<object|<embed|<base|data:text/html"], decision="allow")
+prefix_rule(pattern=["npm", "install"], decision="allow")
+prefix_rule(pattern=["cargo", "fmt"], decision="allow")
+prefix_rule(pattern=["cargo", "check"], decision="allow")
+prefix_rule(pattern=["make", "build"], decision="allow")
+prefix_rule(pattern=["cargo", "test"], decision="allow")
+prefix_rule(pattern=["claude", "-p"], decision="allow")
+prefix_rule(pattern=["npm", "audit"], decision="allow")

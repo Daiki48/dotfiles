@@ -6,7 +6,10 @@ use crate::utils::{copy_if_not_exists, create_symlink, run_command};
 
 const CODEX_FILES: &[(&str, &str)] = &[(".codex/AGENTS.md", ".codex/AGENTS.md")];
 
-const CODEX_COPY_FILES: &[(&str, &str)] = &[(".codex/config.toml", ".codex/config.toml")];
+// テンプレート専用ファイル (.codex/config.base.toml) を ~/.codex/config.toml へコピーする。
+// dotfiles 内では `.codex/config.toml` を置かないことで、Codex の project config が
+// profile (teacher/autonomous) を上書きしないようにしている。
+const CODEX_COPY_FILES: &[(&str, &str)] = &[(".codex/config.base.toml", ".codex/config.toml")];
 
 fn is_codex_installed() -> bool {
     Command::new("codex")
