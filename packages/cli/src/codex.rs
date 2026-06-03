@@ -4,7 +4,19 @@ use std::process::{Command, Stdio};
 
 use crate::utils::{copy_if_not_exists, create_symlink, run_command};
 
-const CODEX_FILES: &[(&str, &str)] = &[(".codex/AGENTS.md", ".codex/AGENTS.md")];
+const CODEX_FILES: &[(&str, &str)] = &[
+    (".codex/AGENTS.md", ".codex/AGENTS.md"),
+    (".codex/teacher.config.toml", ".codex/teacher.config.toml"),
+    (
+        ".codex/autonomous.config.toml",
+        ".codex/autonomous.config.toml",
+    ),
+    (".codex/rules/default.rules", ".codex/rules/default.rules"),
+    (
+        ".codex/hooks/block_git_write.py",
+        ".codex/hooks/block_git_write.py",
+    ),
+];
 
 // テンプレート専用ファイル (.codex/config.base.toml) を ~/.codex/config.toml へコピーする。
 // dotfiles 内では `.codex/config.toml` を置かないことで、Codex の project config が
@@ -76,8 +88,9 @@ pub fn setup() -> Result<()> {
     println!("\n✅ Codex CLI setup completed!");
     println!("\n💡 Next steps:");
     println!("   1. Run 'codex login' if authentication is not configured");
-    println!("   2. Use teacher mode: codex --profile teacher");
-    println!("   3. Use autonomous mode: codex --profile autonomous");
+    println!("   2. Run 'codex' and trust hooks from '/hooks' if prompted");
+    println!("   3. Use teacher mode: codex --profile teacher");
+    println!("   4. Use autonomous mode: codex --profile autonomous");
 
     Ok(())
 }

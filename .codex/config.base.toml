@@ -36,6 +36,6 @@ matcher = "^Bash$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = 'python3 "$HOME/dotfiles/.codex/hooks/block_git_write.py"'
+command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
 timeout = 10
 statusMessage = "Git 書き込みガードを確認中"
