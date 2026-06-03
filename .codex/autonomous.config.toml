@@ -10,3 +10,12 @@ sandbox_mode = "workspace-write"
 
 [sandbox_workspace_write]
 network_access = true
+
+[projects."/media/p3plus/dev/dnfolio-utils"]
+trust_level = "trusted"
+
+[projects."/media/p3plus/dev/nakashima-craft-gallery"]
+trust_level = "trusted"
+
+[projects."/media/p3plus/dev/regret-zero"]
+trust_level = "trusted"
