@@ -8,11 +8,6 @@ use crate::utils::{copy_if_not_exists, create_symlink, run_command};
 
 const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
-    (".codex/teacher.config.toml", ".codex/teacher.config.toml"),
-    (
-        ".codex/autonomous.config.toml",
-        ".codex/autonomous.config.toml",
-    ),
     (".codex/rules/default.rules", ".codex/rules/default.rules"),
     (
         ".codex/hooks/block_git_write.py",
@@ -20,10 +15,18 @@ const CODEX_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-// テンプレート専用ファイル (.codex/config.base.toml) を ~/.codex/config.toml へコピーする。
+// テンプレート専用ファイルは ~/.codex/ へコピーし、以後はローカル管理にする。
 // dotfiles 内では `.codex/config.toml` を置かないことで、Codex の project config が
 // profile (teacher/autonomous) を上書きしないようにしている。
-const CODEX_COPY_FILES: &[(&str, &str)] = &[(".codex/config.base.toml", ".codex/config.toml")];
+// profile ファイルも Codex が project trust を追記するため symlink しない。
+const CODEX_COPY_FILES: &[(&str, &str)] = &[
+    (".codex/config.base.toml", ".codex/config.toml"),
+    (".codex/teacher.config.toml", ".codex/teacher.config.toml"),
+    (
+        ".codex/autonomous.config.toml",
+        ".codex/autonomous.config.toml",
+    ),
+];
 
 fn is_codex_installed() -> bool {
     Command::new("codex")
@@ -118,6 +121,32 @@ fn replace_legacy_config(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_local_config(source: &str, destination: &str) -> Result<()> {
+    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    let source_path = dotfiles_path.join(source);
+
+    let home_path = home::home_dir().context("Failed to get home directory")?;
+    let destination_path = home_path.join(destination);
+
+    if let Ok(existing_target) = fs::read_link(&destination_path)
+        && existing_target == source_path
+    {
+        println!(
+            "- Replacing managed symlink with local copy: {}",
+            destination_path.display()
+        );
+        let contents = fs::read(&source_path)
+            .with_context(|| format!("Failed to read {}", source_path.display()))?;
+        fs::remove_file(&destination_path)
+            .with_context(|| format!("Failed to remove {}", destination_path.display()))?;
+        fs::write(&destination_path, contents)
+            .with_context(|| format!("Failed to write {}", destination_path.display()))?;
+        return Ok(());
+    }
+
+    copy_if_not_exists(source, destination)
+}
+
 pub fn setup() -> Result<()> {
     println!("🧠 Setting up Codex CLI...\n");
 
@@ -138,16 +167,16 @@ pub fn setup() -> Result<()> {
         fs::create_dir_all(&codex_dir)?;
     }
 
-    println!("\nLinking configuration files...");
+    println!("\nLinking shared configuration files...");
     for (source, dest) in CODEX_FILES {
         create_symlink(source, dest)?;
     }
 
     replace_legacy_config(&codex_dir)?;
 
-    println!("\nCopying configuration files...");
+    println!("\nCopying local configuration templates...");
     for (source, dest) in CODEX_COPY_FILES {
-        copy_if_not_exists(source, dest)?;
+        copy_local_config(source, dest)?;
     }
 
     println!("\n✅ Codex CLI setup completed!");

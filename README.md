@@ -64,7 +64,7 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `zellij` | Install Zellij. Ubuntu: `cargo install zellij`. Fedora: `dnf install zellij`. Symlinks `~/.config/zellij`. | yes |
 | `tmux` | Install tmux via apt/dnf, clone [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager) into `~/.config/tmux/plugins/tpm`, and symlink `~/.config/tmux/tmux.conf`. After setup, press `Ctrl+g` then `I` (capital i) inside tmux to install plugins. | yes |
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
-| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks `~/.codex/AGENTS.md`, profile files, rules, and hooks, then copies `config.base.toml` to `~/.codex/config.toml` (only if it does not already exist, so local edits are preserved). If an existing config uses legacy `profile` / `[profiles.*]` settings, it is backed up and replaced with the current base config. | no |
+| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks `~/.codex/AGENTS.md`, rules, and hooks, then copies profile templates and `config.base.toml` to `~/.codex/` (only if they do not already exist, so local edits are preserved). If an existing config uses legacy `profile` / `[profiles.*]` settings, it is backed up and replaced with the current base config. | no |
 | `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`, `~/.gemini/GEMINI.md`, and `~/.gemini/policies/`. Requires `GEMINI_API_KEY` exported in your shell. | no |
 
 #### AI CLI configuration policy
@@ -75,14 +75,14 @@ Codex, Claude, and Gemini share the same operating-mode policy:
 - Autonomous mode is for delegated implementation. The assistant may inspect, edit, test, and verify by itself, except for dangerous commands or external-state-changing operations.
 - Read-only commands do not require confirmation in any mode. Examples include `ls`, `find`, `rg`, `grep`, `sed -n`, `cat`, `head`, `tail`, `wc`, `pwd`, and read-only Git commands.
 
-`~/.codex/AGENTS.md`, `~/.codex/teacher.config.toml`,
-`~/.codex/autonomous.config.toml`, `~/.codex/rules/default.rules`, and
+`~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`, and
 `~/.codex/hooks/block_git_write.py` are managed by this repository as symlinks.
-`~/.codex/config.toml` is copied from `.codex/config.base.toml` only when it does not
-already exist, then managed locally. `.codex/config.base.toml` is a terminal-independent
-template; Codex reads project config only from `.codex/config.toml`, so keeping the
-template under a different name prevents it from overriding the active profile when you
-run Codex inside this repository.
+`~/.codex/config.toml`, `~/.codex/teacher.config.toml`, and
+`~/.codex/autonomous.config.toml` are copied from repository templates only when they do
+not already exist, then managed locally. `.codex/config.base.toml` is a
+terminal-independent template; Codex reads project config only from `.codex/config.toml`,
+so keeping the template under a different name prevents it from overriding the active
+profile when you run Codex inside this repository.
 If `cargo run -- codex` finds legacy profile settings (`profile = ...` or
 `[profiles.*]`) in an existing `~/.codex/config.toml`, it backs up that file to
 `~/.codex/config.toml.bak.legacy.<timestamp>` and installs the current base
@@ -93,7 +93,7 @@ Gemini CLI Policy Engine rules. Do not use deprecated `tools.allowed` in
 `~/.gemini/settings.json` for persistent tool rules.
 
 Keep machine-specific Codex settings such as project trust levels (`[projects.*]`),
-hook trust state (`[hooks.state]`), and TUI state in the local `~/.codex/config.toml`
+hook trust state (`[hooks.state]`), and TUI state in local `~/.codex/*.toml` files
 instead of committing them to this repository. Profiles use the v2 format; launch them
 with `codex --profile teacher` / `codex --profile autonomous`.
 

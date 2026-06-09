@@ -7,15 +7,10 @@ model = "gpt-5.5"
 model_reasoning_effort = "high"
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
+plan_mode_reasoning_effort = "high"
 
 [sandbox_workspace_write]
 network_access = true
 
-[projects."/media/p3plus/dev/dnfolio-utils"]
-trust_level = "trusted"
-
-[projects."/media/p3plus/dev/nakashima-craft-gallery"]
-trust_level = "trusted"
-
-[projects."/media/p3plus/dev/regret-zero"]
-trust_level = "trusted"
+# project trust ([projects.*]) は端末依存なので、このテンプレートには置かない。
+# Codex が追記した trust は local ~/.codex/autonomous.config.toml 側で管理する。

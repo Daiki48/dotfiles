@@ -21,6 +21,9 @@
 .claude/telemetry/
 .claude/todos/
 
+# Codex local state - excluded from version control
+.codex/config.toml
+
 # Gemini CLI - excluded (API keys)
 .gemini/.env
 .gemini/credentials/

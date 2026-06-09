@@ -75,7 +75,7 @@ Daiki の要望:
 
 - **真因（追加で判明）**: Codex は **trusted project の `.codex/config.toml` を project config として読み、`--profile` の値を上書きする**
   （公式 Config Reference: 優先順位は `project config > profile`、closest wins for trusted projects only）。
-  base config の `[projects."/home/daiki/dotfiles"] trust_level = "trusted"` のため、
+  base config の `[projects."<dotfiles path>"] trust_level = "trusted"` のため、
   `~/dotfiles/.codex/config.toml`（read-only）が `~/dotfiles` 内での `--profile autonomous` を read-only に上書きしていた。
 - 一方この同じファイルは install CLI（`packages/cli`）の `copy_if_not_exists` で
   **新端末の `~/.codex/config.toml` テンプレート**としても使われており、2 役割を兼任していた。
@@ -148,17 +148,17 @@ Daiki の要望:
 ```
 ~/dotfiles/.codex/
 ├── AGENTS.md                  # モード定義（sandbox mode で判定）         -> ~/.codex/ へ symlink
-├── teacher.config.toml        # profile v2: read-only / on-request / gpt-5.5  -> symlink
-├── autonomous.config.toml     # profile v2: workspace-write / gpt-5.5         -> symlink
+├── teacher.config.toml        # profile v2: read-only / on-request / gpt-5.5  ※ install CLI が ~/.codex/ へ copy
+├── autonomous.config.toml     # profile v2: workspace-write / gpt-5.5         ※ install CLI が ~/.codex/ へ copy
 ├── config.base.toml           # 新端末用 base テンプレート（端末非依存）      ※ install CLI が ~/.codex/config.toml へ copy
 ├── rules/default.rules        # コマンド単位制御（git forbidden / rm prompt） -> symlink
 └── hooks/block_git_write.py    # git 書き込みガード hook（command で参照）
 
 ~/.codex/（実体・ローカル管理）
 ├── config.toml                # base: グローバルデフォルト + projects(端末依存) + hooks定義 + hooks.state(trusted_hash)
+├── teacher.config.toml        # profile v2 + projects(端末依存)
+├── autonomous.config.toml     # profile v2 + projects(端末依存)
 ├── AGENTS.md              -> dotfiles（symlink）
-├── teacher.config.toml    -> dotfiles（symlink）
-├── autonomous.config.toml -> dotfiles（symlink）
 └── rules/default.rules    -> dotfiles（symlink）
 ```
 

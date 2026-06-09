@@ -6,5 +6,5 @@ model_reasoning_effort = "high"
 approval_policy = "on-request"
 sandbox_mode = "read-only"
 
-[projects."/media/p3plus/dev/nakashima-craft-gallery"]
-trust_level = "trusted"
+# project trust ([projects.*]) は端末依存なので、このテンプレートには置かない。
+# Codex が追記した trust は local ~/.codex/teacher.config.toml 側で管理する。
