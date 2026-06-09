@@ -27,7 +27,7 @@ sandbox_mode = "read-only"
 [sandbox_workspace_write]
 network_access = true
 
-# Git 書き込み系を approval 設定に依存せず確実にブロックするガードレール（全 profile 共通）。
+# Git 書き込み系と削除系コマンドを approval 設定に依存せず確実にブロックするガードレール（全 profile 共通）。
 # rules の forbidden は approval=never（exec 等）では評価されないため、hook で固める。
 # ⚠️ 新端末ではこの hook の trust 登録が必須: 対話 `codex` を起動し `/hooks` で信頼登録すること。
 #    信頼登録するまで hook はスキップされる。
@@ -38,4 +38,4 @@ matcher = "^Bash$"
 type = "command"
 command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
 timeout = 10
-statusMessage = "Git 書き込みガードを確認中"
+statusMessage = "危険コマンドガードを確認中"
