@@ -55,6 +55,7 @@
       "Bash(git reset --hard *)"
     ]
   },
+  "model": "claude-fable-5[1m]",
   "hooks": {
     "PostToolUse": [
       {
@@ -73,6 +74,6 @@
     "typescript-lsp@claude-plugins-official": true
   },
   "language": "japanese",
-  "effortLevel": "xhigh",
+  "effortLevel": "medium",
   "skipAutoPermissionPrompt": true
 }
