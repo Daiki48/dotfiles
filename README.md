@@ -55,8 +55,8 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | Command | Description | Honors `--distro` |
 |---------|-------------|:-----------------:|
 | `zsh` | Install zsh (apt on Ubuntu / dnf on Fedora), symlink `.zshrc`, `.zsh/`, `.zprofile`, `.profile`, then run `chsh -s $(which zsh)` to change the default login shell. | yes |
-| `neovim --tag <tag>` | Build Neovim from source at the given git tag (e.g. `v0.12.2`) and install it via `sudo make install`. Also symlinks `~/.config/nvim`. If Neovim is already installed, only the symlink step runs. | yes |
-| `neovim-update --tag <tag>` | Update an existing Neovim install to the given tag. Runs `git fetch --depth 1` for the tag, `git checkout`, `make distclean`, `make CMAKE_BUILD_TYPE=Release`, then `sudo make install`. The tag is verified against the remote before any work begins. | yes |
+| `neovim --tag <tag>` | Ensure `tree-sitter-cli >= 0.26.1` is installed, build Neovim from source at the given git tag (e.g. `v0.12.2`), and install it via `sudo make install`. Also symlinks `~/.config/nvim`. Ubuntu installs Tree-sitter via Cargo; Fedora uses dnf. If Neovim is already installed, its build is skipped. | yes |
+| `neovim-update --tag <tag>` | Ensure `tree-sitter-cli >= 0.26.1` is installed, then update an existing Neovim install to the given tag. Runs `git fetch --depth 1` for the tag, `git checkout`, `make distclean`, `make CMAKE_BUILD_TYPE=Release`, then `sudo make install`. The tag is verified against the remote before any work begins. | yes |
 | `build-nvim-config` | Build the `nvim-config` Rust library with `cargo build --release -p nvim-config` and copy `libnvim_config.so` (Linux) / `libnvim_config.dylib` (macOS) into `~/.config/nvim/lua/`. The file is **copied**, not symlinked. | no |
 | `wezterm` | Install WezTerm. Ubuntu: `sudo apt update` then `sudo apt install -y wezterm`. Fedora: `dnf install` from the official GitHub release rpm. Symlinks `~/.config/wezterm`. | yes |
 | `alacritty` | Install Alacritty via apt/dnf and symlink `~/.config/alacritty`. | yes |

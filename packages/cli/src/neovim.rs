@@ -5,10 +5,12 @@ use crate::common::Distro;
 use crate::utils::{create_symlink, run_command};
 
 const NEOVIM_REPO_URL: &str = "https://github.com/neovim/neovim.git";
+const MIN_TREE_SITTER_CLI_VERSION: (u32, u32, u32) = (0, 26, 1);
 
 /// Neovimの初回セットアップ（指定タグでビルド・インストール）
 pub fn setup(distro: &Distro, tag: &str) -> Result<()> {
     verify_tag_exists(tag)?;
+    ensure_tree_sitter_cli(distro)?;
 
     if is_nvim_installed() {
         println!("Neovimは既にインストールされています。");
@@ -41,6 +43,7 @@ pub fn update(distro: &Distro, tag: &str) -> Result<()> {
     println!("------------------------------------");
 
     verify_tag_exists(tag)?;
+    ensure_tree_sitter_cli(distro)?;
 
     println!("\nタグ {} にアップデートします...", tag);
     build_from_source(distro, tag)?;
@@ -107,6 +110,85 @@ fn is_nvim_installed() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// nvim-treesitterが必要とするtree-sitter CLIを用意
+fn ensure_tree_sitter_cli(distro: &Distro) -> Result<()> {
+    if let Some(version) = installed_tree_sitter_version()
+        && version >= MIN_TREE_SITTER_CLI_VERSION
+    {
+        println!(
+            "tree-sitter CLI {}.{}.{} はインストール済みです。",
+            version.0, version.1, version.2
+        );
+        return Ok(());
+    }
+
+    println!("tree-sitter CLI 0.26.1以上をインストールします...");
+
+    let cmd = match distro {
+        Distro::Ubuntu => {
+            // Ubuntuの標準パッケージは必要バージョン未満のためCargoを使用する
+            let mut cmd = Command::new("cargo");
+            cmd.args([
+                "install",
+                "--locked",
+                "--version",
+                "^0.26.1",
+                "tree-sitter-cli",
+            ]);
+            cmd
+        }
+        Distro::Fedora => {
+            let mut cmd = Command::new("sudo");
+            cmd.args(["dnf", "install", "-y", "tree-sitter-cli"]);
+            cmd
+        }
+    };
+
+    run_command(cmd, "tree-sitter CLIのインストールに失敗しました")?;
+
+    let version = installed_tree_sitter_version()
+        .context("tree-sitter CLIをインストールしましたが、PATHから実行できません")?;
+    if version < MIN_TREE_SITTER_CLI_VERSION {
+        anyhow::bail!(
+            "tree-sitter CLI {}.{}.{} は古すぎます。0.26.1以上が必要です。",
+            version.0,
+            version.1,
+            version.2
+        );
+    }
+
+    println!(
+        "tree-sitter CLI {}.{}.{} のインストールが完了しました。",
+        version.0, version.1, version.2
+    );
+    Ok(())
+}
+
+fn installed_tree_sitter_version() -> Option<(u32, u32, u32)> {
+    let output = Command::new("tree-sitter").arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_tree_sitter_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_tree_sitter_version(output: &str) -> Option<(u32, u32, u32)> {
+    let version = output.split_whitespace().nth(1)?;
+    let mut components = version.split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    let patch = components
+        .next()?
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+
+    Some((major, minor, patch))
 }
 
 /// 指定タグでNeovimをソースビルド
@@ -239,4 +321,27 @@ fn build_from_source(distro: &Distro, tag: &str) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_tree_sitter_version;
+
+    #[test]
+    fn tree_sitterのバージョンを解析できる() {
+        assert_eq!(
+            parse_tree_sitter_version("tree-sitter 0.26.9\n"),
+            Some((0, 26, 9))
+        );
+        assert_eq!(
+            parse_tree_sitter_version("tree-sitter 0.27.0-dev\n"),
+            Some((0, 27, 0))
+        );
+    }
+
+    #[test]
+    fn 不正なバージョン文字列は拒否する() {
+        assert_eq!(parse_tree_sitter_version("tree-sitter unknown\n"), None);
+        assert_eq!(parse_tree_sitter_version(""), None);
+    }
 }
