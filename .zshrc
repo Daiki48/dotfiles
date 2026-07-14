@@ -68,7 +68,7 @@ umask 022
 unset VOLTA_HOME
 path=("${(@)path:#$HOME/.volta/bin}")
 
-. "$HOME/.deno/env"
+[ -f "$HOME/.deno/env" ] && . "$HOME/.deno/env"
 
 export PATH="$PATH:/snap/bin"
 
