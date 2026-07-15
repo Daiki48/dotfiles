@@ -1,10 +1,10 @@
 # 自律モード（profile v2 / 端末非依存・dotfiles 管理）
 # 起動: codex --profile autonomous
 # 危険コマンド以外は自動。ワークスペース内の編集・検証コマンドは確認なしで実行する。
-# Git 書き込み系と削除系コマンドは hook（block_git_write.py / approval 非依存で常時有効）でブロックする。
+# Git 書き込み系は hook（block_git_write.py）でブロックし、削除系は rules で確認する。
 model = "gpt-5.5"
 model_reasoning_effort = "high"
-approval_policy = "never"
+approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 plan_mode_reasoning_effort = "high"
 

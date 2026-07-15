@@ -57,7 +57,8 @@ Daiki の要望:
 ### 3. rules（コマンド単位制御）を dotfiles 管理
 
 - `~/dotfiles/.codex/rules/default.rules`（`~/.codex/rules/default.rules` へ symlink）。
-- git 書き込み系 = `forbidden` / `rm`・`rmdir`・`mv` = `prompt` / git 読み取り系 = `allow` / 既存 allow（curl, npm install, cargo 等）維持。
+- git 書き込み系 = `forbidden` / `rm`・`rmdir` = `prompt` / `mv` = `allow` / git 読み取り系 = `allow` / 既存 allow（curl, npm install, cargo 等）維持。
+- `cargo info` は crate 名・バージョンにかかわらず `allow` とし、同種の照会で確認を繰り返さない。
 - **実証済み**: `codex execpolicy check` で 42 ケース全て期待どおり。
 - ⚠️ ただし rules の `forbidden` は approval=never では効かない（下記「重要な制約」参照）。
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Codex PreToolUse hook: 危険コマンドをブロックするガードレール。
+"""Codex PreToolUse hook: Git 書き込みをブロックするガードレール。
 
 approval_policy=never でも評価される PreToolUse hook で、git の書き込み系
-サブコマンド（push/pull/commit/...）と削除系コマンド（rm/rmdir）を deny する。
-読み取り系 git（status/log/diff/...）と削除以外の一般コマンドは素通しする。
+サブコマンド（push/pull/commit/...）を deny する。
+読み取り系 git（status/log/diff/...）と一般コマンドは素通しする。
 
 rules の forbidden は approval=never（exec 等）では評価されないため、
 承認設定に依存しない確実なガードとして本 hook を用いる。
@@ -20,9 +20,6 @@ GIT_WRITE = {
     "revert", "add", "rm", "mv", "apply", "am", "tag", "gc", "prune",
     "config", "worktree", "submodule",
 }
-
-# 削除は全面禁止。退避が必要な場合は mv でリネームする。
-DELETE_COMMANDS = {"rm", "rmdir"}
 
 # `-c key=val` のように直後のトークンが値になるグローバルオプション
 OPTS_WITH_VALUE = {"-c", "--config", "-C", "--git-dir", "--work-tree", "--namespace"}
@@ -59,16 +56,8 @@ def first_git_subcommand_is_write(tokens):
     return False
 
 
-def first_command_is_delete(tokens):
-    """最初の実行コマンドが削除系なら True。"""
-    if not tokens:
-        return False
-    cmd = tokens[0]
-    return cmd in DELETE_COMMANDS or cmd.endswith("/rm") or cmd.endswith("/rmdir")
-
-
 def blocked_reason(command):
-    """パイプ・連結・サブシェルで分割し、危険コマンドがあれば理由を返す。"""
+    """パイプ・連結・サブシェルで分割し、Git 書き込みがあれば理由を返す。"""
     segments = re.split(r"[;\n|&()`]+|&&|\|\|", command)
     for seg in segments:
         seg = seg.strip()
@@ -80,8 +69,6 @@ def blocked_reason(command):
             tokens = seg.split()
         if first_git_subcommand_is_write(tokens):
             return "Git の書き込み系操作は Daiki が手動で実施します"
-        if first_command_is_delete(tokens):
-            return "削除系コマンドは使用禁止です。必要なら mv でリネームして退避します"
     return None
 
 

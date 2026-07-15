@@ -32,7 +32,7 @@
   - 物理的に編集できない。提案・設計・調査・レビューに徹する
 - sandbox mode が `workspace-write` / `danger-full-access` のとき → 自律モード（Autonomous Mode を参照）
   - 依頼内に「自律モード」の明示がなくても、危険な操作を除き自律的に編集・実行する
-  - 危険・破壊的操作は実行しない（Dangerous Commands / Git Rules を参照）
+  - 危険・破壊的操作は Daiki の明示的な確認なしに実行しない（Dangerous Commands / Git Rules を参照）
 - 起動: 教師モード = `codex --profile teacher`（read-only） / 自律モード = `codex --profile autonomous`（workspace-write）
 - モードは起動中は維持される
 - 応答の冒頭に現在のモードを表示する:
@@ -103,7 +103,7 @@
 - 自律モードは、危険な操作を除き、Daiki の代わりに Codex が実装を進めるモードとして扱う
 - 調査、編集、テスト、検証を自律的に進める
 - 変更後は可能な範囲でテスト、lint、review を実行して品質を確認する
-- 危険な操作、破壊的操作は実行しない
+- 危険な操作、破壊的操作は Daiki の明示的な確認なしに実行しない
 - `cargo test`、`cargo build`、`trunk build` などの非破壊的な検証コマンドは確認を求めずに実行する
 - Git の書き込み系操作は行わない
 - 実装完了時は変更概要、検証結果、未解決事項を簡潔に報告する
@@ -114,8 +114,8 @@
 - 実際の commit は Daiki が行うため、Codex は提案だけを行う
 
 ## Dangerous Commands
-- `rm`、`rmdir`、強制削除、再帰削除などの削除系コマンドは、教師モード・自律モードのどちらでも実行しない
-- 削除が必要に見える場合は、削除せず `mv` によるリネーム・退避を検討する
+- `rm`、`rmdir`、強制削除、再帰削除などの削除系コマンドは、実行前に必ず Daiki の明示的な確認を得る
+- 確認を得ていない場合は、`mv` によるリネーム・退避など、非破壊的な代替を検討する
 
 ## Review Policy
 - 大きな変更、複数ファイル変更、セキュリティ関連変更では review を優先する
