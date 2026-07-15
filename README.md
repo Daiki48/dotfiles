@@ -63,6 +63,7 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `ghostty` | Install Ghostty. Ubuntu: community installer at `mkasberg/ghostty-ubuntu`. Fedora: `dnf install ghostty`. Symlinks `~/.config/ghostty`. | yes |
 | `zellij` | Install Zellij. Ubuntu: `cargo install zellij`. Fedora: `dnf install zellij`. Symlinks `~/.config/zellij`. | yes |
 | `tmux` | Install tmux via apt/dnf, clone [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager) into `~/.config/tmux/plugins/tpm`, and symlink `~/.config/tmux/tmux.conf`. After setup, press `Ctrl+g` then `I` (capital i) inside tmux to install plugins. | yes |
+| `mise [TOOL@VERSION]...` | Install mise from its recommended apt/dnf repository. Optional tool arguments are installed and recorded in the global mise config; with no arguments, only mise itself is installed. Shell activation is provided by the managed `.zshrc`. | yes |
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
 | `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks `~/.codex/AGENTS.md`, rules, and hooks, then copies profile templates and `config.base.toml` to `~/.codex/` (only if they do not already exist, so local edits are preserved). If an existing config uses legacy `profile` / `[profiles.*]` settings, it is backed up and replaced with the current base config. | no |
 | `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`, `~/.gemini/GEMINI.md`, and `~/.gemini/policies/`. Requires `GEMINI_API_KEY` exported in your shell. | no |
@@ -120,7 +121,13 @@ cargo run -- --distro fedora neovim --tag v0.12.2
 cargo run -- --distro fedora neovim-update --tag v0.12.2
 cargo run -- --distro fedora wezterm
 cargo run -- --distro fedora tmux
+cargo run -- --distro fedora mise
+cargo run -- --distro fedora mise node@lts python@latest deno@latest
 ```
+
+The first mise example installs only mise. The second also installs Node.js,
+Python, and Deno as user-wide defaults. For project-specific versions, run
+`mise use node@lts python@latest deno@latest` in the project directory instead.
 
 After running the `zsh` command, restart your terminal and verify the shell:
 

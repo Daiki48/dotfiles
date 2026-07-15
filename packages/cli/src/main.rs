@@ -4,6 +4,7 @@ mod codex;
 mod common;
 mod gemini;
 mod ghostty;
+mod mise;
 mod neovim;
 mod tmux;
 mod utils;
@@ -60,6 +61,12 @@ enum Commands {
     Zellij,
     /// Setup for tmux
     Tmux,
+    /// Setup for mise and optionally install global tools
+    Mise {
+        /// Global tools to install (e.g. node@lts python@latest deno@latest)
+        #[arg(value_name = "TOOL@VERSION")]
+        tools: Vec<String>,
+    },
     /// Setup for Claude Code
     Claude,
     /// Setup for Codex CLI
@@ -153,6 +160,10 @@ fn main() -> anyhow::Result<()> {
             println!("🚀 Starting tmux setup for {:?} ...", cli.distro);
             tmux::setup(&cli.distro)?;
             println!("\n✅ tmux setup completed successfully!");
+        }
+        Commands::Mise { tools } => {
+            println!("🚀 Starting mise setup for {:?} ...", cli.distro);
+            mise::setup(&cli.distro, &tools)?;
         }
         Commands::Claude => {
             claude::setup()?;

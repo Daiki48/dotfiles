@@ -145,11 +145,10 @@ if [ -f '/home/daiki/google-cloud-sdk/path.zsh.inc' ]; then . '/home/daiki/googl
 # The next line enables shell command completion for gcloud.
 if [ -f '/home/daiki/google-cloud-sdk/completion.zsh.inc' ]; then . '/home/daiki/google-cloud-sdk/completion.zsh.inc'; fi
 
-# mise
+# Added by Antigravity CLI installer
+export PATH="/home/daiki/.local/bin:$PATH"
+
+# mise（PATH設定より後で有効化し、mise管理ツールを優先する）
 if command -v mise >/dev/null 2>&1; then
     eval "$(mise activate zsh)"
 fi
-
-
-# Added by Antigravity CLI installer
-export PATH="/home/daiki/.local/bin:$PATH"
