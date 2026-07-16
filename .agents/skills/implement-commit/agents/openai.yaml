@@ -1,0 +1,4 @@
+interface:
+  display_name: "1コミット分を実装"
+  short_description: "承認済み計画から1コミット単位だけを実装・検証します"
+  default_prompt: "$implement-commit を使い、承認済み計画の現在の1コミット単位だけを実装・検証してください。"

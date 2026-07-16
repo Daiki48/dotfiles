@@ -15,6 +15,10 @@ const CODEX_FILES: &[(&str, &str)] = &[
     ),
 ];
 
+// Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
+// ディレクトリごとリンクすることで、Skill の追加時に CLI 側の列挙を更新せずに済む。
+const CODEX_DIRS: &[(&str, &str)] = &[(".agents/skills", ".agents/skills")];
+
 // テンプレート専用ファイルは ~/.codex/ へコピーし、以後はローカル管理にする。
 // dotfiles 内では `.codex/config.toml` を置かないことで、Codex の project config が
 // profile (teacher/autonomous) を上書きしないようにしている。
@@ -169,6 +173,11 @@ pub fn setup() -> Result<()> {
 
     println!("\nLinking shared configuration files...");
     for (source, dest) in CODEX_FILES {
+        create_symlink(source, dest)?;
+    }
+
+    println!("\nLinking shared skill directories...");
+    for (source, dest) in CODEX_DIRS {
         create_symlink(source, dest)?;
     }
 

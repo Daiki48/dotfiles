@@ -1,0 +1,4 @@
+interface:
+  display_name: "作業ブランチを最終監査"
+  short_description: "コードと仕様を独立した観点で各3周し、最終監査します"
+  default_prompt: "$review-branch を使い、完了した作業ブランチをコード3周・ファクトチェック3周で最終監査してください。"
