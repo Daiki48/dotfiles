@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""Codex PreToolUse hook: Git と GitHub CLI の直接呼び出しを制限する。
+"""Codex PreToolUse hook: 開発ワークフローの危険な直接操作を拒否する。
 
-検出できる Git 呼び出しは許可済みの読み取り操作だけを通す。GitHub CLI は
-Issue の管理操作と読み取り専用操作だけを許可し、それ以外を拒否する。
-
-rules の forbidden は approval=never（exec 等）では評価されないため、
-直接コマンドを早期拒否する多層防御として本 hook を用いる。任意のscriptや
-外部programの内部処理までは解析できないため、sandboxやAGENTS.mdと併用する。
+Git/GitHub CLI は安全な形だけを許可し、削除コマンド、保護ブランチへの
+書き込み、履歴改変、AI帰属、秘密情報を含むcommit/PRを早期拒否する。
+rules、workspace-write sandbox、AGENTS.mdと併用する多層防御であり、
+任意のプログラム内部まで解析できる完全なセキュリティ境界ではない。
 """
+
 import json
 import os
+from pathlib import Path
+import re
 import shlex
+import subprocess
 import sys
 
-# Git は既知の書き込み操作を列挙せず、許可した読み取り専用操作だけを通す。
-# これにより update-ref や alias など未知の変更経路も安全側で拒否できる。
+
 GIT_READ_ONLY = {
     "status", "log", "diff", "show", "rev-parse", "blame", "shortlog",
     "describe", "reflog", "ls-files", "ls-tree", "cat-file", "rev-list",
     "merge-base", "name-rev", "grep",
 }
-
-# 対象リポジトリを指定するだけのグローバルオプションは読み取り時も許可する。
+GIT_SAFE_WRITE = {"add", "commit", "fetch", "push", "switch"}
 GIT_OPTS_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace"}
 GIT_FORBIDDEN_GLOBAL_OPTS = {"-c", "--config", "--config-env", "--exec-path"}
 
@@ -34,18 +34,22 @@ BRANCH_WRITE_ARGS = {
     "--edit-description", "--set-upstream-to", "--unset-upstream",
     "--create-reflog",
 }
-
 REMOTE_READ_ARGS = {"-v", "--verbose"}
 
-# Issue は外部記憶として Codex から更新できる。ブランチを作る develop と
-# 破壊的な delete は含めない。
-GH_ISSUE_ALLOWED = {
-    "list", "status", "view", "create", "edit", "comment", "close",
-    "reopen", "pin", "unpin", "lock", "unlock", "transfer",
+BRANCH_PREFIXES = {
+    "feat", "feature", "fix", "refactor", "docs", "test", "chore", "ci",
+    "build", "perf", "style", "hotfix", "update",
 }
+PROTECTED_BRANCHES = {"main", "master", "develop", "development", "trunk"}
+PROTECTED_BRANCH_PATTERNS = (
+    re.compile(r"^release(?:/|$)"),
+    re.compile(r"^production(?:/|$)"),
+)
+BRANCH_RE = re.compile(r"^[a-z][a-z0-9-]*/[a-z0-9][a-z0-9._-]*$")
 
-# GitHub 上の状態を変えないサブコマンドだけを列挙する。未知のコマンドや
-# extension は安全側に倒して拒否する。
+GH_ISSUE_ALLOWED = {
+    "list", "status", "view", "create", "edit", "comment",
+}
 GH_READ_ONLY = {
     "pr": {"list", "view", "status", "checks", "diff"},
     "run": {"list", "view", "watch", "download"},
@@ -60,12 +64,41 @@ GH_READ_ONLY = {
 }
 GH_READ_ONLY_TOP_LEVEL = {"status", "search"}
 GH_GLOBAL_OPTS_WITH_VALUE = {"-R", "--repo", "--hostname"}
+
+DESTRUCTIVE_COMMANDS = {"rm", "rmdir", "unlink", "shred"}
 SHELLS = {"bash", "dash", "sh", "zsh"}
+COMMAND_WRAPPERS = {"command", "env", "nohup", "sudo"}
+ENV_OPTS_WITH_VALUE = {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
+SUDO_OPTS_WITH_VALUE = {
+    "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
+    "-C", "--chdir", "-R", "--chroot", "-T", "--command-timeout", "-r",
+    "--role", "-t", "--type",
+}
 SHELL_PUNCTUATION = ";&|()`"
+AI_ATTRIBUTION_RE = re.compile(
+    r"(?i)(co-authored-by\s*:\s*.*(?:codex|openai)|generated(?:-| )by\s*:\s*"
+    r".*(?:codex|openai)|signed-off-by\s*:\s*.*(?:codex|openai))"
+)
+COMMIT_SUBJECT_RE = re.compile(r"^:[a-z0-9_+-]+: \S.*$")
+
+SECRET_PATTERNS = (
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"AIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+)
+SENSITIVE_FILENAMES = {
+    ".env", "auth.json", "credentials.json", ".credentials.json",
+    "id_rsa", "id_ed25519",
+}
+SENSITIVE_SUFFIXES = {".pem", ".p12", ".pfx", ".jks", ".keystore"}
 
 
 def _branch_arg_is_write(arg):
-    """git branch の変更オプション（値を結合した形式を含む）なら True。"""
+    """git branch の変更オプション（値を結合した形式を含む）ならTrue。"""
     if arg in BRANCH_WRITE_ARGS:
         return True
     if any(
@@ -75,48 +108,6 @@ def _branch_arg_is_write(arg):
     ):
         return True
     return len(arg) > 2 and arg[:2] in {"-d", "-D", "-m", "-M", "-c", "-C"}
-
-
-def first_git_subcommand_is_write(tokens):
-    """git 呼び出しが許可済みの読み取り用途でなければ True。"""
-    for i, tok in enumerate(tokens):
-        if tok == "git" or tok.endswith("/git"):
-            skip_next = False
-            git_args = tokens[i + 1:]
-            for j, t in enumerate(git_args):
-                if skip_next:
-                    skip_next = False
-                    continue
-                if t in GIT_FORBIDDEN_GLOBAL_OPTS or any(
-                    t.startswith(f"{option}=")
-                    for option in GIT_FORBIDDEN_GLOBAL_OPTS
-                ):
-                    return True
-                if t.startswith("-c") and t != "-C":
-                    return True
-                if t in GIT_OPTS_WITH_VALUE:
-                    skip_next = True
-                    continue
-                if any(
-                    t.startswith(f"{option}=") for option in GIT_OPTS_WITH_VALUE
-                ):
-                    continue
-                if t.startswith("-"):
-                    continue  # その他のグローバルオプションは読み飛ばす
-                rest = git_args[j + 1:]
-                if t == "branch":
-                    if any(_branch_arg_is_write(arg) for arg in rest):
-                        return True
-                    if "--list" in rest or "-l" in rest:
-                        return False
-                    branch_arg, _ = _first_command(
-                        rest, BRANCH_READ_OPTS_WITH_VALUE
-                    )
-                    return branch_arg is not None
-                if t == "remote":
-                    return any(arg not in REMOTE_READ_ARGS for arg in rest)
-                return t not in GIT_READ_ONLY
-    return False
 
 
 def _first_command(args, options_with_value=frozenset()):
@@ -137,71 +128,461 @@ def _first_command(args, options_with_value=frozenset()):
     return None, []
 
 
+def _command_start(tokens):
+    """envやsudoなどを読み飛ばし、実際の実行コマンド位置を返す。"""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        basename = os.path.basename(token)
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            index += 1
+            continue
+        if basename not in COMMAND_WRAPPERS:
+            return index
+        index += 1
+        options_with_value = frozenset()
+        if basename == "env":
+            options_with_value = ENV_OPTS_WITH_VALUE
+        elif basename == "sudo":
+            options_with_value = SUDO_OPTS_WITH_VALUE
+        while index < len(tokens):
+            option = tokens[index]
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", option):
+                index += 1
+                continue
+            if option == "--":
+                index += 1
+                break
+            if option in options_with_value:
+                index += 2
+                continue
+            if any(option.startswith(f"{item}=") for item in options_with_value if item.startswith("--")):
+                index += 1
+                continue
+            if option.startswith("-"):
+                index += 1
+                continue
+            break
+    return None
+
+
+def _is_protected_branch(branch):
+    branch = branch.removeprefix("refs/heads/")
+    return branch in PROTECTED_BRANCHES or any(
+        pattern.match(branch) for pattern in PROTECTED_BRANCH_PATTERNS
+    )
+
+
+def _valid_work_branch(branch):
+    branch = branch.removeprefix("refs/heads/")
+    if _is_protected_branch(branch) or not BRANCH_RE.fullmatch(branch):
+        return False
+    prefix = branch.split("/", 1)[0]
+    return prefix in BRANCH_PREFIXES and prefix != "codex"
+
+
+def _option_values(args, short, long):
+    """短形式・長形式の指定値を列挙する。"""
+    values = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in {short, long}:
+            if index + 1 >= len(args):
+                return None
+            values.append(args[index + 1])
+            index += 2
+            continue
+        if token.startswith(f"{long}="):
+            values.append(token.split("=", 1)[1])
+        elif short and token.startswith(short) and token != short:
+            values.append(token[len(short):])
+        index += 1
+    return values
+
+
+def _git_add_reason(args):
+    if "--" not in args:
+        return "git add は -- の後に対象パスを明示してください"
+    separator = args.index("--")
+    options = args[:separator]
+    paths = args[separator + 1:]
+    if options or not paths:
+        return "git add のオプション指定または空の対象は許可されていません"
+    for path in paths:
+        if path in {".", ".."} or path.startswith("-"):
+            return "git add は個別のファイルまたはディレクトリだけを指定してください"
+        if any(char in path for char in "*?[]"):
+            return "git add でglobは使用できません"
+    return None
+
+
+def _git_commit_reason(args):
+    forbidden = {
+        "--amend", "--no-verify", "--signoff", "-s", "--author", "--date",
+        "--reset-author", "--fixup", "--squash", "--reuse-message", "-C",
+        "--reedit-message", "-c", "--no-gpg-sign",
+    }
+    for arg in args:
+        if arg in forbidden or any(
+            arg.startswith(f"{option}=") for option in forbidden if option.startswith("--")
+        ):
+            return "履歴改変、検証回避、author・帰属の上書きは許可されていません"
+    messages = _option_values(args, "-m", "--message")
+    if messages is None or len(messages) != 1:
+        return "commit messageは-mで1件だけ明示してください"
+    message = messages[0]
+    allowed_tokens = {"-m", "--message", "-S", "--gpg-sign"}
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in {"-m", "--message"}:
+            index += 2
+            continue
+        if token.startswith("--message=") or (token.startswith("-m") and token != "-m"):
+            index += 1
+            continue
+        if token in allowed_tokens or token.startswith("--gpg-sign="):
+            index += 1
+            continue
+        return "git commit ではmessageとDaikiの署名設定以外の引数を使用できません"
+    if "\n" in message or not COMMIT_SUBJECT_RE.fullmatch(message):
+        return "commit messageは':gitmoji: 短い要約'の1行形式にしてください"
+    if AI_ATTRIBUTION_RE.search(message):
+        return "CodexまたはOpenAIのAI帰属は記録できません"
+    if _contains_secret(message):
+        return "commit messageに秘密情報らしい値が含まれています"
+    return None
+
+
+def _git_fetch_reason(args):
+    if len(args) != 2 or args[0] != "origin":
+        return "git fetch はoriginと単一のbase branchを明示してください"
+    base = args[1].removeprefix("refs/heads/")
+    if base not in PROTECTED_BRANCHES and not any(
+        pattern.match(base) for pattern in PROTECTED_BRANCH_PATTERNS
+    ):
+        return "git fetch のbase branchが許可範囲外です"
+    return None
+
+
+def _git_switch_reason(args):
+    if len(args) != 3 or args[0] not in {"-c", "--create"}:
+        return "git switch は新規作業ブランチの作成だけ許可されます"
+    branch, start = args[1], args[2]
+    if not _valid_work_branch(branch):
+        return "一般的なprefixを持つ非保護作業ブランチを指定してください"
+    if not start.startswith("origin/") or not _is_protected_branch(start[7:]):
+        return "作業ブランチはoriginのbase branchから作成してください"
+    return None
+
+
+def _git_push_reason(args, cwd):
+    if any(
+        arg in {"--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"}
+        or arg.startswith("--force-with-lease=")
+        for arg in args
+    ):
+        return "force、削除、mirror、tagまたは一括pushは許可されていません"
+    if len(args) != 3 or args[0] not in {"-u", "--set-upstream"} or args[1] != "origin":
+        return "pushはoriginへの単一作業ブランチを明示してください"
+    refspec = args[2]
+    if not refspec.startswith("HEAD:refs/heads/"):
+        return "push元はHEAD、push先はrefs/heads/<branch>で明示してください"
+    branch = refspec.removeprefix("HEAD:refs/heads/")
+    if not _valid_work_branch(branch):
+        return "保護ブランチまたは許可されていないprefixへのpushです"
+    return _push_preflight_reason(cwd, branch)
+
+
+def _git_invocation_reason(tokens, cwd=None):
+    start = _command_start(tokens)
+    if start is None or os.path.basename(tokens[start]) != "git":
+        return None
+    git_args = tokens[start + 1:]
+    skip_next = False
+    global_option_used = False
+    for index, token in enumerate(git_args):
+        if skip_next:
+            skip_next = False
+            continue
+        if token in GIT_FORBIDDEN_GLOBAL_OPTS or any(
+            token.startswith(f"{option}=") for option in GIT_FORBIDDEN_GLOBAL_OPTS
+        ):
+            return "gitの設定・aliasによるコマンド上書きは許可されていません"
+        if token.startswith("-c") and token != "-C":
+            return "git -cによる設定・alias上書きは許可されていません"
+        if token in GIT_OPTS_WITH_VALUE:
+            global_option_used = True
+            skip_next = True
+            continue
+        if any(token.startswith(f"{option}=") for option in GIT_OPTS_WITH_VALUE):
+            global_option_used = True
+            continue
+        if token.startswith("-"):
+            global_option_used = True
+            continue
+
+        args = git_args[index + 1:]
+        if token == "branch":
+            if any(_branch_arg_is_write(arg) for arg in args):
+                return "git branchの変更操作は許可されていません"
+            if "--list" in args or "-l" in args:
+                return None
+            branch_arg, _ = _first_command(args, BRANCH_READ_OPTS_WITH_VALUE)
+            return None if branch_arg is None else "git branchは一覧・照会だけ許可されます"
+        if token == "remote":
+            return None if all(arg in REMOTE_READ_ARGS for arg in args) else "git remoteは照会だけ許可されます"
+        if token in GIT_READ_ONLY:
+            return None
+        if token not in GIT_SAFE_WRITE:
+            return "許可されていないGit書き込み操作です"
+        if global_option_used:
+            return "Git書き込みではglobal optionや別repository指定を使用できません"
+
+        if token == "push":
+            reason = _git_push_reason(args, cwd)
+        else:
+            reason = {
+                "add": _git_add_reason,
+                "commit": _git_commit_reason,
+                "fetch": _git_fetch_reason,
+                "switch": _git_switch_reason,
+            }[token](args)
+        if reason:
+            return reason
+        if token == "commit":
+            return _staged_secret_reason(cwd)
+        return None
+    return None
+
+
 def _gh_api_is_write(args):
-    """gh api が GET 以外、または入力付きリクエストなら True。"""
     mutation_flags = {"-f", "--raw-field", "-F", "--field", "--input"}
     index = 0
     while index < len(args):
         token = args[index]
-        if token in mutation_flags:
+        if token in mutation_flags or any(token.startswith(f"{flag}=") for flag in mutation_flags):
             return True
-        if any(token.startswith(f"{flag}=") for flag in mutation_flags):
-            return True
-        if token.startswith("-f") and token != "-f":
-            return True
-        if token.startswith("-F") and token != "-F":
+        if token.startswith("-f") and token != "-f" or token.startswith("-F") and token != "-F":
             return True
         if token in {"-X", "--method"}:
             if index + 1 >= len(args) or args[index + 1].upper() != "GET":
                 return True
             index += 2
             continue
-        if token.startswith("--method="):
-            if token.split("=", 1)[1].upper() != "GET":
-                return True
-        elif token.startswith("-X") and token != "-X":
-            if token[2:].upper() != "GET":
-                return True
+        if token.startswith("--method=") and token.split("=", 1)[1].upper() != "GET":
+            return True
+        if token.startswith("-X") and token != "-X" and token[2:].upper() != "GET":
+            return True
         index += 1
     return False
 
 
-def gh_blocked_reason(tokens):
-    """gh 呼び出しが許可範囲外なら拒否理由を返す。"""
-    for index, token in enumerate(tokens):
-        if token != "gh" and not token.endswith("/gh"):
-            continue
+def _required_option(args, short, long):
+    values = _option_values(args, short, long)
+    return values[0] if values is not None and len(values) == 1 else None
 
-        command, args = _first_command(
-            tokens[index + 1:], GH_GLOBAL_OPTS_WITH_VALUE
+
+def _pr_create_reason(args):
+    if "--draft" not in args:
+        return "PRはDraftとして作成してください"
+    if any(option in args for option in {"--fill", "--fill-first", "--fill-verbose", "--web", "--recover"}):
+        return "PRのtitleとbodyは明示してください"
+    repository = _required_option(args, "-R", "--repo")
+    base = _required_option(args, "-B", "--base")
+    head = _required_option(args, "-H", "--head")
+    title = _required_option(args, "-t", "--title")
+    body_file = _required_option(args, "-F", "--body-file")
+    if not all((repository, base, head, title, body_file)):
+        return "Draft PRにはrepo、base、head、title、body-fileを明示してください"
+    if "/" not in repository or _is_protected_branch(head) or not _valid_work_branch(head):
+        return "Draft PRのrepositoryまたはhead branchが許可範囲外です"
+    if not _is_protected_branch(base):
+        return "Draft PRのbase branchが許可範囲外です"
+    if AI_ATTRIBUTION_RE.search(title):
+        return "PR titleにAI帰属を含めることはできません"
+    if _contains_secret(title):
+        return "PR titleに秘密情報らしい値が含まれています"
+    return _file_secret_reason(body_file)
+
+
+def _issue_write_reason(tokens, issue_command, issue_args):
+    repository = _required_option(tokens, "-R", "--repo")
+    if not repository or "/" not in repository:
+        return "Issue書き込みには対象repositoryを明示してください"
+
+    text_flags = {"-t", "--title", "-b", "--body", "--comment"}
+    file_flags = {"-F", "--body-file"}
+    index = 0
+    while index < len(issue_args):
+        token = issue_args[index]
+        if token in text_flags:
+            if index + 1 >= len(issue_args):
+                return "Issueへ送信する本文を検査できません"
+            value = issue_args[index + 1]
+            if _contains_secret(value) or AI_ATTRIBUTION_RE.search(value):
+                return "Issueへ秘密情報またはAI帰属を送信できません"
+            index += 2
+            continue
+        if token in file_flags:
+            if index + 1 >= len(issue_args):
+                return "Issue body fileを検査できません"
+            reason = _file_secret_reason(issue_args[index + 1])
+            if reason:
+                return reason.replace("PR body", "Issue body")
+            index += 2
+            continue
+        for flag in {"--title", "--body", "--comment"}:
+            if token.startswith(f"{flag}="):
+                value = token.split("=", 1)[1]
+                if _contains_secret(value) or AI_ATTRIBUTION_RE.search(value):
+                    return "Issueへ秘密情報またはAI帰属を送信できません"
+        if token.startswith("--body-file="):
+            reason = _file_secret_reason(token.split("=", 1)[1])
+            if reason:
+                return reason.replace("PR body", "Issue body")
+        index += 1
+
+    if issue_command == "create" and not (
+        _required_option(issue_args, "-t", "--title")
+        and (
+            _required_option(issue_args, "-b", "--body")
+            or _required_option(issue_args, "-F", "--body-file")
         )
-        if command is None:
-            return None
-        if command == "issue":
-            issue_command, _ = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
-            if issue_command is None or issue_command in GH_ISSUE_ALLOWED:
-                return None
-            if issue_command == "develop":
-                return "gh issue develop はブランチを作成するため実行できません"
-            if issue_command == "delete":
-                return "GitHub Issue の削除は許可されていません"
-            return "許可されていない GitHub Issue 操作です"
-        if command == "api":
-            if _gh_api_is_write(args):
-                return "gh api は GET の読み取り専用利用に限られます"
-            return None
-        if command in GH_READ_ONLY_TOP_LEVEL:
-            return None
-        if command in GH_READ_ONLY:
-            subcommand, _ = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
-            if subcommand is None or subcommand in GH_READ_ONLY[command]:
-                return None
-        return "GitHub の書き込み操作は Issue 関連だけに制限されています"
+    ):
+        return "Issue作成にはtitleとbodyを明示してください"
     return None
 
 
+def _gh_invocation_reason(tokens):
+    start = _command_start(tokens)
+    if start is None or os.path.basename(tokens[start]) != "gh":
+        return None
+    if "--help" in tokens[start + 1:] or "-h" in tokens[start + 1:]:
+        return None
+    command, args = _first_command(tokens[start + 1:], GH_GLOBAL_OPTS_WITH_VALUE)
+    if command is None:
+        return None
+    if command == "issue":
+        issue_command, issue_args = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
+        if issue_command is None or issue_command in {"list", "status", "view"}:
+            return None
+        if issue_command in {"create", "edit", "comment"}:
+            return _issue_write_reason(tokens[start + 1:], issue_command, issue_args)
+        if issue_command == "develop":
+            return "gh issue developはブランチを作成するため実行できません"
+        if issue_command == "delete":
+            return "GitHub Issueの削除は許可されていません"
+        return "許可されていないGitHub Issue操作です"
+    if command == "api":
+        return "gh apiはGETの読み取り専用利用に限られます" if _gh_api_is_write(args) else None
+    if command == "pr":
+        subcommand, pr_args = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
+        if subcommand == "create":
+            return _pr_create_reason(tokens[start + 1:])
+        if subcommand is None or subcommand in GH_READ_ONLY["pr"]:
+            return None
+        return "PRはDraft作成と読み取り専用操作だけ許可されます"
+    if command in GH_READ_ONLY_TOP_LEVEL:
+        return None
+    if command in GH_READ_ONLY:
+        subcommand, _ = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
+        if subcommand is None or subcommand in GH_READ_ONLY[command]:
+            return None
+    return "許可されていないGitHub書き込み操作です"
+
+
+def _contains_secret(text):
+    return any(pattern.search(text) for pattern in SECRET_PATTERNS)
+
+
+def _sensitive_path(path):
+    candidate = Path(path)
+    name = candidate.name.lower()
+    if name in SENSITIVE_FILENAMES or any(name.endswith(suffix) for suffix in SENSITIVE_SUFFIXES):
+        return True
+    return name.startswith(".env.") and name not in {".env.example", ".env.sample", ".env.template"}
+
+
+def _file_secret_reason(path):
+    if path == "-":
+        return "PR bodyは検査可能なファイルで指定してください"
+    try:
+        contents = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return "PR body fileを安全に検査できません"
+    if _contains_secret(contents):
+        return "PR bodyに秘密情報らしい値が含まれています"
+    if AI_ATTRIBUTION_RE.search(contents):
+        return "PR bodyにCodexまたはOpenAIのAI帰属が含まれています"
+    return None
+
+
+def _run_git(cwd, *args):
+    if not cwd:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=cwd, check=False, capture_output=True,
+            text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _staged_secret_reason(cwd):
+    names = _run_git(cwd, "diff", "--cached", "--name-only", "--diff-filter=ACMR")
+    patch = _run_git(cwd, "diff", "--cached", "--no-ext-diff", "--unified=0", "--")
+    if names is None or patch is None:
+        return "staged changesを検査できないためcommitを拒否しました"
+    return _changes_secret_reason(names, patch, "staged changes")
+
+
+def _changes_secret_reason(names, patch, label):
+    if any(_sensitive_path(name) for name in names.splitlines()):
+        return f"{label}に秘密情報を保持し得るファイルが含まれています"
+    added_lines = "\n".join(
+        line[1:] for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    if _contains_secret(added_lines):
+        return f"{label}に秘密情報らしい値が含まれています"
+    if AI_ATTRIBUTION_RE.search(added_lines):
+        return f"{label}にCodexまたはOpenAIのAI帰属が含まれています"
+    return None
+
+
+def _push_preflight_reason(cwd, branch):
+    current = _run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    if current is None or current.strip() != branch:
+        return "current branchとpush先branchが一致しません"
+
+    remote_target = _run_git(cwd, "rev-parse", "--verify", f"origin/{branch}")
+    if remote_target is not None:
+        base = f"origin/{branch}"
+    else:
+        candidates = []
+        for protected in sorted(PROTECTED_BRANCHES):
+            merge_base = _run_git(cwd, "merge-base", "HEAD", f"origin/{protected}")
+            if merge_base is None:
+                continue
+            distance = _run_git(cwd, "rev-list", "--count", f"{merge_base.strip()}..HEAD")
+            if distance is not None and distance.strip().isdigit():
+                candidates.append((int(distance.strip()), merge_base.strip()))
+        if not candidates:
+            return "未push commitのbaseを特定できません"
+        _, base = min(candidates)
+
+    names = _run_git(cwd, "diff", "--name-only", "--diff-filter=ACMR", f"{base}..HEAD")
+    patch = _run_git(cwd, "diff", "--no-ext-diff", "--unified=0", f"{base}..HEAD", "--")
+    if names is None or patch is None:
+        return "未push commitを検査できません"
+    return _changes_secret_reason(names, patch, "未push commit")
+
+
 def _nested_shell_commands(tokens):
-    """bash -lc '...' などに埋め込まれたコマンド文字列を列挙する。"""
     for index, token in enumerate(tokens):
         if os.path.basename(token) not in SHELLS:
             continue
@@ -216,16 +597,13 @@ def _nested_shell_commands(tokens):
 
 
 def _command_segments(command):
-    """shellの引用を保ったまま、連結されたコマンドをトークン列へ分ける。"""
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=SHELL_PUNCTUATION)
         lexer.whitespace_split = True
         lexer.commenters = ""
         tokens = list(lexer)
     except ValueError:
-        # 引用符が不正なコマンドは通常shellでも失敗する。可能な範囲で検査を続ける。
         tokens = command.split()
-
     segment = []
     for token in tokens:
         if token and all(char in SHELL_PUNCTUATION for char in token):
@@ -238,18 +616,22 @@ def _command_segments(command):
         yield segment
 
 
-def blocked_reason(command, depth=0):
-    """連結コマンドと入れ子のshellを調べ、禁止操作の理由を返す。"""
+def blocked_reason(command, cwd=None, depth=0):
+    """連結コマンドと入れ子shellを調べ、禁止操作の理由を返す。"""
     if depth > 3:
         return "入れ子が深いshellコマンドは安全性を確認できません"
     for tokens in _command_segments(command):
-        if first_git_subcommand_is_write(tokens):
-            return "Git の書き込み系操作は Daiki が手動で実施します"
-        reason = gh_blocked_reason(tokens)
+        start = _command_start(tokens)
+        if start is not None and os.path.basename(tokens[start]) in DESTRUCTIVE_COMMANDS:
+            return "削除コマンドは自動実行できません"
+        reason = _git_invocation_reason(tokens, cwd)
+        if reason:
+            return reason
+        reason = _gh_invocation_reason(tokens)
         if reason:
             return reason
         for nested_command in _nested_shell_commands(tokens):
-            reason = blocked_reason(nested_command, depth + 1)
+            reason = blocked_reason(nested_command, cwd, depth + 1)
             if reason:
                 return reason
     return None
@@ -259,20 +641,13 @@ def main():
     try:
         data = json.load(sys.stdin)
     except Exception:
-        # 入力を解釈できない場合は素通し（git は rules / AGENTS.md でも二重防御）
         sys.exit(0)
-
     tool_input = data.get("tool_input") or {}
     command = tool_input.get("command") or tool_input.get("cmd") or ""
-
-    reason = blocked_reason(command)
+    cwd = tool_input.get("workdir") or tool_input.get("cwd") or data.get("cwd")
+    reason = blocked_reason(command, cwd)
     if reason:
-        reason = f"{reason}（PreToolUse hook が検出した直接操作を拒否しました）。"
-        # deny を二重方式で表現する:
-        #   - stdout の JSON（permissionDecision: deny） … Codex の JSON レスポンス方式
-        #   - stderr の理由 + exit code 2               … Codex の exit code 方式（公式仕様: exit 2 = block）
-        # exit 0 だと JSON が読まれなかった場合に素通り（fail-open）になるため、
-        # どちらが優先評価されても、検出済み操作を拒否できるよう exit 2 にする。
+        reason = f"{reason}（PreToolUse hookが直接操作を拒否しました）。"
         json.dump({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -282,7 +657,6 @@ def main():
         }, sys.stdout)
         print(reason, file=sys.stderr)
         sys.exit(2)
-
     sys.exit(0)
 
 

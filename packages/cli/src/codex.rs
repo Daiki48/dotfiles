@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::utils::{copy_if_not_exists, create_symlink, run_command};
+use crate::utils::{create_symlink, run_command};
 
 const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
@@ -19,17 +19,17 @@ const CODEX_FILES: &[(&str, &str)] = &[
 // ディレクトリごとリンクすることで、Skill の追加時に CLI 側の列挙を更新せずに済む。
 const CODEX_DIRS: &[(&str, &str)] = &[(".agents/skills", ".agents/skills")];
 
-// テンプレート専用ファイルは ~/.codex/ へコピーし、以後はローカル管理にする。
-// dotfiles 内では `.codex/config.toml` を置かないことで、Codex の project config が
-// profile (teacher/autonomous) を上書きしないようにしている。
-// profile ファイルも Codex が project trust を追記するため symlink しない。
-const CODEX_COPY_FILES: &[(&str, &str)] = &[
-    (".codex/config.base.toml", ".codex/config.toml"),
-    (".codex/teacher.config.toml", ".codex/teacher.config.toml"),
-    (
-        ".codex/autonomous.config.toml",
-        ".codex/autonomous.config.toml",
-    ),
+// config.tomlはproject trustやhook trustなどの端末固有値を保持するため、
+// symlinkせず、共有するtop-level keyだけをsetup時に移行する。
+const CODEX_CONFIG_TEMPLATE: &str = ".codex/config.base.toml";
+const MANAGED_CONFIG_KEYS: &[&str] = &[
+    "model",
+    "model_reasoning_effort",
+    "plan_mode_reasoning_effort",
+    "approval_policy",
+    "approvals_reviewer",
+    "sandbox_mode",
+    "commit_attribution",
 ];
 
 fn is_codex_installed() -> bool {
@@ -75,6 +75,68 @@ fn contains_legacy_profile_config(contents: &str) -> bool {
 
         !trimmed.starts_with('#') && (is_profile_selector || is_profile_table)
     })
+}
+
+fn is_managed_assignment(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') || trimmed.starts_with('[') {
+        return false;
+    }
+    MANAGED_CONFIG_KEYS.iter().any(|key| {
+        trimmed
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
+}
+
+fn merge_managed_config(template: &str, existing: &str) -> String {
+    let managed = template
+        .lines()
+        .filter(|line| is_managed_assignment(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut in_top_level = true;
+    let mut in_workspace_sandbox = false;
+    let mut workspace_sandbox_found = false;
+    let mut preserved_lines = Vec::new();
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            in_top_level = false;
+            in_workspace_sandbox = trimmed == "[sandbox_workspace_write]";
+            if in_workspace_sandbox {
+                workspace_sandbox_found = true;
+            }
+        }
+        if in_top_level && is_managed_assignment(line) {
+            continue;
+        }
+        if in_workspace_sandbox
+            && trimmed
+                .strip_prefix("network_access")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        {
+            continue;
+        }
+        preserved_lines.push(line);
+        if in_workspace_sandbox && trimmed == "[sandbox_workspace_write]" {
+            preserved_lines.push("network_access = true");
+        }
+    }
+    if !workspace_sandbox_found {
+        preserved_lines.extend(["", "[sandbox_workspace_write]", "network_access = true"]);
+    }
+    let preserved = preserved_lines
+        .join("\n")
+        .trim_start_matches('\n')
+        .to_string();
+
+    if preserved.is_empty() {
+        format!("{managed}\n")
+    } else {
+        format!("{managed}\n\n{preserved}\n")
+    }
 }
 
 fn replace_legacy_config(codex_dir: &Path) -> Result<()> {
@@ -125,30 +187,79 @@ fn replace_legacy_config(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_local_config(source: &str, destination: &str) -> Result<()> {
+fn migrate_managed_config(codex_dir: &Path) -> Result<()> {
+    let config_path = codex_dir.join("config.toml");
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
-    let source_path = dotfiles_path.join(source);
+    let template_path = dotfiles_path.join(CODEX_CONFIG_TEMPLATE);
 
-    let home_path = home::home_dir().context("Failed to get home directory")?;
-    let destination_path = home_path.join(destination);
-
-    if let Ok(existing_target) = fs::read_link(&destination_path)
-        && existing_target == source_path
-    {
-        println!(
-            "- Replacing managed symlink with local copy: {}",
-            destination_path.display()
-        );
-        let contents = fs::read(&source_path)
-            .with_context(|| format!("Failed to read {}", source_path.display()))?;
-        fs::remove_file(&destination_path)
-            .with_context(|| format!("Failed to remove {}", destination_path.display()))?;
-        fs::write(&destination_path, contents)
-            .with_context(|| format!("Failed to write {}", destination_path.display()))?;
+    if !config_path.exists() {
+        fs::copy(&template_path, &config_path).with_context(|| {
+            format!(
+                "Failed to copy from {} to {}",
+                template_path.display(),
+                config_path.display()
+            )
+        })?;
+        println!("- Installed base config: {}", config_path.display());
         return Ok(());
     }
 
-    copy_if_not_exists(source, destination)
+    let existing = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let template = fs::read_to_string(&template_path)
+        .with_context(|| format!("Failed to read {}", template_path.display()))?;
+    let migrated = merge_managed_config(&template, &existing);
+    if migrated == existing {
+        println!("- Shared Codex settings are up to date.");
+        return Ok(());
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before UNIX_EPOCH")?
+        .as_secs();
+    let backup_path = codex_dir.join(format!("config.toml.bak.automation.{timestamp}"));
+    fs::copy(&config_path, &backup_path).with_context(|| {
+        format!(
+            "Failed to back up {} to {}",
+            config_path.display(),
+            backup_path.display()
+        )
+    })?;
+    fs::write(&config_path, migrated)
+        .with_context(|| format!("Failed to update {}", config_path.display()))?;
+    println!(
+        "- Updated shared Codex settings (backup: {}).",
+        backup_path.display()
+    );
+    Ok(())
+}
+
+fn archive_retired_profiles(codex_dir: &Path) -> Result<()> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before UNIX_EPOCH")?
+        .as_secs();
+    for name in ["teacher.config.toml", "autonomous.config.toml"] {
+        let profile_path = codex_dir.join(name);
+        if !profile_path.exists() {
+            continue;
+        }
+        let backup_path = codex_dir.join(format!("{name}.bak.retired.{timestamp}"));
+        fs::rename(&profile_path, &backup_path).with_context(|| {
+            format!(
+                "Failed to archive retired profile {} to {}",
+                profile_path.display(),
+                backup_path.display()
+            )
+        })?;
+        println!(
+            "- Archived retired profile {} to {}.",
+            profile_path.display(),
+            backup_path.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn setup() -> Result<()> {
@@ -182,18 +293,78 @@ pub fn setup() -> Result<()> {
     }
 
     replace_legacy_config(&codex_dir)?;
+    archive_retired_profiles(&codex_dir)?;
 
-    println!("\nCopying local configuration templates...");
-    for (source, dest) in CODEX_COPY_FILES {
-        copy_local_config(source, dest)?;
-    }
+    println!("\nMigrating shared Codex settings...");
+    migrate_managed_config(&codex_dir)?;
 
     println!("\n✅ Codex CLI setup completed!");
     println!("\n💡 Next steps:");
     println!("   1. Run 'codex login' if authentication is not configured");
     println!("   2. Run 'codex' and trust hooks from '/hooks' if prompted");
-    println!("   3. Use teacher mode: codex --profile teacher");
-    println!("   4. Use autonomous mode: codex --profile autonomous");
+    println!("   3. Run 'codex' (workspace-write + auto-review is the default)");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{contains_legacy_profile_config, merge_managed_config};
+
+    #[test]
+    fn managed_keys_are_replaced_and_local_tables_are_preserved() {
+        let template = r#"
+model = "gpt-5.6-sol"
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+sandbox_mode = "workspace-write"
+commit_attribution = ""
+
+[sandbox_workspace_write]
+network_access = true
+"#;
+        let existing = r#"model = "old"
+sandbox_mode = "read-only"
+
+[sandbox_workspace_write]
+network_access = false
+exclude_tmpdir_env_var = true
+
+[projects."/work"]
+trust_level = "trusted"
+
+[hooks.state]
+trusted_hash = "local-value"
+"#;
+
+        let actual = merge_managed_config(template, existing);
+        assert!(actual.contains("model = \"gpt-5.6-sol\""));
+        assert!(actual.contains("sandbox_mode = \"workspace-write\""));
+        assert!(actual.contains("approvals_reviewer = \"auto_review\""));
+        assert!(actual.contains("commit_attribution = \"\""));
+        assert!(actual.contains("[sandbox_workspace_write]\nnetwork_access = true"));
+        assert!(actual.contains("exclude_tmpdir_env_var = true"));
+        assert!(!actual.contains("network_access = false"));
+        assert!(!actual.contains("model = \"old\""));
+        assert!(actual.contains("[projects.\"/work\"]"));
+        assert!(actual.contains("trusted_hash = \"local-value\""));
+        assert_eq!(merge_managed_config(template, &actual), actual);
+    }
+
+    #[test]
+    fn workspace_sandbox_table_is_added_when_missing() {
+        let actual = merge_managed_config(
+            "model = \"gpt-5.6-sol\"\n",
+            "model = \"old\"\n[projects.\"/work\"]\ntrust_level = \"trusted\"\n",
+        );
+        assert!(actual.contains("[sandbox_workspace_write]\nnetwork_access = true"));
+        assert!(actual.contains("[projects.\"/work\"]"));
+    }
+
+    #[test]
+    fn legacy_profile_detection_ignores_comments() {
+        assert!(contains_legacy_profile_config("profile = \"teacher\"\n"));
+        assert!(contains_legacy_profile_config("[profiles.teacher]\n"));
+        assert!(!contains_legacy_profile_config("# profile = \"teacher\"\n"));
+    }
 }
