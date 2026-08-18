@@ -71,14 +71,15 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 #### AI CLI configuration policy
 
 Codex uses a single default workflow. `workspace-write` allows implementation inside the
-workspace, while `on-request` approvals are routed through auto-review. Dangerous or
-destructive operations remain blocked by the sandbox and a small set of deny rules.
+workspace, while `on-request` approvals are routed through auto-review. A PreToolUse hook
+validates Git and GitHub writes before they run, and deny rules block destructive operations.
 
-Ordinary editing, testing, and local non-destructive Git work are handled without broad
-command monitoring. A small PreToolUse hook rejects only file deletion, branch/tag deletion,
-and force/delete pushes. When a deletion is required, Codex first moves the target to
-`.codex-trash/<timestamp>/` and never stages or automatically removes that directory. Pushes
-otherwise go through auto-review, and Codex uses its normal approval judgment.
+Ordinary editing and testing run inside the sandbox. Hook-validated normal commits, pushes to
+the current non-protected work branch, and Draft PR creation are allowlisted so the workflow
+does not pause for approval. The hook rejects non-canonical writes, protected-branch or
+force/delete/tag pushes, repository mismatches, unsafe commit or PR metadata, and detected
+secrets. When a deletion is required, Codex first moves the target to
+`.codex-trash/<timestamp>/` and never stages or automatically removes that directory.
 
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, and Draft PRs are used
