@@ -141,6 +141,16 @@ class GuardTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_allowed(command)
 
+    def test_git_and_gh_require_canonical_executables(self):
+        for command in (
+            "./git status",
+            "/usr/bin/git status",
+            "./gh pr view 1",
+            "/usr/bin/gh pr view 1",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command)
+
     def test_nested_shell_and_chain_are_checked(self):
         for command in (
             "zsh -lc 'git reset --hard HEAD'",
@@ -275,6 +285,18 @@ class GuardTest(unittest.TestCase):
             side_effect=[
                 "https://github.com/owner/repo.git\n",
                 "https://github.com/attacker/repo.git\n",
+            ],
+        ):
+            self.assertIsNotNone(
+                GUARD._push_preflight_reason("/workspace", "feature/example")
+            )
+
+        with mock.patch.object(
+            GUARD,
+            "_run_git",
+            side_effect=[
+                "https://github.com/owner/repo.git\n",
+                "git@github.com:owner/repo.git\nhttps://github.com/attacker/repo.git\n",
             ],
         ):
             self.assertIsNotNone(
@@ -478,9 +500,9 @@ class GuardTest(unittest.TestCase):
             )
 
         def clean_git(_cwd, *args):
-            if args == ("remote", "get-url", "origin"):
+            if args == ("remote", "get-url", "--all", "origin"):
                 return "https://github.com/owner/repo.git\n"
-            if args == ("remote", "get-url", "--push", "origin"):
+            if args == ("remote", "get-url", "--push", "--all", "origin"):
                 return "git@github.com:owner/repo.git\n"
             if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
                 return "feature/example\n"
@@ -570,8 +592,8 @@ class GuardTest(unittest.TestCase):
 
         def safe_git(_cwd, *args):
             values = {
-                ("remote", "get-url", "origin"): "https://github.com/owner/repo.git\n",
-                ("remote", "get-url", "--push", "origin"): "git@github.com:owner/repo.git\n",
+                ("remote", "get-url", "--all", "origin"): "https://github.com/owner/repo.git\n",
+                ("remote", "get-url", "--push", "--all", "origin"): "git@github.com:owner/repo.git\n",
                 ("rev-parse", "--abbrev-ref", "HEAD"): "feature/example\n",
                 ("status", "--porcelain=v1", "--untracked-files=all"): "",
                 ("rev-parse", "--verify", "origin/feature/example"): None,

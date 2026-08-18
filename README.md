@@ -80,6 +80,8 @@ does not pause for approval. The hook rejects non-canonical writes, protected-br
 force/delete/tag pushes, repository mismatches, unsafe commit or PR metadata, and detected
 secrets. When a deletion is required, Codex first moves the target to
 `.codex-trash/<timestamp>/` and never stages or automatically removes that directory.
+The guard checks direct Bash invocations; arbitrary programs and same-user races remain
+outside its security boundary.
 
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, and Draft PRs are used
