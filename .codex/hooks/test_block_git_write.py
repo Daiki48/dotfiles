@@ -53,6 +53,19 @@ class GuardTest(unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_allowed(command, "/workspace")
 
+    def test_git_add_rejects_repository_wide_pathspecs(self):
+        for command in (
+            "git add -- :/",
+            "git add -- :(glob)**",
+            "git add -- src/..",
+            "git add -- /workspace/file.txt",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
+
+        with mock.patch.dict(GUARD.os.environ, {"GIT_DIR": "/tmp/other/.git"}):
+            self.assert_blocked("git add -- README.md", "/workspace")
+
     def test_unsafe_git_writes_are_blocked(self):
         for command in (
             "git add .",
@@ -104,6 +117,12 @@ class GuardTest(unittest.TestCase):
             "git status\ngit commit -m ':bug: 修正'",
             "git status\r\ngit commit -m ':bug: 修正'",
             "bash -lc 'rm -rf build'",
+            "bash -O extglob -c 'git reset --hard HEAD'",
+            "env -S 'git reset --hard HEAD'",
+            "env --split-string='rm -rf build'",
+            "cd /tmp/other && git push -u origin HEAD:refs/heads/feature/example",
+            "env -C /tmp/other git push -u origin HEAD:refs/heads/feature/example",
+            "GIT_DIR=/tmp/other/.git git push -u origin HEAD:refs/heads/feature/example",
             "env -u TOKEN rm -rf build",
         ):
             with self.subTest(command=command):
@@ -131,18 +150,28 @@ class GuardTest(unittest.TestCase):
                 self.assert_blocked(command)
 
     def test_issue_management_and_github_reads_are_allowed(self):
-        with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
+        for command in (
+            "gh issue list",
+            "gh issue view 123",
+            "gh -R owner/repo issue view 123",
+            "gh pr view 123",
+            "gh pr --repo owner/repo diff 123",
+            "gh run view 456 --log",
+            "gh api repos/owner/repo/issues/123 -X GET",
+            "gh pr create --help",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+
+        with (
+            tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body,
+            mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+        ):
+            body.write("## 計画\n")
+            body.flush()
             for command in (
-                "gh issue list",
-                "gh issue view 123",
-                "gh issue create --repo owner/repo --title test --body body",
-                "gh issue comment 123 --repo owner/repo --body progress",
-                "gh -R owner/repo issue view 123",
-                "gh pr view 123",
-                "gh pr --repo owner/repo diff 123",
-                "gh run view 456 --log",
-                "gh api repos/owner/repo/issues/123 -X GET",
-                "gh pr create --help",
+                f"gh issue create --repo owner/repo --title test --body-file {body.name}",
+                f"gh issue comment 123 --repo owner/repo --body-file {body.name}",
             ):
                 with self.subTest(command=command):
                     self.assert_allowed(command, "/workspace")
@@ -176,6 +205,72 @@ class GuardTest(unittest.TestCase):
                 f"--body-file {body.name}",
                 "/workspace",
             )
+
+    def test_github_write_bypasses_are_blocked(self):
+        with (
+            tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body,
+            mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+        ):
+            body.write("## 本文\n")
+            body.flush()
+            for command in (
+                "gh issue comment 9 --repo owner/repo --delete-last --yes",
+                "gh issue comment 9 --repo owner/repo --edit-last --body-file " + body.name,
+                "gh issue comment https://github.com/attacker/repo/issues/1 --repo owner/repo --body-file " + body.name,
+                "gh issue create --repo owner/repo -ttest -F" + body.name,
+                "GH_HOST=example.com gh issue comment 9 --repo owner/repo --body-file " + body.name,
+                "gh issue create --repo owner/repo --title safe --body $(cat /etc/hostname)",
+                "gh issue create --repo owner/repo --title safe --body-file /etc/hostname",
+                "gh pr create --draft --repo owner/repo --base main --head feature/example --title safe --body-file /etc/hostname",
+            ):
+                with self.subTest(command=command):
+                    self.assert_blocked(command, "/workspace")
+            with mock.patch.dict(GUARD.os.environ, {"GH_HOST": "example.com"}):
+                self.assert_blocked(
+                    "gh issue comment 9 --repo owner/repo --body-file " + body.name,
+                    "/workspace",
+                )
+
+    def test_push_preflight_rejects_pushurl_and_dirty_worktree(self):
+        with mock.patch.object(
+            GUARD,
+            "_run_git",
+            side_effect=[
+                "https://github.com/owner/repo.git\n",
+                "https://github.com/attacker/repo.git\n",
+            ],
+        ):
+            self.assertIsNotNone(
+                GUARD._push_preflight_reason("/workspace", "feature/example")
+            )
+
+        with mock.patch.object(
+            GUARD,
+            "_run_git",
+            side_effect=[
+                "https://github.com/owner/repo.git\n",
+                "git@github.com:owner/repo.git\n",
+                "feature/example\n",
+                " M README.md\n",
+            ],
+        ):
+            self.assertIsNotNone(
+                GUARD._push_preflight_reason("/workspace", "feature/example")
+            )
+
+    def test_read_only_git_rejects_side_effect_options(self):
+        for command in (
+            "git grep -O rm block_git_write",
+            "git grep --open-files-in-pager=rm block_git_write",
+            "git reflog expire --expire=now --all",
+            "git reflog delete HEAD@{0}",
+            "git reflog drop --all",
+            "git diff --output=README.md",
+            "git show --ext-diff HEAD",
+            "git cat-file --filters HEAD:README.md",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
 
     def test_origin_repository_supports_https_and_ssh_urls(self):
         for remote, expected in (
@@ -256,8 +351,14 @@ class GuardTest(unittest.TestCase):
             )
 
         def clean_git(_cwd, *args):
+            if args == ("remote", "get-url", "origin"):
+                return "https://github.com/owner/repo.git\n"
+            if args == ("remote", "get-url", "--push", "origin"):
+                return "git@github.com:owner/repo.git\n"
             if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
                 return "feature/example\n"
+            if args == ("status", "--porcelain=v1", "--untracked-files=all"):
+                return ""
             if args[:3] == ("rev-parse", "--verify", "origin/feature/example"):
                 return None
             if args[:2] == ("merge-base", "HEAD"):

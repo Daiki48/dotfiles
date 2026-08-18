@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import stat
 import subprocess
 import sys
 
@@ -24,6 +25,9 @@ GIT_READ_ONLY = {
 GIT_SAFE_WRITE = {"add", "commit", "fetch", "push", "switch"}
 GIT_OPTS_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace"}
 GIT_FORBIDDEN_GLOBAL_OPTS = {"-c", "--config", "--config-env", "--exec-path"}
+GIT_READ_FORBIDDEN_ARGS = {
+    "--ext-diff", "--textconv", "--filters", "--paginate", "-p", "--output", "-O",
+}
 
 BRANCH_READ_OPTS_WITH_VALUE = {
     "--contains", "--no-contains", "--merged", "--no-merged", "--points-at",
@@ -78,6 +82,12 @@ SUDO_OPTS_WITH_VALUE = {
 # whitespaceになり、前後のcommandが1 segmentへ結合されるため、読み取りの
 # 後ろに置かれた書き込みを見落とす可能性がある。
 SHELL_PUNCTUATION = ";&|()`\n"
+MAX_BODY_FILE_BYTES = 256 * 1024
+GIT_WRITE_ENVIRONMENT_KEYS = {
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+}
 AI_ATTRIBUTION_RE = re.compile(
     r"(?i)(co-authored-by\s*:\s*.*(?:codex|openai)|generated(?:-| )by\s*:\s*"
     r".*(?:codex|openai)|signed-off-by\s*:\s*.*(?:codex|openai))"
@@ -213,10 +223,35 @@ def _git_add_reason(args):
     if options or not paths:
         return "git add のオプション指定または空の対象は許可されていません"
     for path in paths:
-        if path in {".", ".."} or path.startswith("-"):
+        candidate = Path(path)
+        if (
+            candidate.is_absolute()
+            or path in {".", ".."}
+            or path.startswith(("-", ":"))
+            or ".." in candidate.parts
+        ):
             return "git add は個別のファイルまたはディレクトリだけを指定してください"
         if any(char in path for char in "*?[]"):
             return "git add でglobは使用できません"
+    return None
+
+
+def _git_read_reason(command, args, global_option_used):
+    if global_option_used:
+        return "読み取りGitではglobal optionを使用できません"
+    for arg in args:
+        if arg in GIT_READ_FORBIDDEN_ARGS or any(
+            arg.startswith(f"{option}=") for option in GIT_READ_FORBIDDEN_ARGS if option.startswith("--")
+        ):
+            return "外部command実行またはfile書き込みを伴うGit optionは使用できません"
+        if command == "grep" and arg.startswith("-O"):
+            return "git grepの外部pager実行は許可されていません"
+        if command == "grep" and arg.startswith("--open-files-in-pager"):
+            return "git grepの外部pager実行は許可されていません"
+    if command == "reflog" and args:
+        operation = next((arg for arg in args if not arg.startswith("-")), None)
+        if operation not in {"show", "list", "exists"}:
+            return "git reflogはshow、list、existsだけ許可されます"
     return None
 
 
@@ -302,6 +337,8 @@ def _git_invocation_reason(tokens, cwd=None):
     start = _command_start(tokens)
     if start is None or os.path.basename(tokens[start]) != "git":
         return None
+    if start != 0:
+        return "Git commandをwrapper、環境変数、cwd変更経由で実行できません"
     git_args = tokens[start + 1:]
     skip_next = False
     global_option_used = False
@@ -337,11 +374,17 @@ def _git_invocation_reason(tokens, cwd=None):
         if token == "remote":
             return None if all(arg in REMOTE_READ_ARGS for arg in args) else "git remoteは照会だけ許可されます"
         if token in GIT_READ_ONLY:
-            return None
+            return _git_read_reason(token, args, global_option_used)
         if token not in GIT_SAFE_WRITE:
             return "許可されていないGit書き込み操作です"
         if global_option_used:
             return "Git書き込みではglobal optionや別repository指定を使用できません"
+        if any(
+            key in GIT_WRITE_ENVIRONMENT_KEYS
+            or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+            for key in os.environ
+        ):
+            return "Git書き込みではrepositoryやconfigを変更する環境変数を使用できません"
 
         if token == "push":
             reason = _git_push_reason(args, cwd)
@@ -387,10 +430,33 @@ def _required_option(args, short, long):
     return values[0] if values is not None and len(values) == 1 else None
 
 
-def _origin_repository(cwd):
-    remote = _run_git(cwd, "remote", "get-url", "origin")
-    if remote is None:
-        return None
+def _strict_gh_args(args, value_options, switch_options=frozenset()):
+    """GitHub writeの引数を正規形へ限定し、positional引数を返す。"""
+    short_options = {short for short, _ in value_options if short}
+    long_options = {long for _, long in value_options}
+    positional = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in switch_options:
+            index += 1
+            continue
+        if token in short_options or token in long_options:
+            if index + 1 >= len(args):
+                return None
+            index += 2
+            continue
+        if any(token.startswith(f"{long}=") for long in long_options):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return None
+        positional.append(token)
+        index += 1
+    return positional
+
+
+def _github_repository_from_url(remote):
     url = remote.strip().rstrip("/")
     for prefix in (
         "https://github.com/",
@@ -408,6 +474,11 @@ def _origin_repository(cwd):
     return None
 
 
+def _origin_repository(cwd):
+    remote = _run_git(cwd, "remote", "get-url", "origin")
+    return None if remote is None else _github_repository_from_url(remote)
+
+
 def _repository_reason(repository, cwd):
     origin_repository = _origin_repository(cwd)
     if origin_repository is None:
@@ -418,6 +489,19 @@ def _repository_reason(repository, cwd):
 
 
 def _pr_create_reason(args, cwd):
+    positional = _strict_gh_args(
+        args,
+        {
+            ("-R", "--repo"),
+            ("-B", "--base"),
+            ("-H", "--head"),
+            ("-t", "--title"),
+            ("-F", "--body-file"),
+        },
+        {"--draft"},
+    )
+    if positional is None or positional:
+        return "Draft PRでは許可された引数だけを正規形で指定してください"
     if "--draft" not in args:
         return "PRはDraftとして作成してください"
     if any(option in args for option in {"--fill", "--fill-first", "--fill-verbose", "--web", "--recover"}):
@@ -451,46 +535,33 @@ def _issue_write_reason(tokens, issue_command, issue_args, cwd):
     if repository_reason:
         return repository_reason
 
-    text_flags = {"-t", "--title", "-b", "--body", "--comment"}
-    file_flags = {"-F", "--body-file"}
-    index = 0
-    while index < len(issue_args):
-        token = issue_args[index]
-        if token in text_flags:
-            if index + 1 >= len(issue_args):
-                return "Issueへ送信する本文を検査できません"
-            value = issue_args[index + 1]
-            if _contains_secret(value) or AI_ATTRIBUTION_RE.search(value):
-                return "Issueへ秘密情報またはAI帰属を送信できません"
-            index += 2
-            continue
-        if token in file_flags:
-            if index + 1 >= len(issue_args):
-                return "Issue body fileを検査できません"
-            reason = _file_secret_reason(issue_args[index + 1])
-            if reason:
-                return reason.replace("PR body", "Issue body")
-            index += 2
-            continue
-        for flag in {"--title", "--body", "--comment"}:
-            if token.startswith(f"{flag}="):
-                value = token.split("=", 1)[1]
-                if _contains_secret(value) or AI_ATTRIBUTION_RE.search(value):
-                    return "Issueへ秘密情報またはAI帰属を送信できません"
-        if token.startswith("--body-file="):
-            reason = _file_secret_reason(token.split("=", 1)[1])
-            if reason:
-                return reason.replace("PR body", "Issue body")
-        index += 1
-
-    if issue_command == "create" and not (
-        _required_option(issue_args, "-t", "--title")
-        and (
-            _required_option(issue_args, "-b", "--body")
-            or _required_option(issue_args, "-F", "--body-file")
-        )
+    value_options = {("-R", "--repo"), ("-F", "--body-file")}
+    if issue_command in {"create", "edit"}:
+        value_options.add(("-t", "--title"))
+    positional = _strict_gh_args(issue_args, value_options)
+    if positional is None:
+        return "Issue書き込みでは許可された引数だけを正規形で指定してください"
+    if issue_command == "create" and positional:
+        return "Issue作成ではpositional引数を使用できません"
+    if issue_command in {"edit", "comment"} and (
+        len(positional) != 1 or not positional[0].isdigit()
     ):
-        return "Issue作成にはtitleとbodyを明示してください"
+        return "Issueの編集・comment対象は単一の数値IDで指定してください"
+
+    title = _required_option(issue_args, "-t", "--title")
+    body_file = _required_option(issue_args, "-F", "--body-file")
+    if issue_command == "create" and not (title and body_file):
+        return "Issue作成にはtitleとbody-fileを明示してください"
+    if issue_command == "comment" and not body_file:
+        return "Issue commentにはbody-fileを明示してください"
+    if issue_command == "edit" and not (title or body_file):
+        return "Issue編集にはtitleまたはbody-fileを明示してください"
+    if title and (_contains_secret(title) or AI_ATTRIBUTION_RE.search(title)):
+        return "Issueへ秘密情報またはAI帰属を送信できません"
+    if body_file:
+        reason = _file_secret_reason(body_file)
+        if reason:
+            return reason.replace("PR body", "Issue body")
     return None
 
 
@@ -498,6 +569,8 @@ def _gh_invocation_reason(tokens, cwd=None):
     start = _command_start(tokens)
     if start is None or os.path.basename(tokens[start]) != "gh":
         return None
+    if start != 0:
+        return "GitHub commandをwrapper、環境変数、cwd変更経由で実行できません"
     if "--help" in tokens[start + 1:] or "-h" in tokens[start + 1:]:
         return None
     command, args = _first_command(tokens[start + 1:], GH_GLOBAL_OPTS_WITH_VALUE)
@@ -508,6 +581,12 @@ def _gh_invocation_reason(tokens, cwd=None):
         if issue_command is None or issue_command in {"list", "status", "view"}:
             return None
         if issue_command in {"create", "edit", "comment"}:
+            if os.environ.get("GH_HOST", "github.com").casefold() != "github.com":
+                return "GitHub書き込み先hostを環境変数で変更できません"
+            if "--hostname" in tokens or any(
+                token.startswith("--hostname=") for token in tokens
+            ):
+                return "GitHub書き込み先hostを変更できません"
             return _issue_write_reason(tokens[start + 1:], issue_command, issue_args, cwd)
         if issue_command == "develop":
             return "gh issue developはブランチを作成するため実行できません"
@@ -519,7 +598,13 @@ def _gh_invocation_reason(tokens, cwd=None):
     if command == "pr":
         subcommand, pr_args = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
         if subcommand == "create":
-            return _pr_create_reason(tokens[start + 1:], cwd)
+            if os.environ.get("GH_HOST", "github.com").casefold() != "github.com":
+                return "GitHub書き込み先hostを環境変数で変更できません"
+            if "--hostname" in tokens or any(
+                token.startswith("--hostname=") for token in tokens
+            ):
+                return "GitHub書き込み先hostを変更できません"
+            return _pr_create_reason(pr_args, cwd)
         if subcommand is None or subcommand in GH_READ_ONLY["pr"]:
             return None
         return "PRはDraft作成と読み取り専用操作だけ許可されます"
@@ -547,8 +632,22 @@ def _sensitive_path(path):
 def _file_secret_reason(path):
     if path == "-":
         return "PR bodyは検査可能なファイルで指定してください"
+    candidate = Path(path)
     try:
-        contents = Path(path).read_text(encoding="utf-8")
+        if candidate.is_symlink():
+            return "PR body fileにsymlinkは使用できません"
+        resolved = candidate.resolve(strict=True)
+        tmp_root = Path("/tmp").resolve(strict=True)
+        metadata = resolved.stat()
+        if not resolved.is_relative_to(tmp_root):
+            return "PR body fileは/tmp配下の通常ファイルで指定してください"
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+            return "PR body fileの種類または所有者を安全に確認できません"
+        if metadata.st_size > MAX_BODY_FILE_BYTES:
+            return "PR body fileが許容サイズを超えています"
+        if _sensitive_path(resolved):
+            return "PR body fileに機密ファイル名は使用できません"
+        contents = resolved.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return "PR body fileを安全に検査できません"
     if _contains_secret(contents):
@@ -594,9 +693,23 @@ def _changes_secret_reason(names, patch, label):
 
 
 def _push_preflight_reason(cwd, branch):
+    fetch_url = _run_git(cwd, "remote", "get-url", "origin")
+    push_url = _run_git(cwd, "remote", "get-url", "--push", "origin")
+    fetch_repository = (
+        None if fetch_url is None else _github_repository_from_url(fetch_url)
+    )
+    push_repository = (
+        None if push_url is None else _github_repository_from_url(push_url)
+    )
+    if fetch_repository is None or push_repository != fetch_repository:
+        return "originのpush先がcurrent GitHub repositoryと一致しません"
+
     current = _run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
     if current is None or current.strip() != branch:
         return "current branchとpush先branchが一致しません"
+    status = _run_git(cwd, "status", "--porcelain=v1", "--untracked-files=all")
+    if status is None or status.strip():
+        return "worktreeがcleanではないためpushを拒否しました"
 
     remote_target = _run_git(cwd, "rev-parse", "--verify", f"origin/{branch}")
     if remote_target is not None:
@@ -635,6 +748,46 @@ def _nested_shell_commands(tokens):
                 break
 
 
+def _git_operation(tokens):
+    start = _command_start(tokens)
+    if start is None or os.path.basename(tokens[start]) != "git":
+        return None
+    command, _ = _first_command(
+        tokens[start + 1:],
+        GIT_OPTS_WITH_VALUE | GIT_FORBIDDEN_GLOBAL_OPTS,
+    )
+    return command
+
+
+def _has_write_operation(tokens):
+    git_operation = _git_operation(tokens)
+    if git_operation in GIT_SAFE_WRITE:
+        return True
+
+    start = _command_start(tokens)
+    if start is None or os.path.basename(tokens[start]) != "gh":
+        return False
+    command, args = _first_command(tokens[start + 1:], GH_GLOBAL_OPTS_WITH_VALUE)
+    if command == "issue":
+        subcommand, _ = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
+        return subcommand in {"create", "edit", "comment"}
+    if command == "pr":
+        subcommand, _ = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
+        return subcommand == "create"
+    return False
+
+
+def _shell_wraps_restricted_command(tokens):
+    start = _command_start(tokens)
+    if start is None or os.path.basename(tokens[start]) not in SHELLS:
+        return False
+    payload = " ".join(tokens[start + 1:])
+    return re.search(
+        r"(?:^|[\s;&|()])(?:git|gh|rm|rmdir|unlink|shred)(?:\s|$)",
+        payload,
+    ) is not None
+
+
 def _command_segments(command):
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=SHELL_PUNCTUATION)
@@ -662,8 +815,27 @@ def blocked_reason(command, cwd=None, depth=0):
     """連結コマンドと入れ子shellを調べ、禁止操作の理由を返す。"""
     if depth > 3:
         return "入れ子が深いshellコマンドは安全性を確認できません"
-    for tokens in _command_segments(command):
+    segments = list(_command_segments(command))
+    has_write = any(_has_write_operation(tokens) for tokens in segments)
+    if has_write and (depth > 0 or len(segments) != 1):
+        return "Git/GitHub書き込みは単一の直接commandで実行してください"
+    if has_write and ("$" in command or "`" in command):
+        return "Git/GitHub書き込みでshell展開は使用できません"
+
+    for tokens in segments:
         start = _command_start(tokens)
+        if (
+            tokens
+            and os.path.basename(tokens[0]) == "env"
+            and any(
+                token in {"-S", "--split-string"}
+                or token.startswith("--split-string=")
+                for token in tokens[1:]
+            )
+        ):
+            return "envのsplit-stringは安全に解析できません"
+        if _shell_wraps_restricted_command(tokens):
+            return "shell経由のGit/GitHub/削除commandは実行できません"
         if start is not None and os.path.basename(tokens[start]) in DESTRUCTIVE_COMMANDS:
             return "削除コマンドは自動実行できません"
         reason = _git_invocation_reason(tokens, cwd)

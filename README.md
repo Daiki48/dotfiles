@@ -101,14 +101,16 @@ exists, commit messages and PR/Issue bodies default to Japanese, commit subjects
 `~/.codex/hooks/block_git_write.py`, and `~/.agents/skills` are symlinked from this
 repository. `~/.codex/config.toml` remains local because it contains machine-specific
 project trust, hook trust, and TUI state. `cargo run -- codex` backs up the local config
-before migrating the shared top-level settings. A legacy profile config is backed up and
-replaced with the current base template. Retired teacher/autonomous profile files are
-renamed to timestamped backups instead of being deleted.
+before migrating the shared top-level settings. If an older setup left `config.toml` as a
+symlink, setup archives the link and writes a regular local config without modifying the
+link target. A legacy profile config is backed up and replaced with the current base
+template. Retired teacher/autonomous profile files are renamed to timestamped backups
+instead of being deleted.
 
 Authentication, session history, pairing information, local databases, and credentials
-must remain outside this public repository. The hook scans staged additions and Draft PR
-bodies for high-confidence secret patterns, but this complements rather than replaces
-diff review.
+must remain outside this public repository. The hook scans staged additions and Issue/PR
+bodies for high-confidence secret patterns. Outbound body files must be owned regular
+files under `/tmp`; this complements rather than replaces diff review.
 
 `~/.gemini/policies/` is managed by this repository as a symlink and stores Gemini CLI
 Policy Engine rules. Do not use deprecated `tools.allowed` in

@@ -95,14 +95,22 @@ fn is_assignment_for(line: &str, keys: &[&str]) -> bool {
     })
 }
 
+fn table_header(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let header = trimmed
+        .split_once('#')
+        .map_or(trimmed, |(before, _)| before)
+        .trim_end();
+    header.starts_with('[').then_some(header)
+}
+
 fn managed_assignments(template: &str, section: Option<&str>, keys: &[&str]) -> Vec<String> {
     let mut current_section = None;
     template
         .lines()
         .filter_map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('[') {
-                current_section = Some(trimmed);
+            if let Some(header) = table_header(line) {
+                current_section = Some(header);
                 return None;
             }
             if current_section == section && is_assignment_for(line, keys) {
@@ -126,10 +134,11 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     let mut preserved_lines = Vec::new();
     for line in existing.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with('[') {
+        let header = table_header(line);
+        if let Some(header) = header {
             in_top_level = false;
-            in_workspace_sandbox = trimmed == "[sandbox_workspace_write]";
-            in_agents = trimmed == "[agents]";
+            in_workspace_sandbox = header == "[sandbox_workspace_write]";
+            in_agents = header == "[agents]";
             if in_workspace_sandbox {
                 workspace_sandbox_found = true;
             }
@@ -151,10 +160,10 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
             continue;
         }
         preserved_lines.push(line);
-        if in_workspace_sandbox && trimmed == "[sandbox_workspace_write]" {
+        if in_workspace_sandbox && header == Some("[sandbox_workspace_write]") {
             preserved_lines.push("network_access = true");
         }
-        if in_agents && trimmed == "[agents]" {
+        if in_agents && header == Some("[agents]") {
             preserved_lines.extend(managed_agents.iter().map(String::as_str));
         }
     }
@@ -226,13 +235,22 @@ fn replace_legacy_config(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn migrate_managed_config(codex_dir: &Path) -> Result<()> {
+fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) -> Result<()> {
     let config_path = codex_dir.join("config.toml");
-    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
-    let template_path = dotfiles_path.join(CODEX_CONFIG_TEMPLATE);
+    let metadata = match fs::symlink_metadata(&config_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect {}", config_path.display()));
+        }
+    };
+    let is_symlink = metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink());
 
-    if !config_path.exists() {
-        fs::copy(&template_path, &config_path).with_context(|| {
+    if metadata.is_none() {
+        fs::copy(template_path, &config_path).with_context(|| {
             format!(
                 "Failed to copy from {} to {}",
                 template_path.display(),
@@ -245,10 +263,10 @@ fn migrate_managed_config(codex_dir: &Path) -> Result<()> {
 
     let existing = fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
-    let template = fs::read_to_string(&template_path)
+    let template = fs::read_to_string(template_path)
         .with_context(|| format!("Failed to read {}", template_path.display()))?;
     let migrated = merge_managed_config(&template, &existing);
-    if migrated == existing {
+    if migrated == existing && !is_symlink {
         println!("- Shared Codex settings are up to date.");
         return Ok(());
     }
@@ -265,6 +283,55 @@ fn migrate_managed_config(codex_dir: &Path) -> Result<()> {
             backup_path.display()
         )
     })?;
+    if is_symlink {
+        let symlink_backup_path =
+            codex_dir.join(format!("config.toml.bak.automation-link.{timestamp}"));
+        fs::rename(&config_path, &symlink_backup_path).with_context(|| {
+            format!(
+                "Failed to archive symlink {} to {}",
+                config_path.display(),
+                symlink_backup_path.display()
+            )
+        })?;
+        if let Err(write_error) = fs::write(&config_path, migrated) {
+            let restore_result = (|| {
+                if let Ok(metadata) = fs::symlink_metadata(&config_path) {
+                    if !metadata.file_type().is_file() {
+                        anyhow::bail!(
+                            "Cannot restore symlink because {} is no longer a regular file",
+                            config_path.display()
+                        );
+                    }
+                    fs::remove_file(&config_path).with_context(|| {
+                        format!("Failed to remove partial {}", config_path.display())
+                    })?;
+                }
+                fs::rename(&symlink_backup_path, &config_path).with_context(|| {
+                    format!(
+                        "Failed to restore symlink {} from {}",
+                        config_path.display(),
+                        symlink_backup_path.display()
+                    )
+                })
+            })();
+            return match restore_result {
+                Ok(()) => Err(write_error).context(format!(
+                    "Failed to update {}; restored the original symlink",
+                    config_path.display()
+                )),
+                Err(restore_error) => Err(anyhow::anyhow!(
+                    "Failed to update {}: {write_error}; failed to restore the original symlink: {restore_error}",
+                    config_path.display()
+                )),
+            };
+        }
+        println!(
+            "- Updated shared Codex settings (contents backup: {}, symlink backup: {}).",
+            backup_path.display(),
+            symlink_backup_path.display()
+        );
+        return Ok(());
+    }
     fs::write(&config_path, migrated)
         .with_context(|| format!("Failed to update {}", config_path.display()))?;
     println!(
@@ -272,6 +339,12 @@ fn migrate_managed_config(codex_dir: &Path) -> Result<()> {
         backup_path.display()
     );
     Ok(())
+}
+
+fn migrate_managed_config(codex_dir: &Path) -> Result<()> {
+    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    let template_path = dotfiles_path.join(CODEX_CONFIG_TEMPLATE);
+    migrate_managed_config_from_template(codex_dir, &template_path)
 }
 
 fn archive_retired_profiles(codex_dir: &Path) -> Result<()> {
@@ -348,7 +421,39 @@ pub fn setup() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_legacy_profile_config, merge_managed_config};
+    use super::{
+        contains_legacy_profile_config, merge_managed_config, migrate_managed_config_from_template,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after UNIX_EPOCH")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "dotfiles-codex-{label}-{}-{timestamp}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create temporary test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn managed_keys_are_replaced_and_local_tables_are_preserved() {
@@ -424,6 +529,117 @@ description = "local"
             actual.contains("[agents]\nenabled = true\ndefault_subagent_model = \"gpt-5.6-terra\"")
         );
         assert!(actual.contains("[projects.\"/work\"]"));
+    }
+
+    #[test]
+    fn commented_managed_table_headers_are_reused_and_idempotent() {
+        let template = r#"model = "gpt-5.6-terra"
+
+[sandbox_workspace_write]
+network_access = true
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3
+default_subagent_model = "gpt-5.6-terra"
+"#;
+        let existing = r#"model = "old"
+
+[sandbox_workspace_write]   # local sandbox options
+network_access = false
+exclude_tmpdir_env_var = true
+
+[agents] # local agent defaults
+enabled = false
+max_concurrent_threads_per_session = 12
+custom_setting = "preserved"
+
+[agents.local_reviewer] # custom agent
+description = "local"
+"#;
+
+        let actual = merge_managed_config(template, existing);
+        assert!(actual.contains(
+            "[sandbox_workspace_write]   # local sandbox options\nnetwork_access = true"
+        ));
+        assert!(actual.contains("exclude_tmpdir_env_var = true"));
+        assert!(!actual.contains("network_access = false"));
+        assert!(actual.contains("[agents] # local agent defaults\nenabled = true"));
+        assert!(actual.contains("max_concurrent_threads_per_session = 3"));
+        assert!(actual.contains("custom_setting = \"preserved\""));
+        assert!(actual.contains("[agents.local_reviewer] # custom agent\ndescription = \"local\""));
+        assert!(!actual.contains("\n[sandbox_workspace_write]\n"));
+        assert!(!actual.contains("\n[agents]\n"));
+        assert_eq!(merge_managed_config(template, &actual), actual);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_replaces_config_symlink_without_writing_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("symlink-migration");
+        let target_path = directory.path().join("local-config.toml");
+        let config_path = directory.path().join("config.toml");
+        let template_path = directory.path().join("template.toml");
+        let original = "model = \"old\"\n\n[agents]\nenabled = false\n";
+        let template = "model = \"gpt-5.6-terra\"\n\n[agents]\nenabled = true\n";
+        fs::write(&target_path, original).expect("write symlink target");
+        fs::write(&template_path, template).expect("write template");
+        symlink(&target_path, &config_path).expect("create config symlink");
+
+        migrate_managed_config_from_template(directory.path(), &template_path)
+            .expect("migrate symlinked config");
+
+        assert_eq!(
+            fs::read_to_string(&target_path).expect("read symlink target"),
+            original
+        );
+        let config_metadata = fs::symlink_metadata(&config_path).expect("inspect config");
+        assert!(config_metadata.file_type().is_file());
+        assert!(!config_metadata.file_type().is_symlink());
+        assert!(
+            fs::read_to_string(&config_path)
+                .expect("read migrated config")
+                .contains("model = \"gpt-5.6-terra\"")
+        );
+
+        let entries = fs::read_dir(directory.path())
+            .expect("read backup directory")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read backup entries");
+        let contents_backup = entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak.automation.")
+            })
+            .expect("find contents backup");
+        assert_eq!(
+            fs::read_to_string(contents_backup.path()).expect("read contents backup"),
+            original
+        );
+        let symlink_backup = entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak.automation-link.")
+            })
+            .expect("find symlink backup");
+        assert!(
+            fs::symlink_metadata(symlink_backup.path())
+                .expect("inspect symlink backup")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(symlink_backup.path()).expect("read symlink backup"),
+            target_path
+        );
     }
 
     #[test]

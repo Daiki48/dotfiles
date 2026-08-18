@@ -6,16 +6,17 @@
 prefix_rule(pattern=["git", ["status", "log", "diff", "show", "rev-parse", "blame", "shortlog", "describe", "reflog", "ls-files", "ls-tree", "cat-file", "rev-list", "merge-base", "name-rev", "grep"]], decision="allow", justification="読み取り専用Git操作")
 prefix_rule(pattern=["git", "branch"], decision="allow", justification="hookが一覧・照会だけに制限する")
 prefix_rule(pattern=["git", "remote"], decision="allow", justification="hookがremote照会だけに制限する")
+prefix_rule(pattern=["git", "reflog", ["expire", "delete", "drop"]], decision="forbidden", justification="reflogの変更・削除は禁止")
+prefix_rule(pattern=["git", "grep", ["-O", "--open-files-in-pager"]], decision="forbidden", justification="外部pagerの実行は禁止")
+prefix_rule(pattern=["git", ["log", "diff", "show"], "--output"], decision="forbidden", justification="読み取りGitによるfile書き込みは禁止")
 
-# Git: hookが引数と対象を検査できる正規形はnever sessionでも実行可能にする。
-# 非正規形の安全候補だけをauto-reviewへ回す。
+# Git: hookが引数と対象を検査できる正規形だけをrulesで直接許可する。
+# 非正規形はallow規則に一致しないため、既定のapproval判定へ委ねる。
 prefix_rule(pattern=["git", "fetch", "origin"], decision="allow", justification="hook検査済みのbase branch取得")
 prefix_rule(pattern=["git", "switch", ["-c", "--create"]], decision="allow", justification="hook検査済みの作業branch作成")
 prefix_rule(pattern=["git", "add", "--"], decision="allow", justification="hook検査済みの明示パスstage")
 prefix_rule(pattern=["git", "commit", "-m"], decision="allow", justification="hook検査済みの1行commit")
 prefix_rule(pattern=["git", "push", ["-u", "--set-upstream"], "origin"], decision="allow", justification="hook検査済みの単一branch push")
-prefix_rule(pattern=["git", "fetch"], decision="prompt", justification="非正規形のfetchをauto-reviewする")
-prefix_rule(pattern=["git", "commit"], decision="prompt", justification="非正規形のcommitをauto-reviewする")
 
 # Git: 履歴改変・統合・削除・保護対象への変更
 prefix_rule(pattern=["git", "push", ["--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"]], decision="forbidden", justification="履歴改変・削除・一括pushは禁止")
@@ -30,12 +31,10 @@ prefix_rule(pattern=["gh", "repo", ["list", "view"]], decision="allow", justific
 prefix_rule(pattern=["gh", "release", ["list", "view", "download", "verify", "verify-asset"]], decision="allow", justification="Releaseの読み取り専用操作")
 prefix_rule(pattern=["gh", "workflow", ["list", "view"]], decision="allow", justification="Workflowの読み取り専用操作")
 
-# GitHub: repositoryと本文をhookが検査できる正規形はnever sessionでも実行可能にする。
+# GitHub: repositoryと本文をhookが検査できる正規形だけを直接許可する。
 prefix_rule(pattern=["gh", "issue", "create", "--repo"], decision="allow", justification="hook検査済みのIssue作成")
 prefix_rule(pattern=["gh", "issue", "comment"], decision="allow", justification="hook検査済みのIssue記録")
 prefix_rule(pattern=["gh", "pr", "create", "--draft", "--repo"], decision="allow", justification="hook検査済みのDraft PR作成")
-prefix_rule(pattern=["gh", "issue", ["create", "edit", "comment"]], decision="prompt", justification="非正規形のIssue記録をauto-reviewする")
-prefix_rule(pattern=["gh", "pr", "create", "--draft"], decision="prompt", justification="非正規形のDraft PR作成をauto-reviewする")
 
 # GitHub: 決定的・破壊的な変更
 prefix_rule(pattern=["gh", "issue", ["close", "reopen", "pin", "unpin", "lock", "unlock", "transfer", "develop", "delete"]], decision="forbidden", justification="Issue記録以外の状態変更は禁止")
