@@ -124,6 +124,62 @@ fn copy_file_exclusive(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn verify_managed_symlink(expected: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(destination)
+        .with_context(|| format!("Failed to inspect managed path {}", destination.display()))?;
+    if !metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "Managed path {} must be a symlink to {}",
+            destination.display(),
+            expected.display()
+        );
+    }
+    let expected = fs::canonicalize(expected)
+        .with_context(|| format!("Failed to resolve managed source {}", expected.display()))?;
+    let actual = fs::canonicalize(destination).with_context(|| {
+        format!(
+            "Failed to resolve managed symlink {}",
+            destination.display()
+        )
+    })?;
+    if actual != expected {
+        anyhow::bail!(
+            "Managed symlink {} points to {}, expected {}",
+            destination.display(),
+            actual.display(),
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink_exclusive(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let target = fs::read_link(source)
+        .with_context(|| format!("Failed to read symlink {}", source.display()))?;
+    symlink(&target, destination).with_context(|| {
+        format!(
+            "Failed to archive symlink {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn copy_symlink_exclusive(_source: &Path, _destination: &Path) -> Result<()> {
+    anyhow::bail!("Codex config symlink migration is supported only on Unix")
+}
+
+fn ensure_shared_symlink(source: &str, destination: &str) -> Result<()> {
+    create_symlink(source, destination)?;
+    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    let home = home::home_dir().context("Cannot find home directory")?;
+    verify_managed_symlink(&dotfiles_path.join(source), &home.join(destination))
+}
+
 fn is_assignment_for(line: &str, keys: &[&str]) -> bool {
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') || trimmed.starts_with('[') {
@@ -390,6 +446,30 @@ fn write_config_temp(
     Ok(temp_path)
 }
 
+fn ensure_config_unchanged(
+    config_path: &Path,
+    expected: &str,
+    expected_symlink: bool,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(config_path)
+        .with_context(|| format!("Failed to re-inspect {}", config_path.display()))?;
+    if metadata.file_type().is_symlink() != expected_symlink {
+        anyhow::bail!(
+            "{} changed type while settings were being migrated",
+            config_path.display()
+        );
+    }
+    let current = fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to re-read {}", config_path.display()))?;
+    if current != expected {
+        anyhow::bail!(
+            "{} changed while settings were being migrated; retry setup",
+            config_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) -> Result<()> {
     let config_path = codex_dir.join("config.toml");
     let metadata = match fs::symlink_metadata(&config_path) {
@@ -435,40 +515,23 @@ fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) 
         })?
         .permissions();
     let temp_path = write_config_temp(&config_path, &migrated, permissions)?;
+    if let Err(error) = ensure_config_unchanged(&config_path, &existing, is_symlink) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
     if is_symlink {
         let symlink_backup_path =
             codex_dir.join(format!("config.toml.bak.automation-link.{timestamp}"));
-        if let Err(error) = fs::rename(&config_path, &symlink_backup_path) {
+        if let Err(error) = copy_symlink_exclusive(&config_path, &symlink_backup_path) {
             let _ = fs::remove_file(&temp_path);
-            return Err(error).with_context(|| {
-                format!(
-                    "Failed to archive symlink {} to {}",
-                    config_path.display(),
-                    symlink_backup_path.display()
-                )
-            });
+            return Err(error);
         }
         if let Err(write_error) = fs::rename(&temp_path, &config_path) {
-            let restore_result = (|| {
-                fs::rename(&symlink_backup_path, &config_path).with_context(|| {
-                    format!(
-                        "Failed to restore symlink {} from {}",
-                        config_path.display(),
-                        symlink_backup_path.display()
-                    )
-                })
-            })();
             let _ = fs::remove_file(&temp_path);
-            return match restore_result {
-                Ok(()) => Err(write_error).context(format!(
-                    "Failed to update {}; restored the original symlink",
-                    config_path.display()
-                )),
-                Err(restore_error) => Err(anyhow::anyhow!(
-                    "Failed to update {}: {write_error}; failed to restore the original symlink: {restore_error}",
-                    config_path.display()
-                )),
-            };
+            return Err(write_error).context(format!(
+                "Failed to atomically replace symlink {}; the original remains in place",
+                config_path.display()
+            ));
         }
         println!(
             "- Updated shared Codex settings (contents backup: {}, symlink backup: {}).",
@@ -543,12 +606,12 @@ pub fn setup() -> Result<()> {
 
     println!("\nLinking shared configuration files...");
     for (source, dest) in CODEX_FILES {
-        create_symlink(source, dest)?;
+        ensure_shared_symlink(source, dest)?;
     }
 
     println!("\nLinking shared skill directories...");
     for (source, dest) in CODEX_DIRS {
-        create_symlink(source, dest)?;
+        ensure_shared_symlink(source, dest)?;
     }
 
     backup_legacy_config(&codex_dir)?;
@@ -569,8 +632,8 @@ pub fn setup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_legacy_profile_config, copy_file_exclusive, merge_managed_config,
-        migrate_managed_config_from_template,
+        contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
+        merge_managed_config, migrate_managed_config_from_template, verify_managed_symlink,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -679,6 +742,39 @@ description = "local"
             fs::read_to_string(&destination).expect("read existing backup"),
             "existing"
         );
+    }
+
+    #[test]
+    fn concurrent_config_change_is_detected_before_replacement() {
+        let directory = TestDirectory::new("concurrent-config");
+        let config = directory.path().join("config.toml");
+        fs::write(&config, "model = \"old\"\n").expect("write initial config");
+        assert!(ensure_config_unchanged(&config, "model = \"old\"\n", false).is_ok());
+
+        fs::write(&config, "model = \"local-change\"\n").expect("write concurrent change");
+        assert!(ensure_config_unchanged(&config, "model = \"old\"\n", false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_paths_must_be_symlinks_to_the_expected_source() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("managed-symlink");
+        let expected = directory.path().join("expected");
+        let other = directory.path().join("other");
+        let correct_link = directory.path().join("correct-link");
+        let wrong_link = directory.path().join("wrong-link");
+        let regular = directory.path().join("regular");
+        fs::write(&expected, "expected").expect("write expected source");
+        fs::write(&other, "other").expect("write other source");
+        fs::write(&regular, "expected").expect("write regular destination");
+        symlink(&expected, &correct_link).expect("create correct symlink");
+        symlink(&other, &wrong_link).expect("create wrong symlink");
+
+        assert!(verify_managed_symlink(&expected, &correct_link).is_ok());
+        assert!(verify_managed_symlink(&expected, &wrong_link).is_err());
+        assert!(verify_managed_symlink(&expected, &regular).is_err());
     }
 
     #[test]

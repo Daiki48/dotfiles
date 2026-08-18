@@ -104,6 +104,10 @@ class GuardTest(unittest.TestCase):
             "xargs rm",
             "find . -delete",
             "find . -exec rm README.md ;",
+            "x=rm; \"$x\" README.md",
+            "sh -c 'x=rm; \"$x\" README.md'",
+            "x=gh; \"$x\" issue comment 9 --repo attacker/repo",
+            "eval 'rm README.md'",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
@@ -382,6 +386,8 @@ class GuardTest(unittest.TestCase):
                 return ""
             if args[:3] == ("rev-parse", "--verify", "origin/feature/example"):
                 return None
+            if args == ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"):
+                return "origin/main\n"
             if args[:2] == ("merge-base", "HEAD"):
                 return "base123\n" if args[2] == "origin/main" else None
             if args[:2] == ("rev-list", "--count"):
@@ -463,6 +469,42 @@ class GuardTest(unittest.TestCase):
             GUARD.main()
         self.assertEqual(exit_status.exception.code, 2)
         self.assertIn('"permissionDecision": "deny"', stdout.getvalue())
+
+        for payload in ("[]", "null", '{"tool_input": "unexpected"}'):
+            stdout = io.StringIO()
+            with (
+                self.subTest(payload=payload),
+                mock.patch.object(GUARD.sys, "stdin", io.StringIO(payload)),
+                mock.patch.object(GUARD.sys, "stdout", stdout),
+                mock.patch.object(GUARD.sys, "stderr", io.StringIO()),
+                self.assertRaises(SystemExit) as exit_status,
+            ):
+                GUARD.main()
+            self.assertEqual(exit_status.exception.code, 2)
+            self.assertIn('"permissionDecision": "deny"', stdout.getvalue())
+
+    def test_write_context_must_match_the_session_repository(self):
+        repository = MODULE_PATH.resolve().parents[2]
+        with mock.patch.object(
+            GUARD,
+            "_run_git",
+            side_effect=[f"{repository}\n", f"{repository.parent}\n"],
+        ):
+            self.assertIsNotNone(
+                GUARD._write_context_reason(
+                    "git add -- README.md", str(repository), str(repository.parent)
+                )
+            )
+        with mock.patch.object(
+            GUARD,
+            "_run_git",
+            side_effect=[f"{repository}\n", f"{repository}\n"],
+        ):
+            self.assertIsNone(
+                GUARD._write_context_reason(
+                    "git add -- README.md", str(repository), str(repository / ".codex")
+                )
+            )
 
         stdout = io.StringIO()
         with (

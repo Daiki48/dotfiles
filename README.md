@@ -75,10 +75,11 @@ workspace, while `on-request` approvals are routed through auto-review. Dangerou
 destructive operations remain blocked by the sandbox, rules, hooks, and AGENTS.md.
 
 Canonical Git writes, Issue creation, and Draft PR creation whose repository, branch,
-arguments, and outbound text can be fully checked by the hook are allowed directly, so a
-non-interactive `never` session does not deadlock during configuration migration. Issue
-comments and non-canonical candidates go through auto-review, and destructive operations
-remain forbidden.
+arguments, and outbound text can be statically validated by the hook are allowed directly,
+so a non-interactive `never` session does not deadlock during configuration migration.
+Issue comments and non-canonical candidates go through auto-review, and destructive
+operations remain forbidden. Hook checks are pre-execution safeguards; concurrent changes
+after inspection remain a residual risk covered by the sandbox, rules, and workflow policy.
 
 The main agent defaults to `gpt-5.6-terra` with medium reasoning, while plan mode uses
 high reasoning. An approved, versioned plan is recorded in a tracking Issue before

@@ -33,6 +33,7 @@ prefix_rule(pattern=["gh", "workflow", ["list", "view"]], decision="allow", just
 
 # GitHub: repositoryと本文をhookが検査できる正規形だけを直接許可する。
 prefix_rule(pattern=["gh", "issue", "create", "--repo"], decision="allow", justification="hook検査済みのIssue作成")
+prefix_rule(pattern=["gh", "issue", ["edit", "comment"]], decision="prompt", justification="承認済み計画へのIssue記録をauto-reviewする")
 prefix_rule(pattern=["gh", "pr", "create", "--draft", "--repo"], decision="allow", justification="hook検査済みのDraft PR作成")
 
 # GitHub: 決定的・破壊的な変更

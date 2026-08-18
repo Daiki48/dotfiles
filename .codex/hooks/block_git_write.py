@@ -93,7 +93,7 @@ SUDO_OPTS_WITH_VALUE = {
 SHELL_PUNCTUATION = ";&|()`\n"
 MAX_BODY_FILE_BYTES = 256 * 1024
 MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
-GIT_COMMAND_TIMEOUT_SECONDS = 3
+GIT_COMMAND_TIMEOUT_SECONDS = 2
 GIT_WRITE_ENVIRONMENT_KEYS = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
     "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
@@ -825,17 +825,16 @@ def _push_preflight_reason(cwd, branch):
     if remote_target is not None:
         base = f"origin/{branch}"
     else:
-        candidates = []
-        for protected in sorted(PROTECTED_BRANCHES):
-            merge_base = _run_git(cwd, "merge-base", "HEAD", f"origin/{protected}")
-            if merge_base is None:
-                continue
-            distance = _run_git(cwd, "rev-list", "--count", f"{merge_base.strip()}..HEAD")
-            if distance is not None and distance.strip().isdigit():
-                candidates.append((int(distance.strip()), merge_base.strip()))
-        if not candidates:
+        default_ref = _run_git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+        if default_ref is None or not default_ref.strip().startswith("origin/"):
             return "未push commitのbaseを特定できません"
-        _, base = min(candidates)
+        default_branch = default_ref.strip().removeprefix("origin/")
+        if not _is_protected_branch(default_branch):
+            return "originのdefault branchが保護対象ではありません"
+        merge_base = _run_git(cwd, "merge-base", "HEAD", default_ref.strip())
+        if merge_base is None:
+            return "未push commitのbaseを特定できません"
+        base = merge_base.strip()
 
     names = _run_git(cwd, "diff", "--name-only", "--diff-filter=ACMR", f"{base}..HEAD")
     patch = _run_git(
@@ -942,6 +941,8 @@ def blocked_reason(command, cwd=None, depth=0):
 
     for tokens in segments:
         start = _command_start(tokens)
+        if start is not None and any(char in tokens[start] for char in "$`"):
+            return "shell展開で実行commandを決定する操作は許可されていません"
         if (
             tokens
             and os.path.basename(tokens[0]) == "env"
@@ -962,6 +963,13 @@ def blocked_reason(command, cwd=None, depth=0):
             for token in tokens[start + 1:]
         ):
             return "findによる削除、外部command実行、file書き込みは許可されていません"
+        if start is not None and os.path.basename(tokens[start]) == "eval":
+            nested = " ".join(tokens[start + 1:])
+            if not nested:
+                return "evalの実行内容を確認できません"
+            reason = blocked_reason(nested, cwd, depth + 1)
+            if reason:
+                return reason
         reason = _git_invocation_reason(tokens, cwd)
         if reason:
             return reason
@@ -972,6 +980,28 @@ def blocked_reason(command, cwd=None, depth=0):
             reason = blocked_reason(nested_command, cwd, depth + 1)
             if reason:
                 return reason
+    return None
+
+
+def _write_context_reason(command, session_cwd, requested_cwd):
+    segments = list(_command_segments(command))
+    if not any(_has_write_operation(tokens) for tokens in segments):
+        return None
+    if not isinstance(session_cwd, str) or not isinstance(requested_cwd, str):
+        return "Git/GitHub書き込みのsession cwdとrequested cwdを確認できません"
+    session_root = _run_git(session_cwd, "rev-parse", "--show-toplevel")
+    requested_root = _run_git(requested_cwd, "rev-parse", "--show-toplevel")
+    if session_root is None or requested_root is None:
+        return "Git/GitHub書き込みのrepository rootを確認できません"
+    try:
+        same_repository = (
+            Path(session_root.strip()).resolve(strict=True)
+            == Path(requested_root.strip()).resolve(strict=True)
+        )
+    except OSError:
+        return "Git/GitHub書き込みのrepository rootを安全に解決できません"
+    if not same_repository:
+        return "toolのrequested cwdがCodex sessionのrepositoryと一致しません"
     return None
 
 
@@ -990,16 +1020,22 @@ def _deny(reason):
 def main():
     try:
         data = json.load(sys.stdin)
+        if not isinstance(data, dict):
+            raise ValueError("hook input must be an object")
+        tool_input = data.get("tool_input") or {}
+        if not isinstance(tool_input, dict):
+            raise ValueError("tool_input must be an object")
+        command = tool_input.get("command") or tool_input.get("cmd") or ""
+        session_cwd = data.get("cwd")
+        cwd = tool_input.get("workdir") or tool_input.get("cwd") or session_cwd
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command is required")
+        reason = _write_context_reason(command, session_cwd, cwd)
+        if reason is None:
+            reason = blocked_reason(command, cwd)
     except Exception:
-        _deny("hook inputを安全に解析できません")
+        _deny("hook inputを安全に解析・検査できません")
         sys.exit(2)
-    tool_input = data.get("tool_input") or {}
-    command = tool_input.get("command") or tool_input.get("cmd") or ""
-    cwd = tool_input.get("workdir") or tool_input.get("cwd") or data.get("cwd")
-    if not isinstance(command, str) or not command.strip():
-        _deny("hook inputに検査対象commandがありません")
-        sys.exit(2)
-    reason = blocked_reason(command, cwd)
     if reason:
         _deny(reason)
         sys.exit(2)
