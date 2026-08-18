@@ -101,9 +101,9 @@ that the normal two reviews are insufficient.
 can be checked through `gh run` without updating the local branch. When local default-base
 synchronization is needed, only `git pull --ff-only --no-rebase --no-autostash
 --no-recurse-submodules origin <base>` is permitted. The hook requires a clean local
-default branch that tracks the same `origin` default branch and has no local commits or
-in-progress Git operation; merge, rebase, reset, stash, and every other pull form remain
-blocked.
+branch whose name is in the protected-branch allowlist and whose upstream matches local
+`origin/HEAD`, with no local commits or in-progress Git operation; merge, rebase, reset,
+stash, and every other pull form remain blocked.
 
 Repository conventions are discovered from recent history. When no clear convention
 exists, commit messages and PR/Issue bodies default to Japanese, commit subjects use

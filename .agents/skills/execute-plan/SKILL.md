@@ -25,7 +25,7 @@ description: 実装依頼の全実装単位を自律的に実装・検証し、�
 
 依存順に各実装単位を処理する。
 
-Sol highが開始時に固定した最小証拠集合からgo/no-goと仕様解釈を決め、workerはその判断に従う。互いに独立した事前調査、test結果の整理、非重複ファイルの実装だけをsubagentへ委譲する。狭い検索と受入条件の証拠収集は`gpt-5.6-luna`のhigh、仕様が固定された狭い実装とunit testは同modelのxhigh、通常の実装は`gpt-5.6-terra`のmedium、複雑な実装は同modelのhighを使う。同じファイルを複数agentへ同時に編集させず、直列依存の単位はmain agentが処理する。main agentはsubagentの作業を重複せず、統合と受け入れ条件の確認に集中する。
+規模や並列性を問わず、Sol highを最初にleadとして起動する。Solは固定した最小証拠集合からgo/no-go、仕様解釈、最小実装単位を決め、workerはその判断に従う。Solがworker不要と判断した場合も判断結果を残す。互いに独立した事前調査、test結果の整理、非重複ファイルの実装だけをsubagentへ委譲する。狭い検索と受入条件の証拠収集は`gpt-5.6-luna`のhigh、仕様が固定された狭い実装とunit testは同modelのxhigh、通常の実装は`gpt-5.6-terra`のmedium、複雑な実装は同modelのhighを使う。同じファイルを複数agentへ同時に編集させず、直列依存の単位はmain agentが処理する。main agentはsubagentの作業を重複せず、統合と受け入れ条件の確認に集中する。
 
 1. 単位の目的、対象、受け入れ条件、依存する完了単位を確認する。
 2. 周辺実装とテストを読んでから、合意範囲の最小変更を行う。無関係な整形や後続単位を混ぜない。

@@ -26,6 +26,7 @@
 
 ## Model and Delegation Policy
 
+- 修正・追加・構築の依頼では、規模や並列性を問わず最初に`gpt-5.6-sol`のhighをleadとして起動し、go/no-go、仕様解釈、最小実装単位を確定する。worker不要と判断した場合もSolの判断結果を残す
 - 親agentは`gpt-5.6-terra`のmediumで作業を統合し、Solの判断を実装可能な作業単位へ分解して進捗を管理する
 - subagentの既定値は`gpt-5.6-terra`のmediumとし、独立して並行できる作業だけを委譲する
 - 明確で狭い検索、ログ整理、受入条件の証拠収集には`gpt-5.6-luna`のhigh、仕様が固定された狭い実装とunit testには同modelのxhighを明示する
@@ -43,7 +44,7 @@
 1. AGENTS.md、docs、関連Issue、実装、テスト、Git履歴を調査する
 2. 外部仕様を一次情報で確認し、仕様不足、リスク、後方互換性、検証方法を整理する
 3. 一意なPlan IDと版、base、ブランチ名、順序付きの実装単位を内部計画として確定する。Daikiへ計画の作成可否や単位ごとの実行可否を尋ねない
-4. Sol highのgo/no-goで、仕様不足や停止条件がないことを確認する。GitHub Issueへの記録は、Daikiが依頼した場合または既存の追跡Issueがある場合だけ行う
+4. Sol highのgo/no-goで、仕様不足や停止条件がないことを確認する。GitHub Issueへの記録は、Daikiが依頼した場合だけ既存の追跡Issueへ行う
 5. 作業branch上で全実装単位を連続して実装・検証する。依頼スコープ内の失敗は原因調査と修正を反復し、受入条件を満たすまで自律的に続ける
 6. 各実装単位が独立して正しく復元可能な状態になった時点で、明示パスだけをstageし、検査後にcommitする。commitごとのDaiki確認は待たない
 7. 全実装単位後に、同じ証拠集合を使った通常レビューと、独立した反論意見レビューを実施する
@@ -87,7 +88,7 @@
 
 - 合意済み計画には一意なPlan IDと版、各実装単位には一意なIDを付ける
 - 正本は、Daikiの依頼、プロジェクト指定docs、信頼済み追跡Issueの順で特定する
-- 既存追跡Issueがある場合、本文を上書きせず、承認済み計画、完了commit、最終監査を重複しないコメントとして追記する
+- DaikiがIssue記録を依頼し既存追跡Issueがある場合だけ、本文を上書きせず、内部計画、完了commit、最終監査を重複しないコメントとして追記する
 - Issueの新規作成や状態変更は、Daikiが依頼した場合だけ行う
 - commit完了記録にはcommit hash、実装単位、検証結果、残存事項を含める
 - 永続的な正本がない場合は、Draft PR本文と最終報告に引き継ぎ情報を残す
@@ -109,7 +110,7 @@ Git書き込みは、Daikiの実装依頼スコープ内の作業branchに限り
 許可する操作:
 
 - `git fetch origin <base>`
-- cleanな既定保護branch上での`git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin <base>`
+- cleanな既定保護branch上での`git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin <base>`。hookは保護branch名の許可リストとlocalの`origin/HEAD`の両方へ束縛する
 - cleanなworktreeでの`git switch -c <work-branch> origin/<base>`
 - `git add -- <明示パス...>`
 - 1行Gitmoji形式の`git commit -m <message>`
