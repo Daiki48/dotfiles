@@ -1,15 +1,9 @@
-# 通常の作業は workspace-write sandbox と approval_policy に任せる。
-# ここでは明確に不可逆な Git 操作だけを拒否する。
+# 通常の作業は workspace-write sandbox と Codexの判断に任せる。
+# ここでは、ファイル・branch・履歴を失う操作だけを拒否する。
 
 prefix_rule(pattern=["git", "push", ["--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"]], decision="forbidden", justification="履歴改変・削除・一括pushは禁止")
-prefix_rule(pattern=["git", "push", "origin", ["main", "master", "develop", "development", "trunk"]], decision="forbidden", justification="保護branchへの直接pushは禁止")
-prefix_rule(pattern=["git", "push", ["-u", "--set-upstream"], "origin", "HEAD:refs/heads/main"], decision="forbidden", justification="保護branchへの直接pushは禁止")
 prefix_rule(pattern=["git", "push"], decision="prompt", justification="push先と差分をauto-reviewで確認する")
-prefix_rule(pattern=["git", ["merge", "rebase", "reset", "clean", "restore", "revert", "update-ref", "worktree"]], decision="forbidden", justification="履歴改変または広範囲な破棄操作は禁止")
+prefix_rule(pattern=["git", ["rebase", "reset", "clean", "restore", "update-ref"]], decision="forbidden", justification="履歴改変または広範囲な破棄操作は禁止")
 prefix_rule(pattern=["git", "branch", ["-d", "-D", "--delete"]], decision="forbidden", justification="branch削除は禁止")
 prefix_rule(pattern=["git", "tag", ["-d", "--delete"]], decision="forbidden", justification="tag削除は禁止")
 prefix_rule(pattern=[["rm", "rmdir", "unlink", "shred"]], decision="forbidden", justification="削除操作はDaikiの確認が必要")
-prefix_rule(pattern=["gh", "pr", ["merge", "close", "reopen", "ready", "update-branch", "delete"]], decision="forbidden", justification="PRの状態変更はDaikiが行う")
-prefix_rule(pattern=["gh", "issue", ["close", "reopen", "delete", "lock", "unlock"]], decision="forbidden", justification="Issueの状態変更はDaikiが行う")
-prefix_rule(pattern=["gh", "release", ["create", "delete", "edit", "upload"]], decision="forbidden", justification="Release変更はDaikiが行う")
-prefix_rule(pattern=["gh", "repo", ["create", "delete", "rename", "archive", "fork", "sync"]], decision="forbidden", justification="repository変更はDaikiが行う")

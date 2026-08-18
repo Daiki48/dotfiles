@@ -75,8 +75,8 @@ workspace, while `on-request` approvals are routed through auto-review. Dangerou
 destructive operations remain blocked by the sandbox and a small set of deny rules.
 
 Ordinary editing, testing, and local non-destructive Git work are handled without a custom
-PreToolUse hook. Pushes go through auto-review; irreversible Git and GitHub operations are
-denied by rules.
+PreToolUse hook. Pushes go through auto-review. Rules deny operations that delete files,
+branches, tags, or Git history; Codex otherwise uses its normal approval judgment.
 
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, and Draft PRs are used
