@@ -22,7 +22,7 @@ import time
 GIT_READ_ONLY = {
     "status", "log", "diff", "show", "rev-parse", "blame", "shortlog",
     "describe", "reflog", "ls-files", "ls-tree", "cat-file", "rev-list",
-    "merge-base", "name-rev", "grep",
+    "merge-base", "name-rev", "grep", "symbolic-ref",
 }
 GIT_SAFE_WRITE = {"add", "commit", "fetch", "push", "switch"}
 GIT_OPTS_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace"}
@@ -274,6 +274,8 @@ def _git_read_reason(command, args, global_option_used):
         operation = next((arg for arg in args if not arg.startswith("-")), None)
         if operation not in {"show", "list", "exists"}:
             return "git reflogはshow、list、existsだけ許可されます"
+    if command == "symbolic-ref" and args != ["--short", "refs/remotes/origin/HEAD"]:
+        return "git symbolic-refはoriginのdefault branch照会だけ許可されます"
     return None
 
 

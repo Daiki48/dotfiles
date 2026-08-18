@@ -19,7 +19,7 @@ description: 承認済み計画の全実装単位を自律的に実装・検証�
 1. `git status`、current branch、remote、base、既存差分を読む。Daikiの未commit変更がある場合は停止する。
 2. branch名、commit、PRの形式を、最近の関連commitと過去PRから確認する。慣例がなければ日本語と一般的なbranch prefixを使い、`codex/`prefixを使わない。
 3. 指定branchが既に選択されていれば一致を確認する。新規作成が必要なら`git fetch origin <base>`後、`git switch -c <branch> origin/<base>`だけを使う。
-4. protected branch、既存の別作業branch、想定外のupstreamでは進めない。
+4. protected branch、既存の別作業branch、想定外のupstreamでは進めない。`origin/<base>` を起点に新規作成した直後は、そのbaseをupstreamとして追跡する状態を正常とする。初回の `git push -u origin HEAD:refs/heads/<branch>` が成功した後は、作業branch自身の `origin/<branch>` をupstreamとして扱う。両者以外のupstream、または既存branchで計画と異なるupstreamだけを停止条件とする。
 
 ## 実装単位を連続処理する
 

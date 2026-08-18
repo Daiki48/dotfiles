@@ -31,6 +31,7 @@ class GuardTest(unittest.TestCase):
             "git branch --contains main",
             "git branch --list 'feature/*'",
             "git remote -v",
+            "git symbolic-ref --short refs/remotes/origin/HEAD",
             "git --version",
         ):
             with self.subTest(command=command):
@@ -94,6 +95,8 @@ class GuardTest(unittest.TestCase):
             "git reset --hard HEAD~1",
             "git branch -D feature/example",
             "git update-ref refs/heads/main HEAD",
+            "git symbolic-ref --delete refs/remotes/origin/HEAD",
+            "git symbolic-ref refs/remotes/origin/HEAD",
             "git -c alias.save=commit save -m test",
             "git -C /workspace add -- README.md",
             "env -u TOKEN git reset --hard HEAD",
