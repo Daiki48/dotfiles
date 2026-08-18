@@ -630,7 +630,7 @@ def _remote_refs_snapshot(cwd, head=None):
         if head_match is None:
             return None
         remote_head = head_match.group(1)
-    return f"origin/{default_match.group(1)}", remote_head
+    return f"origin/{default_match.group(1)}", default_oid_match.group(1), remote_head
 
 
 def _repository_reason(repository, cwd):
@@ -697,11 +697,19 @@ def _draft_pr_preflight_reason(cwd, base, head):
         snapshot = _remote_refs_snapshot(cwd, head if remote_head is None else None)
         if snapshot is None:
             return "Draft PRのremote refを安全に確認できません"
-        remote_default_ref, fallback_remote_head = snapshot
+        remote_default_ref, remote_default_oid, fallback_remote_head = snapshot
         if default_ref is None:
             default_ref = remote_default_ref
         elif default_ref.strip() != remote_default_ref:
             return "Draft PRのbaseはoriginのdefault branchと一致させてください"
+        local_default_oid = _run_git(
+            cwd, "rev-parse", "--verify", f"refs/remotes/{default_ref.strip()}"
+        )
+        if (
+            local_default_oid is None
+            or local_default_oid.strip().casefold() != remote_default_oid.casefold()
+        ):
+            return "Draft PRのbase remote-tracking refがremoteと一致しません"
         if remote_head is None:
             remote_head = fallback_remote_head
     if remote_head is None or local_head.strip() != remote_head.strip():
@@ -953,13 +961,23 @@ def _push_preflight_reason(cwd, branch):
             snapshot = _remote_refs_snapshot(cwd)
             if snapshot is None:
                 return "未push commitのbaseを特定できません"
-            default_ref, _ = snapshot
+            default_ref, remote_default_oid, _ = snapshot
+        else:
+            remote_default_oid = None
         if not default_ref.strip().startswith("origin/"):
             return "未push commitのbaseを特定できません"
         default_branch = default_ref.strip().removeprefix("origin/")
         if not _is_protected_branch(default_branch):
             return "originのdefault branchが保護対象ではありません"
-        if _run_git(cwd, "rev-parse", "--verify", f"refs/remotes/{default_ref.strip()}") is None:
+        local_default_oid = _run_git(
+            cwd, "rev-parse", "--verify", f"refs/remotes/{default_ref.strip()}"
+        )
+        if local_default_oid is None:
+            return "未push commitのbaseを特定できません"
+        if (
+            remote_default_oid is not None
+            and local_default_oid.strip().casefold() != remote_default_oid.casefold()
+        ):
             return "未push commitのbaseを特定できません"
         merge_base = _run_git(cwd, "merge-base", "HEAD", default_ref.strip())
         if merge_base is None:

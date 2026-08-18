@@ -540,7 +540,7 @@ class GuardTest(unittest.TestCase):
         with mock.patch.object(GUARD, "_run_git", return_value=response) as run_git:
             self.assertEqual(
                 GUARD._remote_refs_snapshot("/workspace", "feature/example"),
-                ("origin/main", head_oid),
+                ("origin/main", default_oid, head_oid),
             )
             run_git.assert_called_once_with(
                 "/workspace",
@@ -566,6 +566,8 @@ class GuardTest(unittest.TestCase):
                     )
 
     def test_push_preflight_uses_remote_default_only_when_origin_head_is_missing(self):
+        default_oid = "c" * 40
+
         def safe_git(_cwd, *args):
             values = {
                 ("remote", "get-url", "origin"): "https://github.com/owner/repo.git\n",
@@ -574,16 +576,16 @@ class GuardTest(unittest.TestCase):
                 ("status", "--porcelain=v1", "--untracked-files=all"): "",
                 ("rev-parse", "--verify", "origin/feature/example"): None,
                 ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"): None,
-                ("rev-parse", "--verify", "refs/remotes/origin/main"): "base123\n",
-                ("merge-base", "HEAD", "origin/main"): "base123\n",
-                ("diff", "--name-only", "--diff-filter=ACMR", "base123..HEAD"): "src/main.rs\n",
-                ("diff", "--no-ext-diff", "--no-textconv", "--unified=0", "base123..HEAD", "--"): "diff --git a/x b/x\n+safe = true\n",
+                ("rev-parse", "--verify", "refs/remotes/origin/main"): f"{default_oid}\n",
+                ("merge-base", "HEAD", "origin/main"): f"{default_oid}\n",
+                ("diff", "--name-only", "--diff-filter=ACMR", f"{default_oid}..HEAD"): "src/main.rs\n",
+                ("diff", "--no-ext-diff", "--no-textconv", "--unified=0", f"{default_oid}..HEAD", "--"): "diff --git a/x b/x\n+safe = true\n",
             }
             return values.get(args)
 
         with (
             mock.patch.object(GUARD, "_run_git", side_effect=safe_git),
-            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", None)),
+            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", default_oid, None)),
         ):
             self.assertIsNone(
                 GUARD._push_preflight_reason("/workspace", "feature/example")
@@ -591,7 +593,7 @@ class GuardTest(unittest.TestCase):
 
         with (
             mock.patch.object(GUARD, "_run_git", side_effect=safe_git),
-            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/release/1", None)),
+            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/release/1", default_oid, None)),
         ):
             self.assertIsNotNone(
                 GUARD._push_preflight_reason("/workspace", "feature/example")
@@ -604,7 +606,15 @@ class GuardTest(unittest.TestCase):
 
         with (
             mock.patch.object(GUARD, "_run_git", side_effect=missing_base_git),
-            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", None)),
+            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", default_oid, None)),
+        ):
+            self.assertIsNotNone(
+                GUARD._push_preflight_reason("/workspace", "feature/example")
+            )
+
+        with (
+            mock.patch.object(GUARD, "_run_git", side_effect=safe_git),
+            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", "d" * 40, None)),
         ):
             self.assertIsNotNone(
                 GUARD._push_preflight_reason("/workspace", "feature/example")
@@ -650,12 +660,13 @@ class GuardTest(unittest.TestCase):
                 ("rev-parse", "HEAD"): f"{head_oid}\n",
                 ("rev-parse", "--verify", "origin/feature/example"): None,
                 ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"): "origin/main\n",
+                ("rev-parse", "--verify", "refs/remotes/origin/main"): "b" * 40 + "\n",
             }
             return values.get(args)
 
         with (
             mock.patch.object(GUARD, "_run_git", side_effect=safe_git),
-            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", head_oid)),
+            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", "b" * 40, head_oid)),
         ):
             self.assertIsNone(
                 GUARD._draft_pr_preflight_reason(
@@ -665,7 +676,17 @@ class GuardTest(unittest.TestCase):
 
         with (
             mock.patch.object(GUARD, "_run_git", side_effect=safe_git),
-            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", "b" * 40)),
+            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", "b" * 40, "b" * 40)),
+        ):
+            self.assertIsNotNone(
+                GUARD._draft_pr_preflight_reason(
+                    "/workspace", "main", "feature/example"
+                )
+            )
+
+        with (
+            mock.patch.object(GUARD, "_run_git", side_effect=safe_git),
+            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", "c" * 40, head_oid)),
         ):
             self.assertIsNotNone(
                 GUARD._draft_pr_preflight_reason(

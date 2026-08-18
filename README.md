@@ -107,8 +107,8 @@ stash, and every other pull form remain blocked.
 
 For the first push of a work branch, a missing local `origin/HEAD` is resolved by one
 read-only remote symref lookup, provided the corresponding local remote-tracking base ref
-exists and has a merge-base with `HEAD`. For Draft PR creation, a missing local
-`origin/<work-branch>` is similarly checked against the remote tip and must match local
+exists, matches the remote OID, and has a merge-base with `HEAD`. A missing local
+`origin/<work-branch>` for Draft PR creation is similarly checked against the remote tip and must match local
 `HEAD` exactly. This removes the need to run a manual fetch solely because the sandbox
 could not update local tracking refs after push. Remote lookup failures, malformed or
 ambiguous ref responses, missing local base refs, and every mismatch are rejected
