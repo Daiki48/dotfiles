@@ -30,6 +30,11 @@ class HookTest(unittest.TestCase):
             "rm important.txt",
             "sudo rm important.txt",
             "env rm important.txt",
+            "env -S 'rm important.txt'",
+            "bash -c 'rm important.txt'",
+            "sh -c 'git push --force origin feature/example'",
+            "nice rm important.txt",
+            "timeout 1 rm important.txt",
             "git rm important.txt",
             "git checkout -- important.txt",
             "git stash clear",
@@ -44,6 +49,9 @@ class HookTest(unittest.TestCase):
             "git push origin +HEAD:refs/heads/feature/example",
             "git push --prune origin",
             "git -c core.pager=cat branch -D feature/example",
+            "git -c alias.p='push --force' p origin feature/example",
+            "git -c remote.origin.mirror=true push origin",
+            "GIT_CONFIG_COUNT=1 git push origin feature/example",
             "git status && git push origin --force feature/example",
         ):
             with self.subTest(command=command):

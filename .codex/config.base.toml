@@ -17,7 +17,7 @@ approvals_reviewer = "auto_review"
 sandbox_mode = "workspace-write"
 
 # Codex/OpenAIのco-authorや生成表記をcommit messageへ追加しない。
-# Codex CLI 0.147.0でstrict config検証済み。hookでもAI帰属を拒否する。
+# Codex CLI 0.147.0でstrict config検証済み。
 commit_attribution = ""
 
 [sandbox_workspace_write]

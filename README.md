@@ -97,6 +97,10 @@ tables are removed while shared settings are merged without discarding project t
 hook trust, TUI state, or custom agents. Retired teacher/autonomous profile files are
 renamed to timestamped backups instead of being deleted.
 
+After the first install or an update of the safety hook, restart Codex and use `/hooks` to
+trust the displayed hook when Codex requests it. This is a one-time local trust decision;
+the hook is not active until it is trusted.
+
 Authentication, session history, pairing information, local databases, and credentials
 must remain outside this public repository. Diff review is required before external writes.
 

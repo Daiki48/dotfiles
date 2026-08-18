@@ -8,6 +8,8 @@ import sys
 
 DELETION_COMMANDS = {"rm", "rmdir", "unlink", "shred"}
 COMMAND_WRAPPERS = {"command", "env", "exec", "sudo"}
+SHELL_WRAPPERS = {"sh", "bash", "zsh", "dash", "ksh"}
+SCHEDULE_WRAPPERS = {"nice", "timeout"}
 WRAPPER_OPTIONS_WITH_VALUE = {"sudo": {"-u", "-g", "-h", "-p", "-C"}, "env": {"-u", "-C"}}
 SHELL_SEPARATORS = {";", "&&", "||", "|", "\n"}
 PROTECTED_PUSH_OPTIONS = {"--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--all", "--tags", "--prune"}
@@ -48,6 +50,10 @@ def _unwrap(tokens):
     index = 0
     while index < len(tokens):
         executable = tokens[index].rsplit("/", 1)[-1]
+        if executable in SHELL_WRAPPERS:
+            return executable, tokens[index:]
+        if executable == "env" and "-S" in tokens[index:]:
+            return executable, tokens[index:]
         if executable not in COMMAND_WRAPPERS:
             return executable, tokens[index:]
         index += 1
@@ -61,6 +67,38 @@ def _unwrap(tokens):
             else:
                 break
     return None, []
+
+
+def _wrapped_command_reason(executable, tokens):
+    if executable in SHELL_WRAPPERS:
+        try:
+            command_index = tokens.index("-c")
+        except ValueError:
+            return None
+        if command_index + 1 >= len(tokens):
+            return "shell commandを安全に解析できません"
+        return blocked_reason(tokens[command_index + 1])
+
+    if executable == "env" and "-S" in tokens:
+        command_index = tokens.index("-S")
+        if command_index + 1 >= len(tokens):
+            return "env -Sを安全に解析できません"
+        return blocked_reason(tokens[command_index + 1])
+
+    if executable == "nice":
+        index = 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            index += 2 if tokens[index] in {"-n", "--adjustment"} else 1
+        return blocked_reason(" ".join(tokens[index:])) if index < len(tokens) else None
+
+    if executable == "timeout":
+        index = 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            index += 2 if tokens[index] in {"-k", "--kill-after"} else 1
+        index += 1  # duration
+        return blocked_reason(" ".join(tokens[index:])) if index < len(tokens) else None
+
+    return None
 
 
 def _is_deleting_refspec(argument):
@@ -81,12 +119,19 @@ def blocked_reason(command):
     for tokens in segments:
         if not tokens:
             continue
+        if any(token.startswith("GIT_CONFIG_") and "=" in token for token in tokens):
+            return "一時Git設定を伴う操作は許可されていません"
         executable, tokens = _unwrap(tokens)
+        wrapped_reason = _wrapped_command_reason(executable, tokens)
+        if wrapped_reason:
+            return wrapped_reason
         if executable in DELETION_COMMANDS:
             return "ファイル削除操作は許可されていません"
         if executable != "git":
             continue
 
+        if any(arg == "-c" or arg.startswith("-c") or arg.startswith("--config") for arg in tokens[1:]):
+            return "一時Git設定を伴う操作は許可されていません"
         subcommand, args = _git_subcommand(tokens)
         if subcommand == "rm":
             return "git rmによるファイル削除は許可されていません"
