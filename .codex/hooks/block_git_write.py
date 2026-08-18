@@ -388,9 +388,22 @@ def _git_pull_reason(args, cwd):
     return _pull_preflight_reason(cwd, base)
 
 
-def _git_switch_reason(args):
+def _default_branch_switch_reason(args, cwd):
+    """既定保護branchへの安全な切り替えに必要なlocal状態を検査する。"""
+    base = args[0]
+    default_ref = _run_git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if default_ref is None or default_ref.strip() != f"origin/{base}":
+        return "git switchの対象はoriginの既定保護branchと一致させてください"
+    if _run_git(cwd, "rev-parse", "--verify", f"refs/heads/{base}") is None:
+        return "git switchの対象local branchを確認できません"
+    return None
+
+
+def _git_switch_reason(args, cwd):
+    if len(args) == 1 and args[0] in PROTECTED_BRANCHES:
+        return _default_branch_switch_reason(args, cwd)
     if len(args) != 3 or args[0] not in {"-c", "--create"}:
-        return "git switch は新規作業ブランチの作成だけ許可されます"
+        return "git switchは既定保護branchへの切り替えか新規作業branch作成だけ許可されます"
     branch, start = args[1], args[2]
     if not _valid_work_branch(branch):
         return "一般的なprefixを持つ非保護作業ブランチを指定してください"
@@ -474,12 +487,13 @@ def _git_invocation_reason(tokens, cwd=None):
             reason = _git_push_reason(args, cwd)
         elif token == "pull":
             reason = _git_pull_reason(args, cwd)
+        elif token == "switch":
+            reason = _git_switch_reason(args, cwd)
         else:
             reason = {
                 "add": _git_add_reason,
                 "commit": _git_commit_reason,
                 "fetch": _git_fetch_reason,
-                "switch": _git_switch_reason,
             }[token](args)
         if reason:
             return reason

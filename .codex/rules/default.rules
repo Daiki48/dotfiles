@@ -14,6 +14,7 @@ prefix_rule(pattern=["git", ["log", "diff", "show"], "--output"], decision="forb
 # 非正規形はallow規則に一致しないため、既定のapproval判定へ委ねる。
 prefix_rule(pattern=["git", "fetch", "origin"], decision="allow", justification="hook検査済みのbase branch取得")
 prefix_rule(pattern=["git", "pull", "--ff-only", "--no-rebase", "--no-autostash", "--no-recurse-submodules", "origin"], decision="allow", justification="hook検査済みの既定保護branch fast-forward同期")
+prefix_rule(pattern=["git", "switch", ["main", "master", "develop", "development", "trunk"]], decision="allow", justification="hook検査済みの既定保護branch切り替え")
 prefix_rule(pattern=["git", "switch", ["-c", "--create"]], decision="allow", justification="hook検査済みの作業branch作成")
 prefix_rule(pattern=["git", "add", "--"], decision="allow", justification="hook検査済みの明示パスstage")
 prefix_rule(pattern=["git", "commit", "-m"], decision="allow", justification="hook検査済みの1行commit")

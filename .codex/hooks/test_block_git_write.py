@@ -42,12 +42,14 @@ class GuardTest(unittest.TestCase):
             mock.patch.object(GUARD, "_staged_secret_reason", return_value=None),
             mock.patch.object(GUARD, "_push_preflight_reason", return_value=None),
             mock.patch.object(GUARD, "_pull_preflight_reason", return_value=None),
+            mock.patch.object(GUARD, "_default_branch_switch_reason", return_value=None),
             mock.patch.object(GUARD, "_current_work_branch_reason", return_value=None),
             mock.patch.object(GUARD, "_clean_worktree_reason", return_value=None),
         ):
             for command in (
                 "git fetch origin main",
                 "git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin main",
+                "git switch main",
                 "git switch -c feature/example origin/main",
                 "git switch --create fix/example origin/master",
                 "git add -- src/main.rs README.md",
@@ -89,9 +91,10 @@ class GuardTest(unittest.TestCase):
             "git pull --ff-only origin main",
             "git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin feature/example",
             "git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin stable",
-            "git switch main",
             "git switch -c codex/example origin/main",
             "git switch -c feature/example origin/feature/base",
+            "git switch feature/example",
+            "git switch release/2026-08",
             "git push origin main",
             "git push -u origin HEAD:refs/heads/main",
             "git push --force-with-lease origin feature/example",
@@ -345,6 +348,33 @@ class GuardTest(unittest.TestCase):
             mock.patch.object(GUARD.Path, "exists", return_value=True),
         ):
             self.assertIsNotNone(GUARD._pull_preflight_reason("/workspace", "main"))
+
+    def test_default_branch_switch_requires_origin_default_and_local_branch(self):
+        def safe_git(_cwd, *args):
+            values = {
+                ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"): "origin/main\n",
+                ("rev-parse", "--verify", "refs/heads/main"): "abc123\n",
+            }
+            return values.get(args)
+
+        with mock.patch.object(GUARD, "_run_git", side_effect=safe_git):
+            self.assertIsNone(GUARD._git_switch_reason(["main"], "/workspace"))
+
+        def wrong_default_git(cwd, *args):
+            if args == ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"):
+                return "origin/develop\n"
+            return safe_git(cwd, *args)
+
+        with mock.patch.object(GUARD, "_run_git", side_effect=wrong_default_git):
+            self.assertIsNotNone(GUARD._git_switch_reason(["main"], "/workspace"))
+
+        def missing_local_git(cwd, *args):
+            if args == ("rev-parse", "--verify", "refs/heads/main"):
+                return None
+            return safe_git(cwd, *args)
+
+        with mock.patch.object(GUARD, "_run_git", side_effect=missing_local_git):
+            self.assertIsNotNone(GUARD._git_switch_reason(["main"], "/workspace"))
 
     def test_read_only_git_rejects_side_effect_options(self):
         for command in (
