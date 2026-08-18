@@ -501,6 +501,16 @@ fn regular_file_exists(path: &Path) -> Result<bool> {
 }
 
 fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create managed hook directory {}",
+                parent.display()
+            )
+        })?;
+    }
     let source_contents = fs::read_to_string(source)
         .with_context(|| format!("Failed to read managed hook source {}", source.display()))?;
     let source_permissions = fs::metadata(source)
@@ -557,8 +567,8 @@ fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
                 .unwrap_or("block_git_write.py")
         ));
         copy_symlink_exclusive(destination, &backup_path)?;
-        write_file_exclusive(&state_path, &source_hash, source_permissions.clone())?;
-        replace_regular_file(destination, &source_contents, source_permissions)?;
+        replace_regular_file(destination, &source_contents, source_permissions.clone())?;
+        write_file_exclusive(&state_path, &source_hash, source_permissions)?;
         println!(
             "- Migrated managed hook to local copy (symlink backup: {}).",
             backup_path.display()
@@ -998,6 +1008,41 @@ description = "local"
 
         fs::write(&destination, "local change\n").expect("change hook");
         assert!(ensure_managed_hook(&source, &destination).is_err());
+    }
+
+    #[test]
+    fn managed_hook_repairs_missing_state_when_hook_matches_source() {
+        let directory = TestDirectory::new("managed-hook-repair");
+        let source = directory.path().join("source.py");
+        let destination = directory.path().join("hook.py");
+        fs::write(&source, "hook\n").expect("write source");
+        fs::write(&destination, "hook\n").expect("write hook");
+
+        ensure_managed_hook(&source, &destination).expect("repair missing state");
+
+        assert_eq!(
+            fs::read_to_string(managed_hook_state_path(&destination)).expect("read state"),
+            sha256("hook\n")
+        );
+    }
+
+    #[test]
+    fn managed_hook_creates_missing_parent_directory() {
+        let directory = TestDirectory::new("managed-hook-parent");
+        let source = directory.path().join("source.py");
+        let destination = directory.path().join("hooks").join("hook.py");
+        fs::write(&source, "hook\n").expect("write source");
+
+        ensure_managed_hook(&source, &destination).expect("install hook in new directory");
+
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read hook"),
+            "hook\n"
+        );
+        assert_eq!(
+            fs::read_to_string(managed_hook_state_path(&destination)).expect("read state"),
+            sha256("hook\n")
+        );
     }
 
     #[test]

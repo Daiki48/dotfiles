@@ -117,7 +117,10 @@ exists, commit messages and PR/Issue bodies default to Japanese, commit subjects
 
 `~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
 `~/.agents/skills` are symlinked from this repository. The Git hook is a local managed copy
-with a checksum sidecar, so branch switching cannot roll its implementation back.
+with a checksum sidecar, so branch switching alone cannot roll its implementation back. Setup
+updates that copy from the currently checked-out source only when the sidecar matches; local
+changes are preserved and cause setup to stop with an error. Each successful replacement keeps
+a timestamped backup for recovery.
 `~/.codex/config.toml` remains local because it contains machine-specific
 project trust, hook trust, and TUI state. `cargo run -- codex` backs up the local config
 before migrating the shared top-level settings. If an older setup left `config.toml` as a
