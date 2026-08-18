@@ -23,8 +23,8 @@ commit_attribution = ""
 [sandbox_workspace_write]
 network_access = true
 
-# 通常のsubagentは探索・実装・レビューを十分に扱えるTerraへ寄せる。
-# 狭い実装はSkillからLuna xhigh、高難度の判断だけSol highを明示する。
+# 通常のsubagentは探索・実装・中立/反論reviewを十分に扱えるTerraへ寄せる。
+# 狭い実装はSkillからLuna xhigh、技術判断の責任者だけSol highを明示する。
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 3
