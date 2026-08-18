@@ -9,8 +9,8 @@
 # repository内ではconfig.base.tomlという名前にし、project configとして
 # Codexに自動読込されないようにする。
 
-model = "gpt-5.6-sol"
-model_reasoning_effort = "high"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "medium"
 plan_mode_reasoning_effort = "high"
 approval_policy = "on-request"
 approvals_reviewer = "auto_review"
@@ -22,6 +22,14 @@ commit_attribution = ""
 
 [sandbox_workspace_write]
 network_access = true
+
+# 通常のsubagentは探索・実装・レビューを十分に扱えるTerraへ寄せる。
+# 狭い実装はSkillからLuna xhigh、高難度の判断だけSol highを明示する。
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3
+default_subagent_model = "gpt-5.6-terra"
+default_subagent_reasoning_effort = "medium"
 
 # workspace-write sandboxを主境界とし、hookはGit/GitHubの引数、削除操作、
 # secret、AI帰属を早期検査する多層防御として使う。

@@ -73,6 +73,13 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 Codex uses a single default workflow. `workspace-write` allows implementation inside the
 workspace, while `on-request` approvals are routed through auto-review. Dangerous or
 destructive operations remain blocked by the sandbox, rules, hooks, and AGENTS.md.
+The main agent defaults to `gpt-5.6-terra` with medium reasoning, while plan mode uses
+high reasoning. An approved, versioned plan is recorded in a tracking Issue before
+implementation when GitHub is available. Up to three subagents default to Terra/medium;
+narrow, fully specified implementation can use Luna/xhigh, ordinary implementation and
+review use Terra, and Sol/high is reserved for unresolved ambiguity, high-risk security
+review, or genuinely difficult decisions. This avoids running every workflow step on the
+most rate-intensive model while keeping escalation available.
 
 After Daiki approves a versioned plan, Codex can implement and verify each unit, create
 checkpoint commits, perform independent adversarial review, push one non-protected work

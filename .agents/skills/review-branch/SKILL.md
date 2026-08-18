@@ -19,9 +19,9 @@ description: 承認済み計画の全実装完了後、baseとの差分を固定
 
 可能なら実装を担当していない3つのsubagentを使う。各subagentへ期待する結論、既知の懸念、他reviewerの所見を渡さず、ファイルを変更しないよう指示する。
 
-1. **正しさ・互換性reviewer**: 要件、制御flow、境界値、error処理、設定・CLI・保存形式の後方互換性、test不足を確認する。
-2. **セキュリティ・堅牢性reviewer**: 入力検証、認証・認可、秘密情報、注入、path traversal、競合、timeout、retry、依存関係、resource枯渇を確認する。
-3. **反論意見・fact-check reviewer**: 「mergeすべきでない」と仮定し、計画からの逸脱、古い前提、外部公式仕様との不一致、運用・性能・rollbackの弱点、他観点の見落としを探す。
+1. **正しさ・互換性reviewer** (`gpt-5.6-terra`, high): 要件、制御flow、境界値、error処理、設定・CLI・保存形式の後方互換性、test不足を確認する。
+2. **セキュリティ・堅牢性reviewer** (`gpt-5.6-sol`, high): 入力検証、認証・認可、秘密情報、注入、path traversal、競合、timeout、retry、依存関係、resource枯渇を確認する。
+3. **反論意見・fact-check reviewer** (`gpt-5.6-terra`, high): 「mergeすべきでない」と仮定し、計画からの逸脱、古い前提、外部公式仕様との不一致、運用・性能・rollbackの弱点、他観点の見落としを探す。
 
 subagentを利用できない場合は、main agentが証拠集合を固定したまま3観点を独立したpassとして実施し、その制約を結果へ明記する。
 
