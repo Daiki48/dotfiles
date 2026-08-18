@@ -19,10 +19,10 @@ description: 内部計画に基づく全実装完了後、baseとの差分を固
 
 可能なら実装を担当していない2つのsubagentを使う。各subagentへ期待する結論、既知の懸念、他reviewerの所見を渡さず、ファイルを変更しないよう指示する。
 
-1. **中立reviewer** (`gpt-5.6-terra`, high): 要件、制御flow、境界値、error処理、設定・CLI・保存形式の後方互換性、性能、受入条件、test不足を確認する。
-2. **反論reviewer** (`gpt-5.6-terra`, high): 「mergeすべきでない」と仮定し、入力検証、認証・認可、秘密情報、注入、path traversal、競合、timeout、retry、依存関係、resource枯渇、計画からの逸脱、外部仕様、運用、rollbackの弱点を探す。
+1. **中立reviewer** (`gpt-5.6-luna`, xhigh): 要件、制御flow、境界値、error処理、設定・CLI・保存形式の後方互換性、性能、受入条件、test不足を確認する。
+2. **反論reviewer** (`gpt-5.6-luna`, xhigh): 「mergeすべきでない」と仮定し、入力検証、認証・認可、秘密情報、注入、path traversal、競合、timeout、retry、依存関係、resource枯渇、計画からの逸脱、外部仕様、運用、rollbackの弱点を探す。
 
-Sol highが固定した証拠集合と両reviewを再判定して、Draft PR可否の最終技術判断を行う。重大なセキュリティ・互換性・データ移行、2回の修正ループ失敗、またはreview結論の衝突ではSol xhighへ昇格する。肯定reviewは、Solが高リスク変更で必要と判断した場合だけ`gpt-5.6-luna`のhighで追加する。
+Sol highが固定した証拠集合と両reviewを再判定して、Draft PR可否の最終技術判断を行う。重大なセキュリティ・互換性・データ移行、2回の修正ループ失敗、またはreview結論の衝突ではSol xhighへ昇格する。肯定reviewは、Solが高リスク変更で必要と判断した場合だけ`gpt-5.6-luna`のxhighで追加する。Luna maxは、xhighで不足する具体的な根拠がある場合だけ使う。
 
 subagentを利用できない場合は、main agentが証拠集合を固定したまま2観点を独立したpassとして実施し、その制約を結果へ明記する。
 
