@@ -434,6 +434,8 @@ def _git_invocation_reason(tokens, cwd=None):
     start = _command_start(tokens)
     if start is None or os.path.basename(tokens[start]) != "git":
         return None
+    if tokens[start] != "git":
+        return "Git commandはPATHからgitを直接実行してください"
     if start != 0:
         return "Git commandをwrapper、環境変数、cwd変更経由で実行できません"
     git_args = tokens[start + 1:]
@@ -763,6 +765,8 @@ def _gh_invocation_reason(tokens, cwd=None):
     start = _command_start(tokens)
     if start is None or os.path.basename(tokens[start]) != "gh":
         return None
+    if tokens[start] != "gh":
+        return "GitHub commandはPATHからghを直接実行してください"
     if start != 0:
         return "GitHub commandをwrapper、環境変数、cwd変更経由で実行できません"
     if "--help" in tokens[start + 1:] or "-h" in tokens[start + 1:]:
@@ -936,14 +940,14 @@ def _changes_secret_reason(names, patch, label):
 
 
 def _push_preflight_reason(cwd, branch):
-    fetch_url = _run_git(cwd, "remote", "get-url", "origin")
-    push_url = _run_git(cwd, "remote", "get-url", "--push", "origin")
-    fetch_repository = (
-        None if fetch_url is None else _github_repository_from_url(fetch_url)
-    )
-    push_repository = (
-        None if push_url is None else _github_repository_from_url(push_url)
-    )
+    fetch_urls = _run_git(cwd, "remote", "get-url", "--all", "origin")
+    push_urls = _run_git(cwd, "remote", "get-url", "--push", "--all", "origin")
+    fetch_lines = [] if fetch_urls is None else fetch_urls.splitlines()
+    push_lines = [] if push_urls is None else push_urls.splitlines()
+    if len(fetch_lines) != 1 or len(push_lines) != 1:
+        return "originのfetch/push先はそれぞれ1件だけ指定してください"
+    fetch_repository = _github_repository_from_url(fetch_lines[0])
+    push_repository = _github_repository_from_url(push_lines[0])
     if fetch_repository is None or push_repository != fetch_repository:
         return "originのpush先がcurrent GitHub repositoryと一致しません"
 

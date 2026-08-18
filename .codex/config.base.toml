@@ -34,6 +34,6 @@ matcher = "^Bash$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = 'python3 "$HOME/.codex/hooks/prevent_irreversible_git.py"'
+command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
 timeout = 10
-statusMessage = "不可逆な操作を確認中"
+statusMessage = "Git/GitHub操作を確認中"

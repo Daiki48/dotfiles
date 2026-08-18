@@ -1,8 +1,10 @@
-# 通常の作業は workspace-write sandbox と Codexの判断に任せる。
-# ここでは、ファイル・branch・履歴を失う操作だけを拒否する。
+# 通常の作業は workspace-write sandbox と厳格なPreToolUse hookで検査する。
+# 検査済みのcommit・単一branch push・Draft PR作成だけを無確認で許可する。
 
 prefix_rule(pattern=["git", "push", ["--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"]], decision="forbidden", justification="履歴改変・削除・一括pushは禁止")
-prefix_rule(pattern=["git", "push"], decision="prompt", justification="push先と差分をauto-reviewで確認する")
+prefix_rule(pattern=["git", "commit", "-m"], decision="allow", justification="hook検査済みの通常commit")
+prefix_rule(pattern=["git", "push", "-u", "origin"], decision="allow", justification="hook検査済みの単一作業branch push")
+prefix_rule(pattern=["gh", "pr", "create", "--draft"], decision="allow", justification="hook検査済みのDraft PR作成")
 prefix_rule(pattern=["git", ["rebase", "reset", "clean", "restore", "rm", "update-ref"]], decision="forbidden", justification="履歴改変または広範囲な破棄操作は禁止")
 prefix_rule(pattern=["git", "checkout", "--"], decision="forbidden", justification="作業中の変更を破棄するcheckoutは禁止")
 prefix_rule(pattern=["git", "stash", ["clear", "drop"]], decision="forbidden", justification="stash削除は禁止")

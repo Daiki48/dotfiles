@@ -12,8 +12,8 @@ const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
     (".codex/rules/default.rules", ".codex/rules/default.rules"),
 ];
-const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/prevent_irreversible_git.py";
-const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/prevent_irreversible_git.py";
+const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/block_git_write.py";
+const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/block_git_write.py";
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 
 // Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
@@ -39,16 +39,16 @@ const MANAGED_AGENT_KEYS: &[&str] = &[
     "default_subagent_reasoning_effort",
 ];
 const MANAGED_HOOK_COMMAND: &str = "command = 'python3 \"$HOME/.codex/hooks/block_git_write.py\"'";
-const IRREVERSIBLE_HOOK_COMMAND: &str =
+const RETIRED_HOOK_COMMAND: &str =
     "command = 'python3 \"$HOME/.codex/hooks/prevent_irreversible_git.py\"'";
-const IRREVERSIBLE_HOOK_CONFIG: &str = r#"[[hooks.PreToolUse]]
+const MANAGED_HOOK_CONFIG: &str = r#"[[hooks.PreToolUse]]
 matcher = "^Bash$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = 'python3 "$HOME/.codex/hooks/prevent_irreversible_git.py"'
+command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
 timeout = 10
-statusMessage = "不可逆な操作を確認中""#;
+statusMessage = "Git/GitHub操作を確認中""#;
 const PRE_TOOL_USE_HEADER: &str = "[[hooks.PreToolUse]]";
 const PRE_TOOL_USE_HOOK_HEADER: &str = "[[hooks.PreToolUse.hooks]]";
 
@@ -250,7 +250,7 @@ fn managed_assignments(template: &str, section: Option<&str>, keys: &[&str]) -> 
         .collect()
 }
 
-fn remove_legacy_managed_hook(existing: &str) -> String {
+fn remove_retired_managed_hook(existing: &str) -> String {
     let existing_lines = existing.lines().collect::<Vec<_>>();
     let mut merged = Vec::new();
     let mut index = 0;
@@ -275,7 +275,7 @@ fn remove_legacy_managed_hook(existing: &str) -> String {
             .unwrap_or(existing_lines.len());
         let has_managed_hook = existing_lines[section_start..section_end]
             .iter()
-            .any(|line| line.trim() == MANAGED_HOOK_COMMAND);
+            .any(|line| line.trim() == RETIRED_HOOK_COMMAND);
         if !has_managed_hook {
             merged.extend_from_slice(&existing_lines[section_start..section_end]);
             index = section_end;
@@ -299,7 +299,7 @@ fn remove_legacy_managed_hook(existing: &str) -> String {
                 .unwrap_or(section_end);
             if !existing_lines[hook_start..hook_end]
                 .iter()
-                .any(|line| line.trim() == MANAGED_HOOK_COMMAND)
+                .any(|line| line.trim() == RETIRED_HOOK_COMMAND)
             {
                 retained_hooks.extend_from_slice(&existing_lines[hook_start..hook_end]);
             }
@@ -389,15 +389,15 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
 }
 
 fn sync_managed_hook(template: &str, existing: &str) -> String {
-    let cleaned = remove_legacy_managed_hook(existing);
-    if !template.contains(IRREVERSIBLE_HOOK_COMMAND)
+    let cleaned = remove_retired_managed_hook(existing);
+    if !template.contains(MANAGED_HOOK_COMMAND)
         || cleaned
             .lines()
-            .any(|line| line.trim() == IRREVERSIBLE_HOOK_COMMAND)
+            .any(|line| line.trim() == MANAGED_HOOK_COMMAND)
     {
         return cleaned;
     }
-    format!("{}\n\n{IRREVERSIBLE_HOOK_CONFIG}\n", cleaned.trim_end())
+    format!("{}\n\n{MANAGED_HOOK_CONFIG}\n", cleaned.trim_end())
 }
 
 fn backup_legacy_config(codex_dir: &Path) -> Result<()> {
@@ -816,8 +816,8 @@ pub fn setup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MANAGED_HOOK_COMMAND, contains_legacy_profile_config, copy_file_exclusive,
-        ensure_config_unchanged, ensure_managed_hook, managed_hook_state_path,
+        MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND, contains_legacy_profile_config,
+        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook, managed_hook_state_path,
         merge_managed_config, migrate_managed_config_from_template, sha256, verify_managed_symlink,
     };
     use std::fs;
@@ -1102,8 +1102,17 @@ description = "local"
     }
 
     #[test]
-    fn managed_hook_is_removed_without_removing_local_hook_state() {
-        let template = r#"model = "gpt-5.6-terra""#;
+    fn retired_hook_is_replaced_without_removing_local_hook_state() {
+        let template = r#"model = "gpt-5.6-terra"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
+timeout = 10
+statusMessage = "Git/GitHub操作を確認中""#;
         let old = r#"model = "old"
 
 [[hooks.PreToolUse]]
@@ -1111,7 +1120,7 @@ matcher = ".*"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
+command = 'python3 "$HOME/.codex/hooks/prevent_irreversible_git.py"'
 timeout = 1
 
 [[hooks.PreToolUse.hooks]]
@@ -1121,17 +1130,18 @@ timeout = 30
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = "echo block_git_write.py"
+command = "echo prevent_irreversible_git.py"
 timeout = 30
 
 [hooks.state]
 "#;
         let updated = merge_managed_config(template, old);
-        assert!(!updated.contains(MANAGED_HOOK_COMMAND));
+        assert!(updated.contains(MANAGED_HOOK_COMMAND));
+        assert!(!updated.contains(RETIRED_HOOK_COMMAND));
         assert!(updated.contains("matcher = \".*\""));
         assert!(!updated.lines().any(|line| line == "timeout = 1"));
         assert!(updated.contains("command = \"local-check\"\ntimeout = 30"));
-        assert!(updated.contains("command = \"echo block_git_write.py\"\ntimeout = 30"));
+        assert!(updated.contains("command = \"echo prevent_irreversible_git.py\"\ntimeout = 30"));
         assert!(updated.contains("[hooks.state]"));
         assert_eq!(merge_managed_config(template, &updated), updated);
     }
