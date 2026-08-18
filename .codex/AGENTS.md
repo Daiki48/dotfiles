@@ -111,7 +111,7 @@ Git書き込みは、Daikiの実装依頼スコープ内の作業branchに限り
 
 - `git fetch origin <base>`
 - cleanな既定保護branch上での`git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin <base>`。hookは保護branch名の許可リストとlocalの`origin/HEAD`の両方へ束縛する
-- cleanなworktreeでの`git switch <base>`。hookは既定保護branchの許可リスト、localの`origin/HEAD`、対象local branchの存在へ束縛する
+- cleanなworktreeでの`git switch <base>`。`<base>`は`main`、`master`、`develop`、`development`、`trunk`に限り、hookはその許可リスト、localの`origin/HEAD`、対象local branchの存在へ束縛する
 - cleanなworktreeでの`git switch -c <work-branch> origin/<base>`
 - `git add -- <明示パス...>`
 - 1行Gitmoji形式の`git commit -m <message>`
