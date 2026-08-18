@@ -11,10 +11,12 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
 import stat
 import subprocess
 import sys
+import time
 
 
 GIT_READ_ONLY = {
@@ -56,9 +58,9 @@ GH_ISSUE_ALLOWED = {
 }
 GH_READ_ONLY = {
     "pr": {"list", "view", "status", "checks", "diff"},
-    "run": {"list", "view", "watch", "download"},
+    "run": {"list", "view", "watch"},
     "repo": {"list", "view"},
-    "release": {"list", "view", "download", "verify", "verify-asset"},
+    "release": {"list", "view", "verify", "verify-asset"},
     "workflow": {"list", "view"},
     "label": {"list"},
     "cache": {"list"},
@@ -71,8 +73,15 @@ GH_GLOBAL_OPTS_WITH_VALUE = {"-R", "--repo", "--hostname"}
 
 DESTRUCTIVE_COMMANDS = {"rm", "rmdir", "unlink", "shred"}
 SHELLS = {"bash", "dash", "sh", "zsh"}
-COMMAND_WRAPPERS = {"command", "env", "nohup", "sudo"}
+COMMAND_WRAPPERS = {"command", "env", "exec", "nice", "nohup", "sudo", "timeout", "xargs"}
 ENV_OPTS_WITH_VALUE = {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
+EXEC_OPTS_WITH_VALUE = {"-a"}
+NICE_OPTS_WITH_VALUE = {"-n", "--adjustment"}
+TIMEOUT_OPTS_WITH_VALUE = {"-k", "--kill-after", "-s", "--signal"}
+XARGS_OPTS_WITH_VALUE = {
+    "-a", "--arg-file", "-d", "--delimiter", "-E", "--eof", "-I", "--replace",
+    "-L", "--max-lines", "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars",
+}
 SUDO_OPTS_WITH_VALUE = {
     "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
     "-C", "--chdir", "-R", "--chroot", "-T", "--command-timeout", "-r",
@@ -83,14 +92,16 @@ SUDO_OPTS_WITH_VALUE = {
 # 後ろに置かれた書き込みを見落とす可能性がある。
 SHELL_PUNCTUATION = ";&|()`\n"
 MAX_BODY_FILE_BYTES = 256 * 1024
+MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
+GIT_COMMAND_TIMEOUT_SECONDS = 3
 GIT_WRITE_ENVIRONMENT_KEYS = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
     "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
 }
 AI_ATTRIBUTION_RE = re.compile(
-    r"(?i)(co-authored-by\s*:\s*.*(?:codex|openai)|generated(?:-| )by\s*:\s*"
-    r".*(?:codex|openai)|signed-off-by\s*:\s*.*(?:codex|openai))"
+    r"(?i)(?:co-authored-by|generated(?:-| )by|signed-off-by)\s*:\s*.*"
+    r"(?:codex|openai|chatgpt|claude|gemini|copilot|\bai(?:\s+(?:assistant|agent|bot))?\b)"
 )
 COMMIT_SUBJECT_RE = re.compile(r"^:[a-z0-9_+-]+: \S.*$")
 
@@ -156,8 +167,16 @@ def _command_start(tokens):
         options_with_value = frozenset()
         if basename == "env":
             options_with_value = ENV_OPTS_WITH_VALUE
+        elif basename == "exec":
+            options_with_value = EXEC_OPTS_WITH_VALUE
+        elif basename == "nice":
+            options_with_value = NICE_OPTS_WITH_VALUE
         elif basename == "sudo":
             options_with_value = SUDO_OPTS_WITH_VALUE
+        elif basename == "timeout":
+            options_with_value = TIMEOUT_OPTS_WITH_VALUE
+        elif basename == "xargs":
+            options_with_value = XARGS_OPTS_WITH_VALUE
         while index < len(tokens):
             option = tokens[index]
             if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", option):
@@ -176,6 +195,9 @@ def _command_start(tokens):
                 index += 1
                 continue
             break
+        if basename == "timeout" and index < len(tokens):
+            # timeoutのdurationは実行commandではないため1 token読み飛ばす。
+            index += 1
     return None
 
 
@@ -293,6 +315,20 @@ def _git_commit_reason(args):
     return None
 
 
+def _current_work_branch_reason(cwd):
+    current = _run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    if current is None or not _valid_work_branch(current.strip()):
+        return "git add/commitは非保護の作業branch上だけで実行できます"
+    return None
+
+
+def _clean_worktree_reason(cwd, operation):
+    status = _run_git(cwd, "status", "--porcelain=v1", "--untracked-files=all")
+    if status is None or status.strip():
+        return f"worktreeがcleanではないためgit {operation}を拒否しました"
+    return None
+
+
 def _git_fetch_reason(args):
     if len(args) != 2 or args[0] != "origin":
         return "git fetch はoriginと単一のbase branchを明示してください"
@@ -397,6 +433,14 @@ def _git_invocation_reason(tokens, cwd=None):
             }[token](args)
         if reason:
             return reason
+        if token in {"add", "commit"}:
+            branch_reason = _current_work_branch_reason(cwd)
+            if branch_reason:
+                return branch_reason
+        if token == "switch":
+            clean_reason = _clean_worktree_reason(cwd, "switch")
+            if clean_reason:
+                return clean_reason
         if token == "commit":
             return _staged_secret_reason(cwd)
         return None
@@ -520,11 +564,28 @@ def _pr_create_reason(args, cwd):
         return repository_reason
     if not _is_protected_branch(base):
         return "Draft PRのbase branchが許可範囲外です"
+    preflight_reason = _draft_pr_preflight_reason(cwd, base, head)
+    if preflight_reason:
+        return preflight_reason
     if AI_ATTRIBUTION_RE.search(title):
         return "PR titleにAI帰属を含めることはできません"
     if _contains_secret(title):
         return "PR titleに秘密情報らしい値が含まれています"
     return _file_secret_reason(body_file)
+
+
+def _draft_pr_preflight_reason(cwd, base, head):
+    current = _run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    local_head = _run_git(cwd, "rev-parse", "HEAD")
+    remote_head = _run_git(cwd, "rev-parse", "--verify", f"origin/{head}")
+    default_ref = _run_git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if current is None or current.strip() != head:
+        return "Draft PRのheadはcurrent branchと一致させてください"
+    if local_head is None or remote_head is None or local_head.strip() != remote_head.strip():
+        return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
+    if default_ref is None or default_ref.strip() != f"origin/{base}":
+        return "Draft PRのbaseはoriginのdefault branchと一致させてください"
+    return None
 
 
 def _issue_write_reason(tokens, issue_command, issue_args, cwd):
@@ -660,19 +721,68 @@ def _file_secret_reason(path):
 def _run_git(cwd, *args):
     if not cwd:
         return None
+    environment = os.environ.copy()
+    for key in list(environment):
+        if (
+            key in GIT_WRITE_ENVIRONMENT_KEYS
+            or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+        ):
+            environment.pop(key, None)
+    process = None
+    selector = None
     try:
-        result = subprocess.run(
-            ["git", *args], cwd=cwd, check=False, capture_output=True,
-            text=True, timeout=10,
+        process = subprocess.Popen(
+            ["git", *args],
+            cwd=cwd,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
+        if process.stdout is None:
+            return None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + GIT_COMMAND_TIMEOUT_SECONDS
+        chunks = []
+        total = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(["git", *args], GIT_COMMAND_TIMEOUT_SECONDS)
+            if not selector.select(remaining):
+                if process.poll() is None:
+                    raise subprocess.TimeoutExpired(
+                        ["git", *args], GIT_COMMAND_TIMEOUT_SECONDS
+                    )
+                break
+            chunk = os.read(process.stdout.fileno(), 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_GIT_OUTPUT_BYTES:
+                return None
+            chunks.append(chunk)
+        remaining = max(0.01, deadline - time.monotonic())
+        if process.wait(timeout=remaining) != 0:
+            return None
+        return b"".join(chunks).decode("utf-8")
     except (OSError, subprocess.SubprocessError):
         return None
-    return result.stdout if result.returncode == 0 else None
+    except UnicodeError:
+        return None
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 def _staged_secret_reason(cwd):
     names = _run_git(cwd, "diff", "--cached", "--name-only", "--diff-filter=ACMR")
-    patch = _run_git(cwd, "diff", "--cached", "--no-ext-diff", "--unified=0", "--")
+    patch = _run_git(
+        cwd, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--unified=0", "--"
+    )
     if names is None or patch is None:
         return "staged changesを検査できないためcommitを拒否しました"
     return _changes_secret_reason(names, patch, "staged changes")
@@ -728,7 +838,15 @@ def _push_preflight_reason(cwd, branch):
         _, base = min(candidates)
 
     names = _run_git(cwd, "diff", "--name-only", "--diff-filter=ACMR", f"{base}..HEAD")
-    patch = _run_git(cwd, "diff", "--no-ext-diff", "--unified=0", f"{base}..HEAD", "--")
+    patch = _run_git(
+        cwd,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--unified=0",
+        f"{base}..HEAD",
+        "--",
+    )
     if names is None or patch is None:
         return "未push commitを検査できません"
     return _changes_secret_reason(names, patch, "未push commit")
@@ -838,6 +956,12 @@ def blocked_reason(command, cwd=None, depth=0):
             return "shell経由のGit/GitHub/削除commandは実行できません"
         if start is not None and os.path.basename(tokens[start]) in DESTRUCTIVE_COMMANDS:
             return "削除コマンドは自動実行できません"
+        if start is not None and os.path.basename(tokens[start]) == "find" and any(
+            token in {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
+            or token.startswith(("-fprint", "-fprintf", "-fls"))
+            for token in tokens[start + 1:]
+        ):
+            return "findによる削除、外部command実行、file書き込みは許可されていません"
         reason = _git_invocation_reason(tokens, cwd)
         if reason:
             return reason
@@ -851,25 +975,33 @@ def blocked_reason(command, cwd=None, depth=0):
     return None
 
 
+def _deny(reason):
+    reason = f"{reason}（PreToolUse hookが直接操作を拒否しました）。"
+    json.dump({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }, sys.stdout)
+    print(reason, file=sys.stderr)
+
+
 def main():
     try:
         data = json.load(sys.stdin)
     except Exception:
-        sys.exit(0)
+        _deny("hook inputを安全に解析できません")
+        sys.exit(2)
     tool_input = data.get("tool_input") or {}
     command = tool_input.get("command") or tool_input.get("cmd") or ""
     cwd = tool_input.get("workdir") or tool_input.get("cwd") or data.get("cwd")
+    if not isinstance(command, str) or not command.strip():
+        _deny("hook inputに検査対象commandがありません")
+        sys.exit(2)
     reason = blocked_reason(command, cwd)
     if reason:
-        reason = f"{reason}（PreToolUse hookが直接操作を拒否しました）。"
-        json.dump({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        }, sys.stdout)
-        print(reason, file=sys.stderr)
+        _deny(reason)
         sys.exit(2)
     sys.exit(0)
 

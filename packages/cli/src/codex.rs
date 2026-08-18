@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,6 +38,9 @@ const MANAGED_AGENT_KEYS: &[&str] = &[
     "default_subagent_model",
     "default_subagent_reasoning_effort",
 ];
+const MANAGED_HOOK_MARKER: &str = "block_git_write.py";
+const PRE_TOOL_USE_HEADER: &str = "[[hooks.PreToolUse]]";
+const PRE_TOOL_USE_HOOK_HEADER: &str = "[[hooks.PreToolUse.hooks]]";
 
 fn is_codex_installed() -> bool {
     Command::new("codex")
@@ -83,6 +87,43 @@ fn contains_legacy_profile_config(contents: &str) -> bool {
     })
 }
 
+fn copy_file_exclusive(source: &Path, destination: &Path) -> Result<()> {
+    let mut destination_created = false;
+    let copy_result = (|| {
+        let mut input = fs::File::open(source)
+            .with_context(|| format!("Failed to open {}", source.display()))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .with_context(|| format!("Failed to create {}", destination.display()))?;
+        destination_created = true;
+        std::io::copy(&mut input, &mut output).with_context(|| {
+            format!(
+                "Failed to copy from {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        let permissions = fs::metadata(source)
+            .with_context(|| format!("Failed to inspect permissions for {}", source.display()))?
+            .permissions();
+        fs::set_permissions(destination, permissions)
+            .with_context(|| format!("Failed to set permissions on {}", destination.display()))?;
+        output
+            .sync_all()
+            .with_context(|| format!("Failed to sync {}", destination.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        if destination_created {
+            let _ = fs::remove_file(destination);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn is_assignment_for(line: &str, keys: &[&str]) -> bool {
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') || trimmed.starts_with('[') {
@@ -122,6 +163,89 @@ fn managed_assignments(template: &str, section: Option<&str>, keys: &[&str]) -> 
         .collect()
 }
 
+fn sync_managed_hook(template: &str, existing: &str) -> String {
+    let template_lines = template.lines().collect::<Vec<_>>();
+    let Some(template_outer_start) = template_lines
+        .iter()
+        .position(|line| table_header(line) == Some(PRE_TOOL_USE_HEADER))
+    else {
+        return existing.to_string();
+    };
+    let Some(template_hook_start) = template_lines
+        .iter()
+        .enumerate()
+        .skip(template_outer_start + 1)
+        .find_map(|(index, line)| {
+            (table_header(line) == Some(PRE_TOOL_USE_HOOK_HEADER)).then_some(index)
+        })
+    else {
+        return existing.to_string();
+    };
+    let template_hook_end = template_lines
+        .iter()
+        .enumerate()
+        .skip(template_hook_start + 1)
+        .find_map(|(index, line)| table_header(line).is_some().then_some(index))
+        .unwrap_or(template_lines.len());
+    let template_outer = &template_lines[template_outer_start..template_hook_start];
+    let template_hook = &template_lines[template_hook_start..template_hook_end];
+    let template_matcher = template_outer
+        .iter()
+        .find(|line| is_assignment_for(line, &["matcher"]))
+        .copied();
+
+    let existing_lines = existing.lines().collect::<Vec<_>>();
+    let mut current_outer = None;
+    let mut managed_range = None;
+    for (index, line) in existing_lines.iter().enumerate() {
+        match table_header(line) {
+            Some(PRE_TOOL_USE_HEADER) => current_outer = Some(index),
+            Some(PRE_TOOL_USE_HOOK_HEADER) => {
+                let end = existing_lines
+                    .iter()
+                    .enumerate()
+                    .skip(index + 1)
+                    .find_map(|(next, candidate)| table_header(candidate).is_some().then_some(next))
+                    .unwrap_or(existing_lines.len());
+                if existing_lines[index..end]
+                    .iter()
+                    .any(|candidate| candidate.contains(MANAGED_HOOK_MARKER))
+                    && let Some(outer_start) = current_outer
+                {
+                    managed_range = Some((outer_start, index, end));
+                    break;
+                }
+            }
+            Some(_) => current_outer = None,
+            None => {}
+        }
+    }
+
+    let mut merged = Vec::new();
+    if let Some((outer_start, hook_start, hook_end)) = managed_range {
+        merged.extend_from_slice(&existing_lines[..=outer_start]);
+        if let Some(matcher) = template_matcher {
+            merged.push(matcher);
+        }
+        merged.extend(
+            existing_lines[outer_start + 1..hook_start]
+                .iter()
+                .copied()
+                .filter(|line| !is_assignment_for(line, &["matcher"])),
+        );
+        merged.extend(template_hook.iter().copied());
+        merged.extend_from_slice(&existing_lines[hook_end..]);
+    } else {
+        merged.extend(existing_lines.iter().copied());
+        if !merged.is_empty() && merged.last().is_some_and(|line| !line.is_empty()) {
+            merged.push("");
+        }
+        merged.extend(template_outer.iter().copied());
+        merged.extend(template_hook.iter().copied());
+    }
+    format!("{}\n", merged.join("\n").trim_start_matches('\n'))
+}
+
 fn merge_managed_config(template: &str, existing: &str) -> String {
     let managed = managed_assignments(template, None, MANAGED_CONFIG_KEYS).join("\n");
     let managed_agents = managed_assignments(template, Some("[agents]"), MANAGED_AGENT_KEYS);
@@ -129,6 +253,7 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     let mut in_top_level = true;
     let mut in_workspace_sandbox = false;
     let mut in_agents = false;
+    let mut in_legacy_profile_table = false;
     let mut workspace_sandbox_found = false;
     let mut agents_found = false;
     let mut preserved_lines = Vec::new();
@@ -137,6 +262,7 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         let header = table_header(line);
         if let Some(header) = header {
             in_top_level = false;
+            in_legacy_profile_table = header == "[profiles]" || header.starts_with("[profiles.");
             in_workspace_sandbox = header == "[sandbox_workspace_write]";
             in_agents = header == "[agents]";
             if in_workspace_sandbox {
@@ -145,6 +271,12 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
             if in_agents {
                 agents_found = true;
             }
+        }
+        if in_legacy_profile_table {
+            continue;
+        }
+        if in_top_level && is_assignment_for(line, &["profile"]) {
+            continue;
         }
         if in_top_level && is_assignment_for(line, MANAGED_CONFIG_KEYS) {
             continue;
@@ -180,14 +312,15 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         .trim_start_matches('\n')
         .to_string();
 
-    if preserved.is_empty() {
+    let merged = if preserved.is_empty() {
         format!("{managed}\n")
     } else {
         format!("{managed}\n\n{preserved}\n")
-    }
+    };
+    sync_managed_hook(template, &merged)
 }
 
-fn replace_legacy_config(codex_dir: &Path) -> Result<()> {
+fn backup_legacy_config(codex_dir: &Path) -> Result<()> {
     let config_path = codex_dir.join("config.toml");
     if !config_path.exists() {
         return Ok(());
@@ -202,37 +335,59 @@ fn replace_legacy_config(codex_dir: &Path) -> Result<()> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("System clock is before UNIX_EPOCH")?
-        .as_secs();
+        .as_nanos();
     let backup_path = codex_dir.join(format!("config.toml.bak.legacy.{timestamp}"));
 
+    copy_file_exclusive(&config_path, &backup_path)?;
     println!(
-        "\nLegacy Codex profile config detected. Backing up {} to {}.",
+        "\nLegacy Codex profile config detected. Backed up {} to {}; local settings will be preserved.",
         config_path.display(),
         backup_path.display()
     );
-    fs::rename(&config_path, &backup_path).with_context(|| {
-        format!(
-            "Failed to back up {} to {}",
-            config_path.display(),
-            backup_path.display()
-        )
-    })?;
-
-    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
-    let source_path = dotfiles_path.join(".codex/config.base.toml");
-    fs::copy(&source_path, &config_path).with_context(|| {
-        format!(
-            "Failed to copy from {} to {}",
-            source_path.display(),
-            config_path.display()
-        )
-    })?;
-    println!(
-        "Replaced legacy config with the current base config: {}",
-        config_path.display()
-    );
 
     Ok(())
+}
+
+fn write_config_temp(
+    config_path: &Path,
+    contents: &str,
+    permissions: fs::Permissions,
+) -> Result<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before UNIX_EPOCH")?
+        .as_nanos();
+    let file_name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temp_path = config_path.with_file_name(format!(
+        ".{file_name}.tmp.automation.{}.{timestamp}",
+        std::process::id()
+    ));
+    let mut temp_created = false;
+    let write_result = (|| {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("Failed to create temporary {}", temp_path.display()))?;
+        temp_created = true;
+        temp.write_all(contents.as_bytes())
+            .with_context(|| format!("Failed to write temporary {}", temp_path.display()))?;
+        fs::set_permissions(&temp_path, permissions)
+            .with_context(|| format!("Failed to set permissions on {}", temp_path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("Failed to sync temporary {}", temp_path.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        if temp_created {
+            let _ = fs::remove_file(&temp_path);
+        }
+        return Err(error);
+    }
+    Ok(temp_path)
 }
 
 fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) -> Result<()> {
@@ -250,13 +405,7 @@ fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) 
         .is_some_and(|metadata| metadata.file_type().is_symlink());
 
     if metadata.is_none() {
-        fs::copy(template_path, &config_path).with_context(|| {
-            format!(
-                "Failed to copy from {} to {}",
-                template_path.display(),
-                config_path.display()
-            )
-        })?;
+        copy_file_exclusive(template_path, &config_path)?;
         println!("- Installed base config: {}", config_path.display());
         return Ok(());
     }
@@ -274,38 +423,33 @@ fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("System clock is before UNIX_EPOCH")?
-        .as_secs();
+        .as_nanos();
     let backup_path = codex_dir.join(format!("config.toml.bak.automation.{timestamp}"));
-    fs::copy(&config_path, &backup_path).with_context(|| {
-        format!(
-            "Failed to back up {} to {}",
-            config_path.display(),
-            backup_path.display()
-        )
-    })?;
+    copy_file_exclusive(&config_path, &backup_path)?;
+    let permissions = fs::metadata(&config_path)
+        .with_context(|| {
+            format!(
+                "Failed to inspect permissions for {}",
+                config_path.display()
+            )
+        })?
+        .permissions();
+    let temp_path = write_config_temp(&config_path, &migrated, permissions)?;
     if is_symlink {
         let symlink_backup_path =
             codex_dir.join(format!("config.toml.bak.automation-link.{timestamp}"));
-        fs::rename(&config_path, &symlink_backup_path).with_context(|| {
-            format!(
-                "Failed to archive symlink {} to {}",
-                config_path.display(),
-                symlink_backup_path.display()
-            )
-        })?;
-        if let Err(write_error) = fs::write(&config_path, migrated) {
+        if let Err(error) = fs::rename(&config_path, &symlink_backup_path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to archive symlink {} to {}",
+                    config_path.display(),
+                    symlink_backup_path.display()
+                )
+            });
+        }
+        if let Err(write_error) = fs::rename(&temp_path, &config_path) {
             let restore_result = (|| {
-                if let Ok(metadata) = fs::symlink_metadata(&config_path) {
-                    if !metadata.file_type().is_file() {
-                        anyhow::bail!(
-                            "Cannot restore symlink because {} is no longer a regular file",
-                            config_path.display()
-                        );
-                    }
-                    fs::remove_file(&config_path).with_context(|| {
-                        format!("Failed to remove partial {}", config_path.display())
-                    })?;
-                }
                 fs::rename(&symlink_backup_path, &config_path).with_context(|| {
                     format!(
                         "Failed to restore symlink {} from {}",
@@ -314,6 +458,7 @@ fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) 
                     )
                 })
             })();
+            let _ = fs::remove_file(&temp_path);
             return match restore_result {
                 Ok(()) => Err(write_error).context(format!(
                     "Failed to update {}; restored the original symlink",
@@ -332,8 +477,10 @@ fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) 
         );
         return Ok(());
     }
-    fs::write(&config_path, migrated)
-        .with_context(|| format!("Failed to update {}", config_path.display()))?;
+    if let Err(error) = fs::rename(&temp_path, &config_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| format!("Failed to update {}", config_path.display()));
+    }
     println!(
         "- Updated shared Codex settings (backup: {}).",
         backup_path.display()
@@ -404,7 +551,7 @@ pub fn setup() -> Result<()> {
         create_symlink(source, dest)?;
     }
 
-    replace_legacy_config(&codex_dir)?;
+    backup_legacy_config(&codex_dir)?;
     archive_retired_profiles(&codex_dir)?;
 
     println!("\nMigrating shared Codex settings...");
@@ -422,7 +569,8 @@ pub fn setup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_legacy_profile_config, merge_managed_config, migrate_managed_config_from_template,
+        contains_legacy_profile_config, copy_file_exclusive, merge_managed_config,
+        migrate_managed_config_from_template,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -519,6 +667,21 @@ description = "local"
     }
 
     #[test]
+    fn exclusive_backup_does_not_overwrite_an_existing_path() {
+        let directory = TestDirectory::new("exclusive-backup");
+        let source = directory.path().join("source.toml");
+        let destination = directory.path().join("backup.toml");
+        fs::write(&source, "new").expect("write backup source");
+        fs::write(&destination, "existing").expect("write existing backup");
+
+        assert!(copy_file_exclusive(&source, &destination).is_err());
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read existing backup"),
+            "existing"
+        );
+    }
+
+    #[test]
     fn workspace_sandbox_table_is_added_when_missing() {
         let actual = merge_managed_config(
             "model = \"gpt-5.6-terra\"\n\n[agents]\nenabled = true\ndefault_subagent_model = \"gpt-5.6-terra\"\n",
@@ -570,6 +733,98 @@ description = "local"
         assert!(actual.contains("[agents.local_reviewer] # custom agent\ndescription = \"local\""));
         assert!(!actual.contains("\n[sandbox_workspace_write]\n"));
         assert!(!actual.contains("\n[agents]\n"));
+        assert_eq!(merge_managed_config(template, &actual), actual);
+    }
+
+    #[test]
+    fn managed_hook_is_added_or_updated_without_removing_local_hook_state() {
+        let template = r#"model = "gpt-5.6-terra"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
+timeout = 10
+statusMessage = "安全性を確認中"
+"#;
+        let hookless = r#"model = "old"
+
+[hooks.state]
+
+[hooks.state."local"]
+trusted_hash = "sha256:local"
+"#;
+        let added = merge_managed_config(template, hookless);
+        assert!(added.contains("[[hooks.PreToolUse]]\nmatcher = \"^Bash$\""));
+        assert!(added.contains("block_git_write.py"));
+        assert!(added.contains("[hooks.state.\"local\"]\ntrusted_hash = \"sha256:local\""));
+        assert_eq!(merge_managed_config(template, &added), added);
+
+        let old = r#"model = "old"
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
+timeout = 1
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "local-check"
+timeout = 30
+
+[hooks.state]
+"#;
+        let updated = merge_managed_config(template, old);
+        assert!(updated.contains("matcher = \"^Bash$\""));
+        assert!(updated.contains("block_git_write.py"));
+        assert!(updated.contains("timeout = 10"));
+        assert!(!updated.lines().any(|line| line == "timeout = 1"));
+        assert!(updated.contains("command = \"local-check\"\ntimeout = 30"));
+        assert!(updated.contains("[hooks.state]"));
+        assert_eq!(merge_managed_config(template, &updated), updated);
+    }
+
+    #[test]
+    fn legacy_profile_settings_are_removed_while_local_tables_are_preserved() {
+        let template = r#"model = "gpt-5.6-terra"
+
+[agents]
+enabled = true
+"#;
+        let existing = r#"profile = "teacher"
+model = "old"
+
+[projects."/work"]
+trust_level = "trusted"
+
+[profiles.teacher]
+model = "gpt-5.6-sol"
+sandbox_mode = "read-only"
+
+[hooks.state]
+
+[hooks.state."local"]
+trusted_hash = "sha256:local"
+
+[tui]
+notifications = false
+
+[agents.local_reviewer]
+description = "local"
+"#;
+
+        let actual = merge_managed_config(template, existing);
+        assert!(!actual.contains("profile = \"teacher\""));
+        assert!(!actual.contains("[profiles.teacher]"));
+        assert!(actual.contains("[projects.\"/work\"]\ntrust_level = \"trusted\""));
+        assert!(actual.contains("[hooks.state.\"local\"]\ntrusted_hash = \"sha256:local\""));
+        assert!(actual.contains("[tui]\nnotifications = false"));
+        assert!(actual.contains("[agents.local_reviewer]\ndescription = \"local\""));
         assert_eq!(merge_managed_config(template, &actual), actual);
     }
 
@@ -639,6 +894,60 @@ description = "local"
         assert_eq!(
             fs::read_link(symlink_backup.path()).expect("read symlink backup"),
             target_path
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_atomically_updates_regular_config_and_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("regular-migration");
+        let config_path = directory.path().join("config.toml");
+        let template_path = directory.path().join("template.toml");
+        let original = "model = \"old\"\n\n[projects.\"/work\"]\ntrust_level = \"trusted\"\n";
+        let template = "model = \"gpt-5.6-terra\"\n";
+        fs::write(&config_path, original).expect("write regular config");
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
+            .expect("set config permissions");
+        fs::write(&template_path, template).expect("write template");
+
+        migrate_managed_config_from_template(directory.path(), &template_path)
+            .expect("migrate regular config");
+
+        let migrated = fs::read_to_string(&config_path).expect("read migrated config");
+        assert!(migrated.contains("model = \"gpt-5.6-terra\""));
+        assert!(migrated.contains("[projects.\"/work\"]\ntrust_level = \"trusted\""));
+        assert_eq!(
+            fs::metadata(&config_path)
+                .expect("inspect migrated config")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let entries = fs::read_dir(directory.path())
+            .expect("read migration directory")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read migration entries");
+        assert!(!entries.iter().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.automation.")
+        }));
+        let backup = entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak.automation.")
+            })
+            .expect("find regular config backup");
+        assert_eq!(
+            fs::read_to_string(backup.path()).expect("read regular config backup"),
+            original
         );
     }
 

@@ -74,10 +74,11 @@ Codex uses a single default workflow. `workspace-write` allows implementation in
 workspace, while `on-request` approvals are routed through auto-review. Dangerous or
 destructive operations remain blocked by the sandbox, rules, hooks, and AGENTS.md.
 
-Canonical Git and GitHub writes whose repository, branch, arguments, and outbound text
-can be fully checked by the hook are allowed directly, so a non-interactive `never`
-session does not deadlock during configuration migration. Non-canonical candidates still
-go through auto-review, and destructive operations remain forbidden.
+Canonical Git writes, Issue creation, and Draft PR creation whose repository, branch,
+arguments, and outbound text can be fully checked by the hook are allowed directly, so a
+non-interactive `never` session does not deadlock during configuration migration. Issue
+comments and non-canonical candidates go through auto-review, and destructive operations
+remain forbidden.
 
 The main agent defaults to `gpt-5.6-terra` with medium reasoning, while plan mode uses
 high reasoning. An approved, versioned plan is recorded in a tracking Issue before
@@ -103,9 +104,10 @@ repository. `~/.codex/config.toml` remains local because it contains machine-spe
 project trust, hook trust, and TUI state. `cargo run -- codex` backs up the local config
 before migrating the shared top-level settings. If an older setup left `config.toml` as a
 symlink, setup archives the link and writes a regular local config without modifying the
-link target. A legacy profile config is backed up and replaced with the current base
-template. Retired teacher/autonomous profile files are renamed to timestamped backups
-instead of being deleted.
+link target. A legacy profile config is backed up; deprecated profile selectors and
+tables are removed while shared settings are merged without discarding project trust,
+hook trust, TUI state, or custom agents. Retired teacher/autonomous profile files are
+renamed to timestamped backups instead of being deleted.
 
 Authentication, session history, pairing information, local databases, and credentials
 must remain outside this public repository. The hook scans staged additions and Issue/PR

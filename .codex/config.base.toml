@@ -40,5 +40,5 @@ matcher = "^Bash$"
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
-timeout = 10
+timeout = 30
 statusMessage = "開発ワークフローの安全性を確認中"

@@ -2,6 +2,7 @@
 """Codex開発ワークフローガードの単体テスト。"""
 
 import importlib.util
+import io
 from pathlib import Path
 from unittest import mock
 import tempfile
@@ -39,6 +40,8 @@ class GuardTest(unittest.TestCase):
         with (
             mock.patch.object(GUARD, "_staged_secret_reason", return_value=None),
             mock.patch.object(GUARD, "_push_preflight_reason", return_value=None),
+            mock.patch.object(GUARD, "_current_work_branch_reason", return_value=None),
+            mock.patch.object(GUARD, "_clean_worktree_reason", return_value=None),
         ):
             for command in (
                 "git fetch origin main",
@@ -95,6 +98,12 @@ class GuardTest(unittest.TestCase):
             "git -C /workspace add -- README.md",
             "env -u TOKEN git reset --hard HEAD",
             "sudo -u root git push -u origin HEAD:refs/heads/main",
+            "exec rm README.md",
+            "nice rm README.md",
+            "timeout 1 rm README.md",
+            "xargs rm",
+            "find . -delete",
+            "find . -exec rm README.md ;",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
@@ -185,7 +194,10 @@ class GuardTest(unittest.TestCase):
                 "--head feature/example --title ':wrench: 設定を更新' "
                 f"--body-file {body.name}"
             )
-            with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
+            with (
+                mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+                mock.patch.object(GUARD, "_draft_pr_preflight_reason", return_value=None),
+            ):
                 self.assert_allowed(command, "/workspace")
 
     def test_github_writes_must_target_current_origin(self):
@@ -303,6 +315,8 @@ class GuardTest(unittest.TestCase):
                 "gh issue delete 123 --yes",
                 "gh issue create --title test --body body",
                 "gh issue close 123 --repo owner/repo",
+                "gh run download 123 --dir /tmp/output",
+                "gh release download v1.0.0 --output /tmp/archive",
             ):
                 with self.subTest(command=command):
                     self.assert_blocked(command)
@@ -318,6 +332,13 @@ class GuardTest(unittest.TestCase):
                 "Co-authored-by: Codex <bot@example.com>"
             )
         )
+        for attribution in (
+            "Generated" + "-by: ChatGPT",
+            "Co-authored" + "-by: Claude <bot@example.com>",
+            "Signed-off" + "-by: AI Assistant <bot@example.com>",
+        ):
+            with self.subTest(attribution=attribution):
+                self.assertIsNotNone(GUARD.AI_ATTRIBUTION_RE.search(attribution))
 
     def test_sensitive_paths_are_detected_without_blocking_templates(self):
         for path in (".env", ".env.local", "auth.json", "id_ed25519", "cert.pem"):
@@ -367,7 +388,12 @@ class GuardTest(unittest.TestCase):
                 return "2\n"
             if args[:3] == ("diff", "--name-only", "--diff-filter=ACMR"):
                 return "src/main.rs\n"
-            if args[:3] == ("diff", "--no-ext-diff", "--unified=0"):
+            if args[:4] == (
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=0",
+            ):
                 return "diff --git a/x b/x\n+safe = true\n"
             return None
 
@@ -380,7 +406,12 @@ class GuardTest(unittest.TestCase):
 
         def secret_git(cwd, *args):
             result = clean_git(cwd, *args)
-            if args[:3] == ("diff", "--no-ext-diff", "--unified=0"):
+            if args[:4] == (
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=0",
+            ):
                 return f"diff --git a/x b/x\n+TOKEN={github_token}\n"
             return result
 
@@ -388,6 +419,61 @@ class GuardTest(unittest.TestCase):
             self.assertIsNotNone(
                 GUARD._push_preflight_reason("/workspace", "feature/example")
             )
+
+    def test_add_and_commit_require_a_non_protected_work_branch(self):
+        with mock.patch.object(GUARD, "_run_git", return_value="main\n"):
+            self.assertIsNotNone(GUARD._current_work_branch_reason("/workspace"))
+        with mock.patch.object(GUARD, "_run_git", return_value="feature/example\n"):
+            self.assertIsNone(GUARD._current_work_branch_reason("/workspace"))
+        with mock.patch.object(GUARD, "_run_git", return_value=" M README.md\n"):
+            self.assertIsNotNone(GUARD._clean_worktree_reason("/workspace", "switch"))
+
+    def test_draft_pr_preflight_binds_base_head_and_pushed_tip(self):
+        with mock.patch.object(
+            GUARD,
+            "_run_git",
+            side_effect=[
+                "feature/example\n",
+                "abc123\n",
+                "abc123\n",
+                "origin/main\n",
+            ],
+        ):
+            self.assertIsNone(
+                GUARD._draft_pr_preflight_reason(
+                    "/workspace", "main", "feature/example"
+                )
+            )
+        with mock.patch.object(GUARD, "_run_git", return_value="main\n"):
+            self.assertIsNotNone(
+                GUARD._draft_pr_preflight_reason(
+                    "/workspace", "main", "feature/example"
+                )
+            )
+
+    def test_malformed_hook_input_fails_closed(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(GUARD.sys, "stdin", io.StringIO("{")),
+            mock.patch.object(GUARD.sys, "stdout", stdout),
+            mock.patch.object(GUARD.sys, "stderr", stderr),
+            self.assertRaises(SystemExit) as exit_status,
+        ):
+            GUARD.main()
+        self.assertEqual(exit_status.exception.code, 2)
+        self.assertIn('"permissionDecision": "deny"', stdout.getvalue())
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(GUARD.sys, "stdin", io.StringIO('{"tool_input": {}}')),
+            mock.patch.object(GUARD.sys, "stdout", stdout),
+            mock.patch.object(GUARD.sys, "stderr", io.StringIO()),
+            self.assertRaises(SystemExit) as exit_status,
+        ):
+            GUARD.main()
+        self.assertEqual(exit_status.exception.code, 2)
+        self.assertIn('"permissionDecision": "deny"', stdout.getvalue())
 
 
 if __name__ == "__main__":

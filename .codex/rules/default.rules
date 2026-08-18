@@ -26,20 +26,21 @@ prefix_rule(pattern=["git", ["gc", "prune"]], decision="forbidden", justificatio
 # GitHub: 読み取り専用
 prefix_rule(pattern=["gh", "pr", ["list", "view", "status", "checks", "diff"]], decision="allow", justification="PRの読み取り専用操作")
 prefix_rule(pattern=["gh", "issue", ["list", "status", "view"]], decision="allow", justification="Issueの読み取り専用操作")
-prefix_rule(pattern=["gh", "run", ["list", "view", "watch", "download"]], decision="allow", justification="Actionsの読み取り専用操作")
+prefix_rule(pattern=["gh", "run", ["list", "view", "watch"]], decision="allow", justification="Actionsの読み取り専用操作")
 prefix_rule(pattern=["gh", "repo", ["list", "view"]], decision="allow", justification="repositoryの読み取り専用操作")
-prefix_rule(pattern=["gh", "release", ["list", "view", "download", "verify", "verify-asset"]], decision="allow", justification="Releaseの読み取り専用操作")
+prefix_rule(pattern=["gh", "release", ["list", "view", "verify", "verify-asset"]], decision="allow", justification="Releaseの読み取り専用操作")
 prefix_rule(pattern=["gh", "workflow", ["list", "view"]], decision="allow", justification="Workflowの読み取り専用操作")
 
 # GitHub: repositoryと本文をhookが検査できる正規形だけを直接許可する。
 prefix_rule(pattern=["gh", "issue", "create", "--repo"], decision="allow", justification="hook検査済みのIssue作成")
-prefix_rule(pattern=["gh", "issue", "comment"], decision="allow", justification="hook検査済みのIssue記録")
 prefix_rule(pattern=["gh", "pr", "create", "--draft", "--repo"], decision="allow", justification="hook検査済みのDraft PR作成")
 
 # GitHub: 決定的・破壊的な変更
 prefix_rule(pattern=["gh", "issue", ["close", "reopen", "pin", "unpin", "lock", "unlock", "transfer", "develop", "delete"]], decision="forbidden", justification="Issue記録以外の状態変更は禁止")
 prefix_rule(pattern=["gh", "pr", ["merge", "close", "reopen", "edit", "comment", "review", "ready", "lock", "unlock", "update-branch", "checkout"]], decision="forbidden", justification="Draft PR作成以外のPR変更は禁止")
 prefix_rule(pattern=["gh", "repo", ["create", "delete", "rename", "archive", "fork", "sync"]], decision="forbidden", justification="repository変更は禁止")
+prefix_rule(pattern=["gh", "run", "download"], decision="forbidden", justification="Actions artifactのfile書き込みは禁止")
+prefix_rule(pattern=["gh", "release", "download"], decision="forbidden", justification="Release assetのfile書き込みは禁止")
 prefix_rule(pattern=["gh", "run", ["cancel", "delete", "rerun"]], decision="forbidden", justification="Actions runの変更は禁止")
 prefix_rule(pattern=["gh", "workflow", ["run", "enable", "disable"]], decision="forbidden", justification="Workflow変更は禁止")
 prefix_rule(pattern=["gh", "release", ["create", "delete", "edit", "upload"]], decision="forbidden", justification="Release変更は禁止")
