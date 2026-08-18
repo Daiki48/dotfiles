@@ -38,7 +38,7 @@ const MANAGED_AGENT_KEYS: &[&str] = &[
     "default_subagent_model",
     "default_subagent_reasoning_effort",
 ];
-const MANAGED_HOOK_MARKER: &str = "block_git_write.py";
+const MANAGED_HOOK_COMMAND: &str = "command = 'python3 \"$HOME/.codex/hooks/block_git_write.py\"'";
 const PRE_TOOL_USE_HEADER: &str = "[[hooks.PreToolUse]]";
 const PRE_TOOL_USE_HOOK_HEADER: &str = "[[hooks.PreToolUse.hooks]]";
 
@@ -266,7 +266,7 @@ fn remove_managed_hook(existing: &str) -> String {
             .unwrap_or(existing_lines.len());
         let has_managed_hook = existing_lines[section_start..section_end]
             .iter()
-            .any(|line| line.contains(MANAGED_HOOK_MARKER));
+            .any(|line| line.trim() == MANAGED_HOOK_COMMAND);
         if !has_managed_hook {
             merged.extend_from_slice(&existing_lines[section_start..section_end]);
             index = section_end;
@@ -290,7 +290,7 @@ fn remove_managed_hook(existing: &str) -> String {
                 .unwrap_or(section_end);
             if !existing_lines[hook_start..hook_end]
                 .iter()
-                .any(|line| line.contains(MANAGED_HOOK_MARKER))
+                .any(|line| line.trim() == MANAGED_HOOK_COMMAND)
             {
                 retained_hooks.extend_from_slice(&existing_lines[hook_start..hook_end]);
             }
@@ -788,8 +788,7 @@ pub fn setup() -> Result<()> {
     println!("\n✅ Codex CLI setup completed!");
     println!("\n💡 Next steps:");
     println!("   1. Run 'codex login' if authentication is not configured");
-    println!("   2. Run 'codex' and trust hooks from '/hooks' if prompted");
-    println!("   3. Run 'codex' (workspace-write + auto-review is the default)");
+    println!("   2. Run 'codex' (workspace-write + auto-review is the default)");
 
     Ok(())
 }
@@ -797,9 +796,9 @@ pub fn setup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
-        ensure_managed_hook, managed_hook_state_path, merge_managed_config,
-        migrate_managed_config_from_template, sha256, verify_managed_symlink,
+        MANAGED_HOOK_COMMAND, contains_legacy_profile_config, copy_file_exclusive,
+        ensure_config_unchanged, ensure_managed_hook, managed_hook_state_path,
+        merge_managed_config, migrate_managed_config_from_template, sha256, verify_managed_symlink,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1100,13 +1099,19 @@ type = "command"
 command = "local-check"
 timeout = 30
 
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "echo block_git_write.py"
+timeout = 30
+
 [hooks.state]
 "#;
         let updated = merge_managed_config(template, old);
-        assert!(!updated.contains("block_git_write.py"));
+        assert!(!updated.contains(MANAGED_HOOK_COMMAND));
         assert!(updated.contains("matcher = \".*\""));
         assert!(!updated.lines().any(|line| line == "timeout = 1"));
         assert!(updated.contains("command = \"local-check\"\ntimeout = 30"));
+        assert!(updated.contains("command = \"echo block_git_write.py\"\ntimeout = 30"));
         assert!(updated.contains("[hooks.state]"));
         assert_eq!(merge_managed_config(template, &updated), updated);
     }
