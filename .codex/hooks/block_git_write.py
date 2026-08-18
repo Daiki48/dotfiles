@@ -383,8 +383,6 @@ def _git_pull_reason(args, cwd):
     if len(args) != len(required_options) + 2 or args[:4] != required_options or args[4] != "origin":
         return "git pullはfast-forward限定の正規形だけを使用してください"
     base = args[5].removeprefix("refs/heads/")
-    if not _is_protected_branch(base):
-        return "git pullの同期対象は既定保護branchだけにしてください"
     return _pull_preflight_reason(cwd, base)
 
 

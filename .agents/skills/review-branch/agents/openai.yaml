@@ -1,4 +1,4 @@
 interface:
   display_name: "作業ブランチを最終監査"
-  short_description: "独立した3観点と反論意見で作業ブランチを最終監査します"
-  default_prompt: "$review-branch を使い、完了した作業ブランチを独立した3観点と反論意見で最終監査してください。"
+  short_description: "中立・反論の独立reviewとSol最終判断で作業ブランチを監査します"
+  default_prompt: "$review-branch を使い、完了した作業ブランチを中立・反論の2観点で最終監査し、Solによる最終技術判断を行ってください。"

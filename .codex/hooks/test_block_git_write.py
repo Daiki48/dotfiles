@@ -48,6 +48,7 @@ class GuardTest(unittest.TestCase):
             for command in (
                 "git fetch origin main",
                 "git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin main",
+                "git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin stable",
                 "git switch -c feature/example origin/main",
                 "git switch --create fix/example origin/master",
                 "git add -- src/main.rs README.md",

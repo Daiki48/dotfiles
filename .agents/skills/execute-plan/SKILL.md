@@ -1,6 +1,6 @@
 ---
 name: execute-plan
-description: 承認済み計画の全実装単位を自律的に実装・検証し、安全なcheckpointごとにcommitして、独立レビュー、修正、限定push、Draft PR作成まで進める。Plan ID、Issue、docs、または同一セッションの合意計画があり、「計画を実装」「進めて」「最後まで自動で」「Draft PRまで」と依頼されたときに使う。方針未確定の調査、単独レビュー、merge・releaseには使わない。
+description: 実装依頼の全実装単位を自律的に実装・検証し、安全なcheckpointごとにcommitして、独立レビュー、修正、限定push、Draft PR作成まで進める。Daikiから修正、追加、構築、「進めて」「最後まで自動で」「Draft PRまで」と依頼されたときに使う。方針未確定の調査、単独レビュー、merge・releaseには使わない。
 ---
 
 # 承認済み計画を完了まで実行する

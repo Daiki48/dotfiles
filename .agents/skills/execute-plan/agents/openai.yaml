@@ -1,4 +1,4 @@
 interface:
-  display_name: "承認済み計画を自動実行"
+  display_name: "実装依頼を自動実行"
   short_description: "実装単位を連続処理し、監査からDraft PRまで進めます"
-  default_prompt: "$execute-plan を使い、承認済み計画を実装単位ごとに検証・commitし、最終監査とDraft PR作成まで進めてください。"
+  default_prompt: "$execute-plan を使い、実装依頼を実装単位ごとに検証・commitし、最終監査とDraft PR作成まで進めてください。"
