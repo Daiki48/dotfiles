@@ -81,18 +81,29 @@ Issue comments and non-canonical candidates go through auto-review, and destruct
 operations remain forbidden. Hook checks are pre-execution safeguards; concurrent changes
 after inspection remain a residual risk covered by the sandbox, rules, and workflow policy.
 
-The main agent defaults to `gpt-5.6-terra` with medium reasoning, while plan mode uses
-high reasoning. An approved, versioned plan is recorded in a tracking Issue before
-implementation when GitHub is available. Up to three subagents default to Terra/medium;
-narrow, fully specified implementation can use Luna/xhigh, ordinary implementation and
-review use Terra, and Sol/high is reserved for unresolved ambiguity, high-risk security
-review, or genuinely difficult decisions. This avoids running every workflow step on the
-most rate-intensive model while keeping escalation available.
+The main agent defaults to `gpt-5.6-terra` with medium reasoning and implements a Sol-led
+workflow. Sol/high makes the internal technical go/no-go, resolves specification ambiguity
+and worker conflicts, and decides whether the fixed evidence supports a Draft PR. Luna/high
+collects narrow evidence, Luna/xhigh handles fully specified narrow implementation and unit
+tests, and Terra/medium or high performs ordinary implementation, neutral review, and
+adversarial review. Sol/xhigh is reserved for material security, compatibility, or data
+migration risk, two failed repair loops, or evidence-backed reviewer disagreement.
 
-After Daiki approves a versioned plan, Codex can implement and verify each unit, create
-checkpoint commits, perform independent adversarial review, push one non-protected work
-branch, and create a Draft PR without waiting after every commit. Ready-for-review,
-merge, close, release, force push, protected-branch push, and deletion remain manual.
+For a change, build, or fix request, Codex can internally plan, implement and verify each
+unit, repeat in-scope repairs, create checkpoint commits, perform independent neutral and
+adversarial review, push one non-protected work branch, and create a Draft PR without
+waiting for a plan or commit confirmation. Ready-for-review, merge, close, release, force
+push, protected-branch push, deletion, material scope expansion, and product decisions
+remain manual. A high-risk change may add a Luna/high affirmative review when Sol judges
+that the normal two reviews are insufficient.
+
+`git fetch origin <base>` remains the normal way to inspect the current base and Actions
+can be checked through `gh run` without updating the local branch. When local default-base
+synchronization is needed, only `git pull --ff-only --no-rebase --no-autostash
+--no-recurse-submodules origin <base>` is permitted. The hook requires a clean local
+branch whose name is in the protected-branch allowlist and whose upstream matches local
+`origin/HEAD`, with no local commits or in-progress Git operation; merge, rebase, reset,
+stash, and every other pull form remain blocked.
 
 Repository conventions are discovered from recent history. When no clear convention
 exists, commit messages and PR/Issue bodies default to Japanese, commit subjects use

@@ -13,6 +13,7 @@ prefix_rule(pattern=["git", ["log", "diff", "show"], "--output"], decision="forb
 # Git: hookが引数と対象を検査できる正規形だけをrulesで直接許可する。
 # 非正規形はallow規則に一致しないため、既定のapproval判定へ委ねる。
 prefix_rule(pattern=["git", "fetch", "origin"], decision="allow", justification="hook検査済みのbase branch取得")
+prefix_rule(pattern=["git", "pull", "--ff-only", "--no-rebase", "--no-autostash", "--no-recurse-submodules", "origin"], decision="allow", justification="hook検査済みの既定保護branch fast-forward同期")
 prefix_rule(pattern=["git", "switch", ["-c", "--create"]], decision="allow", justification="hook検査済みの作業branch作成")
 prefix_rule(pattern=["git", "add", "--"], decision="allow", justification="hook検査済みの明示パスstage")
 prefix_rule(pattern=["git", "commit", "-m"], decision="allow", justification="hook検査済みの1行commit")
@@ -20,7 +21,7 @@ prefix_rule(pattern=["git", "push", ["-u", "--set-upstream"], "origin"], decisio
 
 # Git: 履歴改変・統合・削除・保護対象への変更
 prefix_rule(pattern=["git", "push", ["--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"]], decision="forbidden", justification="履歴改変・削除・一括pushは禁止")
-prefix_rule(pattern=["git", ["pull", "merge", "rebase", "reset", "stash", "cherry-pick", "checkout", "restore", "clean", "revert", "rm", "mv", "apply", "am", "tag", "config", "worktree", "submodule", "update-ref", "symbolic-ref", "replace", "notes"]], decision="forbidden", justification="自動ワークフローの許可範囲外")
+prefix_rule(pattern=["git", ["merge", "rebase", "reset", "stash", "cherry-pick", "checkout", "restore", "clean", "revert", "rm", "mv", "apply", "am", "tag", "config", "worktree", "submodule", "update-ref", "symbolic-ref", "replace", "notes"]], decision="forbidden", justification="自動ワークフローの許可範囲外")
 prefix_rule(pattern=["git", ["gc", "prune"]], decision="forbidden", justification="リポジトリ保守・削除操作は禁止")
 
 # GitHub: 読み取り専用

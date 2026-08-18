@@ -24,7 +24,7 @@ GIT_READ_ONLY = {
     "describe", "reflog", "ls-files", "ls-tree", "cat-file", "rev-list",
     "merge-base", "name-rev", "grep",
 }
-GIT_SAFE_WRITE = {"add", "commit", "fetch", "push", "switch"}
+GIT_SAFE_WRITE = {"add", "commit", "fetch", "pull", "push", "switch"}
 GIT_OPTS_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace"}
 GIT_FORBIDDEN_GLOBAL_OPTS = {"-c", "--config", "--config-env", "--exec-path"}
 GIT_READ_FORBIDDEN_ARGS = {
@@ -340,6 +340,54 @@ def _git_fetch_reason(args):
     return None
 
 
+def _pull_preflight_reason(cwd, base):
+    """既定保護branchのfast-forward同期に必要なlocal状態を検査する。"""
+    if _origin_repository(cwd) is None:
+        return "originのGitHub repositoryを確認できません"
+    default_ref = _run_git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    expected_ref = f"origin/{base}"
+    if default_ref is None or default_ref.strip() != expected_ref:
+        return "git pullはoriginの既定保護branchだけを同期できます"
+    current = _run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    if current is None or current.strip() != base:
+        return "git pullのcurrent branchと同期対象が一致しません"
+    upstream = _run_git(cwd, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    if upstream is None or upstream.strip() != expected_ref:
+        return "git pullのupstreamがoriginの既定保護branchと一致しません"
+    clean_reason = _clean_worktree_reason(cwd, "pull")
+    if clean_reason:
+        return clean_reason
+    if _run_git(cwd, "merge-base", "--is-ancestor", "HEAD", expected_ref) is None:
+        return "local branchがoriginよりaheadまたはdivergedしているためgit pullを拒否しました"
+    git_dir = _run_git(cwd, "rev-parse", "--git-dir")
+    if git_dir is None:
+        return "Gitの進行中操作を確認できないためgit pullを拒否しました"
+    try:
+        path = Path(git_dir.strip())
+        if not path.is_absolute():
+            path = Path(cwd) / path
+        if any((path / name).exists() for name in (
+            "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-apply",
+            "rebase-merge", "sequencer",
+        )):
+            return "Gitの進行中操作があるためgit pullを拒否しました"
+    except OSError:
+        return "Gitの進行中操作を確認できないためgit pullを拒否しました"
+    return None
+
+
+def _git_pull_reason(args, cwd):
+    required_options = [
+        "--ff-only", "--no-rebase", "--no-autostash", "--no-recurse-submodules",
+    ]
+    if len(args) != len(required_options) + 2 or args[:4] != required_options or args[4] != "origin":
+        return "git pullはfast-forward限定の正規形だけを使用してください"
+    base = args[5].removeprefix("refs/heads/")
+    if not _is_protected_branch(base):
+        return "git pullの同期対象は保護branch許可リストに含まれる既定branchだけにしてください"
+    return _pull_preflight_reason(cwd, base)
+
+
 def _git_switch_reason(args):
     if len(args) != 3 or args[0] not in {"-c", "--create"}:
         return "git switch は新規作業ブランチの作成だけ許可されます"
@@ -424,6 +472,8 @@ def _git_invocation_reason(tokens, cwd=None):
 
         if token == "push":
             reason = _git_push_reason(args, cwd)
+        elif token == "pull":
+            reason = _git_pull_reason(args, cwd)
         else:
             reason = {
                 "add": _git_add_reason,

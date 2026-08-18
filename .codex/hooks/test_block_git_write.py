@@ -41,11 +41,13 @@ class GuardTest(unittest.TestCase):
         with (
             mock.patch.object(GUARD, "_staged_secret_reason", return_value=None),
             mock.patch.object(GUARD, "_push_preflight_reason", return_value=None),
+            mock.patch.object(GUARD, "_pull_preflight_reason", return_value=None),
             mock.patch.object(GUARD, "_current_work_branch_reason", return_value=None),
             mock.patch.object(GUARD, "_clean_worktree_reason", return_value=None),
         ):
             for command in (
                 "git fetch origin main",
+                "git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin main",
                 "git switch -c feature/example origin/main",
                 "git switch --create fix/example origin/master",
                 "git add -- src/main.rs README.md",
@@ -82,6 +84,11 @@ class GuardTest(unittest.TestCase):
             "git commit -m 'Fix config'",
             "git commit -m ':bug: 修正\n\nCo-authored-by: Codex <bot@example.com>'",
             "git fetch --prune origin main",
+            "git pull origin main",
+            "git pull --rebase origin main",
+            "git pull --ff-only origin main",
+            "git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin feature/example",
+            "git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin stable",
             "git switch main",
             "git switch -c codex/example origin/main",
             "git switch -c feature/example origin/feature/base",
@@ -284,6 +291,60 @@ class GuardTest(unittest.TestCase):
             self.assertIsNotNone(
                 GUARD._push_preflight_reason("/workspace", "feature/example")
             )
+
+    def test_pull_preflight_requires_clean_default_branch_without_local_commits(self):
+        def safe_git(_cwd, *args):
+            values = {
+                ("remote", "get-url", "origin"): "https://github.com/owner/repo.git\n",
+                ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"): "origin/main\n",
+                ("rev-parse", "--abbrev-ref", "HEAD"): "main\n",
+                ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"): "origin/main\n",
+                ("status", "--porcelain=v1", "--untracked-files=all"): "",
+                ("merge-base", "--is-ancestor", "HEAD", "origin/main"): "",
+                ("rev-parse", "--git-dir"): ".git\n",
+            }
+            return values.get(args)
+
+        with mock.patch.object(GUARD, "_run_git", side_effect=safe_git):
+            self.assertIsNone(GUARD._pull_preflight_reason("/workspace", "main"))
+
+        def dirty_git(cwd, *args):
+            if args == ("status", "--porcelain=v1", "--untracked-files=all"):
+                return "?? local.txt\n"
+            return safe_git(cwd, *args)
+
+        with mock.patch.object(GUARD, "_run_git", side_effect=dirty_git):
+            self.assertIsNotNone(GUARD._pull_preflight_reason("/workspace", "main"))
+
+        def ahead_git(cwd, *args):
+            if args == ("merge-base", "--is-ancestor", "HEAD", "origin/main"):
+                return None
+            return safe_git(cwd, *args)
+
+        with mock.patch.object(GUARD, "_run_git", side_effect=ahead_git):
+            self.assertIsNotNone(GUARD._pull_preflight_reason("/workspace", "main"))
+
+        def wrong_default_git(cwd, *args):
+            if args == ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"):
+                return "origin/develop\n"
+            return safe_git(cwd, *args)
+
+        with mock.patch.object(GUARD, "_run_git", side_effect=wrong_default_git):
+            self.assertIsNotNone(GUARD._pull_preflight_reason("/workspace", "main"))
+
+        def wrong_upstream_git(cwd, *args):
+            if args == ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"):
+                return "origin/develop\n"
+            return safe_git(cwd, *args)
+
+        with mock.patch.object(GUARD, "_run_git", side_effect=wrong_upstream_git):
+            self.assertIsNotNone(GUARD._pull_preflight_reason("/workspace", "main"))
+
+        with (
+            mock.patch.object(GUARD, "_run_git", side_effect=safe_git),
+            mock.patch.object(GUARD.Path, "exists", return_value=True),
+        ):
+            self.assertIsNotNone(GUARD._pull_preflight_reason("/workspace", "main"))
 
     def test_read_only_git_rejects_side_effect_options(self):
         for command in (
