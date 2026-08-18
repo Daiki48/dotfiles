@@ -857,7 +857,11 @@ def _nested_shell_commands(tokens):
             continue
         for option_index in range(index + 1, len(tokens)):
             option = tokens[option_index]
-            if option.startswith("-") and "c" in option[1:]:
+            if (
+                option.startswith("-")
+                and not option.startswith("--")
+                and "c" in option[1:]
+            ):
                 if option_index + 1 < len(tokens):
                     yield tokens[option_index + 1]
                 break

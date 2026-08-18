@@ -110,6 +110,9 @@ class GuardTest(unittest.TestCase):
             "eval 'rm README.md'",
             "printf 'rm README.md\\n' | bash",
             "bash /tmp/payload.sh",
+            "bash --norc /tmp/payload.sh",
+            "bash --restricted /tmp/payload.sh",
+            "bash --rcfile /tmp/payload.sh -i",
             "source /tmp/payload.sh",
             ". /tmp/payload.sh",
         ):
