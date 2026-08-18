@@ -23,22 +23,6 @@ commit_attribution = ""
 [sandbox_workspace_write]
 network_access = true
 
-# 通常のsubagentは探索・実装・中立/反論reviewを十分に扱えるTerraへ寄せる。
-# 狭い実装はSkillからLuna xhigh、技術判断の責任者だけSol highを明示する。
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 3
-default_subagent_model = "gpt-5.6-terra"
-default_subagent_reasoning_effort = "medium"
-
-# workspace-write sandboxを主境界とし、hookはGit/GitHubの引数、削除操作、
-# secret、AI帰属を早期検査する多層防御として使う。
-# 新端末またはhook更新後は、対話Codexの/hooksで内容を確認して信頼登録する。
-[[hooks.PreToolUse]]
-matcher = "^Bash$"
-
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
-timeout = 30
-statusMessage = "開発ワークフローの安全性を確認中"

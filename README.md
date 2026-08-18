@@ -65,72 +65,26 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `tmux` | Install tmux via apt/dnf, clone [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager) into `~/.config/tmux/plugins/tpm`, and symlink `~/.config/tmux/tmux.conf`. After setup, press `Ctrl+g` then `I` (capital i) inside tmux to install plugins. | yes |
 | `mise [TOOL@VERSION]...` | Install mise from its recommended apt/dnf repository. Optional tool arguments are installed and recorded in the global mise config; with no arguments, only mise itself is installed. Shell activation is provided by the managed `.zshrc`. | yes |
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
-| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks the shared AGENTS.md, rules, and Skills; installs the Git hook as a managed local copy; then installs or migrates `~/.codex/config.toml` to the workspace-write + auto-review defaults. Machine-local trust and TUI settings are preserved. | no |
+| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks shared instructions, safety rules, and Skills; then installs or migrates `~/.codex/config.toml` to the workspace-write + auto-review defaults. Machine-local trust and TUI settings are preserved. | no |
 | `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`, `~/.gemini/GEMINI.md`, and `~/.gemini/policies/`. Requires `GEMINI_API_KEY` exported in your shell. | no |
 
 #### AI CLI configuration policy
 
 Codex uses a single default workflow. `workspace-write` allows implementation inside the
 workspace, while `on-request` approvals are routed through auto-review. Dangerous or
-destructive operations remain blocked by the sandbox, rules, hooks, and AGENTS.md.
+destructive operations remain blocked by the sandbox and a small set of deny rules.
 
-Canonical Git writes, Issue creation, and Draft PR creation whose repository, branch,
-arguments, and outbound text can be statically validated by the hook are allowed directly,
-so a non-interactive `never` session does not deadlock during configuration migration.
-Issue comments and non-canonical candidates go through auto-review, and destructive
-operations remain forbidden. Hook checks are pre-execution safeguards; concurrent changes
-after inspection remain a residual risk covered by the sandbox, rules, and workflow policy.
+Ordinary editing, testing, and non-destructive Git work are handled without a custom
+PreToolUse hook.
 
-The main agent defaults to `gpt-5.6-terra` with medium reasoning and implements a Sol-led
-workflow. Sol/high makes the internal technical go/no-go, resolves specification ambiguity
-and worker conflicts, and decides whether the fixed evidence supports a Draft PR. Luna/high
-collects narrow evidence, Luna/xhigh handles fully specified narrow implementation and unit
-tests, and Terra/medium or high performs ordinary implementation, neutral review, and
-adversarial review. Sol/xhigh is reserved for material security, compatibility, or data
-migration risk, two failed repair loops, or evidence-backed reviewer disagreement.
-
-For a change, build, or fix request, Codex can internally plan, implement and verify each
-unit, repeat in-scope repairs, create checkpoint commits, perform independent neutral and
-adversarial review, push one non-protected work branch, and create a Draft PR without
-waiting for a plan or commit confirmation. Ready-for-review, merge, close, release, force
-push, protected-branch push, deletion, material scope expansion, and product decisions
-remain manual. A high-risk change may add a Luna/high affirmative review when Sol judges
-that the normal two reviews are insufficient.
-
-`git fetch origin <base>` remains the normal way to inspect the current base and Actions
-can be checked through `gh run` without updating the local branch. When local default-base
-synchronization is needed, only `git pull --ff-only --no-rebase --no-autostash
---no-recurse-submodules origin <base>` is permitted. The hook requires a clean local
-branch whose name is in the protected-branch allowlist and whose upstream matches local
-`origin/HEAD`, with no local commits or in-progress Git operation; merge, rebase, reset,
-stash, and every other pull form remain blocked.
-
-For the first push of a work branch, a missing local `origin/HEAD` is resolved by one
-read-only remote symref lookup, provided the corresponding local remote-tracking base ref
-exists, matches the remote OID, and has a merge-base with `HEAD`. A missing local
-`origin/<work-branch>` for Draft PR creation is similarly checked against the remote tip and must match local
-`HEAD` exactly. This removes the need to run a manual fetch solely because the sandbox
-could not update local tracking refs after push. Remote lookup failures, malformed or
-ambiguous ref responses, missing local base refs, and every mismatch are rejected
-fail-closed. Pull and default-branch switching continue to require local `origin/HEAD`.
-
-Returning to a local default branch is limited to `git switch <base>` from a clean
-worktree, where `<base>` is one of `main`, `master`, `develop`, `development`, or `trunk`.
-The hook requires the target to match local `origin/HEAD` and verifies that the local branch
-exists; switching to other existing branches, including `release/*` and `production/*`,
-remains blocked.
-
-Repository conventions are discovered from recent history. When no clear convention
-exists, commit messages and PR/Issue bodies default to Japanese, commit subjects use
-`:gitmoji: short summary`, and branches use conventional prefixes such as `feature/`,
-`fix/`, or `refactor/`. The `codex/` branch prefix and all AI attribution are forbidden.
+For a change, build, or fix request, Codex autonomously investigates, implements, and
+verifies the requested scope. Plans, subagents, commits, pushes, and Draft PRs are used
+when the task or an explicit request warrants them. Merge, release, force push,
+protected-branch push, deletion, material scope expansion, and product decisions remain
+manual.
 
 `~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
-`~/.agents/skills` are symlinked from this repository. The Git hook is a local managed copy
-with a checksum sidecar, so branch switching alone cannot roll its implementation back. Setup
-updates that copy from the currently checked-out source only when the sidecar matches; local
-changes are preserved and cause setup to stop with an error. Each successful replacement keeps
-a timestamped backup for recovery.
+`~/.agents/skills` are symlinked from this repository.
 `~/.codex/config.toml` remains local because it contains machine-specific
 project trust, hook trust, and TUI state. `cargo run -- codex` backs up the local config
 before migrating the shared top-level settings. If an older setup left `config.toml` as a
@@ -141,9 +95,7 @@ hook trust, TUI state, or custom agents. Retired teacher/autonomous profile file
 renamed to timestamped backups instead of being deleted.
 
 Authentication, session history, pairing information, local databases, and credentials
-must remain outside this public repository. The hook scans staged additions and Issue/PR
-bodies for high-confidence secret patterns. Outbound body files must be owned regular
-files under `/tmp`; this complements rather than replaces diff review.
+must remain outside this public repository. Diff review is required before external writes.
 
 `~/.gemini/policies/` is managed by this repository as a symlink and stores Gemini CLI
 Policy Engine rules. Do not use deprecated `tools.allowed` in
