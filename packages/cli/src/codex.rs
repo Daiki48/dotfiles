@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -13,7 +12,8 @@ const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
     (".codex/rules/default.rules", ".codex/rules/default.rules"),
 ];
-#[cfg(test)]
+const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/prevent_irreversible_git.py";
+const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/prevent_irreversible_git.py";
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 
 // Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
@@ -39,6 +39,16 @@ const MANAGED_AGENT_KEYS: &[&str] = &[
     "default_subagent_reasoning_effort",
 ];
 const MANAGED_HOOK_COMMAND: &str = "command = 'python3 \"$HOME/.codex/hooks/block_git_write.py\"'";
+const IRREVERSIBLE_HOOK_COMMAND: &str =
+    "command = 'python3 \"$HOME/.codex/hooks/prevent_irreversible_git.py\"'";
+const IRREVERSIBLE_HOOK_CONFIG: &str = r#"[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$HOME/.codex/hooks/prevent_irreversible_git.py"'
+timeout = 10
+statusMessage = "不可逆な操作を確認中""#;
 const PRE_TOOL_USE_HEADER: &str = "[[hooks.PreToolUse]]";
 const PRE_TOOL_USE_HOOK_HEADER: &str = "[[hooks.PreToolUse.hooks]]";
 
@@ -124,7 +134,6 @@ fn copy_file_exclusive(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 fn write_file_exclusive(
     destination: &Path,
     contents: &str,
@@ -241,7 +250,7 @@ fn managed_assignments(template: &str, section: Option<&str>, keys: &[&str]) -> 
         .collect()
 }
 
-fn remove_managed_hook(existing: &str) -> String {
+fn remove_legacy_managed_hook(existing: &str) -> String {
     let existing_lines = existing.lines().collect::<Vec<_>>();
     let mut merged = Vec::new();
     let mut index = 0;
@@ -376,7 +385,19 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     } else {
         format!("{managed}\n\n{preserved}\n")
     };
-    remove_managed_hook(&merged)
+    sync_managed_hook(template, &merged)
+}
+
+fn sync_managed_hook(template: &str, existing: &str) -> String {
+    let cleaned = remove_legacy_managed_hook(existing);
+    if !template.contains(IRREVERSIBLE_HOOK_COMMAND)
+        || cleaned
+            .lines()
+            .any(|line| line.trim() == IRREVERSIBLE_HOOK_COMMAND)
+    {
+        return cleaned;
+    }
+    format!("{}\n\n{IRREVERSIBLE_HOOK_CONFIG}\n", cleaned.trim_end())
 }
 
 fn backup_legacy_config(codex_dir: &Path) -> Result<()> {
@@ -445,7 +466,6 @@ fn write_file_temp(path: &Path, contents: &str, permissions: fs::Permissions) ->
     Ok(temp_path)
 }
 
-#[cfg(test)]
 fn replace_regular_file(path: &Path, contents: &str, permissions: fs::Permissions) -> Result<()> {
     let temp_path = write_file_temp(path, contents, permissions)?;
     if let Err(error) = fs::rename(&temp_path, path) {
@@ -455,7 +475,6 @@ fn replace_regular_file(path: &Path, contents: &str, permissions: fs::Permission
     Ok(())
 }
 
-#[cfg(test)]
 fn managed_hook_state_path(hook_path: &Path) -> PathBuf {
     let file_name = hook_path
         .file_name()
@@ -464,17 +483,14 @@ fn managed_hook_state_path(hook_path: &Path) -> PathBuf {
     hook_path.with_file_name(format!("{file_name}{MANAGED_HOOK_STATE_SUFFIX}"))
 }
 
-#[cfg(test)]
 fn sha256(contents: &str) -> String {
     format!("{:x}", Sha256::digest(contents.as_bytes()))
 }
 
-#[cfg(test)]
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-#[cfg(test)]
 fn regular_file_exists(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(true),
@@ -487,7 +503,6 @@ fn regular_file_exists(path: &Path) -> Result<bool> {
     }
 }
 
-#[cfg(test)]
 fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
     if let Some(parent) = destination.parent()
         && !parent.exists()
@@ -774,6 +789,11 @@ pub fn setup() -> Result<()> {
     for (source, dest) in CODEX_FILES {
         ensure_shared_symlink(source, dest)?;
     }
+    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    ensure_managed_hook(
+        &dotfiles_path.join(MANAGED_HOOK_SOURCE),
+        &home.join(MANAGED_HOOK_DESTINATION),
+    )?;
     println!("\nLinking shared skill directories...");
     for (source, dest) in CODEX_DIRS {
         ensure_shared_symlink(source, dest)?;

@@ -28,3 +28,12 @@ enabled = true
 max_concurrent_threads_per_session = 3
 default_subagent_model = "gpt-5.6-terra"
 default_subagent_reasoning_effort = "medium"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$HOME/.codex/hooks/prevent_irreversible_git.py"'
+timeout = 10
+statusMessage = "不可逆な操作を確認中"
