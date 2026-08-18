@@ -694,7 +694,7 @@ def _draft_pr_preflight_reason(cwd, base, head):
     if local_head is None:
         return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
     if remote_head is None or default_ref is None:
-        snapshot = _remote_refs_snapshot(cwd, head if remote_head is None else None)
+        snapshot = _remote_refs_snapshot(cwd, head)
         if snapshot is None:
             return "Draft PRのremote refを安全に確認できません"
         remote_default_ref, remote_default_oid, fallback_remote_head = snapshot
@@ -712,6 +712,8 @@ def _draft_pr_preflight_reason(cwd, base, head):
             return "Draft PRのbase remote-tracking refがremoteと一致しません"
         if remote_head is None:
             remote_head = fallback_remote_head
+        elif remote_head.strip().casefold() != fallback_remote_head.casefold():
+            return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
     if remote_head is None or local_head.strip() != remote_head.strip():
         return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
     if default_ref is None or default_ref.strip() != f"origin/{base}":

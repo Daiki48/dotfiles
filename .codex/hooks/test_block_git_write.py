@@ -709,6 +709,36 @@ class GuardTest(unittest.TestCase):
                 )
             )
 
+        def missing_default_with_local_head_git(_cwd, *args):
+            values = {
+                ("rev-parse", "--abbrev-ref", "HEAD"): "feature/example\n",
+                ("rev-parse", "HEAD"): f"{head_oid}\n",
+                ("rev-parse", "--verify", "origin/feature/example"): f"{head_oid}\n",
+                ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"): None,
+                ("rev-parse", "--verify", "refs/remotes/origin/main"): "b" * 40 + "\n",
+            }
+            return values.get(args)
+
+        with (
+            mock.patch.object(GUARD, "_run_git", side_effect=missing_default_with_local_head_git),
+            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", "b" * 40, head_oid)),
+        ):
+            self.assertIsNone(
+                GUARD._draft_pr_preflight_reason(
+                    "/workspace", "main", "feature/example"
+                )
+            )
+
+        with (
+            mock.patch.object(GUARD, "_run_git", side_effect=missing_default_with_local_head_git),
+            mock.patch.object(GUARD, "_remote_refs_snapshot", return_value=("origin/main", "b" * 40, "c" * 40)),
+        ):
+            self.assertIsNotNone(
+                GUARD._draft_pr_preflight_reason(
+                    "/workspace", "main", "feature/example"
+                )
+            )
+
     def test_malformed_hook_input_fails_closed(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
