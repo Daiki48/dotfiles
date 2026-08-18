@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,11 +11,10 @@ use crate::utils::{create_symlink, run_command};
 const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
     (".codex/rules/default.rules", ".codex/rules/default.rules"),
-    (
-        ".codex/hooks/block_git_write.py",
-        ".codex/hooks/block_git_write.py",
-    ),
 ];
+const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/block_git_write.py";
+const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/block_git_write.py";
+const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 
 // Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
 // ディレクトリごとリンクすることで、Skill の追加時に CLI 側の列挙を更新せずに済む。
@@ -121,6 +121,27 @@ fn copy_file_exclusive(source: &Path, destination: &Path) -> Result<()> {
         }
         return Err(error);
     }
+    Ok(())
+}
+
+fn write_file_exclusive(
+    destination: &Path,
+    contents: &str,
+    permissions: fs::Permissions,
+) -> Result<()> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .with_context(|| format!("Failed to create {}", destination.display()))?;
+    output
+        .write_all(contents.as_bytes())
+        .with_context(|| format!("Failed to write {}", destination.display()))?;
+    fs::set_permissions(destination, permissions)
+        .with_context(|| format!("Failed to set permissions on {}", destination.display()))?;
+    output
+        .sync_all()
+        .with_context(|| format!("Failed to sync {}", destination.display()))?;
     Ok(())
 }
 
@@ -404,20 +425,16 @@ fn backup_legacy_config(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_config_temp(
-    config_path: &Path,
-    contents: &str,
-    permissions: fs::Permissions,
-) -> Result<PathBuf> {
+fn write_file_temp(path: &Path, contents: &str, permissions: fs::Permissions) -> Result<PathBuf> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("System clock is before UNIX_EPOCH")?
         .as_nanos();
-    let file_name = config_path
+    let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    let temp_path = config_path.with_file_name(format!(
+        .unwrap_or("managed-file");
+    let temp_path = path.with_file_name(format!(
         ".{file_name}.tmp.automation.{}.{timestamp}",
         std::process::id()
     ));
@@ -444,6 +461,167 @@ fn write_config_temp(
         return Err(error);
     }
     Ok(temp_path)
+}
+
+fn replace_regular_file(path: &Path, contents: &str, permissions: fs::Permissions) -> Result<()> {
+    let temp_path = write_file_temp(path, contents, permissions)?;
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| format!("Failed to update {}", path.display()));
+    }
+    Ok(())
+}
+
+fn managed_hook_state_path(hook_path: &Path) -> PathBuf {
+    let file_name = hook_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("block_git_write.py");
+    hook_path.with_file_name(format!("{file_name}{MANAGED_HOOK_STATE_SUFFIX}"))
+}
+
+fn sha256(contents: &str) -> String {
+    format!("{:x}", Sha256::digest(contents.as_bytes()))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn regular_file_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => anyhow::bail!(
+            "Managed hook state {} must be a regular file",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("Failed to inspect {}", path.display())),
+    }
+}
+
+fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create managed hook directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let source_contents = fs::read_to_string(source)
+        .with_context(|| format!("Failed to read managed hook source {}", source.display()))?;
+    let source_permissions = fs::metadata(source)
+        .with_context(|| format!("Failed to inspect managed hook source {}", source.display()))?
+        .permissions();
+    let source_hash = sha256(&source_contents);
+    let state_path = managed_hook_state_path(destination);
+    let state_exists = regular_file_exists(&state_path)?;
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect {}", destination.display()));
+        }
+    };
+
+    if metadata.is_none() {
+        if state_exists {
+            anyhow::bail!(
+                "Managed hook state exists without hook {}; refusing to overwrite",
+                destination.display()
+            );
+        }
+        copy_file_exclusive(source, destination)?;
+        if let Err(error) = write_file_exclusive(&state_path, &source_hash, source_permissions) {
+            let _ = fs::remove_file(destination);
+            return Err(error);
+        }
+        println!("- Installed local managed hook: {}", destination.display());
+        return Ok(());
+    }
+
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        verify_managed_symlink(source, destination)?;
+        if state_exists {
+            anyhow::bail!(
+                "Managed hook state already exists for symlink {}; refusing to migrate",
+                destination.display()
+            );
+        }
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("System clock is before UNIX_EPOCH")?
+            .as_nanos();
+        let backup_path = destination.with_file_name(format!(
+            "{}.bak.automation-link.{timestamp}",
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("block_git_write.py")
+        ));
+        copy_symlink_exclusive(destination, &backup_path)?;
+        replace_regular_file(destination, &source_contents, source_permissions.clone())?;
+        write_file_exclusive(&state_path, &source_hash, source_permissions)?;
+        println!(
+            "- Migrated managed hook to local copy (symlink backup: {}).",
+            backup_path.display()
+        );
+        return Ok(());
+    }
+
+    let existing = fs::read_to_string(destination)
+        .with_context(|| format!("Failed to read managed hook {}", destination.display()))?;
+    let existing_hash = sha256(&existing);
+    let recorded = if state_exists {
+        Some(
+            fs::read_to_string(&state_path)
+                .with_context(|| {
+                    format!("Failed to read managed hook state {}", state_path.display())
+                })?
+                .trim()
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    let state_matches = recorded.as_deref().is_some_and(valid_sha256)
+        && recorded.as_deref() == Some(existing_hash.as_str());
+    if existing_hash != source_hash && !state_matches {
+        anyhow::bail!(
+            "Managed hook {} changed locally; refusing to overwrite",
+            destination.display()
+        );
+    }
+    if existing_hash == source_hash && recorded.as_deref() == Some(source_hash.as_str()) {
+        println!("- Local managed hook is up to date.");
+        return Ok(());
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before UNIX_EPOCH")?
+        .as_nanos();
+    let backup_path = destination.with_file_name(format!(
+        "{}.bak.automation.{timestamp}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("block_git_write.py")
+    ));
+    copy_file_exclusive(destination, &backup_path)?;
+    replace_regular_file(destination, &source_contents, source_permissions.clone())?;
+    replace_regular_file(&state_path, &source_hash, source_permissions)?;
+    println!(
+        "- Updated local managed hook (backup: {}).",
+        backup_path.display()
+    );
+    Ok(())
 }
 
 fn ensure_config_unchanged(
@@ -514,7 +692,7 @@ fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) 
             )
         })?
         .permissions();
-    let temp_path = write_config_temp(&config_path, &migrated, permissions)?;
+    let temp_path = write_file_temp(&config_path, &migrated, permissions)?;
     if let Err(error) = ensure_config_unchanged(&config_path, &existing, is_symlink) {
         let _ = fs::remove_file(&temp_path);
         return Err(error);
@@ -608,6 +786,11 @@ pub fn setup() -> Result<()> {
     for (source, dest) in CODEX_FILES {
         ensure_shared_symlink(source, dest)?;
     }
+    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    ensure_managed_hook(
+        &dotfiles_path.join(MANAGED_HOOK_SOURCE),
+        &home.join(MANAGED_HOOK_DESTINATION),
+    )?;
 
     println!("\nLinking shared skill directories...");
     for (source, dest) in CODEX_DIRS {
@@ -633,7 +816,8 @@ pub fn setup() -> Result<()> {
 mod tests {
     use super::{
         contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
-        merge_managed_config, migrate_managed_config_from_template, verify_managed_symlink,
+        ensure_managed_hook, managed_hook_state_path, merge_managed_config,
+        migrate_managed_config_from_template, sha256, verify_managed_symlink,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -775,6 +959,90 @@ description = "local"
         assert!(verify_managed_symlink(&expected, &correct_link).is_ok());
         assert!(verify_managed_symlink(&expected, &wrong_link).is_err());
         assert!(verify_managed_symlink(&expected, &regular).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_hook_migrates_expected_symlink_to_regular_copy() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("managed-hook-symlink");
+        let source = directory.path().join("source.py");
+        let destination = directory.path().join("hook.py");
+        fs::write(&source, "old hook\n").expect("write source");
+        symlink(&source, &destination).expect("create managed symlink");
+
+        ensure_managed_hook(&source, &destination).expect("migrate managed hook");
+
+        assert!(
+            !fs::symlink_metadata(&destination)
+                .expect("inspect destination")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read hook"),
+            "old hook\n"
+        );
+        assert_eq!(
+            fs::read_to_string(managed_hook_state_path(&destination)).expect("read state"),
+            sha256("old hook\n")
+        );
+    }
+
+    #[test]
+    fn managed_hook_updates_only_when_state_matches_current_copy() {
+        let directory = TestDirectory::new("managed-hook-update");
+        let source = directory.path().join("source.py");
+        let destination = directory.path().join("hook.py");
+        fs::write(&source, "new hook\n").expect("write source");
+        fs::write(&destination, "old hook\n").expect("write hook");
+        fs::write(managed_hook_state_path(&destination), sha256("old hook\n"))
+            .expect("write state");
+
+        ensure_managed_hook(&source, &destination).expect("update managed hook");
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read hook"),
+            "new hook\n"
+        );
+
+        fs::write(&destination, "local change\n").expect("change hook");
+        assert!(ensure_managed_hook(&source, &destination).is_err());
+    }
+
+    #[test]
+    fn managed_hook_repairs_missing_state_when_hook_matches_source() {
+        let directory = TestDirectory::new("managed-hook-repair");
+        let source = directory.path().join("source.py");
+        let destination = directory.path().join("hook.py");
+        fs::write(&source, "hook\n").expect("write source");
+        fs::write(&destination, "hook\n").expect("write hook");
+
+        ensure_managed_hook(&source, &destination).expect("repair missing state");
+
+        assert_eq!(
+            fs::read_to_string(managed_hook_state_path(&destination)).expect("read state"),
+            sha256("hook\n")
+        );
+    }
+
+    #[test]
+    fn managed_hook_creates_missing_parent_directory() {
+        let directory = TestDirectory::new("managed-hook-parent");
+        let source = directory.path().join("source.py");
+        let destination = directory.path().join("hooks").join("hook.py");
+        fs::write(&source, "hook\n").expect("write source");
+
+        ensure_managed_hook(&source, &destination).expect("install hook in new directory");
+
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read hook"),
+            "hook\n"
+        );
+        assert_eq!(
+            fs::read_to_string(managed_hook_state_path(&destination)).expect("read state"),
+            sha256("hook\n")
+        );
     }
 
     #[test]

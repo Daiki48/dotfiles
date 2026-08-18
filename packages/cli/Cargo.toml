@@ -7,3 +7,4 @@ edition.workspace = true
 anyhow.workspace = true
 clap = { version = "4.5.39", features = ["derive"] }
 home = "0.5.11"
+sha2.workspace = true
