@@ -65,38 +65,59 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `tmux` | Install tmux via apt/dnf, clone [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager) into `~/.config/tmux/plugins/tpm`, and symlink `~/.config/tmux/tmux.conf`. After setup, press `Ctrl+g` then `I` (capital i) inside tmux to install plugins. | yes |
 | `mise [TOOL@VERSION]...` | Install mise from its recommended apt/dnf repository. Optional tool arguments are installed and recorded in the global mise config; with no arguments, only mise itself is installed. Shell activation is provided by the managed `.zshrc`. | yes |
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
-| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks `~/.codex/AGENTS.md`, rules, and hooks, then copies profile templates and `config.base.toml` to `~/.codex/` (only if they do not already exist, so local edits are preserved). If an existing config uses legacy `profile` / `[profiles.*]` settings, it is backed up and replaced with the current base config. | no |
+| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks the shared AGENTS.md, rules, hooks, and Skills, then installs or migrates `~/.codex/config.toml` to the workspace-write + auto-review defaults. Machine-local trust and TUI settings are preserved. | no |
 | `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`, `~/.gemini/GEMINI.md`, and `~/.gemini/policies/`. Requires `GEMINI_API_KEY` exported in your shell. | no |
 
 #### AI CLI configuration policy
 
-Codex, Claude, and Gemini share the same operating-mode policy:
+Codex uses a single default workflow. `workspace-write` allows implementation inside the
+workspace, while `on-request` approvals are routed through auto-review. Dangerous or
+destructive operations remain blocked by the sandbox, rules, hooks, and AGENTS.md.
 
-- Teacher mode is for guided implementation. The assistant explains the reason, impact, and minimal code proposal, but does not edit files.
-- Autonomous mode is for delegated implementation. The assistant may inspect, edit, test, and verify by itself, except for dangerous commands or external-state-changing operations.
-- Read-only commands do not require confirmation in any mode. Examples include `ls`, `find`, `rg`, `grep`, `sed -n`, `cat`, `head`, `tail`, `wc`, `pwd`, and read-only Git commands.
+Canonical Git writes, Issue creation, and Draft PR creation whose repository, branch,
+arguments, and outbound text can be statically validated by the hook are allowed directly,
+so a non-interactive `never` session does not deadlock during configuration migration.
+Issue comments and non-canonical candidates go through auto-review, and destructive
+operations remain forbidden. Hook checks are pre-execution safeguards; concurrent changes
+after inspection remain a residual risk covered by the sandbox, rules, and workflow policy.
 
-`~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`, and
-`~/.codex/hooks/block_git_write.py` are managed by this repository as symlinks.
-`~/.codex/config.toml`, `~/.codex/teacher.config.toml`, and
-`~/.codex/autonomous.config.toml` are copied from repository templates only when they do
-not already exist, then managed locally. `.codex/config.base.toml` is a
-terminal-independent template; Codex reads project config only from `.codex/config.toml`,
-so keeping the template under a different name prevents it from overriding the active
-profile when you run Codex inside this repository.
-If `cargo run -- codex` finds legacy profile settings (`profile = ...` or
-`[profiles.*]`) in an existing `~/.codex/config.toml`, it backs up that file to
-`~/.codex/config.toml.bak.legacy.<timestamp>` and installs the current base
-config. Codex 0.134.0 and later require profile-specific settings to live in
-`~/.codex/<profile>.config.toml`.
-`~/.gemini/policies/` is managed by this repository as a symlink and stores
-Gemini CLI Policy Engine rules. Do not use deprecated `tools.allowed` in
+The main agent defaults to `gpt-5.6-terra` with medium reasoning, while plan mode uses
+high reasoning. An approved, versioned plan is recorded in a tracking Issue before
+implementation when GitHub is available. Up to three subagents default to Terra/medium;
+narrow, fully specified implementation can use Luna/xhigh, ordinary implementation and
+review use Terra, and Sol/high is reserved for unresolved ambiguity, high-risk security
+review, or genuinely difficult decisions. This avoids running every workflow step on the
+most rate-intensive model while keeping escalation available.
+
+After Daiki approves a versioned plan, Codex can implement and verify each unit, create
+checkpoint commits, perform independent adversarial review, push one non-protected work
+branch, and create a Draft PR without waiting after every commit. Ready-for-review,
+merge, close, release, force push, protected-branch push, and deletion remain manual.
+
+Repository conventions are discovered from recent history. When no clear convention
+exists, commit messages and PR/Issue bodies default to Japanese, commit subjects use
+`:gitmoji: short summary`, and branches use conventional prefixes such as `feature/`,
+`fix/`, or `refactor/`. The `codex/` branch prefix and all AI attribution are forbidden.
+
+`~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
+`~/.codex/hooks/block_git_write.py`, and `~/.agents/skills` are symlinked from this
+repository. `~/.codex/config.toml` remains local because it contains machine-specific
+project trust, hook trust, and TUI state. `cargo run -- codex` backs up the local config
+before migrating the shared top-level settings. If an older setup left `config.toml` as a
+symlink, setup archives the link and writes a regular local config without modifying the
+link target. A legacy profile config is backed up; deprecated profile selectors and
+tables are removed while shared settings are merged without discarding project trust,
+hook trust, TUI state, or custom agents. Retired teacher/autonomous profile files are
+renamed to timestamped backups instead of being deleted.
+
+Authentication, session history, pairing information, local databases, and credentials
+must remain outside this public repository. The hook scans staged additions and Issue/PR
+bodies for high-confidence secret patterns. Outbound body files must be owned regular
+files under `/tmp`; this complements rather than replaces diff review.
+
+`~/.gemini/policies/` is managed by this repository as a symlink and stores Gemini CLI
+Policy Engine rules. Do not use deprecated `tools.allowed` in
 `~/.gemini/settings.json` for persistent tool rules.
-
-Keep machine-specific Codex settings such as project trust levels (`[projects.*]`),
-hook trust state (`[hooks.state]`), and TUI state in local `~/.codex/*.toml` files
-instead of committing them to this repository. Profiles use the v2 format; launch them
-with `codex --profile teacher` / `codex --profile autonomous`.
 
 #### Examples
 

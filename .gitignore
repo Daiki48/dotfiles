@@ -23,6 +23,17 @@
 
 # Codex local state - excluded from version control
 .codex/config.toml
+.codex/auth.json
+.codex/.credentials.json
+.codex/history.jsonl
+.codex/sessions/
+.codex/archived_sessions/
+.codex/log/
+.codex/shell_snapshots/
+.codex/tmp/
+.codex/state*.sqlite*
+.codex/models_cache.json
+.codex/version.json
 
 # Gemini CLI - excluded (API keys)
 .gemini/.env

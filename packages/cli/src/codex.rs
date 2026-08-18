@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::utils::{copy_if_not_exists, create_symlink, run_command};
+use crate::utils::{create_symlink, run_command};
 
 const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
@@ -19,18 +20,27 @@ const CODEX_FILES: &[(&str, &str)] = &[
 // ディレクトリごとリンクすることで、Skill の追加時に CLI 側の列挙を更新せずに済む。
 const CODEX_DIRS: &[(&str, &str)] = &[(".agents/skills", ".agents/skills")];
 
-// テンプレート専用ファイルは ~/.codex/ へコピーし、以後はローカル管理にする。
-// dotfiles 内では `.codex/config.toml` を置かないことで、Codex の project config が
-// profile (teacher/autonomous) を上書きしないようにしている。
-// profile ファイルも Codex が project trust を追記するため symlink しない。
-const CODEX_COPY_FILES: &[(&str, &str)] = &[
-    (".codex/config.base.toml", ".codex/config.toml"),
-    (".codex/teacher.config.toml", ".codex/teacher.config.toml"),
-    (
-        ".codex/autonomous.config.toml",
-        ".codex/autonomous.config.toml",
-    ),
+// config.tomlはproject trustやhook trustなどの端末固有値を保持するため、
+// symlinkせず、共有するtop-level keyとagents keyだけをsetup時に移行する。
+const CODEX_CONFIG_TEMPLATE: &str = ".codex/config.base.toml";
+const MANAGED_CONFIG_KEYS: &[&str] = &[
+    "model",
+    "model_reasoning_effort",
+    "plan_mode_reasoning_effort",
+    "approval_policy",
+    "approvals_reviewer",
+    "sandbox_mode",
+    "commit_attribution",
 ];
+const MANAGED_AGENT_KEYS: &[&str] = &[
+    "enabled",
+    "max_concurrent_threads_per_session",
+    "default_subagent_model",
+    "default_subagent_reasoning_effort",
+];
+const MANAGED_HOOK_MARKER: &str = "block_git_write.py";
+const PRE_TOOL_USE_HEADER: &str = "[[hooks.PreToolUse]]";
+const PRE_TOOL_USE_HOOK_HEADER: &str = "[[hooks.PreToolUse.hooks]]";
 
 fn is_codex_installed() -> bool {
     Command::new("codex")
@@ -77,7 +87,296 @@ fn contains_legacy_profile_config(contents: &str) -> bool {
     })
 }
 
-fn replace_legacy_config(codex_dir: &Path) -> Result<()> {
+fn copy_file_exclusive(source: &Path, destination: &Path) -> Result<()> {
+    let mut destination_created = false;
+    let copy_result = (|| {
+        let mut input = fs::File::open(source)
+            .with_context(|| format!("Failed to open {}", source.display()))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .with_context(|| format!("Failed to create {}", destination.display()))?;
+        destination_created = true;
+        std::io::copy(&mut input, &mut output).with_context(|| {
+            format!(
+                "Failed to copy from {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        let permissions = fs::metadata(source)
+            .with_context(|| format!("Failed to inspect permissions for {}", source.display()))?
+            .permissions();
+        fs::set_permissions(destination, permissions)
+            .with_context(|| format!("Failed to set permissions on {}", destination.display()))?;
+        output
+            .sync_all()
+            .with_context(|| format!("Failed to sync {}", destination.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        if destination_created {
+            let _ = fs::remove_file(destination);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn verify_managed_symlink(expected: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(destination)
+        .with_context(|| format!("Failed to inspect managed path {}", destination.display()))?;
+    if !metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "Managed path {} must be a symlink to {}",
+            destination.display(),
+            expected.display()
+        );
+    }
+    let expected = fs::canonicalize(expected)
+        .with_context(|| format!("Failed to resolve managed source {}", expected.display()))?;
+    let actual = fs::canonicalize(destination).with_context(|| {
+        format!(
+            "Failed to resolve managed symlink {}",
+            destination.display()
+        )
+    })?;
+    if actual != expected {
+        anyhow::bail!(
+            "Managed symlink {} points to {}, expected {}",
+            destination.display(),
+            actual.display(),
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink_exclusive(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let target = fs::read_link(source)
+        .with_context(|| format!("Failed to read symlink {}", source.display()))?;
+    symlink(&target, destination).with_context(|| {
+        format!(
+            "Failed to archive symlink {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn copy_symlink_exclusive(_source: &Path, _destination: &Path) -> Result<()> {
+    anyhow::bail!("Codex config symlink migration is supported only on Unix")
+}
+
+fn ensure_shared_symlink(source: &str, destination: &str) -> Result<()> {
+    create_symlink(source, destination)?;
+    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    let home = home::home_dir().context("Cannot find home directory")?;
+    verify_managed_symlink(&dotfiles_path.join(source), &home.join(destination))
+}
+
+fn is_assignment_for(line: &str, keys: &[&str]) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') || trimmed.starts_with('[') {
+        return false;
+    }
+    keys.iter().any(|key| {
+        trimmed
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
+}
+
+fn table_header(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let header = trimmed
+        .split_once('#')
+        .map_or(trimmed, |(before, _)| before)
+        .trim_end();
+    header.starts_with('[').then_some(header)
+}
+
+fn managed_assignments(template: &str, section: Option<&str>, keys: &[&str]) -> Vec<String> {
+    let mut current_section = None;
+    template
+        .lines()
+        .filter_map(|line| {
+            if let Some(header) = table_header(line) {
+                current_section = Some(header);
+                return None;
+            }
+            if current_section == section && is_assignment_for(line, keys) {
+                Some(line.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn sync_managed_hook(template: &str, existing: &str) -> String {
+    let template_lines = template.lines().collect::<Vec<_>>();
+    let Some(template_outer_start) = template_lines
+        .iter()
+        .position(|line| table_header(line) == Some(PRE_TOOL_USE_HEADER))
+    else {
+        return existing.to_string();
+    };
+    let Some(template_hook_start) = template_lines
+        .iter()
+        .enumerate()
+        .skip(template_outer_start + 1)
+        .find_map(|(index, line)| {
+            (table_header(line) == Some(PRE_TOOL_USE_HOOK_HEADER)).then_some(index)
+        })
+    else {
+        return existing.to_string();
+    };
+    let template_hook_end = template_lines
+        .iter()
+        .enumerate()
+        .skip(template_hook_start + 1)
+        .find_map(|(index, line)| table_header(line).is_some().then_some(index))
+        .unwrap_or(template_lines.len());
+    let template_outer = &template_lines[template_outer_start..template_hook_start];
+    let template_hook = &template_lines[template_hook_start..template_hook_end];
+    let template_matcher = template_outer
+        .iter()
+        .find(|line| is_assignment_for(line, &["matcher"]))
+        .copied();
+
+    let existing_lines = existing.lines().collect::<Vec<_>>();
+    let mut current_outer = None;
+    let mut managed_range = None;
+    for (index, line) in existing_lines.iter().enumerate() {
+        match table_header(line) {
+            Some(PRE_TOOL_USE_HEADER) => current_outer = Some(index),
+            Some(PRE_TOOL_USE_HOOK_HEADER) => {
+                let end = existing_lines
+                    .iter()
+                    .enumerate()
+                    .skip(index + 1)
+                    .find_map(|(next, candidate)| table_header(candidate).is_some().then_some(next))
+                    .unwrap_or(existing_lines.len());
+                if existing_lines[index..end]
+                    .iter()
+                    .any(|candidate| candidate.contains(MANAGED_HOOK_MARKER))
+                    && let Some(outer_start) = current_outer
+                {
+                    managed_range = Some((outer_start, index, end));
+                    break;
+                }
+            }
+            Some(_) => current_outer = None,
+            None => {}
+        }
+    }
+
+    let mut merged = Vec::new();
+    if let Some((outer_start, hook_start, hook_end)) = managed_range {
+        merged.extend_from_slice(&existing_lines[..=outer_start]);
+        if let Some(matcher) = template_matcher {
+            merged.push(matcher);
+        }
+        merged.extend(
+            existing_lines[outer_start + 1..hook_start]
+                .iter()
+                .copied()
+                .filter(|line| !is_assignment_for(line, &["matcher"])),
+        );
+        merged.extend(template_hook.iter().copied());
+        merged.extend_from_slice(&existing_lines[hook_end..]);
+    } else {
+        merged.extend(existing_lines.iter().copied());
+        if !merged.is_empty() && merged.last().is_some_and(|line| !line.is_empty()) {
+            merged.push("");
+        }
+        merged.extend(template_outer.iter().copied());
+        merged.extend(template_hook.iter().copied());
+    }
+    format!("{}\n", merged.join("\n").trim_start_matches('\n'))
+}
+
+fn merge_managed_config(template: &str, existing: &str) -> String {
+    let managed = managed_assignments(template, None, MANAGED_CONFIG_KEYS).join("\n");
+    let managed_agents = managed_assignments(template, Some("[agents]"), MANAGED_AGENT_KEYS);
+
+    let mut in_top_level = true;
+    let mut in_workspace_sandbox = false;
+    let mut in_agents = false;
+    let mut in_legacy_profile_table = false;
+    let mut workspace_sandbox_found = false;
+    let mut agents_found = false;
+    let mut preserved_lines = Vec::new();
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        let header = table_header(line);
+        if let Some(header) = header {
+            in_top_level = false;
+            in_legacy_profile_table = header == "[profiles]" || header.starts_with("[profiles.");
+            in_workspace_sandbox = header == "[sandbox_workspace_write]";
+            in_agents = header == "[agents]";
+            if in_workspace_sandbox {
+                workspace_sandbox_found = true;
+            }
+            if in_agents {
+                agents_found = true;
+            }
+        }
+        if in_legacy_profile_table {
+            continue;
+        }
+        if in_top_level && is_assignment_for(line, &["profile"]) {
+            continue;
+        }
+        if in_top_level && is_assignment_for(line, MANAGED_CONFIG_KEYS) {
+            continue;
+        }
+        if in_workspace_sandbox
+            && trimmed
+                .strip_prefix("network_access")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        {
+            continue;
+        }
+        if in_agents && is_assignment_for(line, MANAGED_AGENT_KEYS) {
+            continue;
+        }
+        preserved_lines.push(line);
+        if in_workspace_sandbox && header == Some("[sandbox_workspace_write]") {
+            preserved_lines.push("network_access = true");
+        }
+        if in_agents && header == Some("[agents]") {
+            preserved_lines.extend(managed_agents.iter().map(String::as_str));
+        }
+    }
+    if !workspace_sandbox_found {
+        preserved_lines.extend(["", "[sandbox_workspace_write]", "network_access = true"]);
+    }
+    if !agents_found && !managed_agents.is_empty() {
+        preserved_lines.push("");
+        preserved_lines.push("[agents]");
+        preserved_lines.extend(managed_agents.iter().map(String::as_str));
+    }
+    let preserved = preserved_lines
+        .join("\n")
+        .trim_start_matches('\n')
+        .to_string();
+
+    let merged = if preserved.is_empty() {
+        format!("{managed}\n")
+    } else {
+        format!("{managed}\n\n{preserved}\n")
+    };
+    sync_managed_hook(template, &merged)
+}
+
+fn backup_legacy_config(codex_dir: &Path) -> Result<()> {
     let config_path = codex_dir.join("config.toml");
     if !config_path.exists() {
         return Ok(());
@@ -92,63 +391,197 @@ fn replace_legacy_config(codex_dir: &Path) -> Result<()> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("System clock is before UNIX_EPOCH")?
-        .as_secs();
+        .as_nanos();
     let backup_path = codex_dir.join(format!("config.toml.bak.legacy.{timestamp}"));
 
+    copy_file_exclusive(&config_path, &backup_path)?;
     println!(
-        "\nLegacy Codex profile config detected. Backing up {} to {}.",
+        "\nLegacy Codex profile config detected. Backed up {} to {}; local settings will be preserved.",
         config_path.display(),
         backup_path.display()
-    );
-    fs::rename(&config_path, &backup_path).with_context(|| {
-        format!(
-            "Failed to back up {} to {}",
-            config_path.display(),
-            backup_path.display()
-        )
-    })?;
-
-    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
-    let source_path = dotfiles_path.join(".codex/config.base.toml");
-    fs::copy(&source_path, &config_path).with_context(|| {
-        format!(
-            "Failed to copy from {} to {}",
-            source_path.display(),
-            config_path.display()
-        )
-    })?;
-    println!(
-        "Replaced legacy config with the current base config: {}",
-        config_path.display()
     );
 
     Ok(())
 }
 
-fn copy_local_config(source: &str, destination: &str) -> Result<()> {
-    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
-    let source_path = dotfiles_path.join(source);
+fn write_config_temp(
+    config_path: &Path,
+    contents: &str,
+    permissions: fs::Permissions,
+) -> Result<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before UNIX_EPOCH")?
+        .as_nanos();
+    let file_name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temp_path = config_path.with_file_name(format!(
+        ".{file_name}.tmp.automation.{}.{timestamp}",
+        std::process::id()
+    ));
+    let mut temp_created = false;
+    let write_result = (|| {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("Failed to create temporary {}", temp_path.display()))?;
+        temp_created = true;
+        temp.write_all(contents.as_bytes())
+            .with_context(|| format!("Failed to write temporary {}", temp_path.display()))?;
+        fs::set_permissions(&temp_path, permissions)
+            .with_context(|| format!("Failed to set permissions on {}", temp_path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("Failed to sync temporary {}", temp_path.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        if temp_created {
+            let _ = fs::remove_file(&temp_path);
+        }
+        return Err(error);
+    }
+    Ok(temp_path)
+}
 
-    let home_path = home::home_dir().context("Failed to get home directory")?;
-    let destination_path = home_path.join(destination);
-
-    if let Ok(existing_target) = fs::read_link(&destination_path)
-        && existing_target == source_path
-    {
-        println!(
-            "- Replacing managed symlink with local copy: {}",
-            destination_path.display()
+fn ensure_config_unchanged(
+    config_path: &Path,
+    expected: &str,
+    expected_symlink: bool,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(config_path)
+        .with_context(|| format!("Failed to re-inspect {}", config_path.display()))?;
+    if metadata.file_type().is_symlink() != expected_symlink {
+        anyhow::bail!(
+            "{} changed type while settings were being migrated",
+            config_path.display()
         );
-        let contents = fs::read(&source_path)
-            .with_context(|| format!("Failed to read {}", source_path.display()))?;
-        fs::remove_file(&destination_path)
-            .with_context(|| format!("Failed to remove {}", destination_path.display()))?;
-        fs::write(&destination_path, contents)
-            .with_context(|| format!("Failed to write {}", destination_path.display()))?;
+    }
+    let current = fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to re-read {}", config_path.display()))?;
+    if current != expected {
+        anyhow::bail!(
+            "{} changed while settings were being migrated; retry setup",
+            config_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) -> Result<()> {
+    let config_path = codex_dir.join("config.toml");
+    let metadata = match fs::symlink_metadata(&config_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect {}", config_path.display()));
+        }
+    };
+    let is_symlink = metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink());
+
+    if metadata.is_none() {
+        copy_file_exclusive(template_path, &config_path)?;
+        println!("- Installed base config: {}", config_path.display());
         return Ok(());
     }
 
-    copy_if_not_exists(source, destination)
+    let existing = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let template = fs::read_to_string(template_path)
+        .with_context(|| format!("Failed to read {}", template_path.display()))?;
+    let migrated = merge_managed_config(&template, &existing);
+    if migrated == existing && !is_symlink {
+        println!("- Shared Codex settings are up to date.");
+        return Ok(());
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before UNIX_EPOCH")?
+        .as_nanos();
+    let backup_path = codex_dir.join(format!("config.toml.bak.automation.{timestamp}"));
+    copy_file_exclusive(&config_path, &backup_path)?;
+    let permissions = fs::metadata(&config_path)
+        .with_context(|| {
+            format!(
+                "Failed to inspect permissions for {}",
+                config_path.display()
+            )
+        })?
+        .permissions();
+    let temp_path = write_config_temp(&config_path, &migrated, permissions)?;
+    if let Err(error) = ensure_config_unchanged(&config_path, &existing, is_symlink) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    if is_symlink {
+        let symlink_backup_path =
+            codex_dir.join(format!("config.toml.bak.automation-link.{timestamp}"));
+        if let Err(error) = copy_symlink_exclusive(&config_path, &symlink_backup_path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        if let Err(write_error) = fs::rename(&temp_path, &config_path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(write_error).context(format!(
+                "Failed to atomically replace symlink {}; the original remains in place",
+                config_path.display()
+            ));
+        }
+        println!(
+            "- Updated shared Codex settings (contents backup: {}, symlink backup: {}).",
+            backup_path.display(),
+            symlink_backup_path.display()
+        );
+        return Ok(());
+    }
+    if let Err(error) = fs::rename(&temp_path, &config_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| format!("Failed to update {}", config_path.display()));
+    }
+    println!(
+        "- Updated shared Codex settings (backup: {}).",
+        backup_path.display()
+    );
+    Ok(())
+}
+
+fn migrate_managed_config(codex_dir: &Path) -> Result<()> {
+    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    let template_path = dotfiles_path.join(CODEX_CONFIG_TEMPLATE);
+    migrate_managed_config_from_template(codex_dir, &template_path)
+}
+
+fn archive_retired_profiles(codex_dir: &Path) -> Result<()> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before UNIX_EPOCH")?
+        .as_secs();
+    for name in ["teacher.config.toml", "autonomous.config.toml"] {
+        let profile_path = codex_dir.join(name);
+        if !profile_path.exists() {
+            continue;
+        }
+        let backup_path = codex_dir.join(format!("{name}.bak.retired.{timestamp}"));
+        fs::rename(&profile_path, &backup_path).with_context(|| {
+            format!(
+                "Failed to archive retired profile {} to {}",
+                profile_path.display(),
+                backup_path.display()
+            )
+        })?;
+        println!(
+            "- Archived retired profile {} to {}.",
+            profile_path.display(),
+            backup_path.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn setup() -> Result<()> {
@@ -173,27 +606,451 @@ pub fn setup() -> Result<()> {
 
     println!("\nLinking shared configuration files...");
     for (source, dest) in CODEX_FILES {
-        create_symlink(source, dest)?;
+        ensure_shared_symlink(source, dest)?;
     }
 
     println!("\nLinking shared skill directories...");
     for (source, dest) in CODEX_DIRS {
-        create_symlink(source, dest)?;
+        ensure_shared_symlink(source, dest)?;
     }
 
-    replace_legacy_config(&codex_dir)?;
+    backup_legacy_config(&codex_dir)?;
+    archive_retired_profiles(&codex_dir)?;
 
-    println!("\nCopying local configuration templates...");
-    for (source, dest) in CODEX_COPY_FILES {
-        copy_local_config(source, dest)?;
-    }
+    println!("\nMigrating shared Codex settings...");
+    migrate_managed_config(&codex_dir)?;
 
     println!("\n✅ Codex CLI setup completed!");
     println!("\n💡 Next steps:");
     println!("   1. Run 'codex login' if authentication is not configured");
     println!("   2. Run 'codex' and trust hooks from '/hooks' if prompted");
-    println!("   3. Use teacher mode: codex --profile teacher");
-    println!("   4. Use autonomous mode: codex --profile autonomous");
+    println!("   3. Run 'codex' (workspace-write + auto-review is the default)");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
+        merge_managed_config, migrate_managed_config_from_template, verify_managed_symlink,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after UNIX_EPOCH")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "dotfiles-codex-{label}-{}-{timestamp}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create temporary test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn managed_keys_are_replaced_and_local_tables_are_preserved() {
+        let template = r#"
+model = "gpt-5.6-terra"
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+sandbox_mode = "workspace-write"
+commit_attribution = ""
+
+[sandbox_workspace_write]
+network_access = true
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3
+default_subagent_model = "gpt-5.6-terra"
+default_subagent_reasoning_effort = "medium"
+"#;
+        let existing = r#"model = "old"
+sandbox_mode = "read-only"
+
+[sandbox_workspace_write]
+network_access = false
+exclude_tmpdir_env_var = true
+
+[projects."/work"]
+trust_level = "trusted"
+
+[hooks.state]
+trusted_hash = "local-value"
+
+[agents]
+enabled = false
+max_concurrent_threads_per_session = 12
+default_subagent_model = "old"
+custom_setting = "preserved"
+
+[agents.local_reviewer]
+description = "local"
+"#;
+
+        let actual = merge_managed_config(template, existing);
+        assert!(actual.contains("model = \"gpt-5.6-terra\""));
+        assert!(actual.contains("sandbox_mode = \"workspace-write\""));
+        assert!(actual.contains("approvals_reviewer = \"auto_review\""));
+        assert!(actual.contains("commit_attribution = \"\""));
+        assert!(actual.contains("[sandbox_workspace_write]\nnetwork_access = true"));
+        assert!(actual.contains("exclude_tmpdir_env_var = true"));
+        assert!(!actual.contains("network_access = false"));
+        assert!(!actual.contains("model = \"old\""));
+        assert!(actual.contains("[projects.\"/work\"]"));
+        assert!(actual.contains("trusted_hash = \"local-value\""));
+        assert!(actual.contains("[agents]\nenabled = true"));
+        assert!(actual.contains("max_concurrent_threads_per_session = 3"));
+        assert!(actual.contains("default_subagent_model = \"gpt-5.6-terra\""));
+        assert!(actual.contains("default_subagent_reasoning_effort = \"medium\""));
+        assert!(actual.contains("custom_setting = \"preserved\""));
+        assert!(actual.contains("[agents.local_reviewer]\ndescription = \"local\""));
+        assert!(!actual.contains("max_concurrent_threads_per_session = 12"));
+        assert!(!actual.contains("default_subagent_model = \"old\""));
+        assert_eq!(merge_managed_config(template, &actual), actual);
+    }
+
+    #[test]
+    fn exclusive_backup_does_not_overwrite_an_existing_path() {
+        let directory = TestDirectory::new("exclusive-backup");
+        let source = directory.path().join("source.toml");
+        let destination = directory.path().join("backup.toml");
+        fs::write(&source, "new").expect("write backup source");
+        fs::write(&destination, "existing").expect("write existing backup");
+
+        assert!(copy_file_exclusive(&source, &destination).is_err());
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read existing backup"),
+            "existing"
+        );
+    }
+
+    #[test]
+    fn concurrent_config_change_is_detected_before_replacement() {
+        let directory = TestDirectory::new("concurrent-config");
+        let config = directory.path().join("config.toml");
+        fs::write(&config, "model = \"old\"\n").expect("write initial config");
+        assert!(ensure_config_unchanged(&config, "model = \"old\"\n", false).is_ok());
+
+        fs::write(&config, "model = \"local-change\"\n").expect("write concurrent change");
+        assert!(ensure_config_unchanged(&config, "model = \"old\"\n", false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_paths_must_be_symlinks_to_the_expected_source() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("managed-symlink");
+        let expected = directory.path().join("expected");
+        let other = directory.path().join("other");
+        let correct_link = directory.path().join("correct-link");
+        let wrong_link = directory.path().join("wrong-link");
+        let regular = directory.path().join("regular");
+        fs::write(&expected, "expected").expect("write expected source");
+        fs::write(&other, "other").expect("write other source");
+        fs::write(&regular, "expected").expect("write regular destination");
+        symlink(&expected, &correct_link).expect("create correct symlink");
+        symlink(&other, &wrong_link).expect("create wrong symlink");
+
+        assert!(verify_managed_symlink(&expected, &correct_link).is_ok());
+        assert!(verify_managed_symlink(&expected, &wrong_link).is_err());
+        assert!(verify_managed_symlink(&expected, &regular).is_err());
+    }
+
+    #[test]
+    fn workspace_sandbox_table_is_added_when_missing() {
+        let actual = merge_managed_config(
+            "model = \"gpt-5.6-terra\"\n\n[agents]\nenabled = true\ndefault_subagent_model = \"gpt-5.6-terra\"\n",
+            "model = \"old\"\n[projects.\"/work\"]\ntrust_level = \"trusted\"\n",
+        );
+        assert!(actual.contains("[sandbox_workspace_write]\nnetwork_access = true"));
+        assert!(
+            actual.contains("[agents]\nenabled = true\ndefault_subagent_model = \"gpt-5.6-terra\"")
+        );
+        assert!(actual.contains("[projects.\"/work\"]"));
+    }
+
+    #[test]
+    fn commented_managed_table_headers_are_reused_and_idempotent() {
+        let template = r#"model = "gpt-5.6-terra"
+
+[sandbox_workspace_write]
+network_access = true
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3
+default_subagent_model = "gpt-5.6-terra"
+"#;
+        let existing = r#"model = "old"
+
+[sandbox_workspace_write]   # local sandbox options
+network_access = false
+exclude_tmpdir_env_var = true
+
+[agents] # local agent defaults
+enabled = false
+max_concurrent_threads_per_session = 12
+custom_setting = "preserved"
+
+[agents.local_reviewer] # custom agent
+description = "local"
+"#;
+
+        let actual = merge_managed_config(template, existing);
+        assert!(actual.contains(
+            "[sandbox_workspace_write]   # local sandbox options\nnetwork_access = true"
+        ));
+        assert!(actual.contains("exclude_tmpdir_env_var = true"));
+        assert!(!actual.contains("network_access = false"));
+        assert!(actual.contains("[agents] # local agent defaults\nenabled = true"));
+        assert!(actual.contains("max_concurrent_threads_per_session = 3"));
+        assert!(actual.contains("custom_setting = \"preserved\""));
+        assert!(actual.contains("[agents.local_reviewer] # custom agent\ndescription = \"local\""));
+        assert!(!actual.contains("\n[sandbox_workspace_write]\n"));
+        assert!(!actual.contains("\n[agents]\n"));
+        assert_eq!(merge_managed_config(template, &actual), actual);
+    }
+
+    #[test]
+    fn managed_hook_is_added_or_updated_without_removing_local_hook_state() {
+        let template = r#"model = "gpt-5.6-terra"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
+timeout = 10
+statusMessage = "安全性を確認中"
+"#;
+        let hookless = r#"model = "old"
+
+[hooks.state]
+
+[hooks.state."local"]
+trusted_hash = "sha256:local"
+"#;
+        let added = merge_managed_config(template, hookless);
+        assert!(added.contains("[[hooks.PreToolUse]]\nmatcher = \"^Bash$\""));
+        assert!(added.contains("block_git_write.py"));
+        assert!(added.contains("[hooks.state.\"local\"]\ntrusted_hash = \"sha256:local\""));
+        assert_eq!(merge_managed_config(template, &added), added);
+
+        let old = r#"model = "old"
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
+timeout = 1
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "local-check"
+timeout = 30
+
+[hooks.state]
+"#;
+        let updated = merge_managed_config(template, old);
+        assert!(updated.contains("matcher = \"^Bash$\""));
+        assert!(updated.contains("block_git_write.py"));
+        assert!(updated.contains("timeout = 10"));
+        assert!(!updated.lines().any(|line| line == "timeout = 1"));
+        assert!(updated.contains("command = \"local-check\"\ntimeout = 30"));
+        assert!(updated.contains("[hooks.state]"));
+        assert_eq!(merge_managed_config(template, &updated), updated);
+    }
+
+    #[test]
+    fn legacy_profile_settings_are_removed_while_local_tables_are_preserved() {
+        let template = r#"model = "gpt-5.6-terra"
+
+[agents]
+enabled = true
+"#;
+        let existing = r#"profile = "teacher"
+model = "old"
+
+[projects."/work"]
+trust_level = "trusted"
+
+[profiles.teacher]
+model = "gpt-5.6-sol"
+sandbox_mode = "read-only"
+
+[hooks.state]
+
+[hooks.state."local"]
+trusted_hash = "sha256:local"
+
+[tui]
+notifications = false
+
+[agents.local_reviewer]
+description = "local"
+"#;
+
+        let actual = merge_managed_config(template, existing);
+        assert!(!actual.contains("profile = \"teacher\""));
+        assert!(!actual.contains("[profiles.teacher]"));
+        assert!(actual.contains("[projects.\"/work\"]\ntrust_level = \"trusted\""));
+        assert!(actual.contains("[hooks.state.\"local\"]\ntrusted_hash = \"sha256:local\""));
+        assert!(actual.contains("[tui]\nnotifications = false"));
+        assert!(actual.contains("[agents.local_reviewer]\ndescription = \"local\""));
+        assert_eq!(merge_managed_config(template, &actual), actual);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_replaces_config_symlink_without_writing_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("symlink-migration");
+        let target_path = directory.path().join("local-config.toml");
+        let config_path = directory.path().join("config.toml");
+        let template_path = directory.path().join("template.toml");
+        let original = "model = \"old\"\n\n[agents]\nenabled = false\n";
+        let template = "model = \"gpt-5.6-terra\"\n\n[agents]\nenabled = true\n";
+        fs::write(&target_path, original).expect("write symlink target");
+        fs::write(&template_path, template).expect("write template");
+        symlink(&target_path, &config_path).expect("create config symlink");
+
+        migrate_managed_config_from_template(directory.path(), &template_path)
+            .expect("migrate symlinked config");
+
+        assert_eq!(
+            fs::read_to_string(&target_path).expect("read symlink target"),
+            original
+        );
+        let config_metadata = fs::symlink_metadata(&config_path).expect("inspect config");
+        assert!(config_metadata.file_type().is_file());
+        assert!(!config_metadata.file_type().is_symlink());
+        assert!(
+            fs::read_to_string(&config_path)
+                .expect("read migrated config")
+                .contains("model = \"gpt-5.6-terra\"")
+        );
+
+        let entries = fs::read_dir(directory.path())
+            .expect("read backup directory")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read backup entries");
+        let contents_backup = entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak.automation.")
+            })
+            .expect("find contents backup");
+        assert_eq!(
+            fs::read_to_string(contents_backup.path()).expect("read contents backup"),
+            original
+        );
+        let symlink_backup = entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak.automation-link.")
+            })
+            .expect("find symlink backup");
+        assert!(
+            fs::symlink_metadata(symlink_backup.path())
+                .expect("inspect symlink backup")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(symlink_backup.path()).expect("read symlink backup"),
+            target_path
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_atomically_updates_regular_config_and_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("regular-migration");
+        let config_path = directory.path().join("config.toml");
+        let template_path = directory.path().join("template.toml");
+        let original = "model = \"old\"\n\n[projects.\"/work\"]\ntrust_level = \"trusted\"\n";
+        let template = "model = \"gpt-5.6-terra\"\n";
+        fs::write(&config_path, original).expect("write regular config");
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
+            .expect("set config permissions");
+        fs::write(&template_path, template).expect("write template");
+
+        migrate_managed_config_from_template(directory.path(), &template_path)
+            .expect("migrate regular config");
+
+        let migrated = fs::read_to_string(&config_path).expect("read migrated config");
+        assert!(migrated.contains("model = \"gpt-5.6-terra\""));
+        assert!(migrated.contains("[projects.\"/work\"]\ntrust_level = \"trusted\""));
+        assert_eq!(
+            fs::metadata(&config_path)
+                .expect("inspect migrated config")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let entries = fs::read_dir(directory.path())
+            .expect("read migration directory")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read migration entries");
+        assert!(!entries.iter().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.automation.")
+        }));
+        let backup = entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak.automation.")
+            })
+            .expect("find regular config backup");
+        assert_eq!(
+            fs::read_to_string(backup.path()).expect("read regular config backup"),
+            original
+        );
+    }
+
+    #[test]
+    fn legacy_profile_detection_ignores_comments() {
+        assert!(contains_legacy_profile_config("profile = \"teacher\"\n"));
+        assert!(contains_legacy_profile_config("[profiles.teacher]\n"));
+        assert!(!contains_legacy_profile_config("# profile = \"teacher\"\n"));
+    }
 }

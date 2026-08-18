@@ -1,43 +1,44 @@
-# Codex base config の新端末用テンプレート（端末非依存）。
+# Codexの新端末用base config。
 #
-# install CLI（packages/cli）が ~/.codex/config.toml が存在しない場合のみ、
-# このファイルを ~/.codex/config.toml へコピーする（copy_if_not_exists）。
-# コピー後はローカル管理: 端末依存の設定（下記）は ~/.codex/config.toml 側に追記し、
-# このテンプレートには含めない。
-#   - [projects.*]            … プロジェクト trust（パスが端末ごとに異なる）
-#   - [hooks.state]           … hook の trusted_hash（/hooks で信頼登録した結果）
-#   - [tui.*]                 … TUI 状態
+# install CLIはこのtemplateを~/.codex/config.tomlへcopyし、既存端末では
+# 下記の共有keyだけを安全に移行する。端末依存の設定はlocal fileに保持する。
+#   - [projects.*]  project trust
+#   - [hooks.state] hookのtrusted hash
+#   - [tui.*]      TUI state
 #
-# ※ ファイル名を config.base.toml としているのは、Codex が project config として読むのは
-#    `.codex/config.toml` のみで、`.codex/config.base.toml` は読まないため。
-#    Codex の設定優先順位は CLI flags > project config (.codex/config.toml) > profile > user config。
-#    dotfiles は trusted project なので、もし dotfiles 配下に .codex/config.toml を置くと
-#    project config が profile より高優先で評価され、--profile teacher/autonomous が無効化される。
-#    テンプレートを別名にしておくことで project config として読まれず、profile がそのまま効く。
-#
-# profile は v2 形式（~/.codex/<name>.config.toml, dotfiles へ symlink）:
-#   教師モード: codex --profile teacher    （read-only）
-#   自律モード: codex --profile autonomous （workspace-write）
+# repository内ではconfig.base.tomlという名前にし、project configとして
+# Codexに自動読込されないようにする。
 
-model = "gpt-5.5"
-model_reasoning_effort = "high"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "medium"
+plan_mode_reasoning_effort = "high"
 approval_policy = "on-request"
-sandbox_mode = "read-only"
+approvals_reviewer = "auto_review"
+sandbox_mode = "workspace-write"
+
+# Codex/OpenAIのco-authorや生成表記をcommit messageへ追加しない。
+# Codex CLI 0.147.0でstrict config検証済み。hookでもAI帰属を拒否する。
+commit_attribution = ""
 
 [sandbox_workspace_write]
 network_access = true
 
-# workspace-write sandbox の `.git` 読み取り専用保護を主境界とする。
-# 本 hook は Git 書き込みと Issue 以外の GitHub 書き込みの直接呼び出しを
-# 早期拒否する多層防御であり、任意プログラムを解析するセキュリティ境界ではない。
-# 削除系コマンドは rules の prompt で Daiki の確認へ回す。
-# ⚠️ 新端末ではこの hook の trust 登録が必須: 対話 `codex` を起動し `/hooks` で信頼登録すること。
-#    信頼登録するまで hook はスキップされる。
+# 通常のsubagentは探索・実装・レビューを十分に扱えるTerraへ寄せる。
+# 狭い実装はSkillからLuna xhigh、高難度の判断だけSol highを明示する。
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3
+default_subagent_model = "gpt-5.6-terra"
+default_subagent_reasoning_effort = "medium"
+
+# workspace-write sandboxを主境界とし、hookはGit/GitHubの引数、削除操作、
+# secret、AI帰属を早期検査する多層防御として使う。
+# 新端末またはhook更新後は、対話Codexの/hooksで内容を確認して信頼登録する。
 [[hooks.PreToolUse]]
 matcher = "^Bash$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
-timeout = 10
-statusMessage = "Git / GitHub CLI の直接操作ガードを確認中"
+timeout = 30
+statusMessage = "開発ワークフローの安全性を確認中"

@@ -1,90 +1,50 @@
-# ============================================================
-# Git: 書き込み系は全面禁止（Daiki が手動で実施する）
-#   代表的な変更操作を rules で拒否し、未知の操作は hook の allowlist で拒否する
-# ============================================================
-prefix_rule(pattern=["git", "add"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "commit"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "push"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "pull"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "fetch"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "merge"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "rebase"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "reset"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "stash"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "cherry-pick"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "checkout"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "switch"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "restore"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "clean"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "revert"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "rm"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "mv"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "apply"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "am"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "tag"], decision="forbidden", justification="Git 書き込み系は Daiki が実施する")
-prefix_rule(pattern=["git", "config"], decision="forbidden", justification="Git 設定の変更は Daiki が実施する")
-prefix_rule(pattern=["git", "worktree"], decision="forbidden", justification="worktree とブランチの変更は Daiki が実施する")
-prefix_rule(pattern=["git", "submodule"], decision="forbidden", justification="submodule の変更は Daiki が実施する")
-prefix_rule(pattern=["git", ["gc", "prune"]], decision="forbidden", justification="Git リポジトリの変更は Daiki が実施する")
+# Codexの外部実行ルール。
+# workspace-write sandboxを主境界とし、安全なGit/GitHub書き込みだけを
+# auto-reviewへ回す。引数の詳細検査はPreToolUse hookが担当する。
 
-# ============================================================
-# Git: 読み取り系は確認なしで実行可
-#   読み書き両用の branch/remote は hook 側で読み取り用途のみ許可する
-# ============================================================
-prefix_rule(pattern=["git", ["status", "log", "diff", "show", "rev-parse", "blame", "shortlog", "describe", "reflog", "ls-files", "ls-tree", "cat-file", "rev-list", "merge-base", "name-rev", "grep"]], decision="allow", justification="読み取り専用 Git 操作は安全")
+# Git: 読み取り専用
+prefix_rule(pattern=["git", ["status", "log", "diff", "show", "rev-parse", "blame", "shortlog", "describe", "reflog", "ls-files", "ls-tree", "cat-file", "rev-list", "merge-base", "name-rev", "grep"]], decision="allow", justification="読み取り専用Git操作")
+prefix_rule(pattern=["git", "branch"], decision="allow", justification="hookが一覧・照会だけに制限する")
+prefix_rule(pattern=["git", "remote"], decision="allow", justification="hookがremote照会だけに制限する")
+prefix_rule(pattern=["git", "reflog", ["expire", "delete", "drop"]], decision="forbidden", justification="reflogの変更・削除は禁止")
+prefix_rule(pattern=["git", "grep", ["-O", "--open-files-in-pager"]], decision="forbidden", justification="外部pagerの実行は禁止")
+prefix_rule(pattern=["git", ["log", "diff", "show"], "--output"], decision="forbidden", justification="読み取りGitによるfile書き込みは禁止")
 
-# ============================================================
-# GitHub CLI: Issue 管理と読み取り専用操作だけを許可する
-#   詳細な引数検査と未知の変更操作の拒否は PreToolUse hook で行う
-# ============================================================
-prefix_rule(pattern=["gh", "issue", ["list", "status", "view", "create", "edit", "comment", "close", "reopen", "pin", "unpin", "lock", "unlock", "transfer"]], decision="allow", justification="GitHub Issue は仕様・進捗・実装記録として Codex から管理できる")
-prefix_rule(pattern=["gh", "issue", ["develop", "delete"]], decision="forbidden", justification="ブランチ作成と Issue 削除は許可しない")
-prefix_rule(pattern=["gh", "pr", ["create", "merge", "close", "reopen", "edit", "comment", "review", "ready", "lock", "unlock", "update-branch", "checkout"]], decision="forbidden", justification="PR とブランチの変更は Daiki が実施する")
-prefix_rule(pattern=["gh", "repo", ["create", "delete", "rename", "archive", "fork", "sync"]], decision="forbidden", justification="リポジトリの変更は許可しない")
-prefix_rule(pattern=["gh", "run", ["cancel", "delete", "rerun"]], decision="forbidden", justification="Actions run の変更は許可しない")
-prefix_rule(pattern=["gh", "workflow", ["run", "enable", "disable"]], decision="forbidden", justification="Workflow の変更は許可しない")
-prefix_rule(pattern=["gh", "release", ["create", "delete", "edit", "upload"]], decision="forbidden", justification="Release の変更は許可しない")
+# Git: hookが引数と対象を検査できる正規形だけをrulesで直接許可する。
+# 非正規形はallow規則に一致しないため、既定のapproval判定へ委ねる。
+prefix_rule(pattern=["git", "fetch", "origin"], decision="allow", justification="hook検査済みのbase branch取得")
+prefix_rule(pattern=["git", "switch", ["-c", "--create"]], decision="allow", justification="hook検査済みの作業branch作成")
+prefix_rule(pattern=["git", "add", "--"], decision="allow", justification="hook検査済みの明示パスstage")
+prefix_rule(pattern=["git", "commit", "-m"], decision="allow", justification="hook検査済みの1行commit")
+prefix_rule(pattern=["git", "push", ["-u", "--set-upstream"], "origin"], decision="allow", justification="hook検査済みの単一branch push")
 
-# ============================================================
-# 破壊的コマンド: 削除は必ず Daiki に確認、移動・リネームは許可
-# ============================================================
-prefix_rule(pattern=["rm"], decision="prompt", justification="削除操作のため、実行前に Daiki の確認が必要")
-prefix_rule(pattern=["rmdir"], decision="prompt", justification="削除操作のため、実行前に Daiki の確認が必要")
-prefix_rule(pattern=["mv"], decision="allow", justification="削除の代替としてリネーム・退避は許可")
+# Git: 履歴改変・統合・削除・保護対象への変更
+prefix_rule(pattern=["git", "push", ["--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"]], decision="forbidden", justification="履歴改変・削除・一括pushは禁止")
+prefix_rule(pattern=["git", ["pull", "merge", "rebase", "reset", "stash", "cherry-pick", "checkout", "restore", "clean", "revert", "rm", "mv", "apply", "am", "tag", "config", "worktree", "submodule", "update-ref", "symbolic-ref", "replace", "notes"]], decision="forbidden", justification="自動ワークフローの許可範囲外")
+prefix_rule(pattern=["git", ["gc", "prune"]], decision="forbidden", justification="リポジトリ保守・削除操作は禁止")
 
-# ============================================================
-# 既存の許可コマンド（維持）
-# ============================================================
-prefix_rule(pattern=["curl"], decision="allow")
-prefix_rule(pattern=["tmux", "source-file"], decision="allow")
-prefix_rule(pattern=["tmux", "show-options"], decision="allow")
-prefix_rule(pattern=["tmux", "display-message"], decision="allow")
-prefix_rule(pattern=["rg", "-n", "javascript:|vbscript:|on[a-z]+\\s*=|<iframe|<object|<embed|<base|data:text/html"], decision="allow")
-prefix_rule(pattern=["npm", "install"], decision="allow")
-prefix_rule(pattern=["cargo", "fmt"], decision="allow")
-prefix_rule(pattern=["cargo", "info"], decision="allow", justification="crate 情報の取得は非破壊的")
-prefix_rule(pattern=["cargo", "check"], decision="allow")
-prefix_rule(pattern=["cargo", "build"], decision="allow")
-prefix_rule(pattern=["make", "build"], decision="allow")
-prefix_rule(pattern=["cargo", "test"], decision="allow")
-prefix_rule(pattern=["claude", "-p"], decision="allow")
-prefix_rule(pattern=["npm", "audit"], decision="allow")
-prefix_rule(pattern=["env", "-u", "NO_COLOR", "make", "dev-no-open", "DEV_PORT=8121"], decision="allow")
-prefix_rule(pattern=["env", "-u", "NO_COLOR", "make", "dev-no-open", "DEV_PORT=8122"], decision="allow")
-prefix_rule(pattern=["fuser", "-k", "8122/tcp"], decision="allow")
-prefix_rule(pattern=["env", "-u", "NO_COLOR", "make", "dev-no-open", "DEV_PORT=8123"], decision="allow")
-prefix_rule(pattern=["fuser", "-k", "9224/tcp"], decision="allow")
-prefix_rule(pattern=["gh", "run", "view", "27095755052", "--log"], decision="allow")
-prefix_rule(pattern=["npx", "--yes", "wrangler@4.98.0"], decision="allow")
-prefix_rule(pattern=["pkill", "-f", "wrangler.*tail typecraft-worker-production"], decision="allow")
-prefix_rule(pattern=["make", "dev-no-open"], decision="allow")
-prefix_rule(pattern=["/home/daiki/Android/Sdk/emulator/emulator-check"], decision="allow")
-prefix_rule(pattern=["cargo", "test", "--workspace", "--exclude", "kakiro-web"], decision="allow")
-prefix_rule(pattern=["trunk", "build"], decision="allow")
-prefix_rule(pattern=["/usr/bin/zsh", "-lc", "NO_COLOR=false trunk build"], decision="allow")
-prefix_rule(pattern=["timeout", "90s", "make", "dev"], decision="allow")
-prefix_rule(pattern=["make", "down"], decision="allow")
-prefix_rule(pattern=["cargo", "tauri", "android", "init"], decision="allow")
-prefix_rule(pattern=["timeout", "180s", "make", "dev-android"], decision="allow")
-prefix_rule(pattern=["make", "test"], decision="allow")
-prefix_rule(pattern=["timeout", "60s", "make", "dev"], decision="allow")
+# GitHub: 読み取り専用
+prefix_rule(pattern=["gh", "pr", ["list", "view", "status", "checks", "diff"]], decision="allow", justification="PRの読み取り専用操作")
+prefix_rule(pattern=["gh", "issue", ["list", "status", "view"]], decision="allow", justification="Issueの読み取り専用操作")
+prefix_rule(pattern=["gh", "run", ["list", "view", "watch"]], decision="allow", justification="Actionsの読み取り専用操作")
+prefix_rule(pattern=["gh", "repo", ["list", "view"]], decision="allow", justification="repositoryの読み取り専用操作")
+prefix_rule(pattern=["gh", "release", ["list", "view", "verify", "verify-asset"]], decision="allow", justification="Releaseの読み取り専用操作")
+prefix_rule(pattern=["gh", "workflow", ["list", "view"]], decision="allow", justification="Workflowの読み取り専用操作")
+
+# GitHub: repositoryと本文をhookが検査できる正規形だけを直接許可する。
+prefix_rule(pattern=["gh", "issue", "create", "--repo"], decision="allow", justification="hook検査済みのIssue作成")
+prefix_rule(pattern=["gh", "issue", ["edit", "comment"]], decision="prompt", justification="承認済み計画へのIssue記録をauto-reviewする")
+prefix_rule(pattern=["gh", "pr", "create", "--draft", "--repo"], decision="allow", justification="hook検査済みのDraft PR作成")
+
+# GitHub: 決定的・破壊的な変更
+prefix_rule(pattern=["gh", "issue", ["close", "reopen", "pin", "unpin", "lock", "unlock", "transfer", "develop", "delete"]], decision="forbidden", justification="Issue記録以外の状態変更は禁止")
+prefix_rule(pattern=["gh", "pr", ["merge", "close", "reopen", "edit", "comment", "review", "ready", "lock", "unlock", "update-branch", "checkout"]], decision="forbidden", justification="Draft PR作成以外のPR変更は禁止")
+prefix_rule(pattern=["gh", "repo", ["create", "delete", "rename", "archive", "fork", "sync"]], decision="forbidden", justification="repository変更は禁止")
+prefix_rule(pattern=["gh", "run", "download"], decision="forbidden", justification="Actions artifactのfile書き込みは禁止")
+prefix_rule(pattern=["gh", "release", "download"], decision="forbidden", justification="Release assetのfile書き込みは禁止")
+prefix_rule(pattern=["gh", "run", ["cancel", "delete", "rerun"]], decision="forbidden", justification="Actions runの変更は禁止")
+prefix_rule(pattern=["gh", "workflow", ["run", "enable", "disable"]], decision="forbidden", justification="Workflow変更は禁止")
+prefix_rule(pattern=["gh", "release", ["create", "delete", "edit", "upload"]], decision="forbidden", justification="Release変更は禁止")
+
+# 削除コマンドは承認へ回さず拒否する。必要な削除はDaikiが実施する。
+prefix_rule(pattern=[["rm", "rmdir", "unlink", "shred"]], decision="forbidden", justification="削除コマンドの自動実行は禁止")
