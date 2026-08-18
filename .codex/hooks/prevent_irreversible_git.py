@@ -10,7 +10,11 @@ DELETION_COMMANDS = {"rm", "rmdir", "unlink", "shred"}
 COMMAND_WRAPPERS = {"command", "env", "exec", "sudo"}
 SHELL_WRAPPERS = {"sh", "bash", "zsh", "dash", "ksh"}
 SCHEDULE_WRAPPERS = {"nice", "timeout"}
-WRAPPER_OPTIONS_WITH_VALUE = {"sudo": {"-u", "-g", "-h", "-p", "-C"}, "env": {"-u", "-C"}}
+WRAPPER_OPTIONS_WITH_VALUE = {
+    "sudo": {"-u", "-g", "-h", "-p", "-C"},
+    "env": {"-u", "-C"},
+    "exec": {"-a", "--argv0"},
+}
 SHELL_SEPARATORS = {";", "&&", "||", "|", "\n"}
 PROTECTED_PUSH_OPTIONS = {"--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--all", "--tags", "--prune"}
 GIT_OPTIONS_WITH_VALUE = {"-C", "-c", "--config", "--git-dir", "--work-tree", "--namespace"}
@@ -46,6 +50,24 @@ def _git_subcommand(tokens):
     return None, []
 
 
+def _has_temporary_git_config(tokens):
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-c", "--config", "--config-env"}:
+            return True
+        if token.startswith("-c") or token.startswith("--config=") or token.startswith("--config-env="):
+            return True
+        if token in GIT_OPTIONS_WITH_VALUE:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return False
+    return False
+
+
 def _unwrap(tokens):
     index = 0
     while index < len(tokens):
@@ -71,13 +93,12 @@ def _unwrap(tokens):
 
 def _wrapped_command_reason(executable, tokens):
     if executable in SHELL_WRAPPERS:
-        try:
-            command_index = tokens.index("-c")
-        except ValueError:
-            return None
-        if command_index + 1 >= len(tokens):
-            return "shell commandを安全に解析できません"
-        return blocked_reason(tokens[command_index + 1])
+        for command_index, token in enumerate(tokens[1:], start=1):
+            if token == "--command" or (token.startswith("-") and not token.startswith("--") and "c" in token[1:]):
+                if command_index + 1 >= len(tokens):
+                    return "shell commandを安全に解析できません"
+                return blocked_reason(tokens[command_index + 1])
+        return None
 
     if executable == "env" and "-S" in tokens:
         command_index = tokens.index("-S")
@@ -94,7 +115,7 @@ def _wrapped_command_reason(executable, tokens):
     if executable == "timeout":
         index = 1
         while index < len(tokens) and tokens[index].startswith("-"):
-            index += 2 if tokens[index] in {"-k", "--kill-after"} else 1
+            index += 2 if tokens[index] in {"-k", "--kill-after", "-s", "--signal"} else 1
         index += 1  # duration
         return blocked_reason(" ".join(tokens[index:])) if index < len(tokens) else None
 
@@ -130,7 +151,7 @@ def blocked_reason(command):
         if executable != "git":
             continue
 
-        if any(arg == "-c" or arg.startswith("-c") or arg.startswith("--config") for arg in tokens[1:]):
+        if _has_temporary_git_config(tokens):
             return "一時Git設定を伴う操作は許可されていません"
         subcommand, args = _git_subcommand(tokens)
         if subcommand == "rm":
