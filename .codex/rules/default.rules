@@ -3,7 +3,7 @@
 # auto-reviewへ回す。引数の詳細検査はPreToolUse hookが担当する。
 
 # Git: 読み取り専用
-prefix_rule(pattern=["git", ["status", "log", "diff", "show", "rev-parse", "blame", "shortlog", "describe", "reflog", "ls-files", "ls-tree", "cat-file", "rev-list", "merge-base", "name-rev", "grep", "symbolic-ref"]], decision="allow", justification="読み取り専用Git操作")
+prefix_rule(pattern=["git", ["status", "log", "diff", "show", "rev-parse", "blame", "shortlog", "describe", "reflog", "ls-files", "ls-tree", "cat-file", "rev-list", "merge-base", "name-rev", "grep"]], decision="allow", justification="読み取り専用Git操作")
 prefix_rule(pattern=["git", "branch"], decision="allow", justification="hookが一覧・照会だけに制限する")
 prefix_rule(pattern=["git", "remote"], decision="allow", justification="hookがremote照会だけに制限する")
 prefix_rule(pattern=["git", "reflog", ["expire", "delete", "drop"]], decision="forbidden", justification="reflogの変更・削除は禁止")
@@ -20,7 +20,7 @@ prefix_rule(pattern=["git", "push", ["-u", "--set-upstream"], "origin"], decisio
 
 # Git: 履歴改変・統合・削除・保護対象への変更
 prefix_rule(pattern=["git", "push", ["--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"]], decision="forbidden", justification="履歴改変・削除・一括pushは禁止")
-prefix_rule(pattern=["git", ["pull", "merge", "rebase", "reset", "stash", "cherry-pick", "checkout", "restore", "clean", "revert", "rm", "mv", "apply", "am", "tag", "config", "worktree", "submodule", "update-ref", "replace", "notes"]], decision="forbidden", justification="自動ワークフローの許可範囲外")
+prefix_rule(pattern=["git", ["pull", "merge", "rebase", "reset", "stash", "cherry-pick", "checkout", "restore", "clean", "revert", "rm", "mv", "apply", "am", "tag", "config", "worktree", "submodule", "update-ref", "symbolic-ref", "replace", "notes"]], decision="forbidden", justification="自動ワークフローの許可範囲外")
 prefix_rule(pattern=["git", ["gc", "prune"]], decision="forbidden", justification="リポジトリ保守・削除操作は禁止")
 
 # GitHub: 読み取り専用

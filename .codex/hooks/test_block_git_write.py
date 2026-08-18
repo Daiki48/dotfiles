@@ -31,7 +31,7 @@ class GuardTest(unittest.TestCase):
             "git branch --contains main",
             "git branch --list 'feature/*'",
             "git remote -v",
-            "git symbolic-ref --short refs/remotes/origin/HEAD",
+            "git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'",
             "git --version",
         ):
             with self.subTest(command=command):
