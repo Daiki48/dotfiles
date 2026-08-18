@@ -104,6 +104,16 @@ synchronization is needed, only `git pull --ff-only --no-rebase --no-autostash
 branch whose name is in the protected-branch allowlist and whose upstream matches local
 `origin/HEAD`, with no local commits or in-progress Git operation; merge, rebase, reset,
 stash, and every other pull form remain blocked.
+
+For the first push of a work branch, a missing local `origin/HEAD` is resolved by one
+read-only remote symref lookup, provided the corresponding local remote-tracking base ref
+exists and has a merge-base with `HEAD`. For Draft PR creation, a missing local
+`origin/<work-branch>` is similarly checked against the remote tip and must match local
+`HEAD` exactly. This removes the need to run a manual fetch solely because the sandbox
+could not update local tracking refs after push. Remote lookup failures, malformed or
+ambiguous ref responses, missing local base refs, and every mismatch are rejected
+fail-closed. Pull and default-branch switching continue to require local `origin/HEAD`.
+
 Returning to a local default branch is limited to `git switch <base>` from a clean
 worktree, where `<base>` is one of `main`, `master`, `develop`, `development`, or `trunk`.
 The hook requires the target to match local `origin/HEAD` and verifies that the local branch
