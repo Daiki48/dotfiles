@@ -31,7 +31,9 @@ class HookTest(unittest.TestCase):
             "git branch -D feature/example",
             "git tag --delete v1.0.0",
             "git push --force origin feature/example",
+            "git push origin --force-with-lease=refs/heads/feature/example",
             "git push origin --delete feature/example",
+            "git push origin --delete=feature/example",
             "git push origin :feature/example",
             "git status && git push origin --force feature/example",
         ):

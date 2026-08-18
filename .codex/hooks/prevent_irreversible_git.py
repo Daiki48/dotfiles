@@ -60,11 +60,19 @@ def blocked_reason(command):
 
         subcommand, args = _git_subcommand(tokens)
         if subcommand in {"branch", "tag"} and any(
-            arg in {"-d", "-D", "--delete"} for arg in args
+            arg in {"-d", "-D", "--delete"} or arg.startswith("--delete=")
+            for arg in args
         ):
             return f"git {subcommand}による削除は許可されていません"
         if subcommand == "push":
-            if any(arg in PROTECTED_PUSH_OPTIONS for arg in args):
+            if any(
+                arg in PROTECTED_PUSH_OPTIONS
+                or any(
+                    option.startswith("--") and arg.startswith(f"{option}=")
+                    for option in PROTECTED_PUSH_OPTIONS
+                )
+                for arg in args
+            ):
                 return "force/delete/mirror/tag pushは許可されていません"
             if any(arg.startswith(":") for arg in args):
                 return "削除refspecを使うpushは許可されていません"
