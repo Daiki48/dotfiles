@@ -35,7 +35,7 @@
 - `gpt-5.6-sol`のxhighは、重大なセキュリティ・互換性・データ移行、2回の修正ループ失敗、または根拠を伴う結論の衝突だけに昇格する
 - SolはDaikiの明示的な製品判断、外部書き込み・破壊操作の承認境界、system/developerの安全制約を上書きしない
 - 同じ検証を複数agentで重複実行せず、最大3つのsubagentから要約を受け取って親agentが統合する
-- 直列依存の作業や小さな単独作業ではsubagentを起動しない
+- 直列依存の作業や小さな単独作業では、Sol leadと最終reviewer以外のworker subagentを起動しない
 
 ## Collaborative Development Flow
 
@@ -48,14 +48,14 @@
 5. 作業branch上で全実装単位を連続して実装・検証する。依頼スコープ内の失敗は原因調査と修正を反復し、受入条件を満たすまで自律的に続ける
 6. 各実装単位が独立して正しく復元可能な状態になった時点で、明示パスだけをstageし、検査後にcommitする。commitごとのDaiki確認は待たない
 7. 全実装単位後に、同じ証拠集合を使った通常レビューと、独立した反論意見レビューを実施する
-8. 合意範囲内の指摘は修正・検証・追加commitし、重大な問題がなくなるまで再確認する
+8. 依頼スコープ内の指摘は修正・検証・追加commitし、重大な問題がなくなるまで再確認する
 9. push前監査後、許可された単一作業ブランチだけを通常pushし、詳細なDraft PRを作成する
 10. Ready化、merge、close、releaseはDaikiが行う
 
 次の場合だけ停止してDaikiへ確認する。
 
 - 依頼スコープからの実質的な逸脱や、新しい製品判断が必要
-- 必須テスト失敗を合意範囲内で安全に解決できない
+- 必須テスト失敗を依頼スコープ内で安全に解決できない
 - worktreeの既存変更、競合、base不整合によりDaikiの作業を損なう可能性がある
 - 重大なセキュリティ、互換性、データ損失リスクが新たに判明した
 - hookまたはauto-reviewが必要操作を拒否した
@@ -67,7 +67,7 @@
 
 - 計画は人間の確認単位ではなく、依存関係と検証可能性に基づく実装単位へ分ける
 - 1実装単位は原則1commitにするが、レビュー修正や安全な復元点のため複数commitになってもよい
-- 合意範囲外の変更、無関係な整形、後続単位を混ぜない
+- 依頼スコープ外の変更、無関係な整形、後続単位を混ぜない
 - 各commit前に差分、stage対象、テスト結果、秘密情報、AI帰属の不在を確認する
 - `--amend`、fixup、squash、author上書き、signoff、`--no-verify`は使用しない
 - DaikiのローカルGit `user.name`、`user.email`、GPG/SSH署名設定をそのまま使う
@@ -86,7 +86,7 @@
 
 ## Durable Work Record
 
-- 合意済み計画には一意なPlan IDと版、各実装単位には一意なIDを付ける
+- 内部計画には一意なPlan IDと版、各実装単位には一意なIDを付ける
 - 正本は、Daikiの依頼、プロジェクト指定docs、信頼済み追跡Issueの順で特定する
 - DaikiがIssue記録を依頼し既存追跡Issueがある場合だけ、本文を上書きせず、内部計画、完了commit、最終監査を重複しないコメントとして追記する
 - Issueの新規作成や状態変更は、Daikiが依頼した場合だけ行う
@@ -136,7 +136,7 @@ Git書き込みは、Daikiの実装依頼スコープ内の作業branchに限り
 
 ## GitHub CLI Rules
 
-- Issueの作成・編集・コメントは、承認済み計画の記録範囲だけ許可する。close、reopen、pin、lock、transfer、deleteはDaikiが行う
+- Issueの作成・編集・コメントは、Daikiが明示した記録範囲だけ許可する。close、reopen、pin、lock、transfer、deleteはDaikiが行う
 - PRは明示したrepository、base、head、title、body fileを使った`gh pr create --draft`だけ許可する
 - PR作成前に対象repositoryとremoteを照合し、bodyをsecret検査する
 - PRのReady化、merge、close、reopen、編集、review投稿、update-branchは実行しない
