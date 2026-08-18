@@ -65,7 +65,7 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `tmux` | Install tmux via apt/dnf, clone [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager) into `~/.config/tmux/plugins/tpm`, and symlink `~/.config/tmux/tmux.conf`. After setup, press `Ctrl+g` then `I` (capital i) inside tmux to install plugins. | yes |
 | `mise [TOOL@VERSION]...` | Install mise from its recommended apt/dnf repository. Optional tool arguments are installed and recorded in the global mise config; with no arguments, only mise itself is installed. Shell activation is provided by the managed `.zshrc`. | yes |
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
-| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks the shared AGENTS.md, rules, hooks, and Skills, then installs or migrates `~/.codex/config.toml` to the workspace-write + auto-review defaults. Machine-local trust and TUI settings are preserved. | no |
+| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks the shared AGENTS.md, rules, and Skills; installs the Git hook as a managed local copy; then installs or migrates `~/.codex/config.toml` to the workspace-write + auto-review defaults. Machine-local trust and TUI settings are preserved. | no |
 | `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`, `~/.gemini/GEMINI.md`, and `~/.gemini/policies/`. Requires `GEMINI_API_KEY` exported in your shell. | no |
 
 #### AI CLI configuration policy
@@ -116,8 +116,9 @@ exists, commit messages and PR/Issue bodies default to Japanese, commit subjects
 `fix/`, or `refactor/`. The `codex/` branch prefix and all AI attribution are forbidden.
 
 `~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
-`~/.codex/hooks/block_git_write.py`, and `~/.agents/skills` are symlinked from this
-repository. `~/.codex/config.toml` remains local because it contains machine-specific
+`~/.agents/skills` are symlinked from this repository. The Git hook is a local managed copy
+with a checksum sidecar, so branch switching cannot roll its implementation back.
+`~/.codex/config.toml` remains local because it contains machine-specific
 project trust, hook trust, and TUI state. `cargo run -- codex` backs up the local config
 before migrating the shared top-level settings. If an older setup left `config.toml` as a
 symlink, setup archives the link and writes a regular local config without modifying the
