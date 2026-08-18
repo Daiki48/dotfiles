@@ -588,8 +588,8 @@ def _draft_pr_preflight_reason(cwd, base, head):
     return None
 
 
-def _issue_write_reason(tokens, issue_command, issue_args, cwd):
-    repository = _required_option(tokens, "-R", "--repo")
+def _issue_write_reason(issue_command, issue_args, cwd):
+    repository = _required_option(issue_args, "-R", "--repo")
     if not repository or "/" not in repository:
         return "Issue書き込みには対象repositoryを明示してください"
     repository_reason = _repository_reason(repository, cwd)
@@ -648,7 +648,7 @@ def _gh_invocation_reason(tokens, cwd=None):
                 token.startswith("--hostname=") for token in tokens
             ):
                 return "GitHub書き込み先hostを変更できません"
-            return _issue_write_reason(tokens[start + 1:], issue_command, issue_args, cwd)
+            return _issue_write_reason(issue_command, issue_args, cwd)
         if issue_command == "develop":
             return "gh issue developはブランチを作成するため実行できません"
         if issue_command == "delete":
@@ -943,6 +943,14 @@ def blocked_reason(command, cwd=None, depth=0):
         start = _command_start(tokens)
         if start is not None and any(char in tokens[start] for char in "$`"):
             return "shell展開で実行commandを決定する操作は許可されていません"
+        if start is not None and os.path.basename(tokens[start]) in {"source", "."}:
+            return "sourceによる未検査scriptの実行は許可されていません"
+        if (
+            start is not None
+            and os.path.basename(tokens[start]) in SHELLS
+            and not any(_nested_shell_commands(tokens))
+        ):
+            return "shellは検査可能な-c inline commandだけを実行できます"
         if (
             tokens
             and os.path.basename(tokens[0]) == "env"

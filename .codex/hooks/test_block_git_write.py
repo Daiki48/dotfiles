@@ -108,6 +108,10 @@ class GuardTest(unittest.TestCase):
             "sh -c 'x=rm; \"$x\" README.md'",
             "x=gh; \"$x\" issue comment 9 --repo attacker/repo",
             "eval 'rm README.md'",
+            "printf 'rm README.md\\n' | bash",
+            "bash /tmp/payload.sh",
+            "source /tmp/payload.sh",
+            ". /tmp/payload.sh",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
@@ -234,6 +238,7 @@ class GuardTest(unittest.TestCase):
                 "gh issue comment 9 --repo owner/repo --edit-last --body-file " + body.name,
                 "gh issue comment https://github.com/attacker/repo/issues/1 --repo owner/repo --body-file " + body.name,
                 "gh issue create --repo owner/repo -ttest -F" + body.name,
+                "gh -R owner/repo issue comment 9 --body-file " + body.name,
                 "GH_HOST=example.com gh issue comment 9 --repo owner/repo --body-file " + body.name,
                 "gh issue create --repo owner/repo --title safe --body $(cat /etc/hostname)",
                 "gh issue create --repo owner/repo --title safe --body-file /etc/hostname",
