@@ -74,7 +74,10 @@ SUDO_OPTS_WITH_VALUE = {
     "-C", "--chdir", "-R", "--chroot", "-T", "--command-timeout", "-r",
     "--role", "-t", "--type",
 }
-SHELL_PUNCTUATION = ";&|()`"
+# 改行もshellのcommand separatorとして扱う。shlexの既定では改行が単なる
+# whitespaceになり、前後のcommandが1 segmentへ結合されるため、読み取りの
+# 後ろに置かれた書き込みを見落とす可能性がある。
+SHELL_PUNCTUATION = ";&|()`\n"
 AI_ATTRIBUTION_RE = re.compile(
     r"(?i)(co-authored-by\s*:\s*.*(?:codex|openai)|generated(?:-| )by\s*:\s*"
     r".*(?:codex|openai)|signed-off-by\s*:\s*.*(?:codex|openai))"
@@ -384,7 +387,37 @@ def _required_option(args, short, long):
     return values[0] if values is not None and len(values) == 1 else None
 
 
-def _pr_create_reason(args):
+def _origin_repository(cwd):
+    remote = _run_git(cwd, "remote", "get-url", "origin")
+    if remote is None:
+        return None
+    url = remote.strip().rstrip("/")
+    for prefix in (
+        "https://github.com/",
+        "http://github.com/",
+        "ssh://git@github.com/",
+        "git@github.com:",
+    ):
+        if not url.startswith(prefix):
+            continue
+        repository = url.removeprefix(prefix)
+        if repository.endswith(".git"):
+            repository = repository[:-4]
+        if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+            return repository
+    return None
+
+
+def _repository_reason(repository, cwd):
+    origin_repository = _origin_repository(cwd)
+    if origin_repository is None:
+        return "originのGitHub repositoryを確認できません"
+    if repository.casefold() != origin_repository.casefold():
+        return "GitHub書き込み先がcurrent repositoryのoriginと一致しません"
+    return None
+
+
+def _pr_create_reason(args, cwd):
     if "--draft" not in args:
         return "PRはDraftとして作成してください"
     if any(option in args for option in {"--fill", "--fill-first", "--fill-verbose", "--web", "--recover"}):
@@ -398,6 +431,9 @@ def _pr_create_reason(args):
         return "Draft PRにはrepo、base、head、title、body-fileを明示してください"
     if "/" not in repository or _is_protected_branch(head) or not _valid_work_branch(head):
         return "Draft PRのrepositoryまたはhead branchが許可範囲外です"
+    repository_reason = _repository_reason(repository, cwd)
+    if repository_reason:
+        return repository_reason
     if not _is_protected_branch(base):
         return "Draft PRのbase branchが許可範囲外です"
     if AI_ATTRIBUTION_RE.search(title):
@@ -407,10 +443,13 @@ def _pr_create_reason(args):
     return _file_secret_reason(body_file)
 
 
-def _issue_write_reason(tokens, issue_command, issue_args):
+def _issue_write_reason(tokens, issue_command, issue_args, cwd):
     repository = _required_option(tokens, "-R", "--repo")
     if not repository or "/" not in repository:
         return "Issue書き込みには対象repositoryを明示してください"
+    repository_reason = _repository_reason(repository, cwd)
+    if repository_reason:
+        return repository_reason
 
     text_flags = {"-t", "--title", "-b", "--body", "--comment"}
     file_flags = {"-F", "--body-file"}
@@ -455,7 +494,7 @@ def _issue_write_reason(tokens, issue_command, issue_args):
     return None
 
 
-def _gh_invocation_reason(tokens):
+def _gh_invocation_reason(tokens, cwd=None):
     start = _command_start(tokens)
     if start is None or os.path.basename(tokens[start]) != "gh":
         return None
@@ -469,7 +508,7 @@ def _gh_invocation_reason(tokens):
         if issue_command is None or issue_command in {"list", "status", "view"}:
             return None
         if issue_command in {"create", "edit", "comment"}:
-            return _issue_write_reason(tokens[start + 1:], issue_command, issue_args)
+            return _issue_write_reason(tokens[start + 1:], issue_command, issue_args, cwd)
         if issue_command == "develop":
             return "gh issue developはブランチを作成するため実行できません"
         if issue_command == "delete":
@@ -480,7 +519,7 @@ def _gh_invocation_reason(tokens):
     if command == "pr":
         subcommand, pr_args = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
         if subcommand == "create":
-            return _pr_create_reason(tokens[start + 1:])
+            return _pr_create_reason(tokens[start + 1:], cwd)
         if subcommand is None or subcommand in GH_READ_ONLY["pr"]:
             return None
         return "PRはDraft作成と読み取り専用操作だけ許可されます"
@@ -599,6 +638,9 @@ def _nested_shell_commands(tokens):
 def _command_segments(command):
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=SHELL_PUNCTUATION)
+        # 改行をpunctuation tokenとして残し、quoted string内の改行だけは
+        # 元のtoken内に保持する。
+        lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         lexer.commenters = ""
         tokens = list(lexer)
@@ -627,7 +669,7 @@ def blocked_reason(command, cwd=None, depth=0):
         reason = _git_invocation_reason(tokens, cwd)
         if reason:
             return reason
-        reason = _gh_invocation_reason(tokens)
+        reason = _gh_invocation_reason(tokens, cwd)
         if reason:
             return reason
         for nested_command in _nested_shell_commands(tokens):

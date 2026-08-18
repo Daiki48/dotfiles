@@ -99,12 +99,24 @@ class GuardTest(unittest.TestCase):
         for command in (
             "zsh -lc 'git reset --hard HEAD'",
             "zsh -lc 'git status && git push -u origin HEAD:refs/heads/main'",
+            "zsh -lc 'git status\ngit commit -m \":bug: 修正\"'",
             "echo checked; git merge origin/main",
+            "git status\ngit commit -m ':bug: 修正'",
+            "git status\r\ngit commit -m ':bug: 修正'",
             "bash -lc 'rm -rf build'",
             "env -u TOKEN rm -rf build",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command)
+
+    def test_newline_separated_read_commands_are_allowed(self):
+        for command in (
+            "git branch -a\ngit log --oneline -3",
+            "git status\r\ngit diff --stat",
+            "printf '%s' 'git status\ngit commit -m unsafe'",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
 
     def test_destructive_commands_are_blocked(self):
         for command in (
@@ -119,20 +131,21 @@ class GuardTest(unittest.TestCase):
                 self.assert_blocked(command)
 
     def test_issue_management_and_github_reads_are_allowed(self):
-        for command in (
-            "gh issue list",
-            "gh issue view 123",
-            "gh issue create --repo owner/repo --title test --body body",
-            "gh issue comment 123 --repo owner/repo --body progress",
-            "gh -R owner/repo issue view 123",
-            "gh pr view 123",
-            "gh pr --repo owner/repo diff 123",
-            "gh run view 456 --log",
-            "gh api repos/owner/repo/issues/123 -X GET",
-            "gh pr create --help",
-        ):
-            with self.subTest(command=command):
-                self.assert_allowed(command)
+        with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
+            for command in (
+                "gh issue list",
+                "gh issue view 123",
+                "gh issue create --repo owner/repo --title test --body body",
+                "gh issue comment 123 --repo owner/repo --body progress",
+                "gh -R owner/repo issue view 123",
+                "gh pr view 123",
+                "gh pr --repo owner/repo diff 123",
+                "gh run view 456 --log",
+                "gh api repos/owner/repo/issues/123 -X GET",
+                "gh pr create --help",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "/workspace")
 
     def test_draft_pr_with_explicit_fields_is_allowed(self):
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:
@@ -143,7 +156,39 @@ class GuardTest(unittest.TestCase):
                 "--head feature/example --title ':wrench: 設定を更新' "
                 f"--body-file {body.name}"
             )
-            self.assert_allowed(command)
+            with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
+                self.assert_allowed(command, "/workspace")
+
+    def test_github_writes_must_target_current_origin(self):
+        with (
+            tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body,
+            mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+        ):
+            body.write("## 概要\n")
+            body.flush()
+            self.assert_blocked(
+                "gh issue create --repo attacker/repo --title test --body safe",
+                "/workspace",
+            )
+            self.assert_blocked(
+                "gh pr create --draft --repo attacker/repo --base main "
+                "--head feature/example --title test "
+                f"--body-file {body.name}",
+                "/workspace",
+            )
+
+    def test_origin_repository_supports_https_and_ssh_urls(self):
+        for remote, expected in (
+            ("https://github.com/owner/repo.git\n", "owner/repo"),
+            ("git@github.com:owner/repo.git\n", "owner/repo"),
+            ("ssh://git@github.com/owner/repo\n", "owner/repo"),
+            ("https://example.com/owner/repo.git\n", None),
+        ):
+            with (
+                self.subTest(remote=remote),
+                mock.patch.object(GUARD, "_run_git", return_value=remote),
+            ):
+                self.assertEqual(GUARD._origin_repository("/workspace"), expected)
 
     def test_unsafe_pr_and_github_writes_are_blocked(self):
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:

@@ -73,6 +73,12 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 Codex uses a single default workflow. `workspace-write` allows implementation inside the
 workspace, while `on-request` approvals are routed through auto-review. Dangerous or
 destructive operations remain blocked by the sandbox, rules, hooks, and AGENTS.md.
+
+Canonical Git and GitHub writes whose repository, branch, arguments, and outbound text
+can be fully checked by the hook are allowed directly, so a non-interactive `never`
+session does not deadlock during configuration migration. Non-canonical candidates still
+go through auto-review, and destructive operations remain forbidden.
+
 The main agent defaults to `gpt-5.6-terra` with medium reasoning, while plan mode uses
 high reasoning. An approved, versioned plan is recorded in a tracking Issue before
 implementation when GitHub is available. Up to three subagents default to Terra/medium;
