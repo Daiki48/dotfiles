@@ -3,7 +3,9 @@
 
 prefix_rule(pattern=["git", "push", ["--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"]], decision="forbidden", justification="履歴改変・削除・一括pushは禁止")
 prefix_rule(pattern=["git", "push"], decision="prompt", justification="push先と差分をauto-reviewで確認する")
-prefix_rule(pattern=["git", ["rebase", "reset", "clean", "restore", "update-ref"]], decision="forbidden", justification="履歴改変または広範囲な破棄操作は禁止")
+prefix_rule(pattern=["git", ["rebase", "reset", "clean", "restore", "rm", "update-ref"]], decision="forbidden", justification="履歴改変または広範囲な破棄操作は禁止")
+prefix_rule(pattern=["git", "checkout", "--"], decision="forbidden", justification="作業中の変更を破棄するcheckoutは禁止")
+prefix_rule(pattern=["git", "stash", ["clear", "drop"]], decision="forbidden", justification="stash削除は禁止")
 prefix_rule(pattern=["git", "branch", ["-d", "-D", "--delete"]], decision="forbidden", justification="branch削除は禁止")
 prefix_rule(pattern=["git", "tag", ["-d", "--delete"]], decision="forbidden", justification="tag削除は禁止")
 prefix_rule(pattern=[["rm", "rmdir", "unlink", "shred"]], decision="forbidden", justification="削除操作はDaikiの確認が必要")

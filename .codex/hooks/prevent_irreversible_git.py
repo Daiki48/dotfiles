@@ -2,15 +2,16 @@
 """Codexの不可逆な削除操作だけを拒否するPreToolUse hook。"""
 
 import json
-import re
 import shlex
 import sys
 
 
 DELETION_COMMANDS = {"rm", "rmdir", "unlink", "shred"}
+COMMAND_WRAPPERS = {"command", "env", "exec", "sudo"}
+WRAPPER_OPTIONS_WITH_VALUE = {"sudo": {"-u", "-g", "-h", "-p", "-C"}, "env": {"-u", "-C"}}
 SHELL_SEPARATORS = {";", "&&", "||", "|", "\n"}
-PROTECTED_PUSH_OPTIONS = {"--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--all", "--tags"}
-GIT_OPTIONS_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace"}
+PROTECTED_PUSH_OPTIONS = {"--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--all", "--tags", "--prune"}
+GIT_OPTIONS_WITH_VALUE = {"-C", "-c", "--config", "--git-dir", "--work-tree", "--namespace"}
 
 
 def _segments(command):
@@ -43,6 +44,34 @@ def _git_subcommand(tokens):
     return None, []
 
 
+def _unwrap(tokens):
+    index = 0
+    while index < len(tokens):
+        executable = tokens[index].rsplit("/", 1)[-1]
+        if executable not in COMMAND_WRAPPERS:
+            return executable, tokens[index:]
+        index += 1
+        options_with_value = WRAPPER_OPTIONS_WITH_VALUE.get(executable, set())
+        while index < len(tokens):
+            token = tokens[index]
+            if token in options_with_value:
+                index += 2
+            elif token.startswith("-") or (executable == "env" and "=" in token):
+                index += 1
+            else:
+                break
+    return None, []
+
+
+def _is_deleting_refspec(argument):
+    if argument.startswith("+"):
+        return True
+    if ":" not in argument:
+        return False
+    source, destination = argument.split(":", 1)
+    return not source or not destination
+
+
 def blocked_reason(command):
     try:
         segments = list(_segments(command))
@@ -52,18 +81,24 @@ def blocked_reason(command):
     for tokens in segments:
         if not tokens:
             continue
-        executable = tokens[0].rsplit("/", 1)[-1]
+        executable, tokens = _unwrap(tokens)
         if executable in DELETION_COMMANDS:
             return "ファイル削除操作は許可されていません"
         if executable != "git":
             continue
 
         subcommand, args = _git_subcommand(tokens)
+        if subcommand == "rm":
+            return "git rmによるファイル削除は許可されていません"
         if subcommand in {"branch", "tag"} and any(
             arg in {"-d", "-D", "--delete"} or arg.startswith("--delete=")
             for arg in args
         ):
             return f"git {subcommand}による削除は許可されていません"
+        if subcommand == "checkout" and "--" in args:
+            return "作業中の変更を破棄するcheckoutは許可されていません"
+        if subcommand == "stash" and any(arg in {"clear", "drop"} for arg in args):
+            return "stash削除は許可されていません"
         if subcommand == "push":
             if any(
                 arg in PROTECTED_PUSH_OPTIONS
@@ -74,7 +109,7 @@ def blocked_reason(command):
                 for arg in args
             ):
                 return "force/delete/mirror/tag pushは許可されていません"
-            if any(arg.startswith(":") for arg in args):
+            if any(_is_deleting_refspec(arg) for arg in args):
                 return "削除refspecを使うpushは許可されていません"
     return None
 

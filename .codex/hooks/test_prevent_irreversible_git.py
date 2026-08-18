@@ -28,6 +28,11 @@ class HookTest(unittest.TestCase):
     def test_blocks_irreversible_operations(self):
         for command in (
             "rm important.txt",
+            "sudo rm important.txt",
+            "env rm important.txt",
+            "git rm important.txt",
+            "git checkout -- important.txt",
+            "git stash clear",
             "git branch -D feature/example",
             "git tag --delete v1.0.0",
             "git push --force origin feature/example",
@@ -35,6 +40,10 @@ class HookTest(unittest.TestCase):
             "git push origin --delete feature/example",
             "git push origin --delete=feature/example",
             "git push origin :feature/example",
+            "git push origin HEAD:",
+            "git push origin +HEAD:refs/heads/feature/example",
+            "git push --prune origin",
+            "git -c core.pager=cat branch -D feature/example",
             "git status && git push origin --force feature/example",
         ):
             with self.subTest(command=command):

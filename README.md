@@ -76,8 +76,9 @@ destructive operations remain blocked by the sandbox and a small set of deny rul
 
 Ordinary editing, testing, and local non-destructive Git work are handled without broad
 command monitoring. A small PreToolUse hook rejects only file deletion, branch/tag deletion,
-and force/delete pushes. Pushes otherwise go through auto-review, and Codex uses its normal
-approval judgment.
+and force/delete pushes. When a deletion is required, Codex first moves the target to
+`.codex-trash/<timestamp>/` and never stages or automatically removes that directory. Pushes
+otherwise go through auto-review, and Codex uses its normal approval judgment.
 
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, and Draft PRs are used
