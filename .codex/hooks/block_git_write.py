@@ -587,6 +587,52 @@ def _origin_repository(cwd):
     return None if remote is None else _github_repository_from_url(remote)
 
 
+def _valid_remote_branch_name(branch):
+    """ls-remoteの応答から安全に扱えるbranch名か確認する。"""
+    return bool(
+        branch
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch)
+        and ".." not in branch
+        and "//" not in branch
+        and not branch.endswith((".", ".lock"))
+        and "@{" not in branch
+    )
+
+
+def _remote_refs_snapshot(cwd, head=None):
+    """originのdefault branchと任意headを1回のread-only照会で取得する。"""
+    args = ["ls-remote", "--symref", "origin", "HEAD"]
+    if head is not None:
+        args.append(f"refs/heads/{head}")
+    output = _run_git(cwd, *args)
+    if output is None:
+        return None
+
+    lines = output.splitlines()
+    expected_lines = 2 if head is None else 3
+    if len(lines) != expected_lines:
+        return None
+    default_match = re.fullmatch(r"ref: refs/heads/([^\t]+)\tHEAD", lines[0])
+    default_oid_match = re.fullmatch(r"([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\tHEAD", lines[1])
+    if (
+        default_match is None
+        or default_oid_match is None
+        or not _valid_remote_branch_name(default_match.group(1))
+    ):
+        return None
+
+    remote_head = None
+    if head is not None:
+        head_match = re.fullmatch(
+            rf"([0-9a-fA-F]{{40}}|[0-9a-fA-F]{{64}})\trefs/heads/{re.escape(head)}",
+            lines[2],
+        )
+        if head_match is None:
+            return None
+        remote_head = head_match.group(1)
+    return f"origin/{default_match.group(1)}", remote_head
+
+
 def _repository_reason(repository, cwd):
     origin_repository = _origin_repository(cwd)
     if origin_repository is None:
@@ -645,7 +691,20 @@ def _draft_pr_preflight_reason(cwd, base, head):
     default_ref = _run_git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
     if current is None or current.strip() != head:
         return "Draft PRのheadはcurrent branchと一致させてください"
-    if local_head is None or remote_head is None or local_head.strip() != remote_head.strip():
+    if local_head is None:
+        return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
+    if remote_head is None or default_ref is None:
+        snapshot = _remote_refs_snapshot(cwd, head if remote_head is None else None)
+        if snapshot is None:
+            return "Draft PRのremote refを安全に確認できません"
+        remote_default_ref, fallback_remote_head = snapshot
+        if default_ref is None:
+            default_ref = remote_default_ref
+        elif default_ref.strip() != remote_default_ref:
+            return "Draft PRのbaseはoriginのdefault branchと一致させてください"
+        if remote_head is None:
+            remote_head = fallback_remote_head
+    if remote_head is None or local_head.strip() != remote_head.strip():
         return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
     if default_ref is None or default_ref.strip() != f"origin/{base}":
         return "Draft PRのbaseはoriginのdefault branchと一致させてください"
@@ -890,11 +949,18 @@ def _push_preflight_reason(cwd, branch):
         base = f"origin/{branch}"
     else:
         default_ref = _run_git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
-        if default_ref is None or not default_ref.strip().startswith("origin/"):
+        if default_ref is None:
+            snapshot = _remote_refs_snapshot(cwd)
+            if snapshot is None:
+                return "未push commitのbaseを特定できません"
+            default_ref, _ = snapshot
+        if not default_ref.strip().startswith("origin/"):
             return "未push commitのbaseを特定できません"
         default_branch = default_ref.strip().removeprefix("origin/")
         if not _is_protected_branch(default_branch):
             return "originのdefault branchが保護対象ではありません"
+        if _run_git(cwd, "rev-parse", "--verify", f"refs/remotes/{default_ref.strip()}") is None:
+            return "未push commitのbaseを特定できません"
         merge_base = _run_git(cwd, "merge-base", "HEAD", default_ref.strip())
         if merge_base is None:
             return "未push commitのbaseを特定できません"
