@@ -22,6 +22,7 @@
 .claude/todos/
 
 # Codex local state - excluded from version control
+.codex-trash/
 .codex/config.toml
 .codex/auth.json
 .codex/.credentials.json

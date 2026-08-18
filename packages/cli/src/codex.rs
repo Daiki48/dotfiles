@@ -12,8 +12,8 @@ const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
     (".codex/rules/default.rules", ".codex/rules/default.rules"),
 ];
-const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/block_git_write.py";
-const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/block_git_write.py";
+const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/prevent_irreversible_git.py";
+const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/prevent_irreversible_git.py";
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 
 // Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
@@ -38,7 +38,17 @@ const MANAGED_AGENT_KEYS: &[&str] = &[
     "default_subagent_model",
     "default_subagent_reasoning_effort",
 ];
-const MANAGED_HOOK_MARKER: &str = "block_git_write.py";
+const MANAGED_HOOK_COMMAND: &str = "command = 'python3 \"$HOME/.codex/hooks/block_git_write.py\"'";
+const IRREVERSIBLE_HOOK_COMMAND: &str =
+    "command = 'python3 \"$HOME/.codex/hooks/prevent_irreversible_git.py\"'";
+const IRREVERSIBLE_HOOK_CONFIG: &str = r#"[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$HOME/.codex/hooks/prevent_irreversible_git.py"'
+timeout = 10
+statusMessage = "不可逆な操作を確認中""#;
 const PRE_TOOL_USE_HEADER: &str = "[[hooks.PreToolUse]]";
 const PRE_TOOL_USE_HOOK_HEADER: &str = "[[hooks.PreToolUse.hooks]]";
 
@@ -240,85 +250,66 @@ fn managed_assignments(template: &str, section: Option<&str>, keys: &[&str]) -> 
         .collect()
 }
 
-fn sync_managed_hook(template: &str, existing: &str) -> String {
-    let template_lines = template.lines().collect::<Vec<_>>();
-    let Some(template_outer_start) = template_lines
-        .iter()
-        .position(|line| table_header(line) == Some(PRE_TOOL_USE_HEADER))
-    else {
-        return existing.to_string();
-    };
-    let Some(template_hook_start) = template_lines
-        .iter()
-        .enumerate()
-        .skip(template_outer_start + 1)
-        .find_map(|(index, line)| {
-            (table_header(line) == Some(PRE_TOOL_USE_HOOK_HEADER)).then_some(index)
-        })
-    else {
-        return existing.to_string();
-    };
-    let template_hook_end = template_lines
-        .iter()
-        .enumerate()
-        .skip(template_hook_start + 1)
-        .find_map(|(index, line)| table_header(line).is_some().then_some(index))
-        .unwrap_or(template_lines.len());
-    let template_outer = &template_lines[template_outer_start..template_hook_start];
-    let template_hook = &template_lines[template_hook_start..template_hook_end];
-    let template_matcher = template_outer
-        .iter()
-        .find(|line| is_assignment_for(line, &["matcher"]))
-        .copied();
-
+fn remove_legacy_managed_hook(existing: &str) -> String {
     let existing_lines = existing.lines().collect::<Vec<_>>();
-    let mut current_outer = None;
-    let mut managed_range = None;
-    for (index, line) in existing_lines.iter().enumerate() {
-        match table_header(line) {
-            Some(PRE_TOOL_USE_HEADER) => current_outer = Some(index),
-            Some(PRE_TOOL_USE_HOOK_HEADER) => {
-                let end = existing_lines
-                    .iter()
-                    .enumerate()
-                    .skip(index + 1)
-                    .find_map(|(next, candidate)| table_header(candidate).is_some().then_some(next))
-                    .unwrap_or(existing_lines.len());
-                if existing_lines[index..end]
-                    .iter()
-                    .any(|candidate| candidate.contains(MANAGED_HOOK_MARKER))
-                    && let Some(outer_start) = current_outer
-                {
-                    managed_range = Some((outer_start, index, end));
-                    break;
-                }
-            }
-            Some(_) => current_outer = None,
-            None => {}
-        }
-    }
-
     let mut merged = Vec::new();
-    if let Some((outer_start, hook_start, hook_end)) = managed_range {
-        merged.extend_from_slice(&existing_lines[..=outer_start]);
-        if let Some(matcher) = template_matcher {
-            merged.push(matcher);
+    let mut index = 0;
+    while index < existing_lines.len() {
+        if table_header(existing_lines[index]) != Some(PRE_TOOL_USE_HEADER) {
+            merged.push(existing_lines[index]);
+            index += 1;
+            continue;
         }
-        merged.extend(
-            existing_lines[outer_start + 1..hook_start]
+
+        let section_start = index;
+        let section_end = existing_lines
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find_map(|(next, line)| {
+                (table_header(line) == Some(PRE_TOOL_USE_HEADER)
+                    || (table_header(line).is_some()
+                        && table_header(line) != Some(PRE_TOOL_USE_HOOK_HEADER)))
+                .then_some(next)
+            })
+            .unwrap_or(existing_lines.len());
+        let has_managed_hook = existing_lines[section_start..section_end]
+            .iter()
+            .any(|line| line.trim() == MANAGED_HOOK_COMMAND);
+        if !has_managed_hook {
+            merged.extend_from_slice(&existing_lines[section_start..section_end]);
+            index = section_end;
+            continue;
+        }
+
+        let first_hook = (section_start + 1..section_end).find(|position| {
+            table_header(existing_lines[*position]) == Some(PRE_TOOL_USE_HOOK_HEADER)
+        });
+        let Some(first_hook) = first_hook else {
+            index = section_end;
+            continue;
+        };
+        let mut retained_hooks = Vec::new();
+        let mut hook_start = first_hook;
+        while hook_start < section_end {
+            let hook_end = (hook_start + 1..section_end)
+                .find(|position| {
+                    table_header(existing_lines[*position]) == Some(PRE_TOOL_USE_HOOK_HEADER)
+                })
+                .unwrap_or(section_end);
+            if !existing_lines[hook_start..hook_end]
                 .iter()
-                .copied()
-                .filter(|line| !is_assignment_for(line, &["matcher"])),
-        );
-        merged.extend(template_hook.iter().copied());
-        merged.extend_from_slice(&existing_lines[hook_end..]);
-    } else {
-        merged.extend(existing_lines.iter().copied());
-        if !merged.is_empty() && merged.last().is_some_and(|line| !line.is_empty()) {
-            merged.push("");
+                .any(|line| line.trim() == MANAGED_HOOK_COMMAND)
+            {
+                retained_hooks.extend_from_slice(&existing_lines[hook_start..hook_end]);
+            }
+            hook_start = hook_end;
         }
-        merged.extend(template_outer.iter().copied());
-        merged.extend(template_hook.iter().copied());
+        if !retained_hooks.is_empty() {
+            merged.extend_from_slice(&existing_lines[section_start..first_hook]);
+            merged.extend(retained_hooks);
+        }
+        index = section_end;
     }
     format!("{}\n", merged.join("\n").trim_start_matches('\n'))
 }
@@ -395,6 +386,18 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         format!("{managed}\n\n{preserved}\n")
     };
     sync_managed_hook(template, &merged)
+}
+
+fn sync_managed_hook(template: &str, existing: &str) -> String {
+    let cleaned = remove_legacy_managed_hook(existing);
+    if !template.contains(IRREVERSIBLE_HOOK_COMMAND)
+        || cleaned
+            .lines()
+            .any(|line| line.trim() == IRREVERSIBLE_HOOK_COMMAND)
+    {
+        return cleaned;
+    }
+    format!("{}\n\n{IRREVERSIBLE_HOOK_CONFIG}\n", cleaned.trim_end())
 }
 
 fn backup_legacy_config(codex_dir: &Path) -> Result<()> {
@@ -791,7 +794,6 @@ pub fn setup() -> Result<()> {
         &dotfiles_path.join(MANAGED_HOOK_SOURCE),
         &home.join(MANAGED_HOOK_DESTINATION),
     )?;
-
     println!("\nLinking shared skill directories...");
     for (source, dest) in CODEX_DIRS {
         ensure_shared_symlink(source, dest)?;
@@ -806,8 +808,7 @@ pub fn setup() -> Result<()> {
     println!("\n✅ Codex CLI setup completed!");
     println!("\n💡 Next steps:");
     println!("   1. Run 'codex login' if authentication is not configured");
-    println!("   2. Run 'codex' and trust hooks from '/hooks' if prompted");
-    println!("   3. Run 'codex' (workspace-write + auto-review is the default)");
+    println!("   2. Run 'codex' (workspace-write + auto-review is the default)");
 
     Ok(())
 }
@@ -815,9 +816,9 @@ pub fn setup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
-        ensure_managed_hook, managed_hook_state_path, merge_managed_config,
-        migrate_managed_config_from_template, sha256, verify_managed_symlink,
+        MANAGED_HOOK_COMMAND, contains_legacy_profile_config, copy_file_exclusive,
+        ensure_config_unchanged, ensure_managed_hook, managed_hook_state_path,
+        merge_managed_config, migrate_managed_config_from_template, sha256, verify_managed_symlink,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1101,31 +1102,8 @@ description = "local"
     }
 
     #[test]
-    fn managed_hook_is_added_or_updated_without_removing_local_hook_state() {
-        let template = r#"model = "gpt-5.6-terra"
-
-[[hooks.PreToolUse]]
-matcher = "^Bash$"
-
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
-timeout = 10
-statusMessage = "安全性を確認中"
-"#;
-        let hookless = r#"model = "old"
-
-[hooks.state]
-
-[hooks.state."local"]
-trusted_hash = "sha256:local"
-"#;
-        let added = merge_managed_config(template, hookless);
-        assert!(added.contains("[[hooks.PreToolUse]]\nmatcher = \"^Bash$\""));
-        assert!(added.contains("block_git_write.py"));
-        assert!(added.contains("[hooks.state.\"local\"]\ntrusted_hash = \"sha256:local\""));
-        assert_eq!(merge_managed_config(template, &added), added);
-
+    fn managed_hook_is_removed_without_removing_local_hook_state() {
+        let template = r#"model = "gpt-5.6-terra""#;
         let old = r#"model = "old"
 
 [[hooks.PreToolUse]]
@@ -1141,14 +1119,19 @@ type = "command"
 command = "local-check"
 timeout = 30
 
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "echo block_git_write.py"
+timeout = 30
+
 [hooks.state]
 "#;
         let updated = merge_managed_config(template, old);
-        assert!(updated.contains("matcher = \"^Bash$\""));
-        assert!(updated.contains("block_git_write.py"));
-        assert!(updated.contains("timeout = 10"));
+        assert!(!updated.contains(MANAGED_HOOK_COMMAND));
+        assert!(updated.contains("matcher = \".*\""));
         assert!(!updated.lines().any(|line| line == "timeout = 1"));
         assert!(updated.contains("command = \"local-check\"\ntimeout = 30"));
+        assert!(updated.contains("command = \"echo block_git_write.py\"\ntimeout = 30"));
         assert!(updated.contains("[hooks.state]"));
         assert_eq!(merge_managed_config(template, &updated), updated);
     }
