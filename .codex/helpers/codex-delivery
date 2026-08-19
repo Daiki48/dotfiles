@@ -1149,7 +1149,8 @@ def _save_stage(repository: str, task_id: str, state: dict[str, Any], stage: str
 
 
 def _fetch_main(root: Path) -> str:
-    if _run(_git_command("fetch", "origin", "main"), cwd=root).returncode != 0:
+    refspec = "refs/heads/main:refs/remotes/origin/main"
+    if _run(_git_command("fetch", "origin", refspec), cwd=root).returncode != 0:
         raise DeliveryError("origin/mainをfetchできません")
     remote = _git(root, "rev-parse", "refs/remotes/origin/main").strip()
     return _oid(remote, name="origin/main")

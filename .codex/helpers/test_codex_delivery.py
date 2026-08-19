@@ -215,6 +215,18 @@ class DeliveryTest(unittest.TestCase):
         with mock.patch.object(HELPER, "_fetch_main", return_value="b" * 40):
             HELPER._assert_merge_base_unchanged(self.root, ["a" * 40, "b" * 40])
 
+    def test_fetch_main_pins_remote_source_and_tracking_destination(self) -> None:
+        run_result = mock.Mock(returncode=0)
+        with mock.patch.object(HELPER, "_run", return_value=run_result) as run, \
+             mock.patch.object(HELPER, "_git", return_value="b" * 40) as git:
+            self.assertEqual(HELPER._fetch_main(self.root), "b" * 40)
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[-3:],
+            ["fetch", "origin", "refs/heads/main:refs/remotes/origin/main"],
+        )
+        git.assert_called_once_with(self.root, "rev-parse", "refs/remotes/origin/main")
+
     def _record(self, changed: list[str], *, approve: bool = False, risk: str | None = None,
                 gate_mode: str = HELPER.STRICT_GATE_MODE) -> dict[str, object]:
         head = "b" * 40
