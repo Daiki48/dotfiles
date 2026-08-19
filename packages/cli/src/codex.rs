@@ -754,9 +754,9 @@ fn ensure_managed_hook(
     };
     let state_matches = recorded.as_deref().is_some_and(valid_sha256)
         && recorded.as_deref() == Some(existing_hash.as_str());
-    if install_mode == ManagedInstallMode::OwnerExecutable && recorded.is_none() {
+    if install_mode == ManagedInstallMode::OwnerExecutable && !state_matches {
         anyhow::bail!(
-            "Managed state is missing for {}; refusing to adopt an unmanaged file",
+            "Managed state does not match {}; refusing to adopt an unmanaged file",
             destination.display()
         );
     }
@@ -1547,6 +1547,50 @@ description = "local"
             0o755
         );
         assert!(!managed_hook_state_path(&destination).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_helper_rejects_invalid_or_stale_managed_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("delivery-helper-invalid-state");
+        let source = directory.path().join("codex-delivery");
+        fs::write(&source, "same contents\n").expect("write delivery helper");
+
+        for (name, state) in [
+            ("empty", "".to_owned()),
+            ("invalid", "not-a-sha256".to_owned()),
+            ("stale", sha256("different contents\n")),
+        ] {
+            let destination = directory.path().join(format!("codex-delivery-{name}"));
+            let state_path = managed_hook_state_path(&destination);
+            fs::write(&destination, "same contents\n").expect("write installed helper");
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+                .expect("set installed mode");
+            fs::write(&state_path, &state).expect("write invalid managed state");
+
+            assert!(
+                ensure_managed_hook(&source, &destination, ManagedInstallMode::OwnerExecutable)
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read_to_string(&destination).expect("read installed helper"),
+                "same contents\n"
+            );
+            assert_eq!(
+                fs::metadata(&destination)
+                    .expect("inspect installed helper")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+            assert_eq!(
+                fs::read_to_string(&state_path).expect("read invalid managed state"),
+                state
+            );
+        }
     }
 
     #[test]
