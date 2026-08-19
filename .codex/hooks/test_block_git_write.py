@@ -765,6 +765,7 @@ class GuardTest(unittest.TestCase):
             "gh run cancel 123 --repo owner/repo && gh run view 123",
             "gh run cancel 123 --repo owner/repo;",
             "gh run cancel 123 --repo owner/repo &",
+            "(gh run cancel 123 --repo owner/repo)",
             "gh run cancel $RUN_ID --repo owner/repo",
             "gh run cancel 123 --repo owner/repo > /tmp/cancel",
             "gh run cancel 123 --repo owner/repo | tee /tmp/cancel",
@@ -862,9 +863,25 @@ class GuardTest(unittest.TestCase):
             "GIT_CONFIG_GLOBAL=/tmp/evil && git status",
             "cd /tmp/other-repository && git status",
             "pushd /tmp/other-repository && git log --all",
+            "eval 'export GH_HOST=evil.example' && gh pr view 1",
+            "eval 'export GIT_CONFIG_GLOBAL=/tmp/evil' && git status",
+            "eval 'cd /tmp/other-repository' && git status",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
+
+    def test_shell_compound_forms_cannot_hide_guarded_commands(self):
+        for command in (
+            "if gh pr close 1 --repo owner/repo; then true; fi",
+            "if git add -- README.md; then true; fi",
+            "time git add -- README.md",
+            "! gh pr close 1 --repo owner/repo",
+            "for x in 1; do codex-worktree create --issue 1; done",
+            "{ git status; } > /tmp/status",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
+        self.assert_allowed("if command -v codex-delivery; then true; fi")
 
     def test_push_preflight_rejects_pushurl_and_dirty_worktree(self):
         with mock.patch.object(

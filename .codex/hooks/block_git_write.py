@@ -1880,6 +1880,10 @@ def _command_segments(command):
 
 
 RESTRICTED_COMMANDS = {"git", "gh", "codex-worktree", "codex-delivery"}
+SHELL_COMPOUND_PREFIXES = {
+    "!", "{", "case", "coproc", "do", "elif", "else", "for", "function",
+    "if", "noglob", "select", "then", "time", "until", "while",
+}
 
 
 def _has_unquoted_shell_character(command, characters):
@@ -1923,7 +1927,7 @@ def _has_unquoted_shell_redirection(command):
 
 
 def _has_unquoted_shell_control(command):
-    return _has_unquoted_shell_character(command, {";", "&", "|", "\n"})
+    return _has_unquoted_shell_character(command, {";", "&", "|", "(", ")", "\n"})
 
 
 def _has_shell_context_mutation(tokens):
@@ -1936,9 +1940,26 @@ def _has_shell_context_mutation(tokens):
     if start is None:
         return False
     return os.path.basename(tokens[start]) in {
-        "alias", "builtin", "cd", "declare", "export", "function", "local",
+        "alias", "builtin", "cd", "declare", "eval", "export", "function", "local",
         "popd", "pushd", "set", "typeset", "unalias", "unset",
     }
+
+
+def _has_unparsed_guarded_command(tokens):
+    """shell予約語の後ろにguard対象commandがある未解析構文を検出する。"""
+    if not tokens or tokens[0] not in SHELL_COMPOUND_PREFIXES:
+        return False
+    arguments = tokens[1:]
+    if (
+        len(arguments) == 3
+        and os.path.basename(arguments[0]) == "command"
+        and arguments[1] in {"-v", "-V"}
+    ):
+        return False
+    guarded = RESTRICTED_COMMANDS | DESTRUCTIVE_COMMANDS | SHELLS | {
+        ".", "eval", "find", "source",
+    }
+    return any(os.path.basename(token) in guarded for token in arguments)
 
 
 def _contains_restricted_command(tokens, depth=0):
@@ -1963,6 +1984,8 @@ def blocked_reason(command, cwd=None, depth=0):
     if "$(" in command or "`" in command:
         return "command substitutionを含むcommandは安全に検査できません"
     segments = list(_command_segments(command))
+    if any(_has_unparsed_guarded_command(tokens) for tokens in segments):
+        return "shell予約語を介したGit/GitHub/helper commandは安全に検査できません"
     has_restricted = any(_contains_restricted_command(tokens) for tokens in segments)
     if _has_unquoted_shell_redirection(command) and has_restricted:
         return "Git/GitHub/helper commandではshell redirectionを使用できません"
