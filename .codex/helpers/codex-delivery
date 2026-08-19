@@ -26,7 +26,7 @@ from typing import Any, Iterator
 
 
 MANIFEST_VERSION = 1
-RECEIPT_VERSION = 1
+RECEIPT_VERSION = 2
 STATE_VERSION = 1
 MAX_FILE_BYTES = 256 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -45,6 +45,10 @@ OID_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 PLAN_RE = re.compile(r"^[A-Z][A-Z0-9-]{7,127}-v[1-9][0-9]*$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 PR_RE = re.compile(r"^[1-9][0-9]{0,8}$")
+STRICT_GATE_MODE = "strict-ruleset"
+FREE_PRIVATE_GATE_MODE = "github-free-private"
+GATE_MODES = {STRICT_GATE_MODE, FREE_PRIVATE_GATE_MODE}
+FREE_PRIVATE_REPOSITORY = "daiki48/gasostudy"
 
 # These paths change the trust boundary or the ability to install/use this helper.
 SAFETY_PATH_PREFIXES = (
@@ -67,6 +71,25 @@ SAFETY_PATHS = {
 
 class DeliveryError(RuntimeError):
     """安全条件を満たさないdelivery操作。"""
+
+
+def _gate_mode(value: object) -> str:
+    if not isinstance(value, str) or value not in GATE_MODES:
+        raise DeliveryError("gate modeが不正です")
+    return value
+
+
+def _receipt_gate_mode(receipt: dict[str, Any]) -> str:
+    # v1 receiptはRuleset前提の旧形式としてのみ互換にする。
+    return _gate_mode(receipt.get("gate_mode", STRICT_GATE_MODE))
+
+
+def _validate_gate_repository(repository: str, gate_mode: str) -> None:
+    mode = _gate_mode(gate_mode)
+    if not isinstance(repository, str):
+        raise DeliveryError("gate repositoryが不正です")
+    if mode == FREE_PRIVATE_GATE_MODE and repository.casefold() != FREE_PRIVATE_REPOSITORY:
+        raise DeliveryError("github-free-private gateはallowlist対象repositoryだけを許可します")
 
 
 _HELD_LOCKS = threading.local()
@@ -466,16 +489,35 @@ def _receipt(
     payload: dict[str, Any], *, root: Path, task_id: str, head: str,
     repository: str | None = None,
 ) -> dict[str, Any]:
-    fields = {
+    if not isinstance(payload, dict):
+        raise DeliveryError("receiptはobjectである必要があります")
+    legacy_fields = {
         "version", "kind", "task_id", "repository", "pr", "head_sha", "risk", "plan_id",
         "actionable", "human_approved", "tests_passed", "neutral_review_passed",
         "adversarial_review_passed", "changed_files", "created_at",
     }
-    if set(payload) != fields or payload.get("version") != RECEIPT_VERSION or payload.get("kind") != "review":
-        raise DeliveryError("receipt schemaが一致しません")
     current_repository = repository or _repository(root)
+    version = payload.get("version")
+    if version == 1:
+        if set(payload) != legacy_fields:
+            raise DeliveryError("legacy receipt schemaが一致しません")
+        # 旧receiptの意味はstrict-rulesetに固定し、呼び出し側で同じ検査を通す。
+        payload = dict(payload)
+        if payload.get("gate_mode", STRICT_GATE_MODE) != STRICT_GATE_MODE:
+            raise DeliveryError("legacy receiptのgate modeはstrict-rulesetだけを許可します")
+        payload["gate_mode"] = STRICT_GATE_MODE
+    elif version == RECEIPT_VERSION:
+        fields = legacy_fields | {"gate_mode"}
+        if set(payload) != fields:
+            raise DeliveryError("receipt schemaが一致しません")
+    else:
+        raise DeliveryError("receipt schemaが一致しません")
+    if payload.get("kind") != "review":
+        raise DeliveryError("receipt kindが不正です")
     if payload.get("task_id") != task_id or payload.get("repository") != current_repository:
         raise DeliveryError("receipt task/repositoryが一致しません")
+    gate_mode = _receipt_gate_mode(payload)
+    _validate_gate_repository(current_repository, gate_mode)
     if not isinstance(payload.get("pr"), int) or isinstance(payload.get("pr"), bool) or payload["pr"] < 1:
         raise DeliveryError("receipt PR番号が不正です")
     if payload.get("head_sha") != head or payload.get("risk") not in {"low", "medium", "high", "critical"}:
@@ -490,6 +532,10 @@ def _receipt(
         raise DeliveryError("receipt changed-filesが不正です")
     if any(not isinstance(item, str) for item in payload["changed_files"]):
         raise DeliveryError("receipt changed-filesの型が不正です")
+    if gate_mode == FREE_PRIVATE_GATE_MODE and (
+        payload.get("risk") not in {"high", "critical"} or payload.get("human_approved") is not True
+    ):
+        raise DeliveryError("github-free-private receiptにはhigh/criticalとhuman approvalが必要です")
     return payload
 
 
@@ -507,8 +553,9 @@ def _load_receipt(root: Path, task_id: str, head: str, repository: str | None = 
 def _write_review_locked(
     root: Path, task_id: str, pr: int, head: str, risk: str, plan: str,
     approved: bool, tests_passed: bool, neutral_review_passed: bool,
-    adversarial_review_passed: bool,
+    adversarial_review_passed: bool, gate_mode: str = STRICT_GATE_MODE,
 ) -> dict[str, Any]:
+    gate_mode = _gate_mode(gate_mode)
     if risk not in {"low", "medium", "high", "critical"}:
         raise DeliveryError("riskはlow/medium/high/criticalのいずれかです")
     if not isinstance(pr, int) or isinstance(pr, bool) or pr < 1 or pr > 999_999_999:
@@ -519,6 +566,7 @@ def _write_review_locked(
     if not all((tests_passed, neutral_review_passed, adversarial_review_passed)):
         raise DeliveryError("tests/neutral/adversarial reviewの完了flagが必要です")
     repository = _repository(root)
+    _validate_gate_repository(repository, gate_mode)
     manifest, worktree = _manifest(root, task_id, repository)
     _worktree(root, manifest, worktree)
     current = _oid(_git(worktree, "rev-parse", "HEAD").strip(), name="current head")
@@ -533,21 +581,27 @@ def _write_review_locked(
         raise DeliveryError("record-reviewはlow/mediumだけを許可します")
     if approved and risk not in {"high", "critical"}:
         raise DeliveryError("approve-reviewはhigh/criticalだけを許可します")
+    if gate_mode == FREE_PRIVATE_GATE_MODE and (not approved or risk not in {"high", "critical"}):
+        raise DeliveryError("github-free-privateはapprove-reviewのhigh/criticalだけを許可します")
     path = _receipt_path(repository, task_id, head)
     payload = {
         "version": RECEIPT_VERSION, "kind": "review", "task_id": task_id,
         "repository": repository, "pr": pr, "head_sha": head, "risk": risk,
         "plan_id": plan, "actionable": 0, "human_approved": approved,
         "tests_passed": True, "neutral_review_passed": True, "adversarial_review_passed": True,
-        "changed_files": changed, "created_at": _now(),
+        "changed_files": changed, "created_at": _now(), "gate_mode": gate_mode,
     }
     if path.exists() or path.is_symlink():
         existing = _load_receipt(root, task_id, head, repository)
-        immutable = {key: value for key, value in payload.items() if key != "created_at"}
         existing_immutable = {key: value for key, value in existing.items() if key != "created_at"}
+        if existing.get("version") == 1:
+            existing_immutable["version"] = RECEIPT_VERSION
+        immutable = {key: value for key, value in payload.items() if key != "created_at"}
         if approved and existing.get("risk") in {"low", "medium"} and existing.get("human_approved") is False:
             upgrade_keys = {"version", "kind", "task_id", "repository", "pr", "head_sha", "plan_id", "actionable", "tests_passed", "neutral_review_passed", "adversarial_review_passed", "changed_files"}
-            if all(existing.get(key) == payload.get(key) for key in upgrade_keys):
+            if all((RECEIPT_VERSION if key == "version" and existing.get("version") == 1 else existing.get(key)) == payload.get(key) for key in upgrade_keys):
+                if existing.get("gate_mode", STRICT_GATE_MODE) != gate_mode:
+                    raise DeliveryError("同じheadのreceipt gate modeが異なります")
                 _atomic_json(path, payload)
                 return payload
         if existing_immutable != immutable:
@@ -560,14 +614,14 @@ def _write_review_locked(
 def _write_review(
     root: Path, task_id: str, pr: int, head: str, risk: str, plan: str,
     approved: bool, tests_passed: bool, neutral_review_passed: bool,
-    adversarial_review_passed: bool,
+    adversarial_review_passed: bool, gate_mode: str = STRICT_GATE_MODE,
 ) -> dict[str, Any]:
     task_id = _task_id(task_id)
     repository = _repository(root)
     with _task_lock(repository, task_id):
         return _write_review_locked(
             root, task_id, pr, head, risk, plan, approved, tests_passed,
-            neutral_review_passed, adversarial_review_passed,
+            neutral_review_passed, adversarial_review_passed, gate_mode,
         )
 
 
@@ -590,6 +644,33 @@ def _default_branch(root: Path, repository: str) -> None:
     value = _gh_json(root, "api", f"repos/{repository}", "--header", "Accept: application/vnd.github+json")
     if not isinstance(value, dict) or value.get("default_branch") != "main":
         raise DeliveryError("live repositoryのdefault branchがmainではありません")
+
+
+def _free_private_repository(root: Path, repository: str) -> None:
+    _validate_gate_repository(repository, FREE_PRIVATE_GATE_MODE)
+    value = _gh_json(root, "api", f"repos/{repository}", "--header", "Accept: application/vnd.github+json")
+    if not isinstance(value, dict):
+        raise DeliveryError("live repository readbackがobjectではありません")
+    expected = {
+        "full_name": "Daiki48/gasostudy",
+        "private": True,
+        "visibility": "private",
+        "default_branch": "main",
+        "archived": False,
+        "disabled": False,
+        "allow_merge_commit": True,
+        "allow_auto_merge": False,
+    }
+    for key, expected_value in expected.items():
+        actual = value.get(key)
+        if isinstance(expected_value, bool):
+            if type(actual) is not bool or actual is not expected_value:
+                raise DeliveryError("github-free-privateのlive repository policyが一致しません")
+        elif key == "full_name":
+            if not isinstance(actual, str) or actual.casefold() != expected_value.casefold():
+                raise DeliveryError("github-free-privateのlive repository policyが一致しません")
+        elif actual != expected_value:
+            raise DeliveryError("github-free-privateのlive repository policyが一致しません")
 
 
 def _same_head_repository(view: dict[str, Any], repository: str) -> bool:
@@ -801,11 +882,13 @@ def _ruleset(root: Path, repository: str) -> None:
 
 def _validate_delivery(
     root: Path, receipt: dict[str, Any], *, allow_draft: bool = False,
-    expected_branch: str | None = None,
+    expected_branch: str | None = None, inspected_base: list[str] | None = None,
 ) -> dict[str, Any]:
     repository = receipt["repository"]
     pr = receipt["pr"]
     head = receipt["head_sha"]
+    gate_mode = _receipt_gate_mode(receipt)
+    _validate_gate_repository(repository, gate_mode)
     view = _pr_view(root, repository, pr)
     status_ok = (
         view.get("mergeStateStatus") in {"DRAFT", "CLEAN"}
@@ -826,6 +909,8 @@ def _validate_delivery(
         raise DeliveryError("PR state/head/base/source/auto-merge/mergeabilityが安全条件に一致しません")
     _default_branch(root, repository)
     live_main = _fetch_main(root)
+    if inspected_base is not None:
+        inspected_base.append(live_main)
     ancestor = _run(
         _git_command("merge-base", "--is-ancestor", live_main, head),
         cwd=root,
@@ -834,13 +919,20 @@ def _validate_delivery(
         raise DeliveryError("live origin/mainがreceipt headのancestorではありません")
     _check_required_ci(root, repository, head)
     _review_safety(root, repository, pr)
-    _ruleset(root, repository)
+    if gate_mode == FREE_PRIVATE_GATE_MODE:
+        _free_private_repository(root, repository)
+    else:
+        _ruleset(root, repository)
     return view
 
 
 def _match_cli_receipt(
     receipt: dict[str, Any], *, pr: int | None, head: str | None, plan: str | None,
+    gate_mode: str = STRICT_GATE_MODE,
 ) -> None:
+    expected_gate_mode = _gate_mode(gate_mode)
+    if _receipt_gate_mode(receipt) != expected_gate_mode:
+        raise DeliveryError("指定gate modeがreceiptと一致しません")
     if pr is not None and receipt.get("pr") != pr:
         raise DeliveryError("指定PRがreceiptと一致しません")
     if head is not None and receipt.get("head_sha") != _oid(head, name="指定head"):
@@ -849,21 +941,32 @@ def _match_cli_receipt(
         raise DeliveryError("指定Plan IDがreceiptと一致しません")
 
 
+def _assert_merge_base_unchanged(root: Path, inspected_base: list[str]) -> None:
+    if not inspected_base:
+        raise DeliveryError("merge直前の検査済みbaseがありません")
+    merge_base = _fetch_main(root)
+    if merge_base != inspected_base[-1]:
+        raise DeliveryError("merge直前にorigin/mainが検査済みbaseから変化しました")
+
+
 def _validate_receipt_evidence(
     worktree: Path, manifest: dict[str, Any], receipt: dict[str, Any],
 ) -> None:
+    gate_mode = _receipt_gate_mode(receipt)
+    _validate_gate_repository(str(receipt.get("repository", "")), gate_mode)
     changed = _changed_files(worktree, manifest["base_oid"], receipt["head_sha"])
     if changed != receipt["changed_files"]:
         raise DeliveryError("receiptのchanged-filesが固定headの差分と一致しません")
     if receipt["risk"] in {"low", "medium"} and any(_is_safety_path(path) for path in changed):
         raise DeliveryError("安全境界差分をlow/medium receiptでdeliveryできません")
-    if receipt["risk"] in {"high", "critical"} and receipt["human_approved"] is not True:
+    if (receipt["risk"] in {"high", "critical"} or gate_mode == FREE_PRIVATE_GATE_MODE) and receipt["human_approved"] is not True:
         raise DeliveryError("high/critical receiptにはhuman approvalが必要です")
 
 
 def _deliver_locked(
     root: Path, task_id: str, *, expected_pr: int | None = None,
     expected_head: str | None = None, expected_plan: str | None = None,
+    expected_gate_mode: str = STRICT_GATE_MODE,
 ) -> dict[str, Any]:
     task_id = _task_id(task_id)
     repository = _repository(root)
@@ -872,7 +975,9 @@ def _deliver_locked(
     if expected_head is None:
         raise DeliveryError("deliverには固定head SHAが必要です")
     receipt = _load_receipt(root, task_id, _oid(expected_head, name="指定head"), repository)
-    _match_cli_receipt(receipt, pr=expected_pr, head=expected_head, plan=expected_plan)
+    _match_cli_receipt(receipt, pr=expected_pr, head=expected_head, plan=expected_plan, gate_mode=expected_gate_mode)
+    gate_mode = _receipt_gate_mode(receipt)
+    _validate_gate_repository(repository, gate_mode)
     if receipt["risk"] in {"high", "critical"} and receipt["human_approved"] is not True:
         raise DeliveryError("high/critical receiptにはhuman approvalが必要です")
     if receipt["risk"] not in {"low", "medium", "high", "critical"}:
@@ -886,11 +991,16 @@ def _deliver_locked(
         _worktree_clean_head(worktree, receipt["head_sha"])
         _validate_receipt_evidence(worktree, manifest, receipt)
         # Draftでも変更前の全remote preflightを完了してからReadyへ移行する。
-        _validate_delivery(root, receipt, allow_draft=True, expected_branch=manifest["branch"])
+        inspected_base: list[str] = []
+        _validate_delivery(
+            root, receipt, allow_draft=True, expected_branch=manifest["branch"], inspected_base=inspected_base,
+        )
         initial = _pr_view(root, receipt["repository"], receipt["pr"])
         if initial["isDraft"]:
             _gh(root, "pr", "ready", str(receipt["pr"]), "--repo", receipt["repository"])
-        _validate_delivery(root, receipt, allow_draft=False, expected_branch=manifest["branch"])
+        _validate_delivery(
+            root, receipt, allow_draft=False, expected_branch=manifest["branch"], inspected_base=inspected_base,
+        )
         # ready/checks/reviews/rulesetの検査後にもPR identity全体を再取得してrace窓を縮める。
         latest = _pr_view(root, receipt["repository"], receipt["pr"])
         if (
@@ -922,6 +1032,8 @@ def _deliver_locked(
                 "stage": "merge_started", "updated_at": _now(), "last_error": "",
             }
             _atomic_json(state_path, state)
+        # merge直前にもorigin/mainを再取得し、最後に検査したbaseからの変化を拒否する。
+        _assert_merge_base_unchanged(root, inspected_base)
         _gh(root, "pr", "merge", str(receipt["pr"]), "--repo", receipt["repository"], "--merge", "--match-head-commit", receipt["head_sha"])
         merged = _pr_view(root, receipt["repository"], receipt["pr"])
         if merged.get("state") != "MERGED" or _oid(merged.get("headRefOid"), name="merged PR head") != receipt["head_sha"]:
@@ -1020,6 +1132,7 @@ def _worktree_records(root: Path) -> list[dict[str, str]]:
 def _finish_locked(
     root: Path, task_id: str, *, expected_pr: int | None = None,
     expected_head: str | None = None, expected_plan: str | None = None,
+    expected_gate_mode: str = STRICT_GATE_MODE,
 ) -> dict[str, Any]:
     task_id = _task_id(task_id)
     repository = _repository(root)
@@ -1028,7 +1141,9 @@ def _finish_locked(
     if expected_head is None:
         raise DeliveryError("finishには固定head SHAが必要です")
     receipt = _load_receipt(root, task_id, _oid(expected_head, name="指定head"), repository)
-    _match_cli_receipt(receipt, pr=expected_pr, head=expected_head, plan=expected_plan)
+    _match_cli_receipt(receipt, pr=expected_pr, head=expected_head, plan=expected_plan, gate_mode=expected_gate_mode)
+    gate_mode = _receipt_gate_mode(receipt)
+    _validate_gate_repository(repository, gate_mode)
     state = _load_state(repository, task_id, receipt, manifest["branch"])
     with _task_lock(repository, task_id):
         # PRは毎回merged/head一致を確認し、途中で別PR/別headへ差し替えられないようにする。
@@ -1050,8 +1165,13 @@ def _finish_locked(
             _validate_receipt_evidence(worktree, manifest, receipt)
             _check_required_ci(root, repository, receipt["head_sha"])
             _review_safety(root, repository, receipt["pr"])
-            _ruleset(root, repository)
+            if gate_mode == FREE_PRIVATE_GATE_MODE:
+                _free_private_repository(root, repository)
+            else:
+                _ruleset(root, repository)
             state = _save_stage(repository, task_id, state, "merged")
+        elif gate_mode == FREE_PRIVATE_GATE_MODE and state["stage"] != "completed":
+            _free_private_repository(root, repository)
         _assert_main_clean(root)
         if state["stage"] == "completed":
             if _remote_branch(root, manifest["branch"]) is not None or worktree.exists() or worktree.is_symlink():
@@ -1152,6 +1272,7 @@ def _finish_locked(
 def deliver(
     root: Path, task_id: str, *, expected_pr: int | None = None,
     expected_head: str | None = None, expected_plan: str | None = None,
+    expected_gate_mode: str = STRICT_GATE_MODE,
 ) -> dict[str, Any]:
     task_id = _task_id(task_id)
     with _operation_deadline():
@@ -1160,13 +1281,14 @@ def deliver(
         with _task_lock(repository, task_id):
             return _deliver_locked(
                 root, task_id, expected_pr=expected_pr, expected_head=expected_head,
-                expected_plan=expected_plan,
+                expected_plan=expected_plan, expected_gate_mode=expected_gate_mode,
             )
 
 
 def finish(
     root: Path, task_id: str, *, expected_pr: int | None = None,
     expected_head: str | None = None, expected_plan: str | None = None,
+    expected_gate_mode: str = STRICT_GATE_MODE,
 ) -> dict[str, Any]:
     task_id = _task_id(task_id)
     with _operation_deadline():
@@ -1175,7 +1297,7 @@ def finish(
         with _task_lock(repository, task_id):
             return _finish_locked(
                 root, task_id, expected_pr=expected_pr, expected_head=expected_head,
-                expected_plan=expected_plan,
+                expected_plan=expected_plan, expected_gate_mode=expected_gate_mode,
             )
 
 
@@ -1192,16 +1314,27 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--tests-passed", action="store_true")
         command.add_argument("--neutral-review-passed", action="store_true")
         command.add_argument("--adversarial-review-passed", action="store_true")
+        if name == "approve-review":
+            # 省略時は従来どおりstrict-ruleset。Free/privateは明示指定だけを許可する。
+            command.add_argument(
+                "--gate-mode", choices=(FREE_PRIVATE_GATE_MODE,), default=STRICT_GATE_MODE,
+            )
     deliver_parser = commands.add_parser("deliver")
     deliver_parser.add_argument("--task-id", required=True)
     deliver_parser.add_argument("--pr", required=True, type=int)
     deliver_parser.add_argument("--head", required=True)
     deliver_parser.add_argument("--plan-id", required=True)
+    deliver_parser.add_argument(
+        "--gate-mode", choices=(FREE_PRIVATE_GATE_MODE,), default=STRICT_GATE_MODE,
+    )
     finish_parser = commands.add_parser("finish")
     finish_parser.add_argument("--task-id", required=True)
     finish_parser.add_argument("--pr", required=True, type=int)
     finish_parser.add_argument("--head", required=True)
     finish_parser.add_argument("--plan-id", required=True)
+    finish_parser.add_argument(
+        "--gate-mode", choices=(FREE_PRIVATE_GATE_MODE,), default=STRICT_GATE_MODE,
+    )
     return parser
 
 
@@ -1239,12 +1372,18 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "approve-review":
         payload = _write_review(
             root, _task_id(args.task_id), args.pr, args.head, args.risk, args.plan_id, True,
-            args.tests_passed, args.neutral_review_passed, args.adversarial_review_passed,
+            args.tests_passed, args.neutral_review_passed, args.adversarial_review_passed, args.gate_mode,
         )
     elif args.command == "deliver":
-        payload = deliver(root, _task_id(args.task_id), expected_pr=args.pr, expected_head=args.head, expected_plan=args.plan_id)
+        payload = deliver(
+            root, _task_id(args.task_id), expected_pr=args.pr, expected_head=args.head,
+            expected_plan=args.plan_id, expected_gate_mode=args.gate_mode,
+        )
     else:
-        payload = finish(root, _task_id(args.task_id), expected_pr=args.pr, expected_head=args.head, expected_plan=args.plan_id)
+        payload = finish(
+            root, _task_id(args.task_id), expected_pr=args.pr, expected_head=args.head,
+            expected_plan=args.plan_id, expected_gate_mode=args.gate_mode,
+        )
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 0
 

@@ -66,6 +66,121 @@ class DeliveryTest(unittest.TestCase):
         ])
         self.assertEqual((deliver.pr, deliver.head, deliver.plan_id), (24, "b" * 40, "CODEX-DELIVERY-TEST-v1"))
 
+    def test_gate_mode_is_absent_from_record_review_and_explicit_for_free_private(self) -> None:
+        common = [
+            "--task-id", "issue-24", "--pr", "24", "--head", "b" * 40,
+            "--plan-id", "CODEX-DELIVERY-TEST-v1",
+        ]
+        with self.assertRaises(SystemExit):
+            HELPER._parser().parse_args(["record-review", *common, "--risk", "low", "--gate-mode", "github-free-private"])
+        approve = HELPER._parser().parse_args(["approve-review", *common, "--risk", "high"])
+        self.assertEqual(approve.gate_mode, HELPER.STRICT_GATE_MODE)
+        with self.assertRaises(SystemExit):
+            HELPER._parser().parse_args([
+                "approve-review", *common, "--risk", "high", "--gate-mode", "strict-ruleset",
+            ])
+        free_approve = HELPER._parser().parse_args([
+            "approve-review", *common, "--risk", "high", "--gate-mode", "github-free-private",
+        ])
+        self.assertEqual(free_approve.gate_mode, HELPER.FREE_PRIVATE_GATE_MODE)
+        for command in ("deliver", "finish"):
+            args = HELPER._parser().parse_args([command, *common, "--gate-mode", "github-free-private"])
+            self.assertEqual(args.gate_mode, HELPER.FREE_PRIVATE_GATE_MODE)
+
+    def test_v1_receipt_is_normalized_to_strict_and_free_requires_approval_and_allowlist(self) -> None:
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._receipt([], root=self.root, task_id="issue-24", head="b" * 40, repository="owner/repo")
+        legacy = {
+            "version": 1, "kind": "review", "task_id": "issue-24", "repository": "owner/repo",
+            "pr": 24, "head_sha": "b" * 40, "risk": "low", "plan_id": "CODEX-DELIVERY-TEST-v1",
+            "actionable": 0, "human_approved": False, "tests_passed": True,
+            "neutral_review_passed": True, "adversarial_review_passed": True,
+            "changed_files": ["src/main.py"], "created_at": "now",
+        }
+        normalized = HELPER._receipt(legacy, root=self.root, task_id="issue-24", head="b" * 40, repository="owner/repo")
+        self.assertEqual(normalized["gate_mode"], HELPER.STRICT_GATE_MODE)
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._receipt(
+                {**legacy, "gate_mode": HELPER.STRICT_GATE_MODE}, root=self.root,
+                task_id="issue-24", head="b" * 40, repository="owner/repo",
+            )
+        free = {**legacy, "version": 2, "repository": "Daiki48/gasostudy", "risk": "high", "human_approved": True,
+                "gate_mode": HELPER.FREE_PRIVATE_GATE_MODE}
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._receipt({**free, "risk": "low"}, root=self.root, task_id="issue-24", head="b" * 40,
+                            repository="Daiki48/gasostudy")
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._receipt(free, root=self.root, task_id="issue-24", head="b" * 40, repository="other/repo")
+
+    def test_free_private_repository_policy_requires_exact_live_readback(self) -> None:
+        good = {
+            "full_name": "Daiki48/gasostudy", "visibility": "private",
+            "private": True, "default_branch": "main", "archived": False, "disabled": False,
+            "allow_merge_commit": True, "allow_auto_merge": False,
+        }
+        with mock.patch.object(HELPER, "_gh_json", return_value=good):
+            HELPER._free_private_repository(self.root, "Daiki48/gasostudy")
+        for key, value in (("full_name", "Daiki48/other"), ("visibility", "public"),
+                           ("private", False), ("default_branch", "develop"), ("archived", True),
+                           ("disabled", True), ("allow_merge_commit", False), ("allow_auto_merge", True)):
+            with self.subTest(key=key), mock.patch.object(HELPER, "_gh_json", return_value={**good, key: value}):
+                with self.assertRaises(HELPER.DeliveryError):
+                    HELPER._free_private_repository(self.root, "Daiki48/gasostudy")
+        with mock.patch.object(HELPER, "_gh_json", return_value={**good, "private": 1}):
+            with self.assertRaises(HELPER.DeliveryError):
+                HELPER._free_private_repository(self.root, "Daiki48/gasostudy")
+
+    def test_free_private_does_not_fallback_on_network_error(self) -> None:
+        failure = HELPER.DeliveryError("network")
+        with mock.patch.object(HELPER, "_gh_json", side_effect=failure):
+            with self.assertRaisesRegex(HELPER.DeliveryError, "network"):
+                HELPER._free_private_repository(self.root, "Daiki48/gasostudy")
+
+    def test_free_private_delivery_keeps_ci_review_sha_checks_without_ruleset_fallback(self) -> None:
+        head = "b" * 40
+        receipt = {
+            "repository": "Daiki48/gasostudy", "pr": 24, "head_sha": head,
+            "gate_mode": HELPER.FREE_PRIVATE_GATE_MODE, "risk": "high", "human_approved": True,
+        }
+        view = {
+            "state": "OPEN", "isDraft": False, "headRefOid": head,
+            "headRefName": "feat/issue-24", "baseRefName": "main", "isCrossRepository": False,
+            "headRepository": {"nameWithOwner": "Daiki48/gasostudy"},
+            "headRepositoryOwner": {"login": "Daiki48"}, "autoMergeRequest": None,
+            "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        }
+        run_result = mock.Mock(returncode=0)
+        with mock.patch.object(HELPER, "_pr_view", return_value=view), \
+             mock.patch.object(HELPER, "_default_branch"), \
+             mock.patch.object(HELPER, "_fetch_main", return_value=head), \
+             mock.patch.object(HELPER, "_run", return_value=run_result), \
+             mock.patch.object(HELPER, "_check_required_ci") as ci, \
+             mock.patch.object(HELPER, "_review_safety") as review, \
+             mock.patch.object(HELPER, "_free_private_repository") as policy, \
+             mock.patch.object(HELPER, "_ruleset") as ruleset:
+            HELPER._validate_delivery(self.root, receipt, inspected_base=[])
+        ci.assert_called_once_with(self.root, "Daiki48/gasostudy", head)
+        review.assert_called_once_with(self.root, "Daiki48/gasostudy", 24)
+        policy.assert_called_once_with(self.root, "Daiki48/gasostudy")
+        ruleset.assert_not_called()
+
+    def test_free_private_cli_mode_must_match_receipt(self) -> None:
+        receipt = {"repository": "Daiki48/gasostudy", "gate_mode": HELPER.FREE_PRIVATE_GATE_MODE,
+                   "pr": 24, "head_sha": "b" * 40, "plan_id": "CODEX-DELIVERY-TEST-v1"}
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._match_cli_receipt(receipt, pr=24, head="b" * 40, plan="CODEX-DELIVERY-TEST-v1")
+        HELPER._match_cli_receipt(
+            receipt, pr=24, head="b" * 40, plan="CODEX-DELIVERY-TEST-v1",
+            gate_mode=HELPER.FREE_PRIVATE_GATE_MODE,
+        )
+
+    def test_merge_base_change_is_rejected_immediately_before_merge(self) -> None:
+        with mock.patch.object(HELPER, "_fetch_main", return_value="c" * 40):
+            with self.assertRaises(HELPER.DeliveryError):
+                HELPER._assert_merge_base_unchanged(self.root, ["b" * 40])
+        with mock.patch.object(HELPER, "_fetch_main", return_value="b" * 40):
+            HELPER._assert_merge_base_unchanged(self.root, ["a" * 40, "b" * 40])
+
     def _record(self, changed: list[str], *, approve: bool = False) -> dict[str, object]:
         head = "b" * 40
         with mock.patch.object(HELPER, "_repository", return_value="owner/repo"), \
@@ -82,7 +197,9 @@ class DeliveryTest(unittest.TestCase):
         receipt = self._record(["src/main.py"])
         path = self.codex_home / "worktrees" / HELPER._repo_key("owner/repo") / ".state" / ("issue-24.receipt." + "b" * 40 + ".json")
         self.assertTrue(path.is_file())
-        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["actionable"], 0)
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["actionable"], 0)
+        self.assertEqual((saved["version"], saved["gate_mode"]), (2, HELPER.STRICT_GATE_MODE))
         again = self._record(["src/main.py"])
         self.assertEqual(receipt, again)
 
@@ -389,6 +506,12 @@ class DeliveryTest(unittest.TestCase):
             "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
         }
         merged = {"state": "MERGED", "isDraft": False, "headRefOid": head}
+
+        def validate_delivery(*_args: object, **kwargs: object) -> None:
+            inspected_base = kwargs.get("inspected_base")
+            if isinstance(inspected_base, list):
+                inspected_base.append("a" * 40)
+
         with mock.patch.object(HELPER, "_repository", return_value="owner/repo"), \
              mock.patch.object(HELPER, "_manifest", return_value=(self.manifest, self.worktree)), \
              mock.patch.object(HELPER, "_load_receipt", return_value=receipt), \
@@ -396,7 +519,8 @@ class DeliveryTest(unittest.TestCase):
              mock.patch.object(HELPER, "_worktree"), \
              mock.patch.object(HELPER, "_worktree_clean_head"), \
              mock.patch.object(HELPER, "_validate_receipt_evidence"), \
-             mock.patch.object(HELPER, "_validate_delivery"), \
+             mock.patch.object(HELPER, "_validate_delivery", side_effect=validate_delivery), \
+             mock.patch.object(HELPER, "_assert_merge_base_unchanged") as assert_base, \
              mock.patch.object(HELPER, "_pr_view", side_effect=[draft, open_pr, merged]), \
              mock.patch.object(HELPER, "_gh") as gh, \
              mock.patch.object(HELPER, "_task_lock", return_value=nullcontext()):
@@ -405,6 +529,7 @@ class DeliveryTest(unittest.TestCase):
                 expected_plan="CODEX-DELIVERY-TEST-v1",
             )
         self.assertEqual(state["stage"], "merged")
+        assert_base.assert_called_once_with(self.root, ["a" * 40, "a" * 40])
         self.assertEqual(
             gh.call_args_list,
             [
