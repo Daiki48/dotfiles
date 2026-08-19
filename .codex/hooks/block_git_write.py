@@ -109,6 +109,8 @@ AI_ATTRIBUTION_RE = re.compile(
 COPILOT_MENTION_RE = re.compile(r"(?i)(?<![A-Za-z0-9_@])@copilot\b")
 COMMIT_SUBJECT_RE = re.compile(r"^:[a-z0-9_+-]+: \S.*$")
 TASK_ID_RE = re.compile(r"^(?:issue-[1-9][0-9]*|task-[a-z0-9][a-z0-9-]{0,63})$")
+OID_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+PLAN_ID_RE = re.compile(r"^[A-Z][A-Z0-9-]{7,127}-v[1-9][0-9]*$")
 
 SECRET_PATTERNS = (
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
@@ -1115,6 +1117,8 @@ def _pr_write_reason(pr_command, pr_args, cwd):
 
     if pr_command == "ready":
         positional = _strict_gh_args(pr_args, common_options, {"--undo"})
+        if positional is not None and "--undo" not in pr_args:
+            return "PRのReady化はcodex-deliveryだけが実行できます"
     elif pr_command in {"close", "reopen", "update-branch"}:
         positional = _strict_gh_args(pr_args, common_options)
     else:
@@ -1249,6 +1253,63 @@ def _worktree_helper_invocation_reason(tokens):
         return "task IDが許可形式ではありません"
     if "--branch" in values and not _valid_work_branch(values["--branch"]):
         return "一般的なprefixを持つ非保護作業branchを指定してください"
+    return None
+
+
+def _delivery_helper_invocation_reason(tokens):
+    """codex-deliveryを固定したtask・PR・head・planへ拘束する。"""
+    start = _command_start(tokens)
+    if start is None or os.path.basename(tokens[start]) != "codex-delivery":
+        return None
+    if tokens[start] != "codex-delivery" or start != 0:
+        return "delivery helperはPATHから直接実行してください"
+    args = tokens[start + 1:]
+    if args in (["--help"], ["-h"]):
+        return None
+    if not args:
+        return "delivery helperのsubcommandを指定してください"
+    command, arguments = args[0], args[1:]
+    if command not in {"record-review", "approve-review", "deliver", "finish"}:
+        return "許可されていないdelivery helper操作です"
+
+    value_options = {"--task-id", "--pr", "--head", "--plan-id"}
+    switches = set()
+    if command in {"record-review", "approve-review"}:
+        value_options.add("--risk")
+        switches = {
+            "--tests-passed", "--neutral-review-passed", "--adversarial-review-passed",
+        }
+
+    values = {}
+    seen_switches = set()
+    index = 0
+    while index < len(arguments):
+        option = arguments[index]
+        if option in switches:
+            if option in seen_switches:
+                return "delivery helperのevidence flagを重複指定できません"
+            seen_switches.add(option)
+            index += 1
+            continue
+        if option not in value_options or option in values or index + 1 >= len(arguments):
+            return "delivery helperでは許可されたoptionを1回ずつ正規形で指定してください"
+        values[option] = arguments[index + 1]
+        index += 2
+
+    if set(values) != value_options or seen_switches != switches:
+        return "delivery helperのtask、PR、head、plan、review evidenceをすべて明示してください"
+    if not TASK_ID_RE.fullmatch(values["--task-id"]):
+        return "delivery helperのtask IDが許可形式ではありません"
+    if not values["--pr"].isdigit() or int(values["--pr"]) < 1:
+        return "delivery helperのPR番号は1以上の整数にしてください"
+    if not OID_RE.fullmatch(values["--head"]):
+        return "delivery helperのhead SHAが許可形式ではありません"
+    if not PLAN_ID_RE.fullmatch(values["--plan-id"]):
+        return "delivery helperのPlan IDが許可形式ではありません"
+    if command == "record-review" and values["--risk"] not in {"low", "medium"}:
+        return "自律deliveryへ記録できるriskはlowまたはmediumだけです"
+    if command == "approve-review" and values["--risk"] not in {"high", "critical"}:
+        return "確認付きdeliveryのriskはhighまたはcriticalにしてください"
     return None
 
 
@@ -1478,6 +1539,10 @@ def _has_write_operation(tokens):
     start = _command_start(tokens)
     if start is not None and os.path.basename(tokens[start]) == "codex-worktree":
         return len(tokens) > start + 1 and tokens[start + 1] in {"create", "recover"}
+    if start is not None and os.path.basename(tokens[start]) == "codex-delivery":
+        return len(tokens) > start + 1 and tokens[start + 1] in {
+            "record-review", "approve-review", "deliver", "finish",
+        }
 
     if start is None or os.path.basename(tokens[start]) != "gh":
         return False
@@ -1502,7 +1567,7 @@ def _shell_wraps_restricted_command(tokens):
         return False
     payload = " ".join(tokens[start + 1:])
     return re.search(
-        r"(?:^|[\s;&|()])(?:git|gh|rm|rmdir|unlink|shred)(?:\s|$)",
+        r"(?:^|[\s;&|()])(?:git|gh|codex-worktree|codex-delivery|rm|rmdir|unlink|shred)(?:\s|$)",
         payload,
     ) is not None
 
@@ -1589,6 +1654,9 @@ def blocked_reason(command, cwd=None, depth=0):
         if reason:
             return reason
         reason = _worktree_helper_invocation_reason(tokens)
+        if reason:
+            return reason
+        reason = _delivery_helper_invocation_reason(tokens)
         if reason:
             return reason
         for nested_command in _nested_shell_commands(tokens):
