@@ -168,13 +168,77 @@ class HelperTest(unittest.TestCase):
             HELPER.diagnose(self.repo.repository, "task-doctor", allow_local_origin=True)[0][1],
             "dirty",
         )
-        manifest_path = self.repo.codex_home / "worktrees/test--local/.state/task-doctor.json"
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        payload["worktree"] = str(target.parent / "missing")
-        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        target.rename(target.with_name("missing-preserved"))
         self.assertEqual(
             HELPER.diagnose(self.repo.repository, "task-doctor", allow_local_origin=True)[0][1],
             "missing",
+        )
+
+    def test_recover_promotes_only_a_valid_interrupted_worktree(self):
+        target = HELPER.create_worktree(
+            self.repo.repository, "feat/recover", "task-recover", allow_local_origin=True,
+        )
+        manifest_path = self.repo.codex_home / "worktrees/test--local/.state/task-recover.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["status"] = "creating"
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        self.assertEqual(
+            HELPER.diagnose(self.repo.repository, "task-recover", allow_local_origin=True)[0][1],
+            "interrupted",
+        )
+        with self.assertRaises(HELPER.WorktreeError):
+            HELPER.resume(self.repo.repository, "task-recover", allow_local_origin=True)
+        self.assertEqual(
+            HELPER.recover(self.repo.repository, "task-recover", allow_local_origin=True), target,
+        )
+        self.assertEqual(
+            HELPER.diagnose(self.repo.repository, "task-recover", allow_local_origin=True)[0][1],
+            "ready",
+        )
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["status"] = "failed"
+        payload["detail"] = "simulated failure"
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        (target / "dirty.txt").write_text("preserve\n", encoding="utf-8")
+        self.assertEqual(
+            HELPER.diagnose(self.repo.repository, "task-recover", allow_local_origin=True)[0][1],
+            "failed",
+        )
+        with self.assertRaises(HELPER.WorktreeError):
+            HELPER.resume(self.repo.repository, "task-recover", allow_local_origin=True)
+
+    def test_invalid_manifest_is_isolated_and_cannot_escape_managed_root(self):
+        HELPER.create_worktree(
+            self.repo.repository, "feat/invalid", "task-invalid", allow_local_origin=True,
+        )
+        manifest_path = self.repo.codex_home / "worktrees/test--local/.state/task-invalid.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["worktree"] = str(self.repo.repository)
+        payload["branch"] = "main"
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(
+            HELPER.diagnose(self.repo.repository, "task-invalid", allow_local_origin=True)[0][1],
+            "invalid",
+        )
+        with self.assertRaises(HELPER.WorktreeError):
+            HELPER.resume(self.repo.repository, "task-invalid", allow_local_origin=True)
+
+        payload["worktree"] = 1
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(
+            HELPER.diagnose(self.repo.repository, "task-invalid", allow_local_origin=True)[0][1],
+            "invalid",
+        )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO requires POSIX")
+    def test_non_regular_manifest_is_reported_without_reading_it(self):
+        state = self.repo.codex_home / "worktrees/test--local/.state"
+        state.mkdir(parents=True)
+        os.mkfifo(state / "task-fifo.json")
+        self.assertEqual(
+            HELPER.diagnose(self.repo.repository, "task-fifo", allow_local_origin=True)[0][1],
+            "invalid",
         )
 
     def test_symlink_managed_root_is_rejected(self):
@@ -185,6 +249,32 @@ class HelperTest(unittest.TestCase):
             HELPER.create_worktree(
                 self.repo.repository, "feat/symlink", "task-symlink", allow_local_origin=True,
             )
+
+    def test_symlink_parent_of_codex_home_is_rejected(self):
+        real = Path(self.repo.directory.name) / "real-parent"
+        link = Path(self.repo.directory.name) / "linked-parent"
+        real.mkdir()
+        link.symlink_to(real, target_is_directory=True)
+        os.environ["CODEX_HOME"] = str(link / "codex-home")
+        with self.assertRaises(HELPER.WorktreeError):
+            HELPER.create_worktree(
+                self.repo.repository, "feat/parent-symlink", "task-parent-symlink",
+                allow_local_origin=True,
+            )
+
+    @unittest.skipUnless(os.name == "posix", "executable Git hook requires POSIX")
+    def test_create_disables_repository_git_hooks(self):
+        hooks = Path(self.repo.directory.name) / "hooks"
+        hooks.mkdir()
+        marker = Path(self.repo.directory.name) / "post-checkout-ran"
+        post_checkout = hooks / "post-checkout"
+        post_checkout.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
+        post_checkout.chmod(0o755)
+        run("git", "config", "core.hooksPath", str(hooks), cwd=self.repo.repository)
+        HELPER.create_worktree(
+            self.repo.repository, "feat/no-hooks", "task-no-hooks", allow_local_origin=True,
+        )
+        self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":

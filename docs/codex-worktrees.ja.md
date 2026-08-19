@@ -92,6 +92,7 @@ codex-worktree doctor --task-id issue-22
 
 - `ready`: cleanで再開可能
 - `dirty`: commit前または未追跡の変更あり。変更を保持したまま再開可能
+- `interrupted`: worktree作成完了前に処理が中断。`recover`による再検証が必要
 - `missing`: worktree directoryがない
 - `unregistered`: Gitのworktree登録がない
 - `branch-mismatch`: manifestのbranchと現在のbranchが異なる
@@ -118,11 +119,24 @@ cd "$(codex-worktree resume --task-id issue-22)"
 まま停止し、手動で削除・作り直しをしないでください。locked worktreeの復旧やcleanupは
 metadataとの不整合や変更消失を招くため、対象pathとtask IDを確認してから別途判断します。
 
+作成済みworktreeの登録・branch・pathがすべて一致する一方、manifestが`creating`のまま
+残った場合だけ、`doctor`は`interrupted`を返します。次の単独commandで同じ安全条件を
+lock内でもう一度検証し、manifestを`ready`へ進められます。
+
+```sh
+codex-worktree recover --task-id issue-22
+codex-worktree resume --task-id issue-22
+```
+
+`recover`はworktreeを作り直さず、reset、clean、削除を行いません。それ以外の異常状態は
+変更せずに拒否します。
+
 ## 状態とライフサイクル
 
 作成処理はおおむね `creating` → `ready` の順でmanifestを更新します。作成中に失敗した
-場合は`failed`と詳細を記録します。helperは同じrepository管理rootのlifecycle lockを
-取得して、同じtask ID、path、branchの競合を防ぎます。
+場合は`failed`と詳細を記録します。強制終了で`creating`が残った場合は、上記の`recover`
+だけが検証済み状態へ進めます。helperは同じrepository管理rootのlifecycle lockを取得して、
+同じtask ID、path、branchの競合を防ぎます。
 
 PRが未mergeの間はworktreeを自動削除しません。`remove`、`prune`、branch削除、自動cleanup
 はこのIssueの対象外です。未commit・未push・dirtyな変更を破壊する操作も実装しません。
@@ -146,6 +160,8 @@ PRが未mergeの間はworktreeを自動削除しません。`remove`、`prune`�
   からbranchを作成します。
 - manifest、lock、認証情報、session情報、local databaseを公開repositoryへcommitしないで
   ください。
+- `CODEX_HOME`自身と既存の親componentにsymlinkを使わず、helperが検証した管理rootだけを
+  使用してください。
 - pathやtask IDを手入力で組み替えず、helperの出力と `resume` の結果を使ってください。
 
 ## 対象外

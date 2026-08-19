@@ -19,7 +19,7 @@ description: 実装依頼の全実装単位を自律的に実装・検証し、�
 1. 実装、修正、追加、構築など変更を伴う依頼だけを対象にする。調査、設計相談、レビュー、説明、診断のみではworktreeを作らず、実装へ移行した時点で作成する。
 2. 人間用checkoutでrepository、origin、default branch、current branch、HEAD、index、working treeを読み取り、snapshotとして記録する。Daikiの未commit変更があっても変更・退避・削除せず、作成後にsnapshotが不変であることを確認する。
 3. branch名、commit、PRの形式を最近の関連commitと過去PRから確認する。慣例がなければ日本語と一般的なbranch prefixを使い、`codex/`prefixを使わない。
-4. Issue番号があれば `codex-worktree create --issue <番号> --branch <branch>`、なければ `codex-worktree create --branch <branch>` を人間用checkoutで実行する。helperが生成したtask ID、`$CODEX_HOME/worktrees`配下のpath、latest `origin/<default-branch>`起点、clean状態を確認する。既に同じtaskを再開する場合は `codex-worktree doctor --task-id <task-id>` と `codex-worktree resume --task-id <task-id>` でmanifest、branch、pathを照合する。
+4. Issue番号があれば `codex-worktree create --issue <番号> --branch <branch>`、なければ `codex-worktree create --branch <branch>` を人間用checkoutで実行する。helperが生成したtask ID、`$CODEX_HOME/worktrees`配下のpath、latest `origin/<default-branch>`起点、clean状態を確認する。既に同じtaskを再開する場合は `codex-worktree doctor --task-id <task-id>` と `codex-worktree resume --task-id <task-id>` でmanifest、branch、pathを照合する。`interrupted`だけは`codex-worktree recover --task-id <task-id>`で再検証してから再開する。
 5. 作成後の全編集、test、Git/GitHub操作は専用worktreeを明示した`workdir`で行う。人間用checkoutのbranchを切り替えず、同一sessionから別taskのworktreeへ書き込まない。
 6. protected branch、既存branch・worktree・directoryとの衝突、管理root外path、想定外のupstreamでは進めない。`origin/<default-branch>`を起点に新規作成した直後は、そのbaseをupstreamとして追跡する状態を正常とする。初回push後は作業branch自身の`origin/<branch>`だけをupstreamとして扱う。
 7. `CODEX_WORKTREE_MODE=single-checkout`がDaikiにより明示された場合だけ、rollbackとして従来のcleanな単一checkout flowを使う。既存worktree、manifest、branchを自動削除せず、停止理由と手動復旧方法を残す。

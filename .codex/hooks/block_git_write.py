@@ -839,7 +839,7 @@ def _worktree_helper_invocation_reason(tokens):
     command, arguments = args[0], args[1:]
     if command == "list":
         return None if not arguments else "codex-worktree listに引数は指定できません"
-    if command in {"doctor", "resume"}:
+    if command in {"doctor", "resume", "recover"}:
         if not arguments and command == "doctor":
             return None
         if len(arguments) != 2 or arguments[0] != "--task-id" or not TASK_ID_RE.fullmatch(arguments[1]):
@@ -1097,7 +1097,7 @@ def _has_write_operation(tokens):
 
     start = _command_start(tokens)
     if start is not None and os.path.basename(tokens[start]) == "codex-worktree":
-        return len(tokens) > start + 1 and tokens[start + 1] == "create"
+        return len(tokens) > start + 1 and tokens[start + 1] in {"create", "recover"}
 
     if start is None or os.path.basename(tokens[start]) != "gh":
         return False
@@ -1226,8 +1226,21 @@ def _managed_worktree_reason(repository_root, common_git_dir, worktree_root):
     if repository is None or _origin_repository(worktree_root) != repository:
         return "managed worktreeのoriginがsession repositoryと一致しません"
     codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-    if not codex_home.is_absolute() or codex_home.is_symlink():
+    if not codex_home.is_absolute() or ".." in codex_home.parts:
         return "CODEX_HOMEを安全に解決できません"
+    current = Path(codex_home.anchor)
+    for part in codex_home.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError:
+            return "CODEX_HOMEを安全に解決できません"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "CODEX_HOMEのsymlink componentを許可できません"
+        if current != codex_home and not stat.S_ISDIR(metadata.st_mode):
+            return "CODEX_HOMEの親がdirectoryではありません"
     repository_key = repository.casefold().replace("/", "--")
     try:
         managed_repository = (codex_home / "worktrees" / repository_key).resolve(strict=True)
@@ -1244,6 +1257,7 @@ def _managed_worktree_reason(repository_root, common_git_dir, worktree_root):
             manifest_path.is_symlink()
             or not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077
             or metadata.st_size > MAX_MANIFEST_BYTES
         ):
             return "managed worktree manifestを安全に検査できません"

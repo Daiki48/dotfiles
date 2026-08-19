@@ -165,6 +165,7 @@ class GuardTest(unittest.TestCase):
             "codex-worktree doctor",
             "codex-worktree doctor --task-id issue-22",
             "codex-worktree resume --task-id task-safe-id",
+            "codex-worktree recover --task-id task-safe-id",
             "codex-worktree create",
             "codex-worktree create --issue 22 --branch feat/example",
             "codex-worktree create --task-id task-safe-id",
@@ -178,6 +179,7 @@ class GuardTest(unittest.TestCase):
             "codex-worktree remove --task-id issue-22",
             "codex-worktree list --all",
             "codex-worktree resume",
+            "codex-worktree recover",
             "codex-worktree doctor --task-id ../other",
             "codex-worktree create --issue 0",
             "codex-worktree create --issue 22 --task-id task-other",
@@ -185,6 +187,7 @@ class GuardTest(unittest.TestCase):
             "codex-worktree create --branch feat/example --branch fix/example",
             "codex-worktree create --repository /tmp/other",
             "codex-worktree create --issue 22 && git status",
+            "codex-worktree recover --task-id issue-22 && git status",
             "bash -lc 'codex-worktree create --issue 22'",
         ):
             with self.subTest(command=command):
@@ -909,7 +912,9 @@ class GuardTest(unittest.TestCase):
                 "branch": "feat/example",
                 "worktree": str(worktree),
             }
-            (state / "task-safe.json").write_text(json.dumps(manifest), encoding="utf-8")
+            manifest_path = state / "task-safe.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            manifest_path.chmod(0o600)
 
             def safe_git(_cwd, *args):
                 if args == ("rev-parse", "--abbrev-ref", "HEAD"):
@@ -927,9 +932,24 @@ class GuardTest(unittest.TestCase):
                     GUARD._managed_worktree_reason(repository, common, worktree)
                 )
                 manifest["status"] = "failed"
-                (state / "task-safe.json").write_text(json.dumps(manifest), encoding="utf-8")
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                manifest_path.chmod(0o600)
                 self.assertIsNotNone(
                     GUARD._managed_worktree_reason(repository, common, worktree)
+                )
+
+    def test_managed_worktree_rejects_symlink_component_in_codex_home(self):
+        with tempfile.TemporaryDirectory(prefix="guard-worktree-symlink-") as directory:
+            root = Path(directory)
+            real = root / "real"
+            link = root / "link"
+            real.mkdir()
+            link.symlink_to(real, target_is_directory=True)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(link / "codex-home")}):
+                self.assertIsNotNone(
+                    GUARD._managed_worktree_reason(
+                        root / "repository", root / "repository/.git", root / "worktree"
+                    )
                 )
 
 
