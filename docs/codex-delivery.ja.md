@@ -36,13 +36,12 @@ helperはcanonical install先から直接起動し、`/usr/bin/git`と`/usr/bin/
 
 ## DELIVERY-01: 固定SHAのreview receipt
 
-Draft PRを作成したら、次の対象を固定します。
+Draft PRを作成したら、receiptとmanaged manifestを合わせて次の対象を固定します。
 
 - repository、PR番号、base branch/ref、head branch/ref
 - review対象のhead SHAとbase SHA
 - task ID、worktree path、risk分類
-- 必須CIのcheck名と実行結果、実行時刻
-- 独立reviewの判定、actionable件数、未解決review thread件数
+- 独立reviewとtestの完了判定、actionable件数
 
 receiptは対象SHAに束縛します。review後にcommitをpushしてhead SHAが変わった場合、以前の
 receipt、CI、review、確認を新SHAへ引き継ぎません。新しいSHAでCIと独立reviewを実行し、
@@ -54,9 +53,9 @@ review品質を暗号学的に証明するものではありません。helper�
 low/mediumへ分類できません。
 
 required checkは文字通り`success`だけを成功とします。`skipped`、`cancelled`、`timed out`、
-`neutral`、`pending`、取得不能、判定不能は成功として扱いません。check名が同じでもworkflowの
-内容や対象SHAを確認できない場合は不合格です。review receiptにはcheck名だけでなく実行内容を
-確認した根拠を残します。
+`neutral`、`pending`、取得不能、判定不能は成功として扱いません。CI結果はreceiptの自己申告を
+信頼せず、`deliver`が固定head上のcheck runをlive取得し、名前、GitHub Actions app ID、head SHA、
+`completed`、`success`、完了時刻が一意に一致することを確認します。
 
 ## DELIVERY-05: risk別のdelivery
 
