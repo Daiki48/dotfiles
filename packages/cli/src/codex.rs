@@ -754,6 +754,12 @@ fn ensure_managed_hook(
     };
     let state_matches = recorded.as_deref().is_some_and(valid_sha256)
         && recorded.as_deref() == Some(existing_hash.as_str());
+    if install_mode == ManagedInstallMode::OwnerExecutable && recorded.is_none() {
+        anyhow::bail!(
+            "Managed state is missing for {}; refusing to adopt an unmanaged file",
+            destination.display()
+        );
+    }
     if existing_hash != source_hash && !state_matches {
         anyhow::bail!(
             "Managed hook {} changed locally; refusing to overwrite",
@@ -1509,6 +1515,38 @@ description = "local"
                 & 0o777,
             0o755
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_helper_does_not_adopt_an_unmanaged_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("delivery-helper-unmanaged");
+        let source = directory.path().join("codex-delivery");
+        let destination = directory.path().join("codex-delivery-installed");
+        fs::write(&source, "same contents\n").expect("write delivery helper");
+        fs::write(&destination, "same contents\n").expect("write unmanaged helper");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+            .expect("set unmanaged mode");
+
+        assert!(
+            ensure_managed_hook(&source, &destination, ManagedInstallMode::OwnerExecutable)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read unmanaged helper"),
+            "same contents\n"
+        );
+        assert_eq!(
+            fs::metadata(&destination)
+                .expect("inspect unmanaged helper")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!managed_hook_state_path(&destination).exists());
     }
 
     #[test]
