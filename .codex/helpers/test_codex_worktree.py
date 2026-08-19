@@ -166,6 +166,11 @@ class HelperTest(unittest.TestCase):
             "GIT_ASKPASS": "/tmp/askpass",
             "SSH_ASKPASS": "/tmp/ssh-askpass",
             "GIT_PROXY_COMMAND": "malicious proxy",
+            "GIT_INDEX_FILE": "/tmp/index",
+            "GIT_OBJECT_DIRECTORY": "/tmp/objects",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/tmp/alternate-objects",
+            "GIT_EXTERNAL_DIFF": "/tmp/external-diff",
+            "GIT_FUTURE_UNSAFE_VARIABLE": "future-value",
         }
         with mock.patch.dict(os.environ, unsafe, clear=False):
             environment = HELPER._safe_environment()

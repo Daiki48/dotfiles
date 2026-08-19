@@ -93,12 +93,7 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
 def _safe_environment() -> dict[str, str]:
     environment = os.environ.copy()
     for key in list(environment):
-        if key in {
-            "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
-            "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
-            "GIT_CONFIG_SYSTEM", "GIT_EXEC_PATH", "GIT_SSH", "GIT_SSH_COMMAND",
-            "GIT_ASKPASS", "SSH_ASKPASS", "GIT_PROXY_COMMAND",
-        } or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+        if key.startswith("GIT_") or key == "SSH_ASKPASS":
             environment.pop(key, None)
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     return environment

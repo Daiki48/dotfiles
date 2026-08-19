@@ -23,8 +23,7 @@ class GuardTest(unittest.TestCase):
         self.git_environment = {
             key: GUARD.os.environ.pop(key)
             for key in list(GUARD.os.environ)
-            if key in GUARD.GIT_SANITIZED_ENVIRONMENT_KEYS
-            or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+            if key.startswith("GIT_") or key in GUARD.GIT_NON_PREFIX_ENVIRONMENT_KEYS
         }
 
     def tearDown(self):
@@ -118,6 +117,11 @@ class GuardTest(unittest.TestCase):
                 "GIT_ASKPASS",
                 "SSH_ASKPASS",
                 "GIT_PROXY_COMMAND",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_EXTERNAL_DIFF",
+                "GIT_CONFIG_NOSYSTEM",
             ):
                 with self.subTest(key=key), mock.patch.dict(
                     GUARD.os.environ, {key: "/tmp/untrusted-command"}
@@ -147,6 +151,14 @@ class GuardTest(unittest.TestCase):
                     "env -u SSH_ASKPASS git -C /workspace add -- README.md",
                     "/session",
                 )
+
+    def test_git_read_rejects_external_diff_but_allows_launcher_pager(self):
+        with mock.patch.dict(
+            GUARD.os.environ, {"GIT_EXTERNAL_DIFF": "/tmp/untrusted-command"}
+        ):
+            self.assert_blocked("git diff --stat", "/workspace")
+        with mock.patch.dict(GUARD.os.environ, {"GIT_PAGER": "cat"}):
+            self.assert_allowed("git status", "/workspace")
 
     def test_unsafe_git_writes_are_blocked(self):
         for command in (

@@ -95,15 +95,11 @@ MAX_BODY_FILE_BYTES = 256 * 1024
 MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
 GIT_COMMAND_TIMEOUT_SECONDS = 2
 MAX_MANIFEST_BYTES = 256 * 1024
-GIT_WRITE_ENVIRONMENT_KEYS = {
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
-    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-}
-GIT_SANITIZED_ENVIRONMENT_KEYS = GIT_WRITE_ENVIRONMENT_KEYS | {
-    "GIT_EXEC_PATH", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS",
-    "SSH_ASKPASS", "GIT_PROXY_COMMAND",
-}
+# launcherが設定するpagerだけは、非対話の許可commandで外部programを起動しない。
+# その他のGIT_*は将来追加されるものも含め、repository状態・外部command・出力先を
+# 変更し得るためfail closedで拒否し、内部probeからも除去する。
+GIT_ALLOWED_ENVIRONMENT_KEYS = {"GIT_PAGER"}
+GIT_NON_PREFIX_ENVIRONMENT_KEYS = {"SSH_ASKPASS"}
 GIT_SANITIZED_WRAPPER = ("env", "-u", "SSH_ASKPASS")
 AI_ATTRIBUTION_RE = re.compile(
     r"(?i)(?:co-authored-by|generated(?:-| )by|signed-off-by)\s*:\s*.*"
@@ -541,6 +537,11 @@ def _git_invocation_reason(tokens, cwd=None):
             continue
 
         args = git_args[index + 1:]
+        if any(
+            key.startswith("GIT_") and key not in GIT_ALLOWED_ENVIRONMENT_KEYS
+            for key in os.environ
+        ):
+            return "Git commandではGitのrepository状態、path、外部command、出力先を変更する環境変数を使用できません"
         if token == "branch":
             if any(_branch_arg_is_write(arg) for arg in args):
                 return "git branchの変更操作は許可されていません"
@@ -564,8 +565,7 @@ def _git_invocation_reason(tokens, cwd=None):
         if target_reason:
             return target_reason
         if any(
-            key in GIT_SANITIZED_ENVIRONMENT_KEYS - removed_environment
-            or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+            key in GIT_NON_PREFIX_ENVIRONMENT_KEYS - removed_environment
             for key in os.environ
         ):
             return "Git書き込みではrepository、config、外部commandを変更する環境変数を使用できません"
@@ -1030,10 +1030,7 @@ def _run_git(cwd, *args):
         return None
     environment = os.environ.copy()
     for key in list(environment):
-        if (
-            key in GIT_SANITIZED_ENVIRONMENT_KEYS
-            or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
-        ):
+        if key.startswith("GIT_") or key in GIT_NON_PREFIX_ENVIRONMENT_KEYS:
             environment.pop(key, None)
     process = None
     selector = None
