@@ -175,23 +175,24 @@ Draft PR後のdeliveryは、専用`codex-delivery` helperの次の経路だけ�
 `--risk`と3つの検証完了flagも必須です。
 
 ```text
-record-review  ->  (high/critical/判定不能だけ approve-review)  ->  deliver  ->  finish
+(autonomous: record-review | human-required: approve-review)  ->  deliver  ->  finish
 ```
 
 `record-review`は、repository、PR、固定head SHA、Plan ID、risk分類、testと独立reviewの完了証拠を
-receiptとして記録します。low/mediumは指摘を自律修正して新SHAでreviewとCIをやり直し、
-high/critical/判定不能は毎回Daikiの確認を得ます。receiptと現在のSHAが一致し、delivery直前に
+receiptとして記録します。riskとは別にdecision requirementを判定し、仕様・既存権限・rollback・検証を
+確定できる場合は全riskで`record-review`を使います。Daikiだけが決められる事項がある場合は明示回答後に
+`approve-review`を使い、技術gateが不明または失敗ならblockedとしてreceiptを作りません。receiptと
+現在のSHAが一致し、delivery直前に
 再取得したCIが文字通り`success`、actionable=0、未解決thread=0、選択したremote gateが成立した
 場合だけ`deliver`へ進みます。
 
-既定はlive Rulesetを要求するstrict modeです。完全一致allowlistで認可されたGitHub Free/private
-repositoryだけは、`approve-review`、`deliver`、`finish`へ
-`--gate-mode github-free-private`を明示します。このmodeは通常タスクもdelivery上highであり、
-Rulesetの代わりにprivate repository設定とhuman-approved receiptをlive検証します。403やnetwork
+既定はlive Rulesetを要求するstrict modeです。GitHub Free/private repositoryでは、`record-review`
+または`approve-review`、`deliver`、`finish`へ`--gate-mode github-free-private`を明示します。
+このmodeは保証差によりriskをhigh/criticalとし、Rulesetの代わりにlive private repository identityと
+decision receiptを検証します。403やnetwork
 errorから自動fallbackせず、modeを省略した既存commandとv1 receiptはstrictとして扱います。
 
-Issue #24はdelivery安全境界を変更するhighのため、Draft PR作成後にDaikiの確認が必要です。
-確認待ちやdelivery途中の異常で、PR、branch、worktreeを自動cleanupしません。
+確認待ち、blocked、delivery途中の異常で、PR、branch、worktreeを自動cleanupしません。
 
 ## 安全境界
 

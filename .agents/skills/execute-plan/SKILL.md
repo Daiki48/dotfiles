@@ -5,7 +5,7 @@ description: 実装依頼の全実装単位を自律的に実装・検証し、�
 
 # 実装依頼を完了まで実行する
 
-実装依頼を人間の主要な許可として扱い、計画確認やcommitごとの確認待ちを挟まず、全実装単位、最終監査、Draft PR後のdeliveryまで進める。ただしhigh/critical/判定不能のdeliveryだけは毎回Daikiの確認を得る。
+実装依頼を人間の主要な許可として扱い、計画確認やcommitごとの確認待ちを挟まず、全実装単位、最終監査、Draft PR後のdeliveryまで進める。riskと意思決定要否を分離し、Daikiだけが決められる事項がある場合だけ確認を得る。
 
 ## 正本と実行権限を確定する
 
@@ -22,15 +22,25 @@ description: 実装依頼の全実装単位を自律的に実装・検証し、�
   Draft PR後も自律してreview、修正、再検証、Ready、merge、main同期、managed cleanupまで進める。
 - **high/critical**: CI/workflow、Ruleset、hook、rules、AGENTS、Skills、helper、installerなどの
   delivery安全境界、auth/secrets、billing、production、不可逆migration、breaking changeを含むもの。
-  security、互換性、データ損失の重大な懸念も含め、毎回会話でDaikiの明示確認を得てから
-  `approve-review`を実行する。自動approval reviewだけをDaikiの確認とは扱わない。
-- **GitHub Free/private delivery**: helperの完全一致allowlistにあるrepositoryで
-  `--gate-mode github-free-private`を使う場合、実装内容が通常のlow/mediumでもdelivery riskを
-  highへ引き上げる。Rulesetなしの低保証profileなので、固定SHAごとにDaikiの確認を得て
-  `approve-review`だけでreceiptを記録する。403、404、timeoutなどからこのmodeへ自動移行しない。
-- **判定不能**: 影響範囲またはリスクを確定できないもの。highとして扱い、確認なしにdeliveryしない。
+  security、互換性、データ損失の重大な懸念も含む。riskはreview深度と残存影響を決めるが、
+  それだけで人間確認を要求しない。
+- **GitHub Free/private delivery**: `--gate-mode github-free-private`を明示するprivate repositoryでは、
+  Rulesetなしの保証差を反映してriskをhigh/criticalとして扱う。repository固有allowlistやAPI errorからの
+  自動fallbackは使わず、live identityとCodex側gateを検証する。
+- **判定不能**: 影響範囲またはriskを確定できないもの。approvalで迂回せずblockedとする。
 
-Issue #24自身はdelivery安全境界を変更するhighであり、Draft PR作成後にDaikiの確認が必要です。
+### Decision assessment
+
+- **autonomous**: 依頼済みscope内で仕様、既存権限、rollback、test・CI・reviewを根拠付きで確定できる。
+  riskに関係なく`record-review`を使う。
+- **human-required**: 製品・仕様の実質判断、明示されていないscope拡大、新規credentialや権限付与、
+  repository/Ruleset設定、billing・購入、不可逆性、重大な残存リスク受容、releaseなど、Daikiだけが
+  決められる事項がある。会話上の明示判断後だけ`approve-review`を使う。
+- **blocked**: test/CI/review失敗、dirty/stale/conflict、secret混入、live identity不一致、network/API不明、
+  rollback未評価、仕様矛盾など必須証拠が不足する。人間approvalで技術gateを迂回せず、修正または再調査する。
+
+優先順位は`blocked > human-required > autonomous`とする。Issue #24を含むdelivery安全境界変更も
+highとして十分な独立reviewを行うが、decision assessmentは別に判定する。
 
 ## 安全な専用worktreeを確定する
 
@@ -85,23 +95,24 @@ Draft PR作成後は、専用`codex-delivery` helperだけをreceipt、delivery�
 すべてのcommandで`--task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID>`を
 明示し、review記録では`--risk`と`--tests-passed`、`--neutral-review-passed`、
 `--adversarial-review-passed`も指定する。明示認可されたGitHub Free/private repositoryでは
- `approve-review`、`deliver`、`finish`の各commandへ`--gate-mode github-free-private`も指定し、
+ `record-review`または`approve-review`、`deliver`、`finish`の各commandへ`--gate-mode github-free-private`も指定し、
  strict modeでは省略する。
 
 1. PRのbase、head、head SHAを固定し、`review-branch`を読み取り専用で実行する。reviewerは固定SHAの
    差分、実装計画、test結果、既存仕様を確認し、actionable件数と未解決thread件数を返す。
-2. low/mediumでは、review結果とSHA、CI結果、risk分類を`codex-delivery record-review`でreceiptに記録する。
+2. decisionが`autonomous`ならriskに関係なく、review結果とSHA、CI結果、risk分類を
+   `codex-delivery record-review`でreceiptに記録する。
    actionableな指摘があれば同じworktreeで修正、検証、commit、pushし、新しいhead SHAで手順1へ戻る。
    以前のreceipt、review、CIを新SHAの完了根拠として再利用しない。
-3. high/critical/判定不能では、Daikiの会話上の明示確認が得られるまで停止する。確認後だけ同じ証拠を
-   `codex-delivery approve-review`へ渡す。自動approval reviewだけを確認とは扱わない。確認はreceipt単位であり、
-   後続pushやSHA変更後に引き継がない。
+3. decisionが`human-required`なら、必要な判断を具体化してDaikiの明示回答を得る。判断後だけ同じ証拠を
+   `codex-delivery approve-review`へ渡す。自動approval reviewだけを回答とは扱わない。判断の前提を変える
+   後続pushやscope変更があれば再判定する。blockedではreceiptを作らない。
 4. receiptのSHAと現在のPR head SHAが一致し、actionable=0、未解決thread=0、required CIが文字通り
    `success`（skipped、cancelled、timed out、neutral、pending、判定不能は不合格）、merge conflictなし、
    branchが最新baseであることをhelperで再取得する。strict modeはlive Ruleset gateを必須とする。
-   明示したGitHub Free/private modeはallowlist、private repository設定、human-approved high receiptを
+   明示したGitHub Free/private modeはlive private repository identityとhigh/critical receiptを
    必須とし、Rulesetが保証していたhelper外操作の拒否は残存リスクとして扱う。
-5. low/medium、または`approve-review`済みのhigh/critical/判定不能だけ、`codex-delivery deliver`へ進む。
+5. `autonomous`または`human-approved` decisionを持つreceiptだけ、`codex-delivery deliver`へ進む。
    helperがReady化と許可されたmergeを行う。直接の`gh pr ready`/`gh pr merge`はこの経路を迂回するため禁止する。
 6. merge後は`codex-delivery finish ...`でmerged状態、head commitの`origin/main`到達性、人間用checkoutのmain・clean、
    fetch後の`git merge --ff-only origin/main`によるlocal main=`origin/main`を確認する。管理rootの対象worktreeについて、repository、task、
@@ -124,8 +135,7 @@ PRが未mergeの間はworktreeを安全な再開点として保持する。`git 
 - 未実施の手動確認、残存リスク、計画との差異
 - push・PR作成・delivery・finishを実施できなかった場合は、PR、branch、worktreeを保持した安全な再開条件
 
-strict modeのlow/mediumは全live gateを満たす場合だけ`codex-delivery`がdelivery・finishまで実行し、
-GitHub Free/privateを含むhigh/critical/判定不能は
-`approve-review`後にのみ実行する。release、protected branchへの直接push、force push、任意削除は行わない。
+全riskでlive gateとdecision assessmentを満たす場合だけ`codex-delivery`がdelivery・finishまで実行する。
+release、protected branchへの直接push、force push、任意削除は行わない。
 追跡Issueは、依頼された完了条件が外部状態を含めて成立したことを確認できる場合だけcloseする。Draft PR作成だけを
 実装完了とみなしてcloseしない。
