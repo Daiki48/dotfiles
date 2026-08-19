@@ -1,5 +1,5 @@
 # 通常の作業は workspace-write sandbox と厳格なPreToolUse hookで検査する。
-# 検査済みのcommit・単一branch push・Draft PR作成だけを無確認で許可する。
+# 検査済みのcommit・単一branch push・通常のIssue/PR管理を無確認で許可する。
 
 prefix_rule(pattern=["git", "push", ["--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"]], decision="forbidden", justification="履歴改変・削除・一括pushは禁止")
 prefix_rule(pattern=["git", "commit", "-m"], decision="allow", justification="hook検査済みの通常commit")
@@ -7,6 +7,8 @@ prefix_rule(pattern=["git", "push", "-u", "origin"], decision="allow", justifica
 prefix_rule(pattern=["git", "-C"], decision="allow", justification="hookがmanaged worktree pathとGit操作を検査", match=["git -C /tmp/managed/task commit -m ':bug: 修正'", "git -C /tmp/managed/task push -u origin HEAD:refs/heads/fix/example"], not_match=["git commit -m ':bug: 修正'"])
 prefix_rule(pattern=["env", "-u", "SSH_ASKPASS", "git", "-C"], decision="allow", justification="launcher由来のaskpassを除去し、hookがmanaged worktree pathとGit操作を検査", match=["env -u SSH_ASKPASS git -C /tmp/managed/task commit -m ':bug: 修正'", "env -u SSH_ASKPASS git -C /tmp/managed/task push -u origin HEAD:refs/heads/fix/example"], not_match=["env -u GIT_SSH_COMMAND git -C /tmp/managed/task commit -m ':bug: 修正'"])
 prefix_rule(pattern=["gh", "pr", "create", "--draft"], decision="allow", justification="hook検査済みのDraft PR作成")
+prefix_rule(pattern=["gh", "issue", ["create", "edit", "comment", "close", "reopen"]], decision="allow", justification="hook検査済みの単一Issue管理")
+prefix_rule(pattern=["gh", "pr", ["edit", "comment", "review", "ready", "close", "reopen", "update-branch"]], decision="allow", justification="hook検査済みの単一PR管理")
 prefix_rule(pattern=["codex-worktree", "create"], decision="allow", justification="専用helperで検査済みのworktree作成")
 prefix_rule(pattern=["codex-worktree", "recover"], decision="allow", justification="中断したmanaged worktreeの検証済み復旧")
 prefix_rule(pattern=["git", ["rebase", "reset", "clean", "restore", "rm", "update-ref"]], decision="forbidden", justification="履歴改変または広範囲な破棄操作は禁止")

@@ -94,6 +94,7 @@ SHELL_PUNCTUATION = ";&|()`\n"
 MAX_BODY_FILE_BYTES = 256 * 1024
 MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
 GIT_COMMAND_TIMEOUT_SECONDS = 2
+GH_COMMAND_TIMEOUT_SECONDS = 5
 MAX_MANIFEST_BYTES = 256 * 1024
 # launcherが設定するpagerだけは、非対話の許可commandで外部programを起動しない。
 # その他のGIT_*は将来追加されるものも含め、repository状態・外部command・出力先を
@@ -105,6 +106,7 @@ AI_ATTRIBUTION_RE = re.compile(
     r"(?i)(?:co-authored-by|generated(?:-| )by|signed-off-by)\s*:\s*.*"
     r"(?:codex|openai|chatgpt|claude|gemini|copilot|\bai(?:\s+(?:assistant|agent|bot))?\b)"
 )
+COPILOT_MENTION_RE = re.compile(r"(?i)(?<![A-Za-z0-9_@])@copilot\b")
 COMMIT_SUBJECT_RE = re.compile(r"^:[a-z0-9_+-]+: \S.*$")
 TASK_ID_RE = re.compile(r"^(?:issue-[1-9][0-9]*|task-[a-z0-9][a-z0-9-]{0,63})$")
 
@@ -720,6 +722,61 @@ def _remote_refs_snapshot(cwd, head=None):
     return f"origin/{default_match.group(1)}", default_oid_match.group(1), remote_head
 
 
+def _run_gh_json(cwd, *args):
+    """固定したread-only gh commandをtimeout付きで実行し、JSON objectを返す。"""
+    environment = os.environ.copy()
+    for key in {"GH_HOST", "GH_REPO", "GH_FORCE_TTY", "GH_PAGER", "PAGER"}:
+        environment.pop(key, None)
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            cwd=cwd,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=GH_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if result.returncode != 0 or len(result.stdout) > MAX_BODY_FILE_BYTES:
+            return None
+        payload = json.loads(result.stdout.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _pr_update_branch_preflight_reason(cwd, repository, number):
+    """update対象がcurrent repository内のopenな非保護branchかreadbackする。"""
+    payload = _run_gh_json(
+        cwd,
+        "pr", "view", number,
+        "--repo", repository,
+        "--json", "number,state,isCrossRepository,headRepository,headRefName,headRefOid",
+    )
+    if payload is None:
+        return "PR update-branchのremote対象を確認できません"
+    head_repository = payload.get("headRepository")
+    if (
+        payload.get("number") != int(number)
+        or payload.get("state") != "OPEN"
+        or payload.get("isCrossRepository") is not False
+        or not isinstance(head_repository, dict)
+        or not isinstance(head_repository.get("nameWithOwner"), str)
+        or head_repository["nameWithOwner"].casefold() != repository.casefold()
+    ):
+        return "PR update-branchはcurrent repository内のopen PRだけ許可されます"
+    head = payload.get("headRefName")
+    oid = payload.get("headRefOid")
+    if (
+        not isinstance(head, str)
+        or not _valid_work_branch(head)
+        or not isinstance(oid, str)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", oid) is None
+    ):
+        return "PR update-branchのhead branchまたはSHAが許可範囲外です"
+    return None
+
+
 def _repository_reason(repository, cwd):
     origin_repository = _origin_repository(cwd)
     if origin_repository is None:
@@ -764,10 +821,9 @@ def _pr_create_reason(args, cwd):
     preflight_reason = _draft_pr_preflight_reason(cwd, base, head)
     if preflight_reason:
         return preflight_reason
-    if AI_ATTRIBUTION_RE.search(title):
-        return "PR titleにAI帰属を含めることはできません"
-    if _contains_secret(title):
-        return "PR titleに秘密情報らしい値が含まれています"
+    title_reason = _github_text_reason([title], "PR title")
+    if title_reason:
+        return title_reason
     return _file_secret_reason(body_file)
 
 
@@ -847,41 +903,229 @@ def _draft_pr_preflight_reason(cwd, base, head):
     return None
 
 
+def _github_text_reason(values, label):
+    for value in values:
+        if _contains_secret(value):
+            return f"{label}に秘密情報らしい値を含めることはできません"
+        if AI_ATTRIBUTION_RE.search(value):
+            return f"{label}にCodexまたはOpenAIのAI帰属を含めることはできません"
+        if COPILOT_MENTION_RE.search(value):
+            return f"{label}に@copilot mentionを含めることはできません"
+    return None
+
+
+def _github_body_file_reason(path, label):
+    reason = _file_secret_reason(path)
+    return None if reason is None else reason.replace("PR body", label)
+
+
+def _github_target_reason(positional, label):
+    if len(positional) != 1 or not re.fullmatch(r"[1-9][0-9]*", positional[0]):
+        return f"{label}対象は単一の数値IDで指定してください"
+    return None
+
+
 def _issue_write_reason(issue_command, issue_args, cwd):
     repository = _required_option(issue_args, "-R", "--repo")
-    if not repository or "/" not in repository:
+    if not repository or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         return "Issue書き込みには対象repositoryを明示してください"
     repository_reason = _repository_reason(repository, cwd)
     if repository_reason:
         return repository_reason
 
-    value_options = {("-R", "--repo"), ("-F", "--body-file")}
-    if issue_command in {"create", "edit"}:
-        value_options.add(("-t", "--title"))
-    positional = _strict_gh_args(issue_args, value_options)
-    if positional is None:
-        return "Issue書き込みでは許可された引数だけを正規形で指定してください"
-    if issue_command == "create" and positional:
-        return "Issue作成ではpositional引数を使用できません"
-    if issue_command in {"edit", "comment"} and (
-        len(positional) != 1 or not positional[0].isdigit()
-    ):
-        return "Issueの編集・comment対象は単一の数値IDで指定してください"
-
-    title = _required_option(issue_args, "-t", "--title")
-    body_file = _required_option(issue_args, "-F", "--body-file")
-    if issue_command == "create" and not (title and body_file):
-        return "Issue作成にはtitleとbody-fileを明示してください"
-    if issue_command == "comment" and not body_file:
-        return "Issue commentにはbody-fileを明示してください"
-    if issue_command == "edit" and not (title or body_file):
-        return "Issue編集にはtitleまたはbody-fileを明示してください"
-    if title and (_contains_secret(title) or AI_ATTRIBUTION_RE.search(title)):
-        return "Issueへ秘密情報またはAI帰属を送信できません"
-    if body_file:
-        reason = _file_secret_reason(body_file)
+    common_options = {("-R", "--repo")}
+    if issue_command == "create":
+        value_options = common_options | {
+            ("-F", "--body-file"), ("-t", "--title"),
+            ("-l", "--label"), ("-a", "--assignee"), (None, "--milestone"),
+        }
+        positional = _strict_gh_args(issue_args, value_options)
+        if positional is None or positional:
+            return "Issue作成では許可された引数だけを正規形で指定してください"
+        title = _required_option(issue_args, "-t", "--title")
+        body_file = _required_option(issue_args, "-F", "--body-file")
+        if not title or not body_file:
+            return "Issue作成にはtitleとbody-fileを明示してください"
+        metadata_values = []
+        for short, long in (
+            ("-l", "--label"), ("-a", "--assignee"), (None, "--milestone"),
+        ):
+            values = _option_values(issue_args, short, long)
+            if values is None:
+                return "Issue作成のmetadata引数に値を明示してください"
+            metadata_values.extend(values)
+        reason = _github_text_reason([title] + metadata_values, "Issue作成値")
         if reason:
-            return reason.replace("PR body", "Issue body")
+            return reason
+        return _github_body_file_reason(body_file, "Issue body")
+
+    if issue_command == "edit":
+        value_options = common_options | {
+            ("-F", "--body-file"), ("-t", "--title"),
+            (None, "--add-label"), (None, "--remove-label"),
+            (None, "--add-assignee"), (None, "--remove-assignee"),
+            (None, "--milestone"),
+        }
+        positional = _strict_gh_args(issue_args, value_options, {"--remove-milestone"})
+        if positional is None:
+            return "Issue編集では許可された引数だけを正規形で指定してください"
+        target_reason = _github_target_reason(positional, "Issue編集")
+        if target_reason:
+            return target_reason
+        body_files = _option_values(issue_args, "-F", "--body-file")
+        titles = _option_values(issue_args, "-t", "--title")
+        if body_files is None or len(body_files) > 1 or titles is None or len(titles) > 1:
+            return "Issue編集のtitleとbody-fileはそれぞれ1件までです"
+        body_file = body_files[0] if body_files else None
+        title = titles[0] if titles else None
+        mutation = bool(title or body_file or "--remove-milestone" in issue_args)
+        metadata_pairs = (
+            (None, "--add-label"), (None, "--remove-label"),
+            (None, "--add-assignee"), (None, "--remove-assignee"),
+            (None, "--milestone"),
+        )
+        metadata_values = []
+        for short, long in metadata_pairs:
+            values = _option_values(issue_args, short, long)
+            if values is None:
+                return "Issue編集のmetadata引数に値を明示してください"
+            mutation = mutation or bool(values)
+            metadata_values.extend(values)
+        if not mutation:
+            return "Issue編集にはtitle、body-file、label、assignee、milestoneの変更を明示してください"
+        reason = _github_text_reason(([title] if title else []) + metadata_values, "Issue編集値")
+        if reason:
+            return reason
+        return _github_body_file_reason(body_file, "Issue body") if body_file else None
+
+    if issue_command == "comment":
+        value_options = common_options | {("-F", "--body-file")}
+        positional = _strict_gh_args(issue_args, value_options)
+        if positional is None:
+            return "Issue commentでは許可された引数だけを正規形で指定してください"
+        target_reason = _github_target_reason(positional, "Issue comment")
+        if target_reason:
+            return target_reason
+        body_file = _required_option(issue_args, "-F", "--body-file")
+        if not body_file:
+            return "Issue commentにはbody-fileを明示してください"
+        return _github_body_file_reason(body_file, "Issue body")
+
+    if issue_command in {"close", "reopen"}:
+        value_options = common_options | ({(None, "--reason")} if issue_command == "close" else set())
+        positional = _strict_gh_args(issue_args, value_options)
+        if positional is None:
+            return "Issue lifecycleでは許可された引数だけを正規形で指定してください"
+        target_reason = _github_target_reason(positional, f"Issue {issue_command}")
+        if target_reason:
+            return target_reason
+        if issue_command == "close":
+            reasons = _option_values(issue_args, None, "--reason")
+            if reasons is None or len(reasons) > 1:
+                return "Issue closeのreasonは1件だけ指定してください"
+            if reasons and reasons[0] not in {"completed", "not planned"}:
+                return "Issue closeのreasonが許可範囲外です"
+        return None
+
+    return "許可されていないGitHub Issue操作です"
+
+
+def _pr_write_reason(pr_command, pr_args, cwd):
+    repository = _required_option(pr_args, "-R", "--repo")
+    if not repository or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        return "PR書き込みには対象repositoryを明示してください"
+    repository_reason = _repository_reason(repository, cwd)
+    if repository_reason:
+        return repository_reason
+
+    common_options = {("-R", "--repo")}
+    if pr_command == "edit":
+        value_options = common_options | {
+            ("-F", "--body-file"), ("-t", "--title"),
+            (None, "--add-label"), (None, "--remove-label"),
+            (None, "--add-assignee"), (None, "--remove-assignee"),
+            (None, "--milestone"), (None, "--add-reviewer"),
+            (None, "--remove-reviewer"),
+        }
+        positional = _strict_gh_args(pr_args, value_options, {"--remove-milestone"})
+        if positional is None:
+            return "PR編集では許可された引数だけを正規形で指定してください"
+        target_reason = _github_target_reason(positional, "PR編集")
+        if target_reason:
+            return target_reason
+        titles = _option_values(pr_args, "-t", "--title")
+        body_files = _option_values(pr_args, "-F", "--body-file")
+        if titles is None or len(titles) > 1 or body_files is None or len(body_files) > 1:
+            return "PR編集のtitleとbody-fileはそれぞれ1件までです"
+        title = titles[0] if titles else None
+        body_file = body_files[0] if body_files else None
+        mutation = bool(title or body_file or "--remove-milestone" in pr_args)
+        metadata_pairs = (
+            (None, "--add-label"), (None, "--remove-label"),
+            (None, "--add-assignee"), (None, "--remove-assignee"),
+            (None, "--milestone"), (None, "--add-reviewer"),
+            (None, "--remove-reviewer"),
+        )
+        metadata_values = []
+        for short, long in metadata_pairs:
+            values = _option_values(pr_args, short, long)
+            if values is None:
+                return "PR編集のmetadata引数に値を明示してください"
+            mutation = mutation or bool(values)
+            metadata_values.extend(values)
+        if not mutation:
+            return "PR編集にはtitle、body-file、label、assignee、milestone、reviewerの変更を明示してください"
+        reason = _github_text_reason(([title] if title else []) + metadata_values, "PR編集値")
+        if reason:
+            return reason
+        return _github_body_file_reason(body_file, "PR body") if body_file else None
+
+    if pr_command == "comment":
+        positional = _strict_gh_args(
+            pr_args, common_options | {("-F", "--body-file")}
+        )
+        if positional is None:
+            return "PR commentでは許可された引数だけを正規形で指定してください"
+        target_reason = _github_target_reason(positional, "PR comment")
+        if target_reason:
+            return target_reason
+        body_file = _required_option(pr_args, "-F", "--body-file")
+        if not body_file:
+            return "PR commentにはbody-fileを明示してください"
+        return _github_body_file_reason(body_file, "PR body")
+
+    if pr_command == "review":
+        switches = {"--approve", "--request-changes", "--comment"}
+        positional = _strict_gh_args(
+            pr_args, common_options | {("-F", "--body-file")}, switches
+        )
+        if positional is None:
+            return "PR reviewでは許可された引数だけを正規形で指定してください"
+        target_reason = _github_target_reason(positional, "PR review")
+        if target_reason:
+            return target_reason
+        actions = [switch for switch in switches if switch in pr_args]
+        if len(actions) != 1:
+            return "PR reviewのactionは1件だけ明示してください"
+        body_files = _option_values(pr_args, "-F", "--body-file")
+        if body_files is None or len(body_files) > 1:
+            return "PR reviewのbody-fileは1件までです"
+        body_file = body_files[0] if body_files else None
+        return _github_body_file_reason(body_file, "PR body") if body_file else None
+
+    if pr_command == "ready":
+        positional = _strict_gh_args(pr_args, common_options, {"--undo"})
+    elif pr_command in {"close", "reopen", "update-branch"}:
+        positional = _strict_gh_args(pr_args, common_options)
+    else:
+        return "許可されていないGitHub PR操作です"
+    if positional is None:
+        return "PR lifecycleでは許可された引数だけを正規形で指定してください"
+    target_reason = _github_target_reason(positional, f"PR {pr_command}")
+    if target_reason:
+        return target_reason
+    if pr_command == "update-branch":
+        return _pr_update_branch_preflight_reason(cwd, repository, positional[0])
     return None
 
 
@@ -893,6 +1137,14 @@ def _gh_invocation_reason(tokens, cwd=None):
         return "GitHub commandはPATHからghを直接実行してください"
     if start != 0:
         return "GitHub commandをwrapper、環境変数、cwd変更経由で実行できません"
+    if any("$" in token or "`" in token for token in tokens):
+        return "GitHub commandでshell展開を使用できません"
+    if os.environ.get("GH_HOST", "github.com").casefold() != "github.com":
+        return "GitHub接続先hostを環境変数で変更できません"
+    if "--hostname" in tokens or any(
+        token.startswith("--hostname=") for token in tokens
+    ):
+        return "GitHub接続先hostを変更できません"
     if "--help" in tokens[start + 1:] or "-h" in tokens[start + 1:]:
         return None
     command, args = _first_command(tokens[start + 1:], GH_GLOBAL_OPTS_WITH_VALUE)
@@ -902,7 +1154,7 @@ def _gh_invocation_reason(tokens, cwd=None):
         issue_command, issue_args = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
         if issue_command is None or issue_command in {"list", "status", "view"}:
             return None
-        if issue_command in {"create", "edit", "comment"}:
+        if issue_command in {"create", "edit", "comment", "close", "reopen"}:
             if os.environ.get("GH_HOST", "github.com").casefold() != "github.com":
                 return "GitHub書き込み先hostを環境変数で変更できません"
             if "--hostname" in tokens or any(
@@ -916,6 +1168,13 @@ def _gh_invocation_reason(tokens, cwd=None):
             return "GitHub Issueの削除は許可されていません"
         return "許可されていないGitHub Issue操作です"
     if command == "api":
+        if any(
+            token in {"-H", "--header"}
+            or token.startswith(("-H", "--header="))
+            or token.startswith(("//", "http://", "https://"))
+            for token in args
+        ):
+            return "gh apiではhostまたは認証headerを変更できません"
         return "gh apiはGETの読み取り専用利用に限られます" if _gh_api_is_write(args) else None
     if command == "pr":
         subcommand, pr_args = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
@@ -927,9 +1186,17 @@ def _gh_invocation_reason(tokens, cwd=None):
             ):
                 return "GitHub書き込み先hostを変更できません"
             return _pr_create_reason(pr_args, cwd)
+        if subcommand in {"edit", "comment", "review", "ready", "close", "reopen", "update-branch"}:
+            if os.environ.get("GH_HOST", "github.com").casefold() != "github.com":
+                return "GitHub書き込み先hostを環境変数で変更できません"
+            if "--hostname" in tokens or any(
+                token.startswith("--hostname=") for token in tokens
+            ):
+                return "GitHub書き込み先hostを変更できません"
+            return _pr_write_reason(subcommand, pr_args, cwd)
         if subcommand is None or subcommand in GH_READ_ONLY["pr"]:
             return None
-        return "PRはDraft作成と読み取り専用操作だけ許可されます"
+        return "PRはDraft作成、通常lifecycle、読み取り専用操作だけ許可されます"
     if command in GH_READ_ONLY_TOP_LEVEL:
         return None
     if command in GH_READ_ONLY:
@@ -1022,6 +1289,8 @@ def _file_secret_reason(path):
         return "PR bodyに秘密情報らしい値が含まれています"
     if AI_ATTRIBUTION_RE.search(contents):
         return "PR bodyにCodexまたはOpenAIのAI帰属が含まれています"
+    if COPILOT_MENTION_RE.search(contents):
+        return "PR bodyに@copilot mentionを含めることはできません"
     return None
 
 
@@ -1215,10 +1484,15 @@ def _has_write_operation(tokens):
     command, args = _first_command(tokens[start + 1:], GH_GLOBAL_OPTS_WITH_VALUE)
     if command == "issue":
         subcommand, _ = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
-        return subcommand in {"create", "edit", "comment"}
+        return subcommand in {"create", "edit", "comment", "close", "reopen"}
     if command == "pr":
         subcommand, _ = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
-        return subcommand == "create"
+        return subcommand in {
+            "create", "edit", "comment", "review", "ready", "close", "reopen",
+            "update-branch",
+        }
+    if command == "api":
+        return _gh_api_is_write(args)
     return False
 
 

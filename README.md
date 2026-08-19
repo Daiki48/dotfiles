@@ -79,13 +79,20 @@ investigation, design, review, and diagnosis alone do not create a worktree. See
 boundaries. The managed root follows the [OpenAI Git worktrees documentation](https://learn.chatgpt.com/docs/environments/git-worktrees).
 
 Ordinary editing and testing run inside the sandbox. Hook-validated normal commits, pushes to
-the current non-protected work branch, and Draft PR creation are allowlisted so the workflow
-does not pause for approval. The hook rejects non-canonical writes, protected-branch or
-force/delete/tag pushes, repository mismatches, unsafe commit or PR metadata, and detected
-secrets. When a deletion is required, Codex first moves the target to
+the current non-protected work branch, Draft PR creation, and reversible Issue/PR lifecycle
+updates are allowlisted so the workflow does not pause for approval. The hook validates the
+current repository, explicit target IDs, canonical arguments, metadata, and detected secrets.
+It continues to reject protected-branch or force/delete/tag pushes, destructive cleanup,
+arbitrary GitHub API mutations, and repository mismatches. When a deletion is required, Codex first moves the target to
 `.codex-trash/<timestamp>/` and never stages or automatically removes that directory.
 The guard checks direct Bash invocations; arbitrary programs and same-user races remain
 outside its security boundary.
+
+The repository declares a required `required-ci` GitHub Actions job and the intended remote
+`main` Ruleset in `.github/rulesets/main.json`. The declaration does not prove that the remote
+Ruleset is active; apply it with explicit approval and verify its readback. See
+[GitHub CI・Ruleset運用ガイド](docs/github-guardrails.ja.md) for the check mapping, application,
+verification, and rollback procedure.
 
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, and Draft PRs are used

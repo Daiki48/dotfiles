@@ -72,4 +72,6 @@ PRが未mergeの間はworktreeを安全な再開点として保持する。`git 
 - 未実施の手動確認、残存リスク、計画との差異
 - push・PR作成を実施できなかった場合は、安全な再開条件
 
-mergeやIssue closeを実行せず、Daikiの最終判断を待つ。
+mergeは実行せず、Daikiの最終判断を待つ。追跡Issueは、依頼された完了条件が外部状態を
+含めて成立したことを確認できる場合だけcloseする。Draft PR作成だけを実装完了とみなして
+closeしない。
