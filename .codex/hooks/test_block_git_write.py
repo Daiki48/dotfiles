@@ -1038,6 +1038,7 @@ class GuardTest(unittest.TestCase):
             common.mkdir(parents=True)
             worktree.mkdir(parents=True)
             state.mkdir()
+            state.chmod(0o700)
             manifest = {
                 "version": 1,
                 "status": "ready",
@@ -1070,6 +1071,16 @@ class GuardTest(unittest.TestCase):
                 manifest["status"] = "failed"
                 manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
                 manifest_path.chmod(0o600)
+                self.assertIsNotNone(
+                    GUARD._managed_worktree_reason(repository, common, worktree)
+                )
+
+                manifest["status"] = "ready"
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                manifest_path.chmod(0o600)
+                external_state = root / "external-state"
+                state.rename(external_state)
+                state.symlink_to(external_state, target_is_directory=True)
                 self.assertIsNotNone(
                     GUARD._managed_worktree_reason(repository, common, worktree)
                 )

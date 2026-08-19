@@ -1386,11 +1386,20 @@ def _managed_worktree_reason(repository_root, common_git_dir, worktree_root):
     if worktree_root.parent != managed_repository or not TASK_ID_RE.fullmatch(worktree_root.name):
         return "requested cwdが登録対象のmanaged worktreeではありません"
 
-    manifest_path = managed_repository / ".state" / f"{worktree_root.name}.json"
+    state_root = managed_repository / ".state"
+    manifest_path = state_root / f"{worktree_root.name}.json"
     try:
+        state_metadata = state_root.lstat()
+        if (
+            stat.S_ISLNK(state_metadata.st_mode)
+            or not stat.S_ISDIR(state_metadata.st_mode)
+            or state_metadata.st_uid != os.getuid()
+            or state_metadata.st_mode & 0o077
+        ):
+            return "managed worktree state directoryを安全に検査できません"
         metadata = manifest_path.lstat()
         if (
-            manifest_path.is_symlink()
+            stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.getuid()
             or metadata.st_mode & 0o077
