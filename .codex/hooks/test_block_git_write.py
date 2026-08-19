@@ -353,6 +353,83 @@ class GuardTest(unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_allowed(command, "/workspace")
 
+    def test_issue_and_pr_lifecycle_writes_are_allowed(self):
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:
+            body.write("## 変更内容\n\n安全な本文です。\n")
+            body.flush()
+            commands = (
+                "gh issue create --repo owner/repo --title test --body-file " + body.name,
+                "gh issue edit 23 --repo owner/repo --add-label U3 --add-assignee daiki",
+                "gh issue edit 23 --repo owner/repo --remove-milestone",
+                "gh issue comment 23 --repo owner/repo --body-file " + body.name,
+                "gh issue close 23 --repo owner/repo --reason completed",
+                "gh issue reopen 23 --repo owner/repo",
+                "gh pr edit 25 --repo owner/repo --add-label U3",
+                "gh pr edit 25 --repo owner/repo --add-reviewer daiki",
+                "gh pr edit 25 --repo owner/repo --remove-reviewer daiki",
+                "gh pr edit 25 --repo owner/repo --body-file " + body.name,
+                "gh pr comment 25 --repo owner/repo --body-file " + body.name,
+                "gh pr review 25 --repo owner/repo --approve --body-file " + body.name,
+                "gh pr ready 25 --repo owner/repo --undo",
+                "gh pr close 25 --repo owner/repo",
+                "gh pr reopen 25 --repo owner/repo",
+                "gh pr update-branch 25 --repo owner/repo",
+            )
+            with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
+                for command in commands:
+                    with self.subTest(command=command):
+                        self.assert_allowed(command, "/workspace")
+
+    def test_lifecycle_writes_require_numeric_id_and_reject_unsafe_forms(self):
+        with (
+            tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body,
+            mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+        ):
+            body.write("安全な本文です。\n")
+            body.flush()
+            for command in (
+                "gh issue close https://github.com/owner/repo/issues/23 --repo owner/repo",
+                "gh issue reopen 0 --repo owner/repo",
+                "gh issue edit 23 --repo owner/repo --body inline",
+                "gh issue create --repo owner/repo --title test --body-file " + body.name
+                + " --assignee @copilot",
+                "gh issue close 23 --repo owner/repo --delete-branch",
+                "gh pr comment 25 --repo owner/repo --body inline",
+                "gh pr close 25 --repo owner/repo --delete-branch",
+                "gh pr update-branch 25 --repo owner/repo --rebase",
+                "gh pr merge 25 --repo owner/repo --squash",
+                "gh pr edit 25 --repo owner/repo --add-project project",
+                "gh issue comment 23 --repo attacker/repo --body-file " + body.name,
+                "gh pr review 25 --repo owner/repo --approve --comment",
+            ):
+                with self.subTest(command=command):
+                    self.assert_blocked(command, "/workspace")
+
+    def test_has_write_operation_matches_github_lifecycle(self):
+        for command in (
+            "gh issue close 23 --repo owner/repo",
+            "gh issue reopen 23 --repo owner/repo",
+            "gh pr edit 25 --repo owner/repo --add-label U3",
+            "gh pr comment 25 --repo owner/repo --body-file /tmp/body",
+            "gh pr review 25 --repo owner/repo --approve",
+            "gh pr ready 25 --repo owner/repo --undo",
+            "gh pr close 25 --repo owner/repo",
+            "gh pr reopen 25 --repo owner/repo",
+            "gh pr update-branch 25 --repo owner/repo",
+            "gh api repos/owner/repo -X PATCH -f name=test",
+        ):
+            with self.subTest(command=command):
+                tokens = next(GUARD._command_segments(command))
+                self.assertTrue(GUARD._has_write_operation(tokens))
+        for command in (
+            "gh issue view 23 --repo owner/repo",
+            "gh pr view 25 --repo owner/repo",
+            "gh api repos/owner/repo/issues/23 -X GET",
+        ):
+            with self.subTest(command=command):
+                tokens = next(GUARD._command_segments(command))
+                self.assertFalse(GUARD._has_write_operation(tokens))
+
     def test_draft_pr_with_explicit_fields_is_allowed(self):
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:
             body.write("## 概要\n\n設定を更新します。\n")
