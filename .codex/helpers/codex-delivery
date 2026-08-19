@@ -26,7 +26,7 @@ from typing import Any, Iterator
 
 
 MANIFEST_VERSION = 1
-RECEIPT_VERSION = 2
+RECEIPT_VERSION = 3
 STATE_VERSION = 1
 MAX_FILE_BYTES = 256 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -48,7 +48,10 @@ PR_RE = re.compile(r"^[1-9][0-9]{0,8}$")
 STRICT_GATE_MODE = "strict-ruleset"
 FREE_PRIVATE_GATE_MODE = "github-free-private"
 GATE_MODES = {STRICT_GATE_MODE, FREE_PRIVATE_GATE_MODE}
-FREE_PRIVATE_REPOSITORY = "daiki48/gasostudy"
+DECISIONS = {"autonomous", "human-approved"}
+RISKS = {"low", "medium", "high", "critical"}
+RISK_LEVEL = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+DECISION_LEVEL = {"autonomous": 0, "human-approved": 1}
 
 # These paths change the trust boundary or the ability to install/use this helper.
 SAFETY_PATH_PREFIXES = (
@@ -80,16 +83,43 @@ def _gate_mode(value: object) -> str:
 
 
 def _receipt_gate_mode(receipt: dict[str, Any]) -> str:
-    # v1 receiptはRuleset前提の旧形式としてのみ互換にする。
     return _gate_mode(receipt.get("gate_mode", STRICT_GATE_MODE))
 
 
+def _decision(value: object) -> str:
+    if not isinstance(value, str) or value not in DECISIONS:
+        raise DeliveryError("receipt decisionが不正です")
+    return value
+
+
+def _receipt_decision(receipt: dict[str, Any]) -> str:
+    """v3 decisionを正本にし、legacy receiptだけ旧flagを読み替える。"""
+    if "decision" in receipt:
+        return _decision(receipt["decision"])
+    approved = receipt.get("human_approved")
+    if type(approved) is bool:
+        return "human-approved" if approved else "autonomous"
+    raise DeliveryError("receipt decisionが不足しています")
+
+
+def _validate_legacy_decision(
+    *, version: int, risk: str, decision: str, gate_mode: str,
+) -> None:
+    # 旧receiptの制約は、decisionへの読み替え後も緩和しない。
+    if version in {1, 2} and risk in {"high", "critical"} and decision != "human-approved":
+        raise DeliveryError("legacy high/critical receiptにはhuman approvalが必要です")
+    if version in {1, 2} and gate_mode == FREE_PRIVATE_GATE_MODE and (
+        risk not in {"high", "critical"} or decision != "human-approved"
+    ):
+        raise DeliveryError("legacy github-free-private receiptにはhigh/criticalとhuman approvalが必要です")
+
+
 def _validate_gate_repository(repository: str, gate_mode: str) -> None:
-    mode = _gate_mode(gate_mode)
+    _gate_mode(gate_mode)
     if not isinstance(repository, str):
         raise DeliveryError("gate repositoryが不正です")
-    if mode == FREE_PRIVATE_GATE_MODE and repository.casefold() != FREE_PRIVATE_REPOSITORY:
-        raise DeliveryError("github-free-private gateはallowlist対象repositoryだけを許可します")
+    if REPO_RE.fullmatch(repository) is None:
+        raise DeliveryError("gate repository名が不正です")
 
 
 _HELD_LOCKS = threading.local()
@@ -491,27 +521,40 @@ def _receipt(
 ) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise DeliveryError("receiptはobjectである必要があります")
-    legacy_fields = {
+    common_fields = {
         "version", "kind", "task_id", "repository", "pr", "head_sha", "risk", "plan_id",
-        "actionable", "human_approved", "tests_passed", "neutral_review_passed",
-        "adversarial_review_passed", "changed_files", "created_at",
+        "actionable", "tests_passed", "neutral_review_passed", "adversarial_review_passed",
+        "changed_files", "created_at",
     }
+    legacy_fields = common_fields | {"human_approved"}
     current_repository = repository or _repository(root)
     version = payload.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise DeliveryError("receipt versionが不正です")
+    normalized = dict(payload)
     if version == 1:
         if set(payload) != legacy_fields:
             raise DeliveryError("legacy receipt schemaが一致しません")
-        # 旧receiptの意味はstrict-rulesetに固定し、呼び出し側で同じ検査を通す。
-        payload = dict(payload)
-        if payload.get("gate_mode", STRICT_GATE_MODE) != STRICT_GATE_MODE:
-            raise DeliveryError("legacy receiptのgate modeはstrict-rulesetだけを許可します")
-        payload["gate_mode"] = STRICT_GATE_MODE
+        if type(payload.get("human_approved")) is not bool:
+            raise DeliveryError("legacy receipt approvalが不正です")
+        normalized["gate_mode"] = STRICT_GATE_MODE
+        normalized["decision"] = _receipt_decision(payload)
+        normalized.pop("human_approved", None)
     elif version == RECEIPT_VERSION:
-        fields = legacy_fields | {"gate_mode"}
+        fields = common_fields | {"decision", "gate_mode"}
         if set(payload) != fields:
             raise DeliveryError("receipt schemaが一致しません")
+    elif version == 2:
+        fields = legacy_fields | {"gate_mode"}
+        if set(payload) != fields:
+            raise DeliveryError("legacy receipt schemaが一致しません")
+        if type(payload.get("human_approved")) is not bool:
+            raise DeliveryError("legacy receipt approvalが不正です")
+        normalized["decision"] = _receipt_decision(payload)
+        normalized.pop("human_approved", None)
     else:
         raise DeliveryError("receipt schemaが一致しません")
+    payload = normalized
     if payload.get("kind") != "review":
         raise DeliveryError("receipt kindが不正です")
     if payload.get("task_id") != task_id or payload.get("repository") != current_repository:
@@ -520,22 +563,24 @@ def _receipt(
     _validate_gate_repository(current_repository, gate_mode)
     if not isinstance(payload.get("pr"), int) or isinstance(payload.get("pr"), bool) or payload["pr"] < 1:
         raise DeliveryError("receipt PR番号が不正です")
-    if payload.get("head_sha") != head or payload.get("risk") not in {"low", "medium", "high", "critical"}:
+    if payload.get("head_sha") != head or payload.get("risk") not in RISKS:
         raise DeliveryError("receipt head/riskが不正です")
+    decision = _receipt_decision(payload)
+    if gate_mode == FREE_PRIVATE_GATE_MODE and payload["risk"] not in {"high", "critical"}:
+        raise DeliveryError("github-free-private receiptにはhigh/critical riskが必要です")
     if not isinstance(payload.get("plan_id"), str) or PLAN_RE.fullmatch(payload["plan_id"]) is None:
         raise DeliveryError("receipt Plan IDが不正です")
-    if payload.get("actionable") != 0 or not isinstance(payload.get("human_approved"), bool):
-        raise DeliveryError("receipt actionable/approvalが不正です")
+    if type(payload.get("actionable")) is not int or payload.get("actionable") != 0:
+        raise DeliveryError("receipt actionableが不正です")
     if any(payload.get(key) is not True for key in ("tests_passed", "neutral_review_passed", "adversarial_review_passed")):
         raise DeliveryError("receiptの必須検証flagが不足しています")
     if not isinstance(payload.get("changed_files"), list) or len(payload["changed_files"]) > MAX_ITEMS:
         raise DeliveryError("receipt changed-filesが不正です")
     if any(not isinstance(item, str) for item in payload["changed_files"]):
         raise DeliveryError("receipt changed-filesの型が不正です")
-    if gate_mode == FREE_PRIVATE_GATE_MODE and (
-        payload.get("risk") not in {"high", "critical"} or payload.get("human_approved") is not True
-    ):
-        raise DeliveryError("github-free-private receiptにはhigh/criticalとhuman approvalが必要です")
+    _validate_legacy_decision(
+        version=version, risk=payload["risk"], decision=decision, gate_mode=gate_mode,
+    )
     return payload
 
 
@@ -556,14 +601,18 @@ def _write_review_locked(
     adversarial_review_passed: bool, gate_mode: str = STRICT_GATE_MODE,
 ) -> dict[str, Any]:
     gate_mode = _gate_mode(gate_mode)
-    if risk not in {"low", "medium", "high", "critical"}:
+    if type(approved) is not bool:
+        raise DeliveryError("review decisionが不正です")
+    if risk not in RISKS:
         raise DeliveryError("riskはlow/medium/high/criticalのいずれかです")
     if not isinstance(pr, int) or isinstance(pr, bool) or pr < 1 or pr > 999_999_999:
         raise DeliveryError("PR番号が不正です")
     head = _oid(head)
     if not isinstance(plan, str) or PLAN_RE.fullmatch(plan) is None:
         raise DeliveryError("Plan IDが安全ではありません")
-    if not all((tests_passed, neutral_review_passed, adversarial_review_passed)):
+    if not all(type(flag) is bool for flag in (tests_passed, neutral_review_passed, adversarial_review_passed)) or not all(
+        (tests_passed, neutral_review_passed, adversarial_review_passed)
+    ):
         raise DeliveryError("tests/neutral/adversarial reviewの完了flagが必要です")
     repository = _repository(root)
     _validate_gate_repository(repository, gate_mode)
@@ -575,38 +624,39 @@ def _write_review_locked(
     _worktree_clean_head(worktree, head)
     changed = _changed_files(worktree, manifest["base_oid"], head)
     unsafe = [path for path in changed if _is_safety_path(path)]
-    if unsafe and not approved:
-        raise DeliveryError("安全境界差分はhuman-approvedのapprove-reviewが必要です")
-    if not approved and risk not in {"low", "medium"}:
-        raise DeliveryError("record-reviewはlow/mediumだけを許可します")
-    if approved and risk not in {"high", "critical"}:
-        raise DeliveryError("approve-reviewはhigh/criticalだけを許可します")
-    if gate_mode == FREE_PRIVATE_GATE_MODE and (not approved or risk not in {"high", "critical"}):
-        raise DeliveryError("github-free-privateはapprove-reviewのhigh/criticalだけを許可します")
+    if unsafe and risk not in {"high", "critical"}:
+        raise DeliveryError("安全境界差分にはhigh/critical riskが必要です")
+    if gate_mode == FREE_PRIVATE_GATE_MODE and risk not in {"high", "critical"}:
+        raise DeliveryError("github-free-private receiptにはhigh/critical riskが必要です")
+    decision = "human-approved" if approved else "autonomous"
     path = _receipt_path(repository, task_id, head)
     payload = {
         "version": RECEIPT_VERSION, "kind": "review", "task_id": task_id,
         "repository": repository, "pr": pr, "head_sha": head, "risk": risk,
-        "plan_id": plan, "actionable": 0, "human_approved": approved,
+        "plan_id": plan, "actionable": 0, "decision": decision,
         "tests_passed": True, "neutral_review_passed": True, "adversarial_review_passed": True,
         "changed_files": changed, "created_at": _now(), "gate_mode": gate_mode,
     }
     if path.exists() or path.is_symlink():
         existing = _load_receipt(root, task_id, head, repository)
-        existing_immutable = {key: value for key, value in existing.items() if key != "created_at"}
-        if existing.get("version") == 1:
-            existing_immutable["version"] = RECEIPT_VERSION
-        immutable = {key: value for key, value in payload.items() if key != "created_at"}
-        if approved and existing.get("risk") in {"low", "medium"} and existing.get("human_approved") is False:
-            upgrade_keys = {"version", "kind", "task_id", "repository", "pr", "head_sha", "plan_id", "actionable", "tests_passed", "neutral_review_passed", "adversarial_review_passed", "changed_files"}
-            if all((RECEIPT_VERSION if key == "version" and existing.get("version") == 1 else existing.get(key)) == payload.get(key) for key in upgrade_keys):
-                if existing.get("gate_mode", STRICT_GATE_MODE) != gate_mode:
-                    raise DeliveryError("同じheadのreceipt gate modeが異なります")
-                _atomic_json(path, payload)
-                return payload
-        if existing_immutable != immutable:
-            raise DeliveryError("同じheadのreceiptが既に存在し内容が異なります")
-        return existing
+        immutable_keys = {
+            "kind", "task_id", "repository", "pr", "head_sha", "plan_id", "actionable",
+            "tests_passed", "neutral_review_passed", "adversarial_review_passed", "changed_files",
+            "gate_mode",
+        }
+        if any(existing.get(key) != payload.get(key) for key in immutable_keys):
+            raise DeliveryError("同じheadのreceiptのfield/mode/Plan/evidenceが異なります")
+        existing_risk = existing.get("risk")
+        existing_decision = _receipt_decision(existing)
+        if existing_risk not in RISKS or RISK_LEVEL[risk] < RISK_LEVEL[existing_risk]:
+            raise DeliveryError("同じheadのreceipt riskをdowngradeできません")
+        if DECISION_LEVEL[decision] < DECISION_LEVEL[existing_decision]:
+            raise DeliveryError("同じheadのreceipt decisionをdowngradeできません")
+        if risk == existing_risk and decision == existing_decision:
+            # legacy fileはload時にだけ正規化し、自動書換えは行わない。
+            return existing
+        _atomic_json(path, payload)
+        return payload
     _atomic_json(path, payload)
     return payload
 
@@ -652,7 +702,7 @@ def _free_private_repository(root: Path, repository: str) -> None:
     if not isinstance(value, dict):
         raise DeliveryError("live repository readbackがobjectではありません")
     expected = {
-        "full_name": "Daiki48/gasostudy",
+        "full_name": repository,
         "private": True,
         "visibility": "private",
         "default_branch": "main",
@@ -889,6 +939,17 @@ def _validate_delivery(
     head = receipt["head_sha"]
     gate_mode = _receipt_gate_mode(receipt)
     _validate_gate_repository(repository, gate_mode)
+    if any(key in receipt for key in ("version", "decision", "human_approved")):
+        decision = _receipt_decision(receipt)
+        version = receipt.get("version")
+        if isinstance(version, bool) or (version is not None and not isinstance(version, int)):
+            raise DeliveryError("receipt versionが不正です")
+        if version == RECEIPT_VERSION and "human_approved" in receipt:
+            raise DeliveryError("v3 receiptにlegacy approval fieldがあります")
+        if version in {1, 2}:
+            _validate_legacy_decision(
+                version=version, risk=receipt.get("risk", ""), decision=decision, gate_mode=gate_mode,
+            )
     view = _pr_view(root, repository, pr)
     status_ok = (
         view.get("mergeStateStatus") in {"DRAFT", "CLEAN"}
@@ -954,13 +1015,21 @@ def _validate_receipt_evidence(
 ) -> None:
     gate_mode = _receipt_gate_mode(receipt)
     _validate_gate_repository(str(receipt.get("repository", "")), gate_mode)
+    decision = _receipt_decision(receipt)
+    version = receipt.get("version")
+    if isinstance(version, bool) or (version is not None and not isinstance(version, int)):
+        raise DeliveryError("receipt versionが不正です")
+    if version in {1, 2}:
+        _validate_legacy_decision(
+            version=version, risk=receipt.get("risk", ""), decision=decision, gate_mode=gate_mode,
+        )
+    if gate_mode == FREE_PRIVATE_GATE_MODE and receipt.get("risk") not in {"high", "critical"}:
+        raise DeliveryError("github-free-private receiptにはhigh/critical riskが必要です")
     changed = _changed_files(worktree, manifest["base_oid"], receipt["head_sha"])
     if changed != receipt["changed_files"]:
         raise DeliveryError("receiptのchanged-filesが固定headの差分と一致しません")
     if receipt["risk"] in {"low", "medium"} and any(_is_safety_path(path) for path in changed):
         raise DeliveryError("安全境界差分をlow/medium receiptでdeliveryできません")
-    if (receipt["risk"] in {"high", "critical"} or gate_mode == FREE_PRIVATE_GATE_MODE) and receipt["human_approved"] is not True:
-        raise DeliveryError("high/critical receiptにはhuman approvalが必要です")
 
 
 def _deliver_locked(
@@ -978,11 +1047,10 @@ def _deliver_locked(
     _match_cli_receipt(receipt, pr=expected_pr, head=expected_head, plan=expected_plan, gate_mode=expected_gate_mode)
     gate_mode = _receipt_gate_mode(receipt)
     _validate_gate_repository(repository, gate_mode)
-    if receipt["risk"] in {"high", "critical"} and receipt["human_approved"] is not True:
-        raise DeliveryError("high/critical receiptにはhuman approvalが必要です")
+    _receipt_decision(receipt)
     if receipt["risk"] not in {"low", "medium", "high", "critical"}:
         raise DeliveryError("receipt riskが不正です")
-    if receipt["actionable"] != 0:
+    if type(receipt["actionable"]) is not int or receipt["actionable"] != 0:
         raise DeliveryError("actionable reviewはdeliveryできません")
     if receipt["head_sha"] == manifest["base_oid"]:
         raise DeliveryError("baseと同じheadはdeliveryできません")
@@ -1018,6 +1086,12 @@ def _deliver_locked(
         _worktree(root, manifest, worktree)
         _worktree_clean_head(worktree, receipt["head_sha"])
         _validate_receipt_evidence(worktree, manifest, receipt)
+        # merge直前にもCI/review/repository policy/PR identityを再検証する。
+        # base fetchとの間、さらにGitHub側のmerge処理中には非atomicなraceが残るため、
+        # この検査だけでraceが消えるとは主張せず、固定head mergeの失敗を安全側に扱う。
+        _validate_delivery(
+            root, receipt, allow_draft=False, expected_branch=manifest["branch"], inspected_base=inspected_base,
+        )
         state_path = _state_path(repository, task_id)
         if state_path.exists() or state_path.is_symlink():
             state = _load_state(repository, task_id, receipt, manifest["branch"])
@@ -1054,7 +1128,8 @@ def _load_state(repository: str, task_id: str, receipt: dict[str, Any], branch: 
     if not isinstance(state, dict) or set(state) != expected:
         raise DeliveryError("delivery state schemaが不正です")
     if (
-        state["version"] != STATE_VERSION or state["kind"] != "delivery" or state["task_id"] != task_id
+        isinstance(state["version"], bool) or not isinstance(state["version"], int)
+        or state["version"] != STATE_VERSION or state["kind"] != "delivery" or state["task_id"] != task_id
         or state["repository"] != receipt["repository"] or state["pr"] != receipt["pr"]
         or state["head_sha"] != receipt["head_sha"] or state["branch"] != branch
         or state["stage"] not in {"merge_started", "merged", "main_synced", "remote_delete_started", "remote_deleted", "worktree_unlock_started", "worktree_removed", "completed"}
@@ -1144,6 +1219,7 @@ def _finish_locked(
     _match_cli_receipt(receipt, pr=expected_pr, head=expected_head, plan=expected_plan, gate_mode=expected_gate_mode)
     gate_mode = _receipt_gate_mode(receipt)
     _validate_gate_repository(repository, gate_mode)
+    _receipt_decision(receipt)
     state = _load_state(repository, task_id, receipt, manifest["branch"])
     with _task_lock(repository, task_id):
         # PRは毎回merged/head一致を確認し、途中で別PR/別headへ差し替えられないようにする。
@@ -1304,21 +1380,20 @@ def finish(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name, risks in (("record-review", ("low", "medium")), ("approve-review", ("high", "critical"))):
+    for name in ("record-review", "approve-review"):
         command = commands.add_parser(name)
         command.add_argument("--task-id", required=True)
         command.add_argument("--pr", required=True, type=int)
         command.add_argument("--head", required=True)
-        command.add_argument("--risk", required=True, choices=risks)
+        command.add_argument("--risk", required=True, choices=tuple(sorted(RISKS, key=RISK_LEVEL.get)))
         command.add_argument("--plan-id", required=True)
         command.add_argument("--tests-passed", action="store_true")
         command.add_argument("--neutral-review-passed", action="store_true")
         command.add_argument("--adversarial-review-passed", action="store_true")
-        if name == "approve-review":
-            # 省略時は従来どおりstrict-ruleset。Free/privateは明示指定だけを許可する。
-            command.add_argument(
-                "--gate-mode", choices=(FREE_PRIVATE_GATE_MODE,), default=STRICT_GATE_MODE,
-            )
+        # 省略時は従来どおりstrict-ruleset。Free/privateは明示指定だけを許可する。
+        command.add_argument(
+            "--gate-mode", choices=(FREE_PRIVATE_GATE_MODE,), default=STRICT_GATE_MODE,
+        )
     deliver_parser = commands.add_parser("deliver")
     deliver_parser.add_argument("--task-id", required=True)
     deliver_parser.add_argument("--pr", required=True, type=int)
@@ -1367,7 +1442,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "record-review":
         payload = _write_review(
             root, _task_id(args.task_id), args.pr, args.head, args.risk, args.plan_id, False,
-            args.tests_passed, args.neutral_review_passed, args.adversarial_review_passed,
+            args.tests_passed, args.neutral_review_passed, args.adversarial_review_passed, args.gate_mode,
         )
     elif args.command == "approve-review":
         payload = _write_review(

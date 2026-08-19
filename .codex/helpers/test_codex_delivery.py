@@ -66,13 +66,15 @@ class DeliveryTest(unittest.TestCase):
         ])
         self.assertEqual((deliver.pr, deliver.head, deliver.plan_id), (24, "b" * 40, "CODEX-DELIVERY-TEST-v1"))
 
-    def test_gate_mode_is_absent_from_record_review_and_explicit_for_free_private(self) -> None:
+    def test_gate_mode_is_explicit_for_free_private_on_both_review_commands(self) -> None:
         common = [
             "--task-id", "issue-24", "--pr", "24", "--head", "b" * 40,
             "--plan-id", "CODEX-DELIVERY-TEST-v1",
         ]
-        with self.assertRaises(SystemExit):
-            HELPER._parser().parse_args(["record-review", *common, "--risk", "low", "--gate-mode", "github-free-private"])
+        record_free = HELPER._parser().parse_args([
+            "record-review", *common, "--risk", "low", "--gate-mode", "github-free-private",
+        ])
+        self.assertEqual(record_free.gate_mode, HELPER.FREE_PRIVATE_GATE_MODE)
         approve = HELPER._parser().parse_args(["approve-review", *common, "--risk", "high"])
         self.assertEqual(approve.gate_mode, HELPER.STRICT_GATE_MODE)
         with self.assertRaises(SystemExit):
@@ -87,7 +89,7 @@ class DeliveryTest(unittest.TestCase):
             args = HELPER._parser().parse_args([command, *common, "--gate-mode", "github-free-private"])
             self.assertEqual(args.gate_mode, HELPER.FREE_PRIVATE_GATE_MODE)
 
-    def test_v1_receipt_is_normalized_to_strict_and_free_requires_approval_and_allowlist(self) -> None:
+    def test_legacy_receipt_is_normalized_without_relaxing_old_constraints(self) -> None:
         with self.assertRaises(HELPER.DeliveryError):
             HELPER._receipt([], root=self.root, task_id="issue-24", head="b" * 40, repository="owner/repo")
         legacy = {
@@ -98,37 +100,69 @@ class DeliveryTest(unittest.TestCase):
             "changed_files": ["src/main.py"], "created_at": "now",
         }
         normalized = HELPER._receipt(legacy, root=self.root, task_id="issue-24", head="b" * 40, repository="owner/repo")
-        self.assertEqual(normalized["gate_mode"], HELPER.STRICT_GATE_MODE)
+        self.assertEqual(
+            (normalized["gate_mode"], normalized["decision"], normalized["version"]),
+            (HELPER.STRICT_GATE_MODE, "autonomous", 1),
+        )
+        self.assertNotIn("human_approved", normalized)
         with self.assertRaises(HELPER.DeliveryError):
             HELPER._receipt(
                 {**legacy, "gate_mode": HELPER.STRICT_GATE_MODE}, root=self.root,
                 task_id="issue-24", head="b" * 40, repository="owner/repo",
             )
-        free = {**legacy, "version": 2, "repository": "Daiki48/gasostudy", "risk": "high", "human_approved": True,
+        high_false = {**legacy, "risk": "high"}
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._receipt(high_false, root=self.root, task_id="issue-24", head="b" * 40, repository="owner/repo")
+        free = {**legacy, "version": 2, "repository": "Owner/Repo", "risk": "high", "human_approved": True,
                 "gate_mode": HELPER.FREE_PRIVATE_GATE_MODE}
+        normalized_free = HELPER._receipt(free, root=self.root, task_id="issue-24", head="b" * 40,
+                                          repository="Owner/Repo")
+        self.assertEqual(normalized_free["decision"], "human-approved")
         with self.assertRaises(HELPER.DeliveryError):
-            HELPER._receipt({**free, "risk": "low"}, root=self.root, task_id="issue-24", head="b" * 40,
-                            repository="Daiki48/gasostudy")
+            HELPER._receipt({**free, "human_approved": False}, root=self.root, task_id="issue-24", head="b" * 40,
+                            repository="Owner/Repo")
+
+    def test_v3_receipt_separates_risk_and_decision_and_rejects_bool_version(self) -> None:
+        base = {
+            "version": 3, "kind": "review", "task_id": "issue-24", "repository": "owner/repo",
+            "pr": 24, "head_sha": "b" * 40, "risk": "high", "plan_id": "CODEX-DELIVERY-TEST-v1",
+            "actionable": 0, "decision": "autonomous", "tests_passed": True,
+            "neutral_review_passed": True, "adversarial_review_passed": True,
+            "changed_files": ["src/main.py"], "created_at": "now", "gate_mode": HELPER.STRICT_GATE_MODE,
+        }
+        value = HELPER._receipt(base, root=self.root, task_id="issue-24", head="b" * 40, repository="owner/repo")
+        self.assertEqual((value["risk"], value["decision"]), ("high", "autonomous"))
+        self.assertNotIn("human_approved", value)
         with self.assertRaises(HELPER.DeliveryError):
-            HELPER._receipt(free, root=self.root, task_id="issue-24", head="b" * 40, repository="other/repo")
+            HELPER._receipt({**base, "version": True}, root=self.root, task_id="issue-24", head="b" * 40,
+                            repository="owner/repo")
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._receipt({**base, "human_approved": True}, root=self.root, task_id="issue-24", head="b" * 40,
+                            repository="owner/repo")
 
     def test_free_private_repository_policy_requires_exact_live_readback(self) -> None:
         good = {
-            "full_name": "Daiki48/gasostudy", "visibility": "private",
+            "full_name": "Owner/Repo", "visibility": "private",
             "private": True, "default_branch": "main", "archived": False, "disabled": False,
             "allow_merge_commit": True, "allow_auto_merge": False,
         }
         with mock.patch.object(HELPER, "_gh_json", return_value=good):
-            HELPER._free_private_repository(self.root, "Daiki48/gasostudy")
-        for key, value in (("full_name", "Daiki48/other"), ("visibility", "public"),
+            HELPER._free_private_repository(self.root, "Owner/Repo")
+        second = {**good, "full_name": "Second/Project"}
+        with mock.patch.object(HELPER, "_gh_json", return_value=second):
+            HELPER._free_private_repository(self.root, "Second/Project")
+        for key, value in (("full_name", "Owner/Other"), ("visibility", "public"),
                            ("private", False), ("default_branch", "develop"), ("archived", True),
                            ("disabled", True), ("allow_merge_commit", False), ("allow_auto_merge", True)):
             with self.subTest(key=key), mock.patch.object(HELPER, "_gh_json", return_value={**good, key: value}):
                 with self.assertRaises(HELPER.DeliveryError):
-                    HELPER._free_private_repository(self.root, "Daiki48/gasostudy")
+                    HELPER._free_private_repository(self.root, "Owner/Repo")
         with mock.patch.object(HELPER, "_gh_json", return_value={**good, "private": 1}):
             with self.assertRaises(HELPER.DeliveryError):
-                HELPER._free_private_repository(self.root, "Daiki48/gasostudy")
+                HELPER._free_private_repository(self.root, "Owner/Repo")
+        with mock.patch.object(HELPER, "_gh_json", return_value=good):
+            with self.assertRaises(HELPER.DeliveryError):
+                HELPER._free_private_repository(self.root, "Other/Project")
 
     def test_free_private_does_not_fallback_on_network_error(self) -> None:
         failure = HELPER.DeliveryError("network")
@@ -140,7 +174,7 @@ class DeliveryTest(unittest.TestCase):
         head = "b" * 40
         receipt = {
             "repository": "Daiki48/gasostudy", "pr": 24, "head_sha": head,
-            "gate_mode": HELPER.FREE_PRIVATE_GATE_MODE, "risk": "high", "human_approved": True,
+            "gate_mode": HELPER.FREE_PRIVATE_GATE_MODE, "risk": "high", "decision": "autonomous",
         }
         view = {
             "state": "OPEN", "isDraft": False, "headRefOid": head,
@@ -181,7 +215,8 @@ class DeliveryTest(unittest.TestCase):
         with mock.patch.object(HELPER, "_fetch_main", return_value="b" * 40):
             HELPER._assert_merge_base_unchanged(self.root, ["a" * 40, "b" * 40])
 
-    def _record(self, changed: list[str], *, approve: bool = False) -> dict[str, object]:
+    def _record(self, changed: list[str], *, approve: bool = False, risk: str | None = None,
+                gate_mode: str = HELPER.STRICT_GATE_MODE) -> dict[str, object]:
         head = "b" * 40
         with mock.patch.object(HELPER, "_repository", return_value="owner/repo"), \
              mock.patch.object(HELPER, "_manifest", return_value=(self.manifest, self.worktree)), \
@@ -189,8 +224,8 @@ class DeliveryTest(unittest.TestCase):
              mock.patch.object(HELPER, "_git", side_effect=["b" * 40, "", "b" * 40]), \
              mock.patch.object(HELPER, "_changed_files", return_value=changed):
             return HELPER._write_review(
-                self.root, "issue-24", 24, head, "high" if approve else "low", "CODEX-DELIVERY-TEST-v1", approve,
-                True, True, True,
+                self.root, "issue-24", 24, head, risk or ("high" if approve else "low"),
+                "CODEX-DELIVERY-TEST-v1", approve, True, True, True, gate_mode,
             )
 
     def test_record_review_writes_head_scoped_machine_receipt_and_is_idempotent(self) -> None:
@@ -199,7 +234,8 @@ class DeliveryTest(unittest.TestCase):
         self.assertTrue(path.is_file())
         saved = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(saved["actionable"], 0)
-        self.assertEqual((saved["version"], saved["gate_mode"]), (2, HELPER.STRICT_GATE_MODE))
+        self.assertEqual((saved["version"], saved["gate_mode"], saved["decision"]), (3, HELPER.STRICT_GATE_MODE, "autonomous"))
+        self.assertNotIn("human_approved", saved)
         again = self._record(["src/main.py"])
         self.assertEqual(receipt, again)
 
@@ -208,15 +244,61 @@ class DeliveryTest(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(HELPER.DeliveryError):
                 self._record([path])
         receipt = self._record([".github/workflows/ci.yml"], approve=True)
-        self.assertTrue(receipt["human_approved"])
-        self.assertEqual(receipt["risk"], "high")
+        self.assertEqual((receipt["decision"], receipt["risk"]), ("human-approved", "high"))
 
     def test_human_approval_can_upgrade_same_head_receipt(self) -> None:
         low = self._record(["src/main.py"])
-        self.assertFalse(low["human_approved"])
+        self.assertEqual(low["decision"], "autonomous")
         high = self._record(["src/main.py"], approve=True)
-        self.assertTrue(high["human_approved"])
-        self.assertEqual(high["risk"], "high")
+        self.assertEqual((high["decision"], high["risk"]), ("human-approved", "high"))
+
+    def test_each_risk_is_available_to_both_commands_with_separate_decision(self) -> None:
+        for risk in ("low", "medium", "high", "critical"):
+            with self.subTest(command="record-review", risk=risk):
+                self.assertEqual(self._record(["src/main.py"], risk=risk)["decision"], "autonomous")
+            with self.subTest(command="approve-review", risk=risk):
+                # approve on a new head to avoid same-head monotonicity constraints.
+                head = ("c" if risk != "critical" else "d") * 40
+                with mock.patch.object(HELPER, "_repository", return_value="owner/repo"), \
+                     mock.patch.object(HELPER, "_manifest", return_value=(self.manifest, self.worktree)), \
+                     mock.patch.object(HELPER, "_worktree"), \
+                     mock.patch.object(HELPER, "_git", side_effect=[head, "", head]), \
+                     mock.patch.object(HELPER, "_changed_files", return_value=["src/main.py"]):
+                    result = HELPER._write_review(
+                        self.root, "issue-24", 24, head, risk, "CODEX-DELIVERY-TEST-v1", True, True, True, True,
+                    )
+                self.assertEqual(result["decision"], "human-approved")
+
+    def test_safety_path_requires_high_risk_but_not_human_decision(self) -> None:
+        result = self._record([".github/workflows/ci.yml"], risk="high")
+        self.assertEqual((result["risk"], result["decision"]), ("high", "autonomous"))
+
+    def test_free_private_requires_high_risk_but_not_human_decision(self) -> None:
+        with self.assertRaises(HELPER.DeliveryError):
+            self._record(["src/main.py"], risk="medium", gate_mode=HELPER.FREE_PRIVATE_GATE_MODE)
+        result = self._record(
+            ["src/main.py"], risk="high", gate_mode=HELPER.FREE_PRIVATE_GATE_MODE,
+        )
+        self.assertEqual((result["risk"], result["decision"]), ("high", "autonomous"))
+        invalid = {
+            **result, "risk": "medium", "gate_mode": HELPER.FREE_PRIVATE_GATE_MODE,
+        }
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._receipt(
+                invalid, root=self.root, task_id="issue-24", head="b" * 40,
+                repository="owner/repo",
+            )
+
+    def test_same_head_updates_only_allow_risk_upgrade_and_autonomous_to_human(self) -> None:
+        self._record(["src/main.py"], risk="medium")
+        upgraded = self._record(["src/main.py"], approve=False, risk="high")
+        self.assertEqual((upgraded["risk"], upgraded["decision"]), ("high", "autonomous"))
+        approved = self._record(["src/main.py"], approve=True, risk="high")
+        self.assertEqual(approved["decision"], "human-approved")
+        with self.assertRaises(HELPER.DeliveryError):
+            self._record(["src/main.py"], approve=False, risk="critical")
+        with self.assertRaises(HELPER.DeliveryError):
+            self._record(["src/main.py"], approve=True, risk="medium")
 
     def test_receipt_identity_mismatch_is_fail_closed_before_network(self) -> None:
         receipt = self._record(["src/main.py"])
@@ -402,7 +484,7 @@ class DeliveryTest(unittest.TestCase):
 
     def test_receipt_changed_files_are_recomputed_and_must_match_exactly(self) -> None:
         receipt = {
-            "risk": "low", "human_approved": False,
+            "risk": "low", "decision": "autonomous",
             "head_sha": "b" * 40, "changed_files": ["src/main.py"],
         }
         with mock.patch.object(HELPER, "_changed_files", return_value=["src/other.py"]):
@@ -488,14 +570,27 @@ class DeliveryTest(unittest.TestCase):
         with self.assertRaises(HELPER.DeliveryError):
             HELPER._load_state("owner/repo", "issue-24", receipt, "feat/issue-24")
 
+    def test_delivery_state_bool_version_spoof_is_rejected(self) -> None:
+        receipt = {
+            "repository": "owner/repo", "pr": 24, "head_sha": "b" * 40,
+        }
+        path = self.codex_home / "worktrees" / HELPER._repo_key("owner/repo") / ".state" / "issue-24.delivery.json"
+        path.write_text(json.dumps({
+            "version": True, "kind": "delivery", "task_id": "issue-24", "repository": "owner/repo",
+            "pr": 24, "head_sha": "b" * 40, "branch": "feat/issue-24", "stage": "merged",
+            "updated_at": "now", "last_error": "",
+        }), encoding="utf-8")
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._load_state("owner/repo", "issue-24", receipt, "feat/issue-24")
+
     def test_deliver_success_uses_ready_fixed_head_merge_and_persists_state(self) -> None:
         head = "b" * 40
         receipt = {
-            "version": 1, "kind": "review", "task_id": "issue-24", "repository": "owner/repo",
+            "version": 3, "kind": "review", "task_id": "issue-24", "repository": "owner/repo",
             "pr": 24, "head_sha": head, "risk": "low", "plan_id": "CODEX-DELIVERY-TEST-v1",
-            "actionable": 0, "human_approved": False, "tests_passed": True,
+            "actionable": 0, "decision": "autonomous", "tests_passed": True,
             "neutral_review_passed": True, "adversarial_review_passed": True,
-            "changed_files": ["src/main.py"], "created_at": "now",
+            "changed_files": ["src/main.py"], "created_at": "now", "gate_mode": HELPER.STRICT_GATE_MODE,
         }
         draft = {"state": "OPEN", "isDraft": True, "headRefOid": head}
         open_pr = {
@@ -529,7 +624,7 @@ class DeliveryTest(unittest.TestCase):
                 expected_plan="CODEX-DELIVERY-TEST-v1",
             )
         self.assertEqual(state["stage"], "merged")
-        assert_base.assert_called_once_with(self.root, ["a" * 40, "a" * 40])
+        assert_base.assert_called_once_with(self.root, ["a" * 40, "a" * 40, "a" * 40])
         self.assertEqual(
             gh.call_args_list,
             [
@@ -543,10 +638,11 @@ class DeliveryTest(unittest.TestCase):
     def _finish_mock(self, stage: str, *, unlocked_dirty: bool = False, remote: str | None = None) -> tuple[dict[str, object], list[list[str]], mock.Mock]:
         head = "b" * 40
         receipt = {
-            "version": 1, "kind": "review", "task_id": "issue-24", "repository": "owner/repo",
+            "version": 3, "kind": "review", "task_id": "issue-24", "repository": "owner/repo",
             "pr": 24, "head_sha": head, "risk": "low", "plan_id": "CODEX-DELIVERY-TEST-v1", "actionable": 0,
-            "human_approved": False, "tests_passed": True, "neutral_review_passed": True,
+            "decision": "autonomous", "tests_passed": True, "neutral_review_passed": True,
             "adversarial_review_passed": True, "changed_files": ["src/main.py"], "created_at": "now",
+            "gate_mode": HELPER.STRICT_GATE_MODE,
         }
         state = {"version": 1, "kind": "delivery", "task_id": "issue-24", "repository": "owner/repo", "pr": 24,
                  "head_sha": head, "branch": "feat/issue-24", "stage": stage, "updated_at": "now", "last_error": ""}
