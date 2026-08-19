@@ -24,8 +24,8 @@ CLIとhelperの配布、managed writable rootの設定・移行は次のコマ�
 cargo run -- codex
 ```
 
-設定を反映するため、実行後はCodexを再起動してください。helperがPATHから見えることを
-確認できます。
+installerは`~/.local/bin`が`PATH`に含まれることを事前検査します。設定を反映するため、
+実行後はCodexを再起動してください。helperがPATHから見えることを確認できます。
 
 ```sh
 command -v codex-worktree

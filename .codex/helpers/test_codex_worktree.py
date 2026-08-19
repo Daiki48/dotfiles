@@ -158,6 +158,32 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(len(paths), 2)
         self.assertTrue(all(Path(path).exists() for path in paths))
 
+    def test_safe_environment_removes_command_bearing_git_variables(self):
+        unsafe = {
+            "GIT_EXEC_PATH": "/tmp/commands",
+            "GIT_SSH": "/tmp/ssh",
+            "GIT_SSH_COMMAND": "malicious command",
+            "GIT_ASKPASS": "/tmp/askpass",
+            "SSH_ASKPASS": "/tmp/ssh-askpass",
+            "GIT_PROXY_COMMAND": "malicious proxy",
+        }
+        with mock.patch.dict(os.environ, unsafe, clear=False):
+            environment = HELPER._safe_environment()
+        self.assertTrue(unsafe.keys().isdisjoint(environment))
+
+    def test_diagnose_rejects_symlinked_managed_root(self):
+        HELPER.create_worktree(
+            self.repo.repository, "feat/root-link", "task-root-link", allow_local_origin=True,
+        )
+        root = self.repo.codex_home / "worktrees"
+        external = self.repo.codex_home / "external-worktrees"
+        root.rename(external)
+        root.symlink_to(external, target_is_directory=True)
+        with self.assertRaises(HELPER.WorktreeError):
+            HELPER.diagnose(
+                self.repo.repository, "task-root-link", allow_local_origin=True,
+            )
+
     def test_doctor_and_resume_report_ready_dirty_and_missing(self):
         target = HELPER.create_worktree(
             self.repo.repository, "feat/doctor", "task-doctor", allow_local_origin=True,

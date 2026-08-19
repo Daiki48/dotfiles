@@ -48,19 +48,37 @@ class GuardTest(unittest.TestCase):
             mock.patch.object(GUARD, "_default_branch_switch_reason", return_value=None),
             mock.patch.object(GUARD, "_current_work_branch_reason", return_value=None),
             mock.patch.object(GUARD, "_clean_worktree_reason", return_value=None),
+            mock.patch.object(GUARD, "_git_write_target", return_value=("/workspace", None)),
         ):
             for command in (
                 "git fetch origin main",
-                "git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin main",
-                "git switch main",
-                "git switch -c feature/example origin/main",
-                "git switch --create fix/example origin/master",
                 "git add -- src/main.rs README.md",
                 "git commit -m ':wrench: 設定を更新'",
                 "git commit -S -m ':bug: Fix startup failure'",
                 "git push -u origin HEAD:refs/heads/feature/example",
                 "git push --set-upstream origin HEAD:refs/heads/refactor/example",
             ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "/workspace")
+
+    def test_pull_and_switch_require_explicit_single_checkout_rollback(self):
+        commands = (
+            "git pull --ff-only --no-rebase --no-autostash --no-recurse-submodules origin main",
+            "git switch main",
+            "git switch -c feature/example origin/main",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
+        with (
+            mock.patch.dict(
+                GUARD.os.environ, {"CODEX_WORKTREE_MODE": "single-checkout"}, clear=False
+            ),
+            mock.patch.object(GUARD, "_pull_preflight_reason", return_value=None),
+            mock.patch.object(GUARD, "_default_branch_switch_reason", return_value=None),
+            mock.patch.object(GUARD, "_clean_worktree_reason", return_value=None),
+        ):
+            for command in commands:
                 with self.subTest(command=command):
                     self.assert_allowed(command, "/workspace")
 
@@ -212,6 +230,15 @@ class GuardTest(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command)
+
+    def test_command_substitution_is_always_blocked(self):
+        for command in (
+            'git status "$(git push -u origin HEAD:refs/heads/feature/example)"',
+            'git status "$(rm -rf /tmp/target)"',
+            "git status `git push -u origin HEAD:refs/heads/feature/example`",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
 
     def test_newline_separated_read_commands_are_allowed(self):
         for command in (
@@ -1010,6 +1037,23 @@ class GuardTest(unittest.TestCase):
                 )
                 self.assertIsNotNone(reason)
                 self.assertIn("symlink component", reason)
+
+    def test_managed_worktree_rejects_symlinked_worktrees_root(self):
+        with tempfile.TemporaryDirectory(prefix="guard-worktree-root-link-") as directory:
+            root = Path(directory)
+            codex_home = root / "codex-home"
+            external = root / "external" / GUARD._repository_key("owner/repo") / "task-safe"
+            external.mkdir(parents=True)
+            codex_home.mkdir()
+            (codex_home / "worktrees").symlink_to(root / "external", target_is_directory=True)
+            with (
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}),
+                mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+            ):
+                reason = GUARD._managed_worktree_reason(
+                    root / "repository", root / "repository/.git", external
+                )
+            self.assertIsNotNone(reason)
 
 
 if __name__ == "__main__":

@@ -96,7 +96,8 @@ def _safe_environment() -> dict[str, str]:
         if key in {
             "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
             "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
-            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_SYSTEM", "GIT_EXEC_PATH", "GIT_SSH", "GIT_SSH_COMMAND",
+            "GIT_ASKPASS", "SSH_ASKPASS", "GIT_PROXY_COMMAND",
         } or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
             environment.pop(key, None)
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -239,6 +240,23 @@ def _ensure_directory(path: Path, parent: Path | None = None) -> None:
         raise WorktreeError(f"安全な管理directoryではありません: {path}")
 
 
+def _reject_symlink_components(path: Path) -> None:
+    """既存のpath componentがsymlinkまたは非directoryなら拒否する。"""
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise WorktreeError(f"管理pathを安全に検査できません: {current}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise WorktreeError(f"symlink componentを拒否しました: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise WorktreeError(f"管理pathのcomponentがdirectoryではありません: {current}")
+
+
 def _managed_paths(
     repository: Repository,
     task_id: str,
@@ -255,6 +273,7 @@ def _managed_paths(
     repository_root = root / repository.key
     state_root = repository_root / ".state"
     lock_root = repository_root / ".locks"
+    _reject_symlink_components(lock_root)
     if create:
         _ensure_directory(root, codex_home)
         _ensure_directory(repository_root, root)

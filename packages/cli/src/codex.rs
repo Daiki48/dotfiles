@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::utils::{create_symlink, run_command};
 
@@ -411,95 +412,6 @@ fn sync_managed_hook(template: &str, existing: &str) -> String {
     format!("{}\n\n{MANAGED_HOOK_CONFIG}\n", cleaned.trim_end())
 }
 
-fn toml_string_array(line: &str, key: &str) -> Result<(Vec<String>, usize)> {
-    let trimmed = line.trim_start();
-    let rest = trimmed
-        .strip_prefix(key)
-        .filter(|rest| rest.trim_start().starts_with('='))
-        .and_then(|rest| rest.trim_start().strip_prefix('='))
-        .map(str::trim_start)
-        .with_context(|| format!("Invalid {key} assignment"))?;
-    let open = rest
-        .find('[')
-        .with_context(|| format!("{key} must be a TOML string array"))?;
-    let close = rest
-        .rfind(']')
-        .with_context(|| format!("{key} must be a TOML string array"))?;
-    if close < open {
-        anyhow::bail!("{key} must be a single-line TOML string array");
-    }
-    let suffix = rest[close + 1..].trim_start();
-    if !suffix.is_empty() && !suffix.starts_with('#') {
-        anyhow::bail!("{key} must be a single-line TOML string array");
-    }
-
-    let mut values = Vec::new();
-    let mut chars = rest[open + 1..close].chars().peekable();
-    loop {
-        while chars
-            .peek()
-            .is_some_and(|character| character.is_whitespace())
-        {
-            chars.next();
-        }
-        if chars.peek().is_none() {
-            break;
-        }
-        let quote = chars
-            .next()
-            .filter(|character| *character == '"' || *character == '\'')
-            .with_context(|| format!("{key} contains an unquoted value"))?;
-        let mut value = String::new();
-        loop {
-            let character = chars
-                .next()
-                .with_context(|| format!("{key} contains an unterminated string"))?;
-            if character == quote {
-                break;
-            }
-            if character == '\\' && quote == '"' {
-                let escaped = chars
-                    .next()
-                    .with_context(|| format!("{key} contains an invalid escape"))?;
-                value.push(match escaped {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    '\\' => '\\',
-                    '"' => '"',
-                    other => other,
-                });
-            } else {
-                value.push(character);
-            }
-        }
-        values.push(value);
-        while chars
-            .peek()
-            .is_some_and(|character| character.is_whitespace())
-        {
-            chars.next();
-        }
-        match chars.next() {
-            None => break,
-            Some(',') => {}
-            Some(_) => anyhow::bail!("{key} must contain comma-separated strings"),
-        }
-    }
-    Ok((values, close))
-}
-
-fn toml_escape_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn managed_root_assignment(root: &Path) -> String {
-    format!(
-        "writable_roots = [\"{}\"]",
-        toml_escape_string(&root.to_string_lossy())
-    )
-}
-
 fn ensure_managed_writable_root(contents: &str, managed_root: &Path) -> Result<String> {
     let root = managed_root.to_str().with_context(|| {
         format!(
@@ -510,55 +422,30 @@ fn ensure_managed_writable_root(contents: &str, managed_root: &Path) -> Result<S
     if !managed_root.is_absolute() {
         anyhow::bail!("Managed worktree root must be absolute: {root}");
     }
-    let assignment = managed_root_assignment(managed_root);
-    let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
-    let section_start = lines
-        .iter()
-        .position(|line| table_header(line) == Some("[sandbox_workspace_write]"));
-    let Some(section_start) = section_start else {
-        if !lines.is_empty() {
-            lines.push(String::new());
-        }
-        lines.push("[sandbox_workspace_write]".to_owned());
-        lines.push(assignment);
-        return Ok(format!("{}\n", lines.join("\n")));
-    };
-    let section_end = lines
-        .iter()
-        .enumerate()
-        .skip(section_start + 1)
-        .find_map(|(index, line)| table_header(line).map(|_| index))
-        .unwrap_or(lines.len());
-    let writable_roots_line = lines[section_start + 1..section_end]
-        .iter()
-        .position(|line| is_assignment_for(line, &["writable_roots"]))
-        .map(|offset| section_start + 1 + offset);
-    if let Some(index) = writable_roots_line {
-        let (mut roots, close) = toml_string_array(&lines[index], "writable_roots")?;
-        if !roots.iter().any(|existing| existing == root) {
-            roots.push(root.to_owned());
-        }
-        let indentation = &lines[index][..lines[index].len() - lines[index].trim_start().len()];
-        let trimmed = lines[index].trim_start();
-        let rest = trimmed
-            .strip_prefix("writable_roots")
-            .and_then(|value| value.trim_start().strip_prefix('='))
-            .map(str::trim_start)
-            .expect("writable_roots assignment was already identified");
-        let suffix = &rest[close + 1..];
-        let values = roots
-            .iter()
-            .map(|value| format!("\"{}\"", toml_escape_string(value)))
-            .collect::<Vec<_>>();
-        lines[index] = format!(
-            "{indentation}writable_roots = [{}]{}",
-            values.join(", "),
-            suffix
-        );
-    } else {
-        lines.insert(section_start + 1, assignment);
+    let mut document = contents
+        .parse::<DocumentMut>()
+        .context("Codex config must be valid TOML before adding writable_roots")?;
+    let sandbox = document
+        .entry("sandbox_workspace_write")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .context("sandbox_workspace_write must be a TOML table")?;
+    let roots = sandbox
+        .entry("writable_roots")
+        .or_insert_with(|| value(Array::new()))
+        .as_array_mut()
+        .context("writable_roots must be a TOML string array")?;
+    if roots.iter().any(|item| item.as_str().is_none()) {
+        anyhow::bail!("writable_roots must contain only TOML strings");
     }
-    Ok(format!("{}\n", lines.join("\n")))
+    if !roots.iter().any(|item| item.as_str() == Some(root)) {
+        roots.push(root);
+    }
+    let mut rendered = document.to_string();
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    Ok(rendered)
 }
 
 fn backup_legacy_config(codex_dir: &Path) -> Result<()> {
@@ -664,16 +551,45 @@ fn regular_file_exists(path: &Path) -> Result<bool> {
     }
 }
 
+fn reject_symlink_directory_components(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "Symlink directory component is not allowed: {}",
+                    current.display()
+                )
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                anyhow::bail!(
+                    "Managed path component is not a directory: {}",
+                    current.display()
+                )
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
-    if let Some(parent) = destination.parent()
-        && !parent.exists()
-    {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create managed hook directory {}",
-                parent.display()
-            )
-        })?;
+    if let Some(parent) = destination.parent() {
+        reject_symlink_directory_components(parent)?;
+        if !parent.exists() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create managed hook directory {}",
+                    parent.display()
+                )
+            })?;
+        }
     }
     let source_contents = fs::read_to_string(source)
         .with_context(|| format!("Failed to read managed hook source {}", source.display()))?;
@@ -1072,6 +988,15 @@ pub fn setup() -> Result<()> {
     codex_check()?;
 
     let home = home::home_dir().context("Cannot find home directory")?;
+    let helper_directory = home.join(".local/bin");
+    let helper_on_path = std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|path| path == helper_directory));
+    if !helper_on_path {
+        anyhow::bail!(
+            "{} must be present in PATH before installing codex-worktree",
+            helper_directory.display()
+        );
+    }
     let codex_dir = resolve_codex_home(&home)?;
     if !codex_dir.exists() {
         println!("\nCreating CODEX_HOME directory: {}", codex_dir.display());
@@ -1346,6 +1271,23 @@ description = "local"
             fs::read_to_string(managed_hook_state_path(&destination)).expect("read state"),
             sha256("hook\n")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_hook_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("managed-hook-parent-symlink");
+        let source = directory.path().join("source.py");
+        let real_parent = directory.path().join("real-hooks");
+        let linked_parent = directory.path().join("linked-hooks");
+        fs::write(&source, "hook\n").expect("write source");
+        fs::create_dir(&real_parent).expect("create real parent");
+        symlink(&real_parent, &linked_parent).expect("create parent symlink");
+
+        assert!(ensure_managed_hook(&source, &linked_parent.join("hook.py")).is_err());
+        assert!(!real_parent.join("hook.py").exists());
     }
 
     #[test]
@@ -1635,6 +1577,32 @@ exclude_tmpdir_env_var = true
         assert!(merged.contains("\"/srv/other\""));
         assert!(merged.contains(&format!("\"{}\"", managed_root.display())));
         assert!(merged.contains("# keep these roots"));
+        assert_eq!(
+            ensure_managed_writable_root(&merged, &managed_root).expect("repeat merge"),
+            merged
+        );
+    }
+
+    #[test]
+    fn writable_roots_accept_multiline_toml_and_preserve_comments_and_escapes() {
+        let directory = TestDirectory::new("multiline-writable-roots");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let existing = r#"[sandbox_workspace_write] # local options
+writable_roots = [
+  "/srv/other", # keep this root
+  "C:\\Users\\example",
+]
+exclude_tmpdir_env_var = true
+"#;
+
+        let merged = ensure_managed_writable_root(existing, &managed_root)
+            .expect("merge multiline writable roots");
+        assert!(merged.contains("/srv/other"));
+        assert!(merged.contains("# keep this root"));
+        assert!(merged.contains(r#"C:\\Users\\example"#));
+        assert!(merged.contains(&managed_root.to_string_lossy().to_string()));
+        assert!(merged.contains("exclude_tmpdir_env_var = true"));
         assert_eq!(
             ensure_managed_writable_root(&merged, &managed_root).expect("repeat merge"),
             merged

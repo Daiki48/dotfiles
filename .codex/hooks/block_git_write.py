@@ -100,6 +100,10 @@ GIT_WRITE_ENVIRONMENT_KEYS = {
     "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
 }
+GIT_SANITIZED_ENVIRONMENT_KEYS = GIT_WRITE_ENVIRONMENT_KEYS | {
+    "GIT_EXEC_PATH", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS",
+    "SSH_ASKPASS", "GIT_PROXY_COMMAND",
+}
 AI_ATTRIBUTION_RE = re.compile(
     r"(?i)(?:co-authored-by|generated(?:-| )by|signed-off-by)\s*:\s*.*"
     r"(?:codex|openai|chatgpt|claude|gemini|copilot|\bai(?:\s+(?:assistant|agent|bot))?\b)"
@@ -441,7 +445,19 @@ def _git_push_reason(args, cwd):
 def _git_write_target(session_cwd, explicit_cwd):
     """git -Cで明示されたmanaged worktreeを検証し、実行rootを返す。"""
     if explicit_cwd is None:
-        return session_cwd, None
+        if os.environ.get("CODEX_WORKTREE_MODE") == "single-checkout":
+            return session_cwd, None
+        session_root = _resolved_git_path(session_cwd, "--show-toplevel")
+        session_common = _resolved_git_path(session_cwd, "--git-common-dir")
+        if session_root is None or session_common is None:
+            return None, "Git書き込みのsession repositoryを確認できません"
+        main_root = session_common.parent
+        if session_root == main_root:
+            return None, "Git書き込みは専用managed worktreeで実行してください"
+        reason = _managed_worktree_reason(main_root, session_common, session_root)
+        if reason:
+            return None, reason
+        return str(session_root), None
     if not isinstance(session_cwd, str) or not session_cwd:
         return None, "Git書き込みのsession cwdを確認できません"
     candidate = Path(explicit_cwd)
@@ -536,6 +552,8 @@ def _git_invocation_reason(tokens, cwd=None):
             return _git_read_reason(token, args, global_option_used)
         if token not in GIT_SAFE_WRITE:
             return "許可されていないGit書き込み操作です"
+        if token in {"pull", "switch"} and os.environ.get("CODEX_WORKTREE_MODE") != "single-checkout":
+            return "git pull/switchは明示的なsingle-checkout rollback時だけ使用できます"
         if other_global_option_used:
             return "Git書き込みではglobal optionや別repository指定を使用できません"
         effective_cwd, target_reason = _git_write_target(cwd, explicit_cwd)
@@ -1009,7 +1027,7 @@ def _run_git(cwd, *args):
     environment = os.environ.copy()
     for key in list(environment):
         if (
-            key in GIT_WRITE_ENVIRONMENT_KEYS
+            key in GIT_SANITIZED_ENVIRONMENT_KEYS
             or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
         ):
             environment.pop(key, None)
@@ -1241,6 +1259,8 @@ def blocked_reason(command, cwd=None, depth=0):
     """連結コマンドと入れ子shellを調べ、禁止操作の理由を返す。"""
     if depth > 3:
         return "入れ子が深いshellコマンドは安全性を確認できません"
+    if "$(" in command or "`" in command:
+        return "command substitutionを含むcommandは安全に検査できません"
     segments = list(_command_segments(command))
     has_write = any(_has_write_operation(tokens) for tokens in segments)
     if has_write and (depth > 0 or len(segments) != 1):
@@ -1340,6 +1360,20 @@ def _managed_worktree_reason(repository_root, common_git_dir, worktree_root):
         if current != codex_home and not stat.S_ISDIR(metadata.st_mode):
             return "CODEX_HOMEの親がdirectoryではありません"
     repository_key = _repository_key(repository)
+    expected_worktree = codex_home / "worktrees" / repository_key / worktree_root.name
+    if worktree_root != expected_worktree:
+        return "requested cwdが登録対象のmanaged worktreeではありません"
+    current = Path(expected_worktree.anchor)
+    for part in expected_worktree.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError:
+            return "managed worktree pathを安全に解決できません"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "managed worktree pathのsymlink componentを許可できません"
+        if not stat.S_ISDIR(metadata.st_mode):
+            return "managed worktree pathのcomponentがdirectoryではありません"
     try:
         managed_repository = (codex_home / "worktrees" / repository_key).resolve(strict=True)
         worktree_root = worktree_root.resolve(strict=True)
