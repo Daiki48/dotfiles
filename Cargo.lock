@@ -120,6 +120,7 @@ dependencies = [
  "anyhow",
  "clap",
  "home",
+ "libc",
  "sha2",
  "toml_edit",
 ]

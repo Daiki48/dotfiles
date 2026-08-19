@@ -5,6 +5,12 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::{
+    ffi::{CStr, OsStr},
+    os::unix::ffi::OsStrExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::utils::{create_symlink, run_command};
@@ -15,9 +21,23 @@ const CODEX_FILES: &[(&str, &str)] = &[
 ];
 const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/block_git_write.py";
 const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/block_git_write.py";
-const MANAGED_HELPERS: &[(&str, &str)] = &[
-    (".codex/helpers/codex-worktree", ".local/bin/codex-worktree"),
-    (".codex/helpers/codex-delivery", ".local/bin/codex-delivery"),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedInstallMode {
+    PreserveSource,
+    OwnerExecutable,
+}
+
+const MANAGED_HELPERS: &[(&str, &str, ManagedInstallMode)] = &[
+    (
+        ".codex/helpers/codex-worktree",
+        ".local/bin/codex-worktree",
+        ManagedInstallMode::PreserveSource,
+    ),
+    (
+        ".codex/helpers/codex-delivery",
+        ".local/bin/codex-delivery",
+        ManagedInstallMode::OwnerExecutable,
+    ),
 ];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 
@@ -103,13 +123,26 @@ fn contains_legacy_profile_config(contents: &str) -> bool {
 }
 
 fn copy_file_exclusive(source: &Path, destination: &Path) -> Result<()> {
+    let permissions = fs::metadata(source)
+        .with_context(|| format!("Failed to inspect permissions for {}", source.display()))?
+        .permissions();
+    copy_file_exclusive_with_permissions(source, destination, permissions)
+}
+
+fn copy_file_exclusive_with_permissions(
+    source: &Path,
+    destination: &Path,
+    permissions: fs::Permissions,
+) -> Result<()> {
     let mut destination_created = false;
     let copy_result = (|| {
         let mut input = fs::File::open(source)
             .with_context(|| format!("Failed to open {}", source.display()))?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut output = options
             .open(destination)
             .with_context(|| format!("Failed to create {}", destination.display()))?;
         destination_created = true;
@@ -120,9 +153,6 @@ fn copy_file_exclusive(source: &Path, destination: &Path) -> Result<()> {
                 destination.display()
             )
         })?;
-        let permissions = fs::metadata(source)
-            .with_context(|| format!("Failed to inspect permissions for {}", source.display()))?
-            .permissions();
         fs::set_permissions(destination, permissions)
             .with_context(|| format!("Failed to set permissions on {}", destination.display()))?;
         output
@@ -144,9 +174,11 @@ fn write_file_exclusive(
     contents: &str,
     permissions: fs::Permissions,
 ) -> Result<()> {
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut output = options
         .open(destination)
         .with_context(|| format!("Failed to create {}", destination.display()))?;
     output
@@ -493,9 +525,11 @@ fn write_file_temp(path: &Path, contents: &str, permissions: fs::Permissions) ->
     ));
     let mut temp_created = false;
     let write_result = (|| {
-        let mut temp = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut temp = options
             .open(&temp_path)
             .with_context(|| format!("Failed to create temporary {}", temp_path.display()))?;
         temp_created = true;
@@ -581,7 +615,47 @@ fn reject_symlink_directory_components(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
+fn installed_permissions(source: &fs::Permissions, mode: ManagedInstallMode) -> fs::Permissions {
+    #[cfg(unix)]
+    if mode == ManagedInstallMode::OwnerExecutable {
+        return fs::Permissions::from_mode(0o700);
+    }
+    source.clone()
+}
+
+fn repair_managed_permissions(
+    destination: &Path,
+    expected: &fs::Permissions,
+    mode: ManagedInstallMode,
+) -> Result<bool> {
+    if mode == ManagedInstallMode::PreserveSource {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        let current = fs::metadata(destination)
+            .with_context(|| {
+                format!(
+                    "Failed to inspect permissions for {}",
+                    destination.display()
+                )
+            })?
+            .permissions();
+        if current.mode() & 0o7777 != expected.mode() & 0o7777 {
+            fs::set_permissions(destination, expected.clone()).with_context(|| {
+                format!("Failed to repair permissions on {}", destination.display())
+            })?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_managed_hook(
+    source: &Path,
+    destination: &Path,
+    install_mode: ManagedInstallMode,
+) -> Result<()> {
     if let Some(parent) = destination.parent() {
         reject_symlink_directory_components(parent)?;
         if !parent.exists() {
@@ -598,6 +672,7 @@ fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
     let source_permissions = fs::metadata(source)
         .with_context(|| format!("Failed to inspect managed hook source {}", source.display()))?
         .permissions();
+    let destination_permissions = installed_permissions(&source_permissions, install_mode);
     let source_hash = sha256(&source_contents);
     let state_path = managed_hook_state_path(destination);
     let state_exists = regular_file_exists(&state_path)?;
@@ -617,7 +692,7 @@ fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
                 destination.display()
             );
         }
-        copy_file_exclusive(source, destination)?;
+        copy_file_exclusive_with_permissions(source, destination, destination_permissions.clone())?;
         if let Err(error) = write_file_exclusive(&state_path, &source_hash, source_permissions) {
             let _ = fs::remove_file(destination);
             return Err(error);
@@ -649,7 +724,11 @@ fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
                 .unwrap_or("block_git_write.py")
         ));
         copy_symlink_exclusive(destination, &backup_path)?;
-        replace_regular_file(destination, &source_contents, source_permissions.clone())?;
+        replace_regular_file(
+            destination,
+            &source_contents,
+            destination_permissions.clone(),
+        )?;
         write_file_exclusive(&state_path, &source_hash, source_permissions)?;
         println!(
             "- Migrated managed hook to local copy (symlink backup: {}).",
@@ -682,7 +761,14 @@ fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
         );
     }
     if existing_hash == source_hash && recorded.as_deref() == Some(source_hash.as_str()) {
-        println!("- Local managed hook is up to date.");
+        if repair_managed_permissions(destination, &destination_permissions, install_mode)? {
+            println!(
+                "- Repaired local managed file permissions: {}.",
+                destination.display()
+            );
+        } else {
+            println!("- Local managed hook is up to date.");
+        }
         return Ok(());
     }
     let timestamp = SystemTime::now()
@@ -697,7 +783,7 @@ fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
             .unwrap_or("block_git_write.py")
     ));
     copy_file_exclusive(destination, &backup_path)?;
-    replace_regular_file(destination, &source_contents, source_permissions.clone())?;
+    replace_regular_file(destination, &source_contents, destination_permissions)?;
     replace_regular_file(&state_path, &source_hash, source_permissions)?;
     println!(
         "- Updated local managed hook (backup: {}).",
@@ -932,6 +1018,88 @@ fn resolve_codex_home(home: &Path) -> Result<PathBuf> {
     Ok(candidate)
 }
 
+fn validate_setup_home(configured: PathBuf, account: PathBuf) -> Result<PathBuf> {
+    validate_absolute_path(&configured)?;
+    validate_absolute_path(&account)?;
+    if configured != account {
+        anyhow::bail!(
+            "HOME must match the current account home: configured={}, account={}",
+            configured.display(),
+            account.display()
+        );
+    }
+    Ok(account)
+}
+
+#[cfg(unix)]
+fn account_home_dir() -> Result<PathBuf> {
+    const DEFAULT_BUFFER: usize = 16 * 1024;
+    const MAX_BUFFER: usize = 1024 * 1024;
+    // SAFETY: getuid and sysconf do not dereference pointers or retain state supplied by Rust.
+    let uid = unsafe { libc::getuid() };
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut size = if suggested > 0 {
+        usize::try_from(suggested).unwrap_or(DEFAULT_BUFFER)
+    } else {
+        DEFAULT_BUFFER
+    }
+    .clamp(DEFAULT_BUFFER, MAX_BUFFER);
+    loop {
+        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; size];
+        // SAFETY: record, buffer, and result are valid writable storage for the duration of
+        // getpwuid_r. The returned pw_dir points into buffer and is copied before it is dropped.
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && size < MAX_BUFFER {
+            size = (size * 2).min(MAX_BUFFER);
+            continue;
+        }
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(status))
+                .context("Failed to resolve current account home");
+        }
+        if result.is_null() {
+            anyhow::bail!("Current account is missing from the password database");
+        }
+        // SAFETY: a successful getpwuid_r initialized record and returned a non-null result.
+        let record = unsafe { record.assume_init() };
+        if record.pw_dir.is_null() {
+            anyhow::bail!("Current account home is missing from the password database");
+        }
+        // SAFETY: POSIX passwd strings are NUL-terminated and remain valid while buffer lives.
+        let bytes = unsafe { CStr::from_ptr(record.pw_dir) }.to_bytes();
+        if bytes.is_empty() {
+            anyhow::bail!("Current account home is empty");
+        }
+        return Ok(PathBuf::from(OsStr::from_bytes(bytes)));
+    }
+}
+
+#[cfg(unix)]
+fn setup_home_dir() -> Result<PathBuf> {
+    let configured = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .context("HOME must be set to the current account home")?;
+    validate_setup_home(configured, account_home_dir()?)
+}
+
+#[cfg(not(unix))]
+fn setup_home_dir() -> Result<PathBuf> {
+    let home = home::home_dir().context("Cannot find home directory")?;
+    validate_absolute_path(&home)?;
+    Ok(home)
+}
+
 fn ensure_private_directory(path: &Path) -> Result<()> {
     validate_absolute_path(path)?;
     match fs::symlink_metadata(path) {
@@ -989,7 +1157,7 @@ pub fn setup() -> Result<()> {
 
     codex_check()?;
 
-    let home = home::home_dir().context("Cannot find home directory")?;
+    let home = setup_home_dir()?;
     let helper_directory = home.join(".local/bin");
     let helper_on_path = std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|path| path == helper_directory));
@@ -1015,9 +1183,14 @@ pub fn setup() -> Result<()> {
     ensure_managed_hook(
         &dotfiles_path.join(MANAGED_HOOK_SOURCE),
         &home.join(MANAGED_HOOK_DESTINATION),
+        ManagedInstallMode::PreserveSource,
     )?;
-    for (source, destination) in MANAGED_HELPERS {
-        ensure_managed_hook(&dotfiles_path.join(source), &home.join(destination))?;
+    for (source, destination, install_mode) in MANAGED_HELPERS {
+        ensure_managed_hook(
+            &dotfiles_path.join(source),
+            &home.join(destination),
+            *install_mode,
+        )?;
     }
     println!("\nLinking shared skill directories...");
     for (source, dest) in CODEX_DIRS {
@@ -1041,12 +1214,14 @@ pub fn setup() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::account_home_dir;
     use super::{
-        MANAGED_HELPERS, MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND,
+        MANAGED_HELPERS, MANAGED_HOOK_COMMAND, ManagedInstallMode, RETIRED_HOOK_COMMAND,
         contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
         ensure_managed_hook, ensure_managed_writable_root, ensure_private_directory,
         managed_hook_state_path, merge_managed_config, merge_managed_config_with_root,
-        migrate_managed_config_from_template, sha256, verify_managed_symlink,
+        migrate_managed_config_from_template, sha256, validate_setup_home, verify_managed_symlink,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1059,8 +1234,16 @@ mod tests {
         assert_eq!(
             MANAGED_HELPERS,
             &[
-                (".codex/helpers/codex-worktree", ".local/bin/codex-worktree"),
-                (".codex/helpers/codex-delivery", ".local/bin/codex-delivery"),
+                (
+                    ".codex/helpers/codex-worktree",
+                    ".local/bin/codex-worktree",
+                    ManagedInstallMode::PreserveSource,
+                ),
+                (
+                    ".codex/helpers/codex-delivery",
+                    ".local/bin/codex-delivery",
+                    ManagedInstallMode::OwnerExecutable,
+                ),
             ]
         );
     }
@@ -1212,7 +1395,8 @@ description = "local"
         fs::write(&source, "old hook\n").expect("write source");
         symlink(&source, &destination).expect("create managed symlink");
 
-        ensure_managed_hook(&source, &destination).expect("migrate managed hook");
+        ensure_managed_hook(&source, &destination, ManagedInstallMode::PreserveSource)
+            .expect("migrate managed hook");
 
         assert!(
             !fs::symlink_metadata(&destination)
@@ -1240,14 +1424,119 @@ description = "local"
         fs::write(managed_hook_state_path(&destination), sha256("old hook\n"))
             .expect("write state");
 
-        ensure_managed_hook(&source, &destination).expect("update managed hook");
+        ensure_managed_hook(&source, &destination, ManagedInstallMode::PreserveSource)
+            .expect("update managed hook");
         assert_eq!(
             fs::read_to_string(&destination).expect("read hook"),
             "new hook\n"
         );
 
         fs::write(&destination, "local change\n").expect("change hook");
-        assert!(ensure_managed_hook(&source, &destination).is_err());
+        assert!(
+            ensure_managed_hook(&source, &destination, ManagedInstallMode::PreserveSource,)
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_helper_is_installed_private_and_repairs_managed_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("delivery-helper-mode");
+        let source = directory.path().join("codex-delivery");
+        let destination = directory.path().join("bin").join("codex-delivery");
+        fs::write(&source, "#!/bin/sh\n").expect("write delivery helper");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).expect("set source mode");
+
+        ensure_managed_hook(&source, &destination, ManagedInstallMode::OwnerExecutable)
+            .expect("install delivery helper");
+        assert_eq!(
+            fs::metadata(&destination)
+                .expect("inspect installed helper")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::read_to_string(managed_hook_state_path(&destination)).expect("read state"),
+            sha256("#!/bin/sh\n")
+        );
+
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+            .expect("introduce managed mode drift");
+        ensure_managed_hook(&source, &destination, ManagedInstallMode::OwnerExecutable)
+            .expect("repair managed delivery helper mode");
+        assert_eq!(
+            fs::metadata(&destination)
+                .expect("inspect repaired helper")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_helper_does_not_chmod_a_local_modification() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("delivery-helper-local");
+        let source = directory.path().join("codex-delivery");
+        let destination = directory.path().join("codex-delivery-installed");
+        fs::write(&source, "reviewed\n").expect("write delivery helper");
+        ensure_managed_hook(&source, &destination, ManagedInstallMode::OwnerExecutable)
+            .expect("install delivery helper");
+        fs::write(&destination, "local change\n").expect("change installed helper");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+            .expect("set local mode");
+
+        assert!(
+            ensure_managed_hook(&source, &destination, ManagedInstallMode::OwnerExecutable)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read local helper"),
+            "local change\n"
+        );
+        assert_eq!(
+            fs::metadata(&destination)
+                .expect("inspect local helper")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn setup_home_must_match_the_account_home() {
+        let account = PathBuf::from("/home/account");
+        assert_eq!(
+            validate_setup_home(account.clone(), account.clone()).expect("matching home"),
+            account
+        );
+        assert!(
+            validate_setup_home(
+                PathBuf::from("/home/configured"),
+                PathBuf::from("/home/account"),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_setup_home(PathBuf::from("relative"), PathBuf::from("/home/account")).is_err()
+        );
+        assert!(validate_setup_home(PathBuf::new(), PathBuf::from("/home/account")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_account_home_is_resolved_from_the_password_database() {
+        let account_home = account_home_dir().expect("resolve current account home");
+        assert!(account_home.is_absolute());
+        assert!(!account_home.as_os_str().is_empty());
     }
 
     #[test]
@@ -1258,7 +1547,8 @@ description = "local"
         fs::write(&source, "hook\n").expect("write source");
         fs::write(&destination, "hook\n").expect("write hook");
 
-        ensure_managed_hook(&source, &destination).expect("repair missing state");
+        ensure_managed_hook(&source, &destination, ManagedInstallMode::PreserveSource)
+            .expect("repair missing state");
 
         assert_eq!(
             fs::read_to_string(managed_hook_state_path(&destination)).expect("read state"),
@@ -1273,7 +1563,8 @@ description = "local"
         let destination = directory.path().join("hooks").join("hook.py");
         fs::write(&source, "hook\n").expect("write source");
 
-        ensure_managed_hook(&source, &destination).expect("install hook in new directory");
+        ensure_managed_hook(&source, &destination, ManagedInstallMode::PreserveSource)
+            .expect("install hook in new directory");
 
         assert_eq!(
             fs::read_to_string(&destination).expect("read hook"),
@@ -1298,7 +1589,14 @@ description = "local"
         fs::create_dir(&real_parent).expect("create real parent");
         symlink(&real_parent, &linked_parent).expect("create parent symlink");
 
-        assert!(ensure_managed_hook(&source, &linked_parent.join("hook.py")).is_err());
+        assert!(
+            ensure_managed_hook(
+                &source,
+                &linked_parent.join("hook.py"),
+                ManagedInstallMode::PreserveSource,
+            )
+            .is_err()
+        );
         assert!(!real_parent.join("hook.py").exists());
     }
 
