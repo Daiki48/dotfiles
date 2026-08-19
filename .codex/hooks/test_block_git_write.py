@@ -853,7 +853,9 @@ class GuardTest(unittest.TestCase):
                 )
             )
 
-        linked = Path("/tmp/codex-home/worktrees/owner--repo/task-safe")
+        linked = Path(
+            f"/tmp/codex-home/worktrees/{GUARD._repository_key('owner/repo')}/task-safe"
+        )
         with (
             mock.patch.object(
                 GUARD,
@@ -897,7 +899,12 @@ class GuardTest(unittest.TestCase):
             root = Path(directory)
             repository = root / "repository"
             common = repository / ".git"
-            worktree = root / "codex-home/worktrees/owner--repo/task-safe"
+            worktree = (
+                root
+                / "codex-home/worktrees"
+                / GUARD._repository_key("owner/repo")
+                / "task-safe"
+            )
             state = worktree.parent / ".state"
             common.mkdir(parents=True)
             worktree.mkdir(parents=True)
@@ -945,12 +952,15 @@ class GuardTest(unittest.TestCase):
             link = root / "link"
             real.mkdir()
             link.symlink_to(real, target_is_directory=True)
-            with mock.patch.dict(os.environ, {"CODEX_HOME": str(link / "codex-home")}):
-                self.assertIsNotNone(
-                    GUARD._managed_worktree_reason(
-                        root / "repository", root / "repository/.git", root / "worktree"
-                    )
+            with (
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(link / "codex-home")}),
+                mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+            ):
+                reason = GUARD._managed_worktree_reason(
+                    root / "repository", root / "repository/.git", root / "worktree"
                 )
+                self.assertIsNotNone(reason)
+                self.assertIn("symlink component", reason)
 
 
 if __name__ == "__main__":

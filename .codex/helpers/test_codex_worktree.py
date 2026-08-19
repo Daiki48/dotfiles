@@ -49,6 +49,9 @@ class TemporaryRepository:
         self.remote = root / "remote.git"
         self.repository = root / "main"
         self.codex_home = root / "codex-home"
+        self.managed_repository = (
+            self.codex_home / "worktrees" / HELPER.repository_key("test/local")
+        )
         run("git", "init", "--bare", str(self.remote), cwd=root)
         run("git", "init", "--initial-branch=main", str(self.repository), cwd=root)
         run("git", "config", "user.name", "Test User", cwd=self.repository)
@@ -97,6 +100,9 @@ class HelperTest(unittest.TestCase):
         ):
             self.assertEqual(HELPER._github_repository(remote), "owner/repo")
         self.assertIsNone(HELPER._github_repository("https://example.com/owner/repo.git"))
+        self.assertNotEqual(
+            HELPER.repository_key("a--b/c"), HELPER.repository_key("a/b--c")
+        )
 
     def test_create_preserves_dirty_main_and_creates_clean_worktree(self):
         local = self.repo.repository / "local.txt"
@@ -109,7 +115,7 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(run("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=target).strip(), "feat/first")
         self.assertEqual(run("git", "status", "--porcelain=v1", cwd=target), "")
         manifest = json.loads(
-            (self.repo.codex_home / "worktrees/test--local/.state/issue-22.json").read_text(encoding="utf-8")
+            (self.repo.managed_repository / ".state/issue-22.json").read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["status"], "ready")
         self.assertEqual(manifest["worktree"], str(target))
@@ -178,7 +184,7 @@ class HelperTest(unittest.TestCase):
         target = HELPER.create_worktree(
             self.repo.repository, "feat/recover", "task-recover", allow_local_origin=True,
         )
-        manifest_path = self.repo.codex_home / "worktrees/test--local/.state/task-recover.json"
+        manifest_path = self.repo.managed_repository / ".state/task-recover.json"
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         payload["status"] = "creating"
         manifest_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -208,11 +214,45 @@ class HelperTest(unittest.TestCase):
         with self.assertRaises(HELPER.WorktreeError):
             HELPER.resume(self.repo.repository, "task-recover", allow_local_origin=True)
 
+    def test_recover_rejects_an_interrupted_worktree_with_a_changed_head(self):
+        target = HELPER.create_worktree(
+            self.repo.repository, "feat/diverged", "task-diverged", allow_local_origin=True,
+        )
+        manifest_path = self.repo.managed_repository / ".state/task-diverged.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["status"] = "creating"
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        (target / "changed.txt").write_text("changed\n", encoding="utf-8")
+        run("git", "add", "--", "changed.txt", cwd=target)
+        run("git", "commit", "-m", "changed head", cwd=target)
+
+        self.assertEqual(
+            HELPER.diagnose(self.repo.repository, "task-diverged", allow_local_origin=True)[0][1],
+            "diverged",
+        )
+        with self.assertRaises(HELPER.WorktreeError):
+            HELPER.recover(self.repo.repository, "task-diverged", allow_local_origin=True)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO requires POSIX")
+    def test_non_directory_worktree_is_isolated_during_diagnosis(self):
+        target = HELPER.create_worktree(
+            self.repo.repository, "feat/broken-target", "task-broken-target",
+            allow_local_origin=True,
+        )
+        target.rename(target.with_name("broken-target-preserved"))
+        os.mkfifo(target)
+        self.assertEqual(
+            HELPER.diagnose(
+                self.repo.repository, "task-broken-target", allow_local_origin=True,
+            )[0][1],
+            "invalid",
+        )
+
     def test_invalid_manifest_is_isolated_and_cannot_escape_managed_root(self):
         HELPER.create_worktree(
             self.repo.repository, "feat/invalid", "task-invalid", allow_local_origin=True,
         )
-        manifest_path = self.repo.codex_home / "worktrees/test--local/.state/task-invalid.json"
+        manifest_path = self.repo.managed_repository / ".state/task-invalid.json"
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         payload["worktree"] = str(self.repo.repository)
         payload["branch"] = "main"
@@ -233,7 +273,7 @@ class HelperTest(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO requires POSIX")
     def test_non_regular_manifest_is_reported_without_reading_it(self):
-        state = self.repo.codex_home / "worktrees/test--local/.state"
+        state = self.repo.managed_repository / ".state"
         state.mkdir(parents=True)
         os.mkfifo(state / "task-fifo.json")
         self.assertEqual(

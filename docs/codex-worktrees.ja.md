@@ -63,18 +63,20 @@ command substitutionやchain内で実行することを拒否するため、help
 
 ```sh
 codex-worktree create --issue 22
-# 出力例: /home/user/.codex/worktrees/owner--repo/issue-22
+# 出力例: /home/user/.codex/worktrees/5-owner--4-repo/issue-22
 ```
 
 作成されるpathは次の形式です。
 
 ```text
-$CODEX_HOME/worktrees/<owner--repo>/<task-id>
+$CODEX_HOME/worktrees/<length-owner--length-repo>/<task-id>
 ```
 
-`CODEX_HOME` 未設定時は `~/.codex/worktrees/<owner--repo>/<task-id>` です。repository名は
-`owner/repo`を安全な`owner--repo`表記にしたものです。taskごとのmanifestはrepository管理
-rootの`.state/<task-id>.json`、lifecycle lockは`.locks/lifecycle.lock`に保存され、Git
+`CODEX_HOME` 未設定時は
+`~/.codex/worktrees/<length-owner--length-repo>/<task-id>`です。repository名は
+`owner/repo`を小文字化し、各segmentの文字数を付けることで、区切り文字を含む名前同士も
+曖昧にならない管理keyにします。taskごとのmanifestはrepository管理rootの
+`.state/<task-id>.json`、lifecycle lockは`.locks/lifecycle.lock`に保存され、Git
 worktree自体もlocked状態で保持されます。これらのmetadataやlockを作業用ファイルとして
 編集・移動しないでください。
 
@@ -93,6 +95,7 @@ codex-worktree doctor --task-id issue-22
 - `ready`: cleanで再開可能
 - `dirty`: commit前または未追跡の変更あり。変更を保持したまま再開可能
 - `interrupted`: worktree作成完了前に処理が中断。`recover`による再検証が必要
+- `diverged`: 中断後にworktreeのHEADが作成時baseから変化。自動復旧不可
 - `missing`: worktree directoryがない
 - `unregistered`: Gitのworktree登録がない
 - `branch-mismatch`: manifestのbranchと現在のbranchが異なる
@@ -119,9 +122,9 @@ cd "$(codex-worktree resume --task-id issue-22)"
 まま停止し、手動で削除・作り直しをしないでください。locked worktreeの復旧やcleanupは
 metadataとの不整合や変更消失を招くため、対象pathとtask IDを確認してから別途判断します。
 
-作成済みworktreeの登録・branch・pathがすべて一致する一方、manifestが`creating`のまま
-残った場合だけ、`doctor`は`interrupted`を返します。次の単独commandで同じ安全条件を
-lock内でもう一度検証し、manifestを`ready`へ進められます。
+作成済みworktreeの登録・branch・path・common Git dir・作成時HEADがすべて一致する一方、
+manifestが`creating`のまま残った場合だけ、`doctor`は`interrupted`を返します。次の
+単独commandで同じ安全条件をlock内でもう一度検証し、manifestを`ready`へ進められます。
 
 ```sh
 codex-worktree recover --task-id issue-22

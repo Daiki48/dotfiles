@@ -1221,6 +1221,12 @@ def _resolved_git_path(cwd, argument):
         return None
 
 
+def _repository_key(repository):
+    normalized = repository.casefold()
+    owner, name = normalized.split("/", 1)
+    return f"{len(owner)}-{owner}--{len(name)}-{name}"
+
+
 def _managed_worktree_reason(repository_root, common_git_dir, worktree_root):
     repository = _origin_repository(repository_root)
     if repository is None or _origin_repository(worktree_root) != repository:
@@ -1241,7 +1247,7 @@ def _managed_worktree_reason(repository_root, common_git_dir, worktree_root):
             return "CODEX_HOMEのsymlink componentを許可できません"
         if current != codex_home and not stat.S_ISDIR(metadata.st_mode):
             return "CODEX_HOMEの親がdirectoryではありません"
-    repository_key = repository.casefold().replace("/", "--")
+    repository_key = _repository_key(repository)
     try:
         managed_repository = (codex_home / "worktrees" / repository_key).resolve(strict=True)
         worktree_root = worktree_root.resolve(strict=True)

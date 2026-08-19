@@ -47,7 +47,7 @@ class Repository:
 
     @property
     def key(self) -> str:
-        return self.github_name.casefold().replace("/", "--")
+        return repository_key(self.github_name)
 
 
 @dataclass(frozen=True)
@@ -64,6 +64,12 @@ class Manifest:
     worktree: str
     created_at: str
     detail: str = ""
+
+
+def repository_key(github_name: str) -> str:
+    normalized = github_name.casefold()
+    owner, name = normalized.split("/", 1)
+    return f"{len(owner)}-{owner}--{len(name)}-{name}"
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -483,18 +489,29 @@ def diagnose(cwd: Path, task_id: str | None = None, *, allow_local_origin: bool 
         elif record is None:
             status, detail = "unregistered", "Git worktreeとして登録されていません"
         else:
-            current = _git_stdout(path, "rev-parse", "--abbrev-ref", "HEAD").strip()
-            dirty = _git_stdout(path, "status", "--porcelain=v1", "--untracked-files=all")
-            if current != manifest.branch:
-                status, detail = "branch-mismatch", f"current branch: {current}"
-            elif manifest.status == "failed":
-                pass
-            elif manifest.status == "creating":
-                status, detail = "interrupted", "作成完了前に中断しました。recoverで再検証できます"
-            elif dirty:
-                status, detail = "dirty", "未commitまたは未追跡の変更があります"
-            elif manifest.status == "ready":
-                status, detail = "ready", "再開可能です"
+            try:
+                metadata = path.lstat()
+                if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+                    raise WorktreeError("worktree pathが安全なdirectoryではありません")
+                if _absolute_git_path(path, "--git-common-dir") != repository.common_git_dir:
+                    raise WorktreeError("worktreeのcommon Git dirが一致しません")
+                current = _git_stdout(path, "rev-parse", "--abbrev-ref", "HEAD").strip()
+                head = _git_stdout(path, "rev-parse", "HEAD").strip().casefold()
+                dirty = _git_stdout(path, "status", "--porcelain=v1", "--untracked-files=all")
+                if current != manifest.branch:
+                    status, detail = "branch-mismatch", f"current branch: {current}"
+                elif manifest.status == "failed":
+                    pass
+                elif manifest.status == "creating" and head != manifest.base_oid.casefold():
+                    status, detail = "diverged", "中断後にworktree HEADがbaseから変化しました"
+                elif manifest.status == "creating":
+                    status, detail = "interrupted", "作成完了前に中断しました。recoverで再検証できます"
+                elif dirty:
+                    status, detail = "dirty", "未commitまたは未追跡の変更があります"
+                elif manifest.status == "ready":
+                    status, detail = "ready", "再開可能です"
+            except (OSError, WorktreeError):
+                status, detail = "invalid", "worktree実体を安全に検証できません"
         results.append((manifest.task_id, status, detail))
     if task_id is not None and not found:
         raise WorktreeError("指定taskのmanifestがありません")
