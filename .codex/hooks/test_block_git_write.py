@@ -885,7 +885,14 @@ class GuardTest(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
-        self.assert_allowed("if command -v codex-delivery; then true; fi")
+        for command in (
+            "if command -v codex-delivery; then true; fi",
+            "if echo git; then true; fi",
+            "if echo codex-delivery; then true; fi",
+            "if rg --files /tmp/codex-delivery; then true; fi",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
 
     def test_push_preflight_rejects_pushurl_and_dirty_worktree(self):
         with mock.patch.object(

@@ -1950,16 +1950,15 @@ def _has_unparsed_guarded_command(tokens):
     if not tokens or tokens[0] not in SHELL_COMPOUND_PREFIXES:
         return False
     arguments = tokens[1:]
-    if (
-        len(arguments) == 3
-        and os.path.basename(arguments[0]) == "command"
-        and arguments[1] in {"-v", "-V"}
-    ):
+    start = _command_start(arguments)
+    if start is None:
         return False
     guarded = RESTRICTED_COMMANDS | DESTRUCTIVE_COMMANDS | SHELLS | {
         ".", "eval", "find", "source",
     }
-    return any(os.path.basename(token) in guarded for token in arguments)
+    if os.path.basename(arguments[start]) in guarded:
+        return True
+    return _python_helper_invocation_reason(arguments) is not None
 
 
 def _contains_restricted_command(tokens, depth=0):
