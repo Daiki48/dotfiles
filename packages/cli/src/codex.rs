@@ -1154,16 +1154,6 @@ fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
 pub fn setup() -> Result<()> {
     println!("🧠 Setting up Codex CLI...\n");
     let home = setup_home_dir()?;
-
-    if !is_codex_installed() {
-        println!("Codex CLI is not found.");
-        codex_install()?;
-    } else {
-        println!("Codex CLI is already installed.");
-    }
-
-    codex_check()?;
-
     let helper_directory = home.join(".local/bin");
     let helper_on_path = std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|path| path == helper_directory));
@@ -1174,6 +1164,16 @@ pub fn setup() -> Result<()> {
         );
     }
     let codex_dir = resolve_codex_home(&home)?;
+
+    if !is_codex_installed() {
+        println!("Codex CLI is not found.");
+        codex_install()?;
+    } else {
+        println!("Codex CLI is already installed.");
+    }
+
+    codex_check()?;
+
     if !codex_dir.exists() {
         println!("\nCreating CODEX_HOME directory: {}", codex_dir.display());
     }
