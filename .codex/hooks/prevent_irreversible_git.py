@@ -165,6 +165,12 @@ def blocked_reason(command):
             return "作業中の変更を破棄するcheckoutは許可されていません"
         if subcommand == "stash" and any(arg in {"clear", "drop"} for arg in args):
             return "stash削除は許可されていません"
+        if subcommand == "worktree":
+            operation = next((arg for arg in args if not arg.startswith("-")), None)
+            if operation in {"remove", "prune", "move", "repair", "unlock"}:
+                return f"git worktree {operation}は自動実行できません"
+            if operation == "add" and any(arg in {"-f", "--force"} for arg in args):
+                return "git worktree add --forceは許可されていません"
         if subcommand == "push":
             if any(
                 arg in PROTECTED_PUSH_OPTIONS

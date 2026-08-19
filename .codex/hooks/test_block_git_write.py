@@ -3,6 +3,8 @@
 
 import importlib.util
 import io
+import json
+import os
 from pathlib import Path
 from unittest import mock
 import tempfile
@@ -31,6 +33,7 @@ class GuardTest(unittest.TestCase):
             "git branch --contains main",
             "git branch --list 'feature/*'",
             "git remote -v",
+            "git worktree list --porcelain -z",
             "git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'",
             "git --version",
         ):
@@ -107,6 +110,10 @@ class GuardTest(unittest.TestCase):
             "git update-ref refs/heads/main HEAD",
             "git symbolic-ref --delete refs/remotes/origin/HEAD",
             "git symbolic-ref refs/remotes/origin/HEAD",
+            "git worktree list",
+            "git worktree add /tmp/worktree feature/example",
+            "git worktree remove /tmp/worktree",
+            "git worktree prune",
             "git -c alias.save=commit save -m test",
             "git -C /workspace add -- README.md",
             "env -u TOKEN git reset --hard HEAD",
@@ -150,6 +157,38 @@ class GuardTest(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command)
+
+    def test_worktree_helper_accepts_only_canonical_operations(self):
+        for command in (
+            "codex-worktree --help",
+            "codex-worktree list",
+            "codex-worktree doctor",
+            "codex-worktree doctor --task-id issue-22",
+            "codex-worktree resume --task-id task-safe-id",
+            "codex-worktree create",
+            "codex-worktree create --issue 22 --branch feat/example",
+            "codex-worktree create --task-id task-safe-id",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "/workspace")
+
+        for command in (
+            "./codex-worktree list",
+            "command codex-worktree create --issue 22",
+            "codex-worktree remove --task-id issue-22",
+            "codex-worktree list --all",
+            "codex-worktree resume",
+            "codex-worktree doctor --task-id ../other",
+            "codex-worktree create --issue 0",
+            "codex-worktree create --issue 22 --task-id task-other",
+            "codex-worktree create --branch main",
+            "codex-worktree create --branch feat/example --branch fix/example",
+            "codex-worktree create --repository /tmp/other",
+            "codex-worktree create --issue 22 && git status",
+            "bash -lc 'codex-worktree create --issue 22'",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
 
     def test_nested_shell_and_chain_are_checked(self):
         for command in (
@@ -789,10 +828,11 @@ class GuardTest(unittest.TestCase):
 
     def test_write_context_must_match_the_session_repository(self):
         repository = MODULE_PATH.resolve().parents[2]
+        common = repository / ".git"
         with mock.patch.object(
             GUARD,
-            "_run_git",
-            side_effect=[f"{repository}\n", f"{repository.parent}\n"],
+            "_resolved_git_path",
+            side_effect=[repository, repository.parent, common, repository.parent / ".git"],
         ):
             self.assertIsNotNone(
                 GUARD._write_context_reason(
@@ -801,12 +841,40 @@ class GuardTest(unittest.TestCase):
             )
         with mock.patch.object(
             GUARD,
-            "_run_git",
-            side_effect=[f"{repository}\n", f"{repository}\n"],
+            "_resolved_git_path",
+            side_effect=[repository, repository, common, common],
         ):
             self.assertIsNone(
                 GUARD._write_context_reason(
                     "git add -- README.md", str(repository), str(repository / ".codex")
+                )
+            )
+
+        linked = Path("/tmp/codex-home/worktrees/owner--repo/task-safe")
+        with (
+            mock.patch.object(
+                GUARD,
+                "_resolved_git_path",
+                side_effect=[repository, linked, common, common],
+            ),
+            mock.patch.object(GUARD, "_managed_worktree_reason", return_value=None) as managed,
+        ):
+            self.assertIsNone(
+                GUARD._write_context_reason(
+                    "git add -- README.md", str(repository), str(linked)
+                )
+            )
+            managed.assert_called_once_with(repository, common, linked)
+
+        other = linked.parent / "task-other"
+        with mock.patch.object(
+            GUARD,
+            "_resolved_git_path",
+            side_effect=[linked, other, common, common],
+        ):
+            self.assertIsNotNone(
+                GUARD._write_context_reason(
+                    "git add -- README.md", str(linked), str(other)
                 )
             )
 
@@ -820,6 +888,49 @@ class GuardTest(unittest.TestCase):
             GUARD.main()
         self.assertEqual(exit_status.exception.code, 2)
         self.assertIn('"permissionDecision": "deny"', stdout.getvalue())
+
+    def test_managed_worktree_requires_matching_manifest_and_registration(self):
+        with tempfile.TemporaryDirectory(prefix="guard-worktree-") as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            common = repository / ".git"
+            worktree = root / "codex-home/worktrees/owner--repo/task-safe"
+            state = worktree.parent / ".state"
+            common.mkdir(parents=True)
+            worktree.mkdir(parents=True)
+            state.mkdir()
+            manifest = {
+                "version": 1,
+                "status": "ready",
+                "task_id": "task-safe",
+                "repository": str(repository),
+                "common_git_dir": str(common),
+                "github_name": "owner/repo",
+                "branch": "feat/example",
+                "worktree": str(worktree),
+            }
+            (state / "task-safe.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            def safe_git(_cwd, *args):
+                if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+                    return "feat/example\n"
+                if args == ("worktree", "list", "--porcelain", "-z"):
+                    return f"worktree {repository}\0\0worktree {worktree}\0\0"
+                return None
+
+            with (
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(root / "codex-home")}),
+                mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+                mock.patch.object(GUARD, "_run_git", side_effect=safe_git),
+            ):
+                self.assertIsNone(
+                    GUARD._managed_worktree_reason(repository, common, worktree)
+                )
+                manifest["status"] = "failed"
+                (state / "task-safe.json").write_text(json.dumps(manifest), encoding="utf-8")
+                self.assertIsNotNone(
+                    GUARD._managed_worktree_reason(repository, common, worktree)
+                )
 
 
 if __name__ == "__main__":
