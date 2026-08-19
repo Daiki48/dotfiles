@@ -878,6 +878,10 @@ class GuardTest(unittest.TestCase):
             "! gh pr close 1 --repo owner/repo",
             "for x in 1; do codex-worktree create --issue 1; done",
             "{ git status; } > /tmp/status",
+            "if cd /tmp/other-repository; then true; fi; git status",
+            "if export GIT_CONFIG_GLOBAL=/tmp/evil; then true; fi; git status",
+            "for x in /tmp/other-repository; do cd \"$x\"; done; git status",
+            "f(){ cd /tmp/other-repository; }; f; git status",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")

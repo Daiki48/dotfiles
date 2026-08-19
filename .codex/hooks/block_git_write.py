@@ -1987,6 +1987,11 @@ def blocked_reason(command, cwd=None, depth=0):
     if any(_has_unparsed_guarded_command(tokens) for tokens in segments):
         return "shell予約語を介したGit/GitHub/helper commandは安全に検査できません"
     has_restricted = any(_contains_restricted_command(tokens) for tokens in segments)
+    has_compound_shell = any(
+        tokens and tokens[0] in SHELL_COMPOUND_PREFIXES for tokens in segments
+    )
+    if has_restricted and has_compound_shell:
+        return "shell複合構文とGit/GitHub/helper commandを同じ入力で実行できません"
     if _has_unquoted_shell_redirection(command) and has_restricted:
         return "Git/GitHub/helper commandではshell redirectionを使用できません"
     has_write = any(_has_write_operation(tokens) for tokens in segments)
