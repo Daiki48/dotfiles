@@ -438,6 +438,44 @@ def _git_push_reason(args, cwd):
     return _push_preflight_reason(cwd, branch)
 
 
+def _git_write_target(session_cwd, explicit_cwd):
+    """git -Cで明示されたmanaged worktreeを検証し、実行rootを返す。"""
+    if explicit_cwd is None:
+        return session_cwd, None
+    if not isinstance(session_cwd, str) or not session_cwd:
+        return None, "Git書き込みのsession cwdを確認できません"
+    candidate = Path(explicit_cwd)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return None, "git -Cにはmanaged worktreeの絶対pathを指定してください"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None, "git -Cのpathを安全に解決できません"
+    if candidate != resolved:
+        return None, "git -Cではsymlinkまたは非正規pathを使用できません"
+
+    session_root = _resolved_git_path(session_cwd, "--show-toplevel")
+    session_common = _resolved_git_path(session_cwd, "--git-common-dir")
+    target_root = _resolved_git_path(resolved, "--show-toplevel")
+    target_common = _resolved_git_path(resolved, "--git-common-dir")
+    if None in {session_root, session_common, target_root, target_common}:
+        return None, "git -Cのrepositoryを確認できません"
+    if resolved != target_root:
+        return None, "git -Cにはmanaged worktree rootを指定してください"
+    if session_common != target_common:
+        return None, "git -CのworktreeがCodex sessionのrepositoryと一致しません"
+
+    main_root = session_common.parent
+    if session_root != main_root:
+        return None, "linked worktree sessionから別worktreeへ書き込むことはできません"
+    if target_root == main_root:
+        return None, "git -Cは別のmanaged worktreeを明示するときだけ使用できます"
+    reason = _managed_worktree_reason(main_root, session_common, target_root)
+    if reason:
+        return None, reason
+    return str(target_root), None
+
+
 def _git_invocation_reason(tokens, cwd=None):
     start = _command_start(tokens)
     if start is None or os.path.basename(tokens[start]) != "git":
@@ -449,6 +487,8 @@ def _git_invocation_reason(tokens, cwd=None):
     git_args = tokens[start + 1:]
     skip_next = False
     global_option_used = False
+    other_global_option_used = False
+    explicit_cwd = None
     for index, token in enumerate(git_args):
         if skip_next:
             skip_next = False
@@ -459,15 +499,25 @@ def _git_invocation_reason(tokens, cwd=None):
             return "gitの設定・aliasによるコマンド上書きは許可されていません"
         if token.startswith("-c") and token != "-C":
             return "git -cによる設定・alias上書きは許可されていません"
+        if token == "-C":
+            if explicit_cwd is not None or index + 1 >= len(git_args):
+                return "git -Cはmanaged worktreeの絶対pathを1件だけ指定してください"
+            explicit_cwd = git_args[index + 1]
+            global_option_used = True
+            skip_next = True
+            continue
         if token in GIT_OPTS_WITH_VALUE:
             global_option_used = True
+            other_global_option_used = True
             skip_next = True
             continue
         if any(token.startswith(f"{option}=") for option in GIT_OPTS_WITH_VALUE):
             global_option_used = True
+            other_global_option_used = True
             continue
         if token.startswith("-"):
             global_option_used = True
+            other_global_option_used = True
             continue
 
         args = git_args[index + 1:]
@@ -486,8 +536,11 @@ def _git_invocation_reason(tokens, cwd=None):
             return _git_read_reason(token, args, global_option_used)
         if token not in GIT_SAFE_WRITE:
             return "許可されていないGit書き込み操作です"
-        if global_option_used:
+        if other_global_option_used:
             return "Git書き込みではglobal optionや別repository指定を使用できません"
+        effective_cwd, target_reason = _git_write_target(cwd, explicit_cwd)
+        if target_reason:
+            return target_reason
         if any(
             key in GIT_WRITE_ENVIRONMENT_KEYS
             or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
@@ -496,11 +549,11 @@ def _git_invocation_reason(tokens, cwd=None):
             return "Git書き込みではrepositoryやconfigを変更する環境変数を使用できません"
 
         if token == "push":
-            reason = _git_push_reason(args, cwd)
+            reason = _git_push_reason(args, effective_cwd)
         elif token == "pull":
-            reason = _git_pull_reason(args, cwd)
+            reason = _git_pull_reason(args, effective_cwd)
         elif token == "switch":
-            reason = _git_switch_reason(args, cwd)
+            reason = _git_switch_reason(args, effective_cwd)
         else:
             reason = {
                 "add": _git_add_reason,
@@ -510,15 +563,15 @@ def _git_invocation_reason(tokens, cwd=None):
         if reason:
             return reason
         if token in {"add", "commit"}:
-            branch_reason = _current_work_branch_reason(cwd)
+            branch_reason = _current_work_branch_reason(effective_cwd)
             if branch_reason:
                 return branch_reason
         if token == "switch":
-            clean_reason = _clean_worktree_reason(cwd, "switch")
+            clean_reason = _clean_worktree_reason(effective_cwd, "switch")
             if clean_reason:
                 return clean_reason
         if token == "commit":
-            return _staged_secret_reason(cwd)
+            return _staged_secret_reason(effective_cwd)
         return None
     return None
 
@@ -696,40 +749,79 @@ def _pr_create_reason(args, cwd):
     return _file_secret_reason(body_file)
 
 
-def _draft_pr_preflight_reason(cwd, base, head):
-    current = _run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
-    local_head = _run_git(cwd, "rev-parse", "HEAD")
-    remote_head = _run_git(cwd, "rev-parse", "--verify", f"origin/{head}")
-    default_ref = _run_git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
-    if current is None or current.strip() != head:
-        return "Draft PRのheadはcurrent branchと一致させてください"
-    if local_head is None:
-        return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
-    if remote_head is None or default_ref is None:
-        snapshot = _remote_refs_snapshot(cwd, head)
-        if snapshot is None:
-            return "Draft PRのremote refを安全に確認できません"
-        remote_default_ref, remote_default_oid, fallback_remote_head = snapshot
-        if default_ref is None:
-            default_ref = remote_default_ref
-        elif default_ref.strip() != remote_default_ref:
-            return "Draft PRのbaseはoriginのdefault branchと一致させてください"
-        local_default_oid = _run_git(
-            cwd, "rev-parse", "--verify", f"refs/remotes/{default_ref.strip()}"
-        )
-        if (
-            local_default_oid is None
-            or local_default_oid.strip().casefold() != remote_default_oid.casefold()
+def _branch_worktree(cwd, head):
+    """明示head branchを所有する登録済みworktreeを一意に解決する。"""
+    output = _run_git(cwd, "worktree", "list", "--porcelain", "-z")
+    if output is None:
+        return None, "Draft PRの登録済みworktreeを確認できません"
+    matches = []
+    expected_branch = f"refs/heads/{head}"
+    for raw_record in output.split("\0\0"):
+        if not raw_record:
+            continue
+        fields = raw_record.split("\0")
+        paths = [field[9:] for field in fields if field.startswith("worktree ")]
+        branches = [field[7:] for field in fields if field.startswith("branch ")]
+        if branches != [expected_branch]:
+            continue
+        if len(paths) != 1 or any(
+            field == "prunable" or field.startswith("prunable ") for field in fields
         ):
-            return "Draft PRのbase remote-tracking refがremoteと一致しません"
-        if remote_head is None:
-            remote_head = fallback_remote_head
-        elif remote_head.strip().casefold() != fallback_remote_head.casefold():
-            return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
-    if remote_head is None or local_head.strip() != remote_head.strip():
-        return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
-    if default_ref is None or default_ref.strip() != f"origin/{base}":
+            return None, "Draft PRのhead worktree登録が安全な状態ではありません"
+        matches.append(paths[0])
+    if len(matches) != 1:
+        return None, "Draft PRのhead branchを所有するworktreeを一意に確認できません"
+
+    candidate = Path(matches[0])
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return None, "Draft PRのhead worktree pathを安全に解決できません"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None, "Draft PRのhead worktree pathを安全に解決できません"
+    if candidate != resolved:
+        return None, "Draft PRのhead worktreeにsymlinkまたは非正規pathは使用できません"
+    target_root = _resolved_git_path(resolved, "--show-toplevel")
+    if target_root != resolved:
+        return None, "Draft PRのhead worktree rootを確認できません"
+    return str(resolved), None
+
+
+def _draft_pr_preflight_reason(cwd, base, head):
+    head_cwd, worktree_reason = _branch_worktree(cwd, head)
+    if worktree_reason:
+        return worktree_reason
+    session_common = _resolved_git_path(cwd, "--git-common-dir")
+    head_common = _resolved_git_path(head_cwd, "--git-common-dir")
+    if session_common is None or session_common != head_common:
+        return "Draft PRのhead worktreeがsession repositoryと一致しません"
+    if _origin_repository(cwd) != _origin_repository(head_cwd):
+        return "Draft PRのhead worktreeのoriginがsession repositoryと一致しません"
+
+    current = _run_git(head_cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    local_head = _run_git(head_cwd, "rev-parse", "HEAD")
+    if current is None or current.strip() != head or local_head is None:
+        return "Draft PRのhead worktreeとbranchを確認できません"
+    status = _run_git(head_cwd, "status", "--porcelain=v1", "--untracked-files=all")
+    if status is None or status.strip():
+        return "Draft PRのhead worktreeがcleanではありません"
+
+    snapshot = _remote_refs_snapshot(head_cwd, head)
+    if snapshot is None:
+        return "Draft PRのremote refを安全に確認できません"
+    remote_default_ref, remote_default_oid, remote_head = snapshot
+    if remote_default_ref != f"origin/{base}":
         return "Draft PRのbaseはoriginのdefault branchと一致させてください"
+    local_default_oid = _run_git(
+        head_cwd, "rev-parse", "--verify", f"refs/remotes/{remote_default_ref}"
+    )
+    if (
+        local_default_oid is None
+        or local_default_oid.strip().casefold() != remote_default_oid.casefold()
+    ):
+        return "Draft PRのbase remote-tracking refがremoteと一致しません"
+    if remote_head is None or local_head.strip().casefold() != remote_head.casefold():
+        return "Draft PRのheadはpush済みのworktree HEADと一致させてください"
     return None
 
 
@@ -1293,28 +1385,21 @@ def _managed_worktree_reason(repository_root, common_git_dir, worktree_root):
     return None
 
 
-def _write_context_reason(command, session_cwd, requested_cwd):
+def _write_context_reason(command, session_cwd):
     segments = list(_command_segments(command))
     if not any(_has_write_operation(tokens) for tokens in segments):
         return None
-    if not isinstance(session_cwd, str) or not isinstance(requested_cwd, str):
-        return "Git/GitHub書き込みのsession cwdとrequested cwdを確認できません"
+    if not isinstance(session_cwd, str):
+        return "Git/GitHub書き込みのsession cwdを確認できません"
     session_root = _resolved_git_path(session_cwd, "--show-toplevel")
-    requested_root = _resolved_git_path(requested_cwd, "--show-toplevel")
     session_common = _resolved_git_path(session_cwd, "--git-common-dir")
-    requested_common = _resolved_git_path(requested_cwd, "--git-common-dir")
-    if None in {session_root, requested_root, session_common, requested_common}:
+    if None in {session_root, session_common}:
         return "Git/GitHub書き込みのrepository rootを確認できません"
-    if session_common != requested_common:
-        return "toolのrequested cwdがCodex sessionのrepositoryと一致しません"
     main_root = session_common.parent
-    if session_root != main_root and requested_root != session_root:
-        return "linked worktree sessionから別worktreeへ書き込むことはできません"
-    for root in {session_root, requested_root}:
-        if root != main_root:
-            reason = _managed_worktree_reason(main_root, session_common, root)
-            if reason:
-                return reason
+    if session_root != main_root:
+        reason = _managed_worktree_reason(main_root, session_common, session_root)
+        if reason:
+            return reason
     return None
 
 
@@ -1340,12 +1425,11 @@ def main():
             raise ValueError("tool_input must be an object")
         command = tool_input.get("command") or tool_input.get("cmd") or ""
         session_cwd = data.get("cwd")
-        cwd = tool_input.get("workdir") or tool_input.get("cwd") or session_cwd
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command is required")
-        reason = _write_context_reason(command, session_cwd, cwd)
+        reason = _write_context_reason(command, session_cwd)
         if reason is None:
-            reason = blocked_reason(command, cwd)
+            reason = blocked_reason(command, session_cwd)
     except Exception:
         _deny("hook inputを安全に解析・検査できません")
         sys.exit(2)
