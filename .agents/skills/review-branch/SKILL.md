@@ -28,7 +28,8 @@ commit、push、Ready化、merge、cleanupは呼び出し元が行う。レビ�
 Sol highが固定した証拠集合と両reviewを再判定して、delivery準備可否の最終技術判断を行う。重大なセキュリティ・
 互換性・データ移行、2回の修正ループ失敗、またはreview結論の衝突ではSol xhighへ昇格する。肯定reviewは、Solが
 高リスク変更で必要と判断した場合だけ`gpt-5.6-luna`のxhighで追加する。Luna maxは、xhighで不足する具体的な
-根拠がある場合だけ使う。risk分類、確認要求、receiptの記録は呼び出し元の`codex-delivery`へ返す。
+根拠がある場合だけ使う。risk分類とdecision requirement（autonomous / human-required / blocked）を
+別々に判定し、receiptの記録は呼び出し元の`codex-delivery`へ返す。
 
 subagentを利用できない場合は、main agentが証拠集合を固定したまま2観点を独立したpassとして実施し、その制約を結果へ明記する。
 
@@ -48,6 +49,7 @@ subagentを利用できない場合は、main agentが証拠集合を固定し�
 - 実行した自動検証と結果
 - 確定した指摘を重大度順に整理した一覧
 - 受け入れ条件、docs、Issue、外部仕様への適合状況
+- risk分類と、そのriskから独立したdecision requirementおよび根拠
 - 未実施の手動確認、残存リスク、push・Draft PR・`codex-delivery record-review`準備可否。receipt、Ready化、merge、cleanupは実行しない
 
 重大な問題、計画との差異、必須条件の未確認が残る状態を準備完了と判定しない。監査結果をIssueやreceiptへ

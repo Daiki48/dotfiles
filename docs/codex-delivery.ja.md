@@ -9,7 +9,7 @@ managed worktree cleanupまでを同じdeliveryとして扱います。
 `codex-delivery` helperを、次の一連の唯一のreceipt・delivery・finish経路とします。
 
 ```text
-record-review -> (high/critical/判定不能だけ approve-review) -> deliver -> finish
+(autonomous: record-review | human-required: approve-review) -> deliver -> finish
 ```
 
 すべてのcommandはcurrent repositoryのrootで実行し、`--task-id`、`--pr`、`--head`、
@@ -19,14 +19,24 @@ record-review -> (high/critical/判定不能だけ approve-review) -> deliver ->
 merge API、`git worktree remove/prune`、任意branch削除を実行してこの経路を迂回してはいけません。
 
 ```sh
-codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --tests-passed --neutral-review-passed --adversarial-review-passed
-codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --tests-passed --neutral-review-passed --adversarial-review-passed
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium|high|critical> --plan-id <Plan ID> --tests-passed --neutral-review-passed --adversarial-review-passed
+codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium|high|critical> --plan-id <Plan ID> --tests-passed --neutral-review-passed --adversarial-review-passed
 codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID>
 codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID>
 ```
 
+既定は`strict-ruleset` modeです。GitHub Free/private repositoryでは、次の低保証profileを
+明示できます。API errorからこのmodeへ自動fallbackしません。
+
+```sh
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --gate-mode github-free-private --tests-passed --neutral-review-passed --adversarial-review-passed
+codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --gate-mode github-free-private --tests-passed --neutral-review-passed --adversarial-review-passed
+codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --gate-mode github-free-private
+codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --gate-mode github-free-private
+```
+
 `review-branch`は読み取り専用です。reviewerはreceipt、Issue、PR、Git、worktreeを変更せず、
-呼び出し元がreview結果を`record-review`へ渡します。
+呼び出し元がdecision assessmentに応じてreview結果を`record-review`または`approve-review`へ渡します。
 
 helperは固定した`~/.local/bin/codex-delivery`のprivate regular fileから直接起動し、
 `/usr/bin/git`と`/usr/bin/gh`だけを使います。
@@ -45,11 +55,17 @@ Draft PRを作成したら、receiptとmanaged manifestを合わせて次の対�
 - repository、PR番号、base branch/ref、head branch/ref
 - review対象のhead SHAとbase SHA
 - task ID、worktree path、risk分類
+- remote gate mode
 - 独立reviewとtestの完了判定、actionable件数
 
 receiptは対象SHAに束縛します。review後にcommitをpushしてhead SHAが変わった場合、以前の
 receipt、CI、review、確認を新SHAへ引き継ぎません。新しいSHAでCIと独立reviewを実行し、
 新しいreceiptを記録します。
+
+receipt v3は`gate_mode`と`decision`（`autonomous`または`human-approved`）を固定し、riskから
+意思決定要否を推測しません。既存v1 receiptは`strict-ruleset`、v2 receiptは保存済みmodeとして
+読み取りますが、旧形式のhigh/criticalやFree/privateを遡及的にautonomousへ緩和しません。CLIで
+指定したmodeとreceiptが一致しない場合はdeliveryもfinishも停止します。
 
 receiptのreview/test flagは、定めた手順を完了したことをmachine-readableに束縛する構造証拠であり、
 review品質を暗号学的に証明するものではありません。helperはdelivery直前にbase SHAと固定head SHAの
@@ -61,14 +77,16 @@ required checkは文字通り`success`だけを成功とします。`skipped`、
 信頼せず、`deliver`が固定head上のcheck runをlive取得し、名前、GitHub Actions app ID、head SHA、
 `completed`、`success`、完了時刻が一意に一致することを確認します。
 
-## DELIVERY-05: risk別のdelivery
+## DELIVERY-05: riskとdecision assessment
 
-### low/medium
+### risk
 
 通常の実装・修正で、delivery安全境界や高リスクデータ・権限に影響しないタスクをlow/mediumと
-します。固定SHAに対する独立reviewでactionableな指摘があれば、同じworktreeで修正、検証、
-commit、pushを自律的に行います。そのpushでSHAが変わるため、review、CI、receiptを最初から
-やり直します。低・中程度の指摘を自律修正するために確認待ちへ遷移しません。
+します。CI/workflow、hook、rules、AGENTS、Skills、helper、installer、auth/secrets、production、
+不可逆migration、breaking change、重大なsecurity・互換性・データ損失影響はhigh/criticalです。
+riskはreview深度と残存影響を決めますが、人間確認を自動決定しません。固定SHAに対する独立reviewで
+actionableな指摘があれば、同じworktreeで修正、検証、commit、pushを自律的に行います。そのpushで
+SHAが変わるため、review、CI、receiptを最初からやり直します。
 
 次の条件が同じhead SHAで成立した場合だけ、`codex-delivery deliver`へ進みます。
 
@@ -80,33 +98,49 @@ commit、pushを自律的に行います。そのpushでSHAが変わるため、
    現在有効な個別reviewに`CHANGES_REQUESTED`がなく、`reviewDecision`も`CHANGES_REQUESTED`、
    `REVIEW_REQUIRED`、不明値ではない。
 5. merge conflictがなく、branchが最新baseの要件を満たす。
-6. 実行時点のlive Ruleset gateがactiveで、required CI、PR経由、conversation解決、merge method、
-   force push/branch deletion禁止などのrepository正本と一致する。
+6. 選択したremote gateが実行時点でも成立する。strict modeではlive Rulesetがrequired CI、PR経由、
+   conversation解決、merge method、force push/branch deletion禁止などのrepository正本と一致する。
+   Free/private modeでは後述するlive repository identityと設定が一致する。
 
-### high/critical/判定不能
+### decision assessment
 
-次はhighです。criticalはhighより厳格に扱い、判定不能もhighへ寄せます。
+- `autonomous`: 依頼済みscope内で仕様、既存権限、rollback、test・CI・reviewを根拠付きで確定できる。
+  全riskで`record-review`を使う。
+- `human-required`: 製品・仕様の実質判断、scope拡大、新規credentialや権限付与、repository設定、
+  billing・購入、不可逆性、重大な残存リスク受容、releaseなどDaikiだけが決められる事項がある。
+  明示回答後だけ`approve-review`を使う。
+- `blocked`: test/CI/review失敗、dirty/stale/conflict、secret混入、identity不一致、network/API不明、
+  rollback未評価、仕様矛盾など必須証拠が不足する。approvalで迂回せず、receiptを作らない。
 
-- CI/workflow、Ruleset、hook、rules、AGENTS、Skills、helper、installerなどdelivery安全境界
-- auth、secrets、billing、production、本番データ、不可逆migration
-- breaking change、後方互換性を壊す変更、security・データ損失に関わる変更
-- 影響範囲またはリスクを確定できない変更
+優先順位は`blocked > human-required > autonomous`です。同一headのdecisionは
+`autonomous -> human-approved`への単調な更新だけを許し、risk downgradeや承認の取消で既存receiptを
+弱めません。
 
-上記以外でも、reviewで同等の重大な懸念が出た場合はhighへ引き上げます。high/critical/判定不能
-は、CI、独立review、actionable=0、未解決thread=0、live Ruleset gateが成立しても、毎回
-会話でDaikiの今回のreceiptに対する明示確認を得てから`codex-delivery approve-review`を実行します。
-commandのpromptや自動approval reviewだけをDaikiの確認とは扱いません。確認はタスク全体や以前の
-SHAへ引き継がず、push、SHA変更、再reviewの
-たびに求めます。
+### GitHub Free/private
 
-Issue #24自身は、AGENTS、Skills、rules、delivery経路を変更するためhighです。#24のDraft PR後は
-low/mediumの自律経路へ降格せず、Daikiの確認を待ちます。
+GitHub Freeのprivate repositoryではRulesetやprotected branchをserver-sideで利用できません。
+この制約をAPI errorから自動推測してfallbackせず、`--gate-mode github-free-private`を明示した場合だけ
+低保証profileを使用します。
+
+このmodeではserver-side強制がない保証差を反映してriskをhigh/criticalとして扱います。ただし
+decision assessmentが`autonomous`なら`record-review`、Daikiの判断が必要な場合だけ`approve-review`を
+使います。live repository readbackはcurrent repositoryと完全一致するrepository identity、
+`private=true`、`default_branch=main`、`archived=false`、`disabled=false`、
+`allow_merge_commit=true`、`allow_auto_merge=false`を要求します。さらに唯一のGitHub Actions App
+由来`required-ci`成功、最新mainのancestor、全review thread解決、`CHANGES_REQUESTED`なし、
+same-repository PR、固定head、mergeable/CLEANをstrict modeと同じく検証します。
+
+GitHub側ではmainへの直接push、helper外merge、force push、branch削除、最新base CIを強制できません。
+ローカルhook、decision receipt、live readback、`--match-head-commit`で低減しますが、Rulesetと
+同等の保証とは説明しません。identity不一致、public化、repository設定drift、mode省略・不一致、
+API取得不能ではfail closedにします。
 
 ## deliver
 
 `deliver`はreceiptとlive状態をもう一度読み取り、上記の全条件を満たした同一SHAだけを対象にします。
-low/medium、または`approve-review`済みのhigh/critical/判定不能だけをReady化し、Rulesetが許可する
-merge methodでmergeします。Ready化やmergeの前後でhead SHA、PR状態、Ruleset、CIを取り直し、
+`autonomous`または`human-approved` decisionを持つreceiptだけをReady化し、
+選択したremote gateが許可するmerge methodでmergeします。Ready化やmergeの前後でhead SHA、
+PR状態、remote gate、CIを取り直し、
 raceやstale状態を検出したら停止します。
 
 merge直前にはrepository、PR番号、open/Ready、base=`main`、head branch、head SHA、同一repository、
@@ -118,7 +152,7 @@ base branchやrepository設定を同時変更する競合をatomicには拘束�
 `--admin`、`--auto`、`--delete-branch`、squash/rebaseは使いません。
 
 確認できない状態を成功扱いしません。失敗、timeout、pending、dirty、stale、conflict、mergeable
-不明、network/auth障害、Ruleset readback不一致ではdeliverしません。PR、remote/local branch、
+不明、network/auth障害、RulesetまたはFree/private readback不一致ではdeliverしません。PR、remote/local branch、
 worktree、receiptを保持し、再開時に状態を再取得します。
 
 ## finishとmain同期
@@ -167,8 +201,9 @@ state machineです。lock取得待ちもdeadlineへ含め、競合processが停
 - head SHAがreview済みreceiptから変化した
 - CIが失敗、skip、cancel、timeout、pending、neutral、または取得不能
 - actionableな指摘、未解決thread、merge conflict、stale branchが残る
-- Rulesetがinactive、readback不一致、mergeability判定不能
-- high/critical/判定不能で`approve-review`がない
+- Rulesetがinactive、またはFree/private repository設定を含むremote gateのreadback不一致、
+  mergeability判定不能
+- decision assessmentが未確定、または`human-required`なのにDaikiの判断がない
 - PR、branch、worktree、human checkoutがdirtyまたは対象を一意に解決できない
 - mainがff-onlyで同期できない、またはremote/localの到達性を確認できない
 

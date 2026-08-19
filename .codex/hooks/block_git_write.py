@@ -1282,6 +1282,8 @@ def _delivery_helper_invocation_reason(tokens):
         switches = {
             "--tests-passed", "--neutral-review-passed", "--adversarial-review-passed",
         }
+    if command in {"record-review", "approve-review", "deliver", "finish"}:
+        value_options.add("--gate-mode")
 
     values = {}
     seen_switches = set()
@@ -1299,8 +1301,12 @@ def _delivery_helper_invocation_reason(tokens):
         values[option] = arguments[index + 1]
         index += 2
 
-    if set(values) != value_options or seen_switches != switches:
+    required_values = value_options - {"--gate-mode"}
+    if not required_values.issubset(values) or not set(values).issubset(value_options) or seen_switches != switches:
         return "delivery helperのtask、PR、head、plan、review evidenceをすべて明示してください"
+    gate_mode = values.get("--gate-mode")
+    if gate_mode is not None and gate_mode != "github-free-private":
+        return "delivery helperのgate modeが許可形式ではありません"
     if not TASK_ID_RE.fullmatch(values["--task-id"]):
         return "delivery helperのtask IDが許可形式ではありません"
     if not values["--pr"].isdigit() or int(values["--pr"]) < 1:
@@ -1309,10 +1315,10 @@ def _delivery_helper_invocation_reason(tokens):
         return "delivery helperのhead SHAが許可形式ではありません"
     if not PLAN_ID_RE.fullmatch(values["--plan-id"]):
         return "delivery helperのPlan IDが許可形式ではありません"
-    if command == "record-review" and values["--risk"] not in {"low", "medium"}:
-        return "自律deliveryへ記録できるriskはlowまたはmediumだけです"
-    if command == "approve-review" and values["--risk"] not in {"high", "critical"}:
-        return "確認付きdeliveryのriskはhighまたはcriticalにしてください"
+    if command in {"record-review", "approve-review"} and values["--risk"] not in {
+        "low", "medium", "high", "critical",
+    }:
+        return "delivery riskはlow、medium、high、criticalのいずれかにしてください"
     return None
 
 

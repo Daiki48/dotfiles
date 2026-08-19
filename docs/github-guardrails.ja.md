@@ -50,6 +50,22 @@ review済みhead SHAの固定とrisk-based reviewは`codex-delivery`による完
 防げません。#24ではworkflow差分を含む固定head SHAを独立reviewし、check名だけでなく実行内容も
 確認します。独立したreview identityを用意できる場合は、CODEOWNERSとrequired approvalを再検討します。
 
+## GitHub Free/private profile
+
+Rulesetを利用できないGitHub Free/private repositoryは、既定のstrict gateを暗黙に緩和しません。
+`--gate-mode github-free-private`を明示したcurrent private repositoryだけが低保証profileを使用できます。
+receipt v3へmode、risk、decisionを別々に保存し、既存v1/v2 receiptの意味を遡及的に緩和しません。
+
+Free/private profileでも唯一の`required-ci`、GitHub Actions App ID `15368`、文字どおりの
+`success`、PR identity、最新mainのancestor、review thread、mergeabilityを検証します。
+Rulesetの代替としてprivate/default branch/archive/disable/merge/auto-merge設定をlive readbackし、
+設定driftや取得不能を拒否します。Ruleset APIの403、404、timeoutはfallback条件ではありません。
+
+このprofileではGitHubサーバーが直接push、helper外merge、force push、branch削除を拒否しません。
+そのため実装内容にかかわらずdelivery riskをhigh/criticalへ引き上げます。ただしdecision requirementは
+riskと分離し、根拠を確定できる場合は`record-review`、Daikiだけが決められる事項がある場合だけ
+`approve-review`を使います。Rulesetを利用可能になった場合はstrict gateへ戻せます。
+
 ## Delivery gate（Issue #24）
 
 Draft PR作成後は、PRのrepository、base branch、head branch、head SHAを固定し、固定SHAに対する
@@ -58,22 +74,21 @@ review後にpushされた場合、以前のreceipt、review、CIを
 再利用せず、新しいSHAで最初からやり直します。`review-branch`は読み取り専用であり、receiptの記録と
 delivery判断は呼び出し元の専用`codex-delivery` helperが担当します。
 
-low/mediumの通常タスクでは、actionableな指摘を自律修正して再pushし、同じloopを繰り返します。
+修正可能なactionable指摘はriskに関係なく自律修正して再pushし、同じloopを繰り返します。
 次の条件が同一SHAで同時に成立した場合だけReady化・merge候補になります。
 
 - required-ciなどrequired checkがすべて文字通り`success`である（skipped、cancelled、timed out、
   neutral、pending、判定不能は成功と扱わない）
 - actionableな指摘が0件、GitHub review conversationの未解決件数が0件
 - PRがopen、baseがdefault branch、headがreceiptのSHAと一致し、merge conflictがない
-- branchが最新baseを満たし、実行時点のlive Ruleset gateがrequired CI、PR必須、conversation解決、
-  merge-only、force push/branch deletion禁止などの正本と一致する
+- branchが最新baseを満たし、strict modeでは実行時点のlive Ruleset gateがrequired CI、PR必須、
+  conversation解決、merge-only、force push/branch deletion禁止などの正本と一致する
+- 明示したFree/private profileではhigh/criticalのdecision receiptとlive repository identityが一致する
 
-high/critical、または判定不能なriskでは、上記条件を満たしても毎回会話でDaikiの明示確認を得た後だけ
-`codex-delivery approve-review`を実行します。commandのpromptや自動approval reviewだけをDaikiの
-確認とは扱いません。CI/workflow、Ruleset、hook、rules、AGENTS、Skills、helper、installerなど
-delivery安全境界の変更、auth/secrets、billing、production、不可逆migration、breaking changeはhighです。
-Issue #24自身もhighで、Draft PR後にDaikiの確認を要します。確認済みreceiptは後続pushやSHA変更へ
-引き継ぎません。
+riskはreview深度を決め、decision requirementとは分離します。仕様、既存権限、rollback、検証を確定できる
+場合はhigh/criticalでも`record-review`で自律deliveryします。製品判断、scope拡大、追加権限、費用、
+不可逆性、重大な残存リスク受容などDaikiだけが決められる場合は、回答後だけ`approve-review`を使います。
+技術gateの失敗や不明状態はapprovalで迂回しません。
 
 Ready化、merge、main同期、cleanupは`codex-delivery deliver`と`finish`だけが行う経路です。
 直接の`gh pr merge`、直接のReady化、`git worktree remove/prune`や任意branch削除でこのgateを

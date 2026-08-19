@@ -100,18 +100,26 @@ Ruleset is active; apply it with explicit approval and verify its readback. See
 [GitHub CI・Ruleset運用ガイド](docs/github-guardrails.ja.md) for the check mapping, application,
 verification, and rollback procedure.
 
+`codex-delivery` defaults to that strict Ruleset gate. A GitHub Free private repository may instead
+explicitly use `--gate-mode github-free-private`; this lower-assurance mode binds the live private
+repository identity, one successful exact-SHA `required-ci`, review state, and a high/critical
+receipt. GitHub does not enforce direct-push, force-push, deletion, or helper-only merge constraints
+server-side.
+
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, Draft PRs, and the delivery
-loop are used when the task or an explicit request warrants them. low/mediumの通常タスクは、
-固定head SHAの独立review、actionable=0、未解決thread=0、required checkの文字通りの
-`success`、live Ruleset gateを満たす場合に`codex-delivery`がReady、merge、mainのfetch後の
-`merge --ff-only`、managed cleanupまで進めます。CI/workflow、Ruleset、hook、rules、AGENTS、
-Skills、helper、installerなどdelivery安全境界、auth/secrets、billing、production、
-不可逆migration、breaking change、および判定不能なriskはhighとして、毎回会話でDaikiの明示確認を
-得てから`approve-review`を実行し、その後だけdeliveryします。自動approval reviewだけをDaikiの
-確認とは扱いません。release、force push、protected-branch push、
-任意削除、material scope expansion、product decisionsは引き続き手動です。詳しい条件は
-[Codex delivery運用ガイド](docs/codex-delivery.ja.md)を参照してください。
+loop are used when the task or an explicit request warrants them. risk分類とDaikiの意思決定要否は
+別々に判定します。全riskで固定head SHAの独立review、actionable=0、未解決thread=0、required
+checkの文字どおりの`success`、選択したremote gateを満たし、仕様・既存権限・rollback・検証を
+Codexが確定できる場合に`codex-delivery`がReady、merge、mainのfetch後の`merge --ff-only`、
+managed cleanupまで進めます。delivery安全境界、auth/secrets、production、不可逆migration、
+breaking changeはhigh/criticalとしてreviewを強化しますが、riskだけで確認待ちにしません。
+product decision、追加権限、費用、不可逆性、重大な残存リスク受容が必要な場合だけ
+`approve-review`を使います。release、force push、protected-branch push、任意削除、material
+scope expansionは引き続き手動です。詳しい条件は
+[Codex delivery運用ガイド](docs/codex-delivery.ja.md)を参照してください。GitHub Free/private modeは
+server-side強制がないためriskをhigh/criticalへ引き上げますが、decision assessmentがautonomousなら
+確認待ちせずdeliveryできます。
 
 `~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
 `~/.agents/skills` are symlinked from this repository.
