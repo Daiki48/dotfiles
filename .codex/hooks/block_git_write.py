@@ -82,6 +82,9 @@ XARGS_OPTS_WITH_VALUE = {
     "-a", "--arg-file", "-d", "--delimiter", "-E", "--eof", "-I", "--replace",
     "-L", "--max-lines", "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars",
 }
+PYTHON_SCRIPT_OPTS_WITH_VALUE = {
+    "-c", "-m", "-W", "-X", "--check-hash-based-pycs",
+}
 SUDO_OPTS_WITH_VALUE = {
     "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
     "-C", "--chdir", "-R", "--chroot", "-T", "--command-timeout", "-r",
@@ -165,6 +168,13 @@ def _command_start(tokens):
     while index < len(tokens):
         token = tokens[index]
         basename = os.path.basename(token)
+        if (
+            basename == "command"
+            and index + 1 < len(tokens)
+            and tokens[index + 1] in {"-v", "-V"}
+        ):
+            # command -v/-Vは実行可能fileの照会であり、後続tokenを実行しない。
+            return index
         if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
             index += 1
             continue
@@ -282,6 +292,47 @@ def _git_read_reason(command, args, global_option_used):
         if operation not in {"show", "list", "exists"}:
             return "git reflogはshow、list、existsだけ許可されます"
     return None
+
+
+def _git_read_target(session_cwd, explicit_cwd):
+    """read-only git -Cの対象をsession repositoryのmanaged worktreeへ限定する。"""
+    if not isinstance(session_cwd, str) or not session_cwd:
+        return None, "git -Cのsession cwdを確認できません"
+    candidate = Path(explicit_cwd)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return None, "git -Cにはrepository rootの絶対pathを指定してください"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None, "git -Cのpathを安全に解決できません"
+    if candidate != resolved:
+        return None, "git -Cではsymlinkまたは非正規pathを使用できません"
+
+    session_root = _resolved_git_path(session_cwd, "--show-toplevel")
+    session_common = _resolved_git_path(session_cwd, "--git-common-dir")
+    target_root = _resolved_git_path(resolved, "--show-toplevel")
+    target_common = _resolved_git_path(resolved, "--git-common-dir")
+    if None in {session_root, session_common, target_root, target_common}:
+        return None, "git -Cのrepositoryを確認できません"
+    if resolved != target_root:
+        return None, "git -Cにはrepository rootだけを指定してください"
+    if session_common != target_common:
+        return None, "git -Cのrepositoryがsession repositoryと一致しません"
+
+    main_root = session_common.parent
+    if session_root == main_root:
+        if target_root == main_root:
+            return None, "git -Cではmain repositoryを対象にできません"
+        reason = _managed_worktree_reason(main_root, session_common, target_root)
+        if reason:
+            return None, reason
+    elif target_root != session_root:
+        return None, "linked worktree sessionから別worktreeを照会できません"
+    else:
+        reason = _managed_worktree_reason(main_root, session_common, session_root)
+        if reason:
+            return None, reason
+    return str(target_root), None
 
 
 def _git_commit_reason(args):
@@ -420,9 +471,29 @@ def _git_switch_reason(args, cwd):
 
 
 def _git_worktree_read_reason(args):
-    if args == ["list", "--porcelain", "-z"]:
+    if args in (["list", "--porcelain"], ["list", "--porcelain", "-z"]):
         return None
     return "git worktreeは安定形式のlist照会だけ許可されます"
+
+
+def _git_ls_remote_read_reason(args):
+    """安全なoriginの単一作業branchだけをls-remoteで照会する。"""
+    if len(args) != 3 or args[0] not in {"--branches", "--heads"}:
+        return "git ls-remoteはoriginの単一作業branchを照会する正規形だけ許可されます"
+    remote, ref = args[1:]
+    if remote != "origin":
+        return "git ls-remoteのremoteはoriginだけ許可されます"
+    if ref.startswith("refs/heads/"):
+        branch = ref.removeprefix("refs/heads/")
+    else:
+        branch = ref
+    if (
+        not _valid_work_branch(branch)
+        or not _valid_remote_branch_name(branch)
+        or any(char in ref for char in "*?[]")
+    ):
+        return "git ls-remoteは安全な作業branchのrefを1件だけ指定してください"
+    return None
 
 
 def _git_push_reason(args, cwd):
@@ -454,7 +525,10 @@ def _git_write_target(session_cwd, explicit_cwd):
             return None, "Git書き込みのsession repositoryを確認できません"
         main_root = session_common.parent
         if session_root == main_root:
-            return None, "Git書き込みは専用managed worktreeで実行してください"
+            return None, (
+                "Git書き込みは専用managed worktreeで実行してください。"
+                "例: env -u SSH_ASKPASS git -C <managed-worktree> ..."
+            )
         reason = _managed_worktree_reason(main_root, session_common, session_root)
         if reason:
             return None, reason
@@ -546,6 +620,14 @@ def _git_invocation_reason(tokens, cwd=None):
             for key in os.environ
         ):
             return "Git commandではGitのrepository状態、path、外部command、出力先を変更する環境変数を使用できません"
+        if explicit_cwd is not None and token in (
+            GIT_READ_ONLY | {"branch", "remote", "worktree", "ls-remote"}
+        ):
+            if other_global_option_used:
+                return "read-only git -Cでは他のglobal optionを使用できません"
+            _, target_reason = _git_read_target(cwd, explicit_cwd)
+            if target_reason:
+                return target_reason
         if token == "branch":
             if any(_branch_arg_is_write(arg) for arg in args):
                 return "git branchの変更操作は許可されていません"
@@ -557,8 +639,10 @@ def _git_invocation_reason(tokens, cwd=None):
             return None if all(arg in REMOTE_READ_ARGS for arg in args) else "git remoteは照会だけ許可されます"
         if token == "worktree":
             return _git_worktree_read_reason(args)
+        if token == "ls-remote":
+            return _git_ls_remote_read_reason(args)
         if token in GIT_READ_ONLY:
-            return _git_read_reason(token, args, global_option_used)
+            return _git_read_reason(token, args, False if explicit_cwd is not None else global_option_used)
         if token not in GIT_SAFE_WRITE:
             return "許可されていないGit書き込み操作です"
         if token in {"pull", "switch"} and os.environ.get("CODEX_WORKTREE_MODE") != "single-checkout":
@@ -622,6 +706,30 @@ def _gh_api_is_write(args):
             return True
         index += 1
     return False
+
+
+def _gh_api_endpoint(args):
+    """gh apiのendpointだけを抽出し、option値をendpointと誤認しない。"""
+    value_options = {
+        "-X", "--method", "-H", "--header", "-f", "--raw-field", "-F", "--field",
+        "--input", "--jq", "--cache", "--hostname",
+    }
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            return args[index + 1] if index + 1 < len(args) else None
+        if token in value_options:
+            index += 2
+            continue
+        if any(token.startswith(f"{option}=") for option in value_options if option.startswith("--")):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return None
 
 
 def _required_option(args, short, long):
@@ -729,11 +837,13 @@ def _run_gh_json(cwd, *args):
     environment = os.environ.copy()
     for key in {"GH_HOST", "GH_REPO", "GH_FORCE_TTY", "GH_PAGER", "PAGER"}:
         environment.pop(key, None)
+    environment["GH_PROMPT_DISABLED"] = "1"
     try:
         result = subprocess.run(
             ["gh", *args],
             cwd=cwd,
             env=environment,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=GH_COMMAND_TIMEOUT_SECONDS,
@@ -776,6 +886,59 @@ def _pr_update_branch_preflight_reason(cwd, repository, number):
         or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", oid) is None
     ):
         return "PR update-branchのhead branchまたはSHAが許可範囲外です"
+    return None
+
+
+def _run_cancel_reason(args, cwd):
+    """単一runのcancelを、current repositoryとread-back状態へ拘束する。"""
+    if (
+        len(args) != 4
+        or args[0] != "cancel"
+        or not re.fullmatch(r"[1-9][0-9]*", args[1])
+        or args[2] != "--repo"
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args[3])
+    ):
+        return "gh run cancelはrun-idとrepoを指定する正規形だけ許可されます"
+    if os.environ.get("GH_REPO"):
+        return "gh run cancelではGH_REPO環境変数を使用できません"
+    run_id, repository = args[1], args[3]
+    repository_reason = _repository_reason(repository, cwd)
+    if repository_reason:
+        return repository_reason
+
+    payload = _run_gh_json(
+        cwd,
+        "api", "--method", "GET",
+        f"repos/{repository}/actions/runs/{run_id}",
+    )
+    if not isinstance(payload, dict):
+        return "gh run cancel対象のremote状態を確認できません"
+    database_id = payload.get("id")
+    if isinstance(database_id, bool) or not isinstance(database_id, int):
+        return "gh run cancel対象のidを確認できません"
+    if database_id != int(run_id):
+        return "gh run cancel対象のidがrun-idと一致しません"
+    remote_repository = payload.get("repository")
+    if (
+        not isinstance(remote_repository, dict)
+        or not isinstance(remote_repository.get("full_name"), str)
+        or remote_repository["full_name"].casefold() != repository.casefold()
+    ):
+        return "gh run cancel対象のrepository identityが一致しません"
+    status = payload.get("status")
+    if not isinstance(status, str) or status not in {"queued", "in_progress"}:
+        return "gh run cancel対象のstatusはqueuedまたはin_progressだけ許可されます"
+    if "conclusion" not in payload or payload["conclusion"] is not None:
+        return "gh run cancel対象は未完了runだけ許可されます"
+    expected_cancel_url = (
+        f"https://api.github.com/repos/{repository}/actions/runs/{run_id}/cancel"
+    )
+    cancel_url = payload.get("cancel_url")
+    if (
+        not isinstance(cancel_url, str)
+        or cancel_url.casefold() != expected_cancel_url.casefold()
+    ):
+        return "gh run cancel対象のcancel_urlがrepositoryまたはrun-idと一致しません"
     return None
 
 
@@ -928,6 +1091,13 @@ def _github_target_reason(positional, label):
 
 
 def _issue_write_reason(issue_command, issue_args, cwd):
+    if issue_command == "comment" and any(
+        token in {"-b", "--body"}
+        or token.startswith("--body=")
+        or (token.startswith("-b") and not token.startswith("--"))
+        for token in issue_args
+    ):
+        return "Issue commentでは--body-fileが必須です（--bodyは使用できません）"
     repository = _required_option(issue_args, "-R", "--repo")
     if not repository or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         return "Issue書き込みには対象repositoryを明示してください"
@@ -1149,6 +1319,12 @@ def _gh_invocation_reason(tokens, cwd=None):
         token.startswith("--hostname=") for token in tokens
     ):
         return "GitHub接続先hostを変更できません"
+    if (
+        len(tokens) >= start + 3
+        and tokens[start + 1:start + 3] == ["run", "cancel"]
+        and any(token in {"--help", "-h"} for token in tokens[start + 3:])
+    ):
+        return "gh run cancelはrun-idとrepoを指定する正規形だけ許可されます"
     if "--help" in tokens[start + 1:] or "-h" in tokens[start + 1:]:
         return None
     command, args = _first_command(tokens[start + 1:], GH_GLOBAL_OPTS_WITH_VALUE)
@@ -1172,6 +1348,9 @@ def _gh_invocation_reason(tokens, cwd=None):
             return "GitHub Issueの削除は許可されていません"
         return "許可されていないGitHub Issue操作です"
     if command == "api":
+        endpoint = _gh_api_endpoint(args)
+        if endpoint == "graphql":
+            return "gh api graphqlはquery、mutation、subscriptionを問わず直接実行できません"
         if any(
             token in {"-H", "--header"}
             or token.startswith(("-H", "--header="))
@@ -1180,6 +1359,15 @@ def _gh_invocation_reason(tokens, cwd=None):
         ):
             return "gh apiではhostまたは認証headerを変更できません"
         return "gh apiはGETの読み取り専用利用に限られます" if _gh_api_is_write(args) else None
+    if command == "run":
+        if tokens[start + 1:start + 2] != ["run"]:
+            return "gh run cancelではglobal optionを使用できません"
+        subcommand, run_args = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
+        if subcommand == "cancel":
+            return _run_cancel_reason([subcommand, *run_args], cwd)
+        if subcommand in GH_READ_ONLY["run"]:
+            return None
+        return "gh runはcancelまたは読み取り専用操作だけ許可されます"
     if command == "pr":
         subcommand, pr_args = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
         if subcommand == "create":
@@ -1210,6 +1398,57 @@ def _gh_invocation_reason(tokens, cwd=None):
     return "許可されていないGitHub書き込み操作です"
 
 
+def _python_script_operand(tokens, start):
+    """Python interpreterのscript operandだけを返す（任意引数は走査しない）。"""
+    index = start + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+        if token in {"-c", "-m"}:
+            return None
+        if token.startswith("-c") or token.startswith("-m"):
+            return None
+        if token in PYTHON_SCRIPT_OPTS_WITH_VALUE:
+            index += 2
+            continue
+        if token.startswith("--check-hash-based-pycs="):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return None
+
+
+def _python_helper_invocation_reason(tokens):
+    start = _command_start(tokens)
+    if start is None or not re.fullmatch(r"python(?:3(?:\.[0-9]+)?)?", os.path.basename(tokens[start])):
+        return None
+    index = start + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-m" and index + 1 < len(tokens):
+            module = tokens[index + 1]
+            if module in {"codex-worktree", "codex-delivery"}:
+                return "helperはPython moduleまたはinterpreter経由で実行できません"
+            return None
+        if token.startswith("-m") and token != "-m":
+            module = token[2:]
+            if module in {"codex-worktree", "codex-delivery"}:
+                return "helperはPython moduleまたはinterpreter経由で実行できません"
+            return None
+        break
+    operand = _python_script_operand(tokens, start)
+    if operand is None:
+        return None
+    helper = os.path.basename(operand)
+    if helper in {"codex-worktree", "codex-delivery"}:
+        return "helperはPython interpreterやwrapper経由で実行できません"
+    return None
+
+
 def _worktree_helper_invocation_reason(tokens):
     start = _command_start(tokens)
     if start is None or os.path.basename(tokens[start]) != "codex-worktree":
@@ -1222,6 +1461,14 @@ def _worktree_helper_invocation_reason(tokens):
     if not args:
         return "worktree helperのsubcommandを指定してください"
     command, arguments = args[0], args[1:]
+    if (
+        command in {"list", "doctor", "resume", "recover", "create"}
+        and len(arguments) == 1
+        and arguments[0] in {"--help", "-h"}
+    ):
+        return None
+    if any(argument in {"--help", "-h"} for argument in arguments):
+        return "codex-worktreeのhelpはsubcommand直後に単独指定してください"
     if command == "list":
         return None if not arguments else "codex-worktree listに引数は指定できません"
     if command in {"doctor", "resume", "recover"}:
@@ -1259,10 +1506,7 @@ def _worktree_helper_invocation_reason(tokens):
 def _delivery_helper_invocation_reason(tokens):
     """codex-deliveryを固定したtask・PR・head・planへ拘束する。"""
     start = _command_start(tokens)
-    mentions_helper = any(os.path.basename(token) == "codex-delivery" for token in tokens)
     if start is None or os.path.basename(tokens[start]) != "codex-delivery":
-        if mentions_helper:
-            return "delivery helperはinterpreterやwrapper経由で実行できません"
         return None
     if tokens[start] != "codex-delivery" or start != 0:
         return "delivery helperはPATHから直接実行してください"
@@ -1274,6 +1518,10 @@ def _delivery_helper_invocation_reason(tokens):
     command, arguments = args[0], args[1:]
     if command not in {"record-review", "approve-review", "deliver", "finish"}:
         return "許可されていないdelivery helper操作です"
+    if len(arguments) == 1 and arguments[0] in {"--help", "-h"}:
+        return None
+    if any(argument in {"--help", "-h"} for argument in arguments):
+        return "delivery helperのhelpはsubcommand直後に単独指定してください"
 
     value_options = {"--task-id", "--pr", "--head", "--plan-id"}
     switches = set()
@@ -1565,6 +1813,9 @@ def _has_write_operation(tokens):
             "create", "edit", "comment", "review", "ready", "close", "reopen",
             "update-branch",
         }
+    if command == "run":
+        subcommand, _ = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)
+        return subcommand == "cancel"
     if command == "api":
         return _gh_api_is_write(args)
     return False
@@ -1604,6 +1855,60 @@ def _command_segments(command):
         yield segment
 
 
+RESTRICTED_COMMANDS = {"git", "gh", "codex-worktree", "codex-delivery"}
+
+
+def _has_unquoted_shell_redirection(command):
+    """quoted/escaped文字を除き、shell redirection記号の有無だけを調べる。"""
+    quote = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "#" and (index == 0 or command[index - 1].isspace()):
+            newline = command.find("\n", index)
+            index = len(command) if newline == -1 else newline + 1
+            continue
+        if char in {"<", ">"}:
+            return True
+        index += 1
+    return False
+
+
+def _contains_restricted_command(tokens, depth=0):
+    if depth > 3:
+        return False
+    start = _command_start(tokens)
+    if start is not None and os.path.basename(tokens[start]) in RESTRICTED_COMMANDS:
+        return True
+    for nested_command in _nested_shell_commands(tokens):
+        if any(
+            _contains_restricted_command(nested, depth + 1)
+            for nested in _command_segments(nested_command)
+        ):
+            return True
+    return False
+
+
 def blocked_reason(command, cwd=None, depth=0):
     """連結コマンドと入れ子shellを調べ、禁止操作の理由を返す。"""
     if depth > 3:
@@ -1611,6 +1916,10 @@ def blocked_reason(command, cwd=None, depth=0):
     if "$(" in command or "`" in command:
         return "command substitutionを含むcommandは安全に検査できません"
     segments = list(_command_segments(command))
+    if _has_unquoted_shell_redirection(command) and any(
+        _contains_restricted_command(tokens) for tokens in segments
+    ):
+        return "Git/GitHub/helper commandではshell redirectionを使用できません"
     has_write = any(_has_write_operation(tokens) for tokens in segments)
     if has_write and (depth > 0 or len(segments) != 1):
         return "Git/GitHub書き込みは単一の直接commandで実行してください"
@@ -1660,6 +1969,9 @@ def blocked_reason(command, cwd=None, depth=0):
         if reason:
             return reason
         reason = _gh_invocation_reason(tokens, cwd)
+        if reason:
+            return reason
+        reason = _python_helper_invocation_reason(tokens)
         if reason:
             return reason
         reason = _worktree_helper_invocation_reason(tokens)

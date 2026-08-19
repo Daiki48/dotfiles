@@ -26,6 +26,41 @@ path filterは設定しないため、required checkがskipされてpendingの�
 通常のIssue・PR lifecycleは、hookがcurrent repository、単一対象、正規形の引数、送信内容を
 検査した上で自律実行します。force pushや削除は、検査を外して直接許可せずhard denyを維持します。
 
+読み取り操作も、外部command実行、別repository参照、file書き込みへ変わらない正規形だけを
+許可します。代表的な許可形は次のとおりです。
+
+```sh
+git worktree list --porcelain
+git worktree list --porcelain -z
+git ls-remote --branches origin refs/heads/<作業branch>
+git -C <同一repositoryの検証済みmanaged worktree> status --short
+codex-delivery record-review --help
+```
+
+`git ls-remote --heads`はGitの後方互換aliasとして受け付けますが、新しい利用では
+`--branches`を使用します。任意URL、追加ref、glob、`--upload-pack`、`--server-option`、
+別repositoryを指す`git -C`、その他のGit global optionは許可しません。Git、GitHub CLI、
+`codex-worktree`、`codex-delivery`のshell redirectionも、読み取りに見せかけたfile書き込みを
+避けるため拒否します。
+
+GitHub Actionsのrun取消は、次の正規形だけを例外的なwrite allowlistとします。
+
+```sh
+gh run cancel <正の数値run ID> --repo <current originのowner/repository>
+```
+
+hookは実行前に固定したread-only REST GETで同じrepositoryとrun IDをread-backし、run ID、
+repository、cancel URL、status、conclusionが一致することを確認します。公式にcancel対象として
+案内されている`queued`または
+`in_progress`だけを許可し、完了済み、別repository、取得不能、競合状態ではfail closedにします。
+read-back後にrunが完了するraceではcancel側が失敗するだけで、別runへ対象を切り替えません。
+`--force`、追加option、runのdelete・rerun、その他のGitHub writeはこの例外へ含めません。
+
+GitHub GraphQLは`query`でもfield指定によりPOSTになるため、直接の
+`gh api graphql -f/-F ...`を読み取りとして一括許可しません。固定queryと対象検証を持つ
+専用helperだけを信頼経路にします。helper名が検索commandや`command -v`の引数に現れるだけでは
+実行と扱いませんが、wrapperやinterpreterからhelper scriptを起動する形は引き続き拒否します。
+
 Codexの[`PreToolUse` hook](https://learn.chatgpt.com/docs/hooks)は現時点で承認要求を新規に
 発生させられません。そのため、危険操作を
 「Daikiの確認後だけCodexが実行」へ移す場合は、対象の退避・repository・refを検査する専用helperと、
