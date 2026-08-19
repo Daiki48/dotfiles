@@ -16,10 +16,12 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Iterator
 
 
@@ -29,14 +31,18 @@ STATE_VERSION = 1
 MAX_FILE_BYTES = 256 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_PAGE_ITEMS = 100
-MAX_PAGES = 100
+MAX_PAGES = 20
 MAX_ITEMS = 10_000
-MAX_RULESETS = 100
+MAX_RULESETS = 20
 COMMAND_TIMEOUT = 45
+OPERATION_TIMEOUT = 300
+SYSTEM_PATH = "/usr/bin:/bin"
+GIT_BINARY = Path("/usr/bin/git")
+GH_BINARY = Path("/usr/bin/gh")
 TASK_ID_RE = re.compile(r"^(?:issue-[1-9][0-9]*|task-[a-z0-9][a-z0-9-]{0,63})$")
 BRANCH_RE = re.compile(r"^(?:feat|feature|fix|refactor|docs|test|chore|ci|build|perf|style|hotfix|update)/[a-z0-9][a-z0-9._-]*$")
 OID_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
-PLAN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+PLAN_RE = re.compile(r"^[A-Z][A-Z0-9-]{7,127}-v[1-9][0-9]*$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 PR_RE = re.compile(r"^[1-9][0-9]{0,8}$")
 
@@ -64,6 +70,24 @@ class DeliveryError(RuntimeError):
 
 
 _HELD_LOCKS = threading.local()
+_DEADLINES = threading.local()
+
+
+@contextmanager
+def _operation_deadline(seconds: int = OPERATION_TIMEOUT) -> Iterator[None]:
+    previous = getattr(_DEADLINES, "value", None)
+    current = time.monotonic() + seconds
+    _DEADLINES.value = min(previous, current) if previous is not None else current
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                del _DEADLINES.value
+            except AttributeError:
+                pass
+        else:
+            _DEADLINES.value = previous
 
 
 def _safe_environment() -> dict[str, str]:
@@ -73,7 +97,31 @@ def _safe_environment() -> dict[str, str]:
             environment.pop(key, None)
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment.pop("GH_REPO", None)
+    environment.pop("GH_CONFIG_DIR", None)
+    environment["GH_HOST"] = "github.com"
+    environment["PATH"] = SYSTEM_PATH
     return environment
+
+
+def _trusted_binary(path: Path, name: str) -> str:
+    try:
+        metadata = path.lstat()
+        parent = path.parent.lstat()
+    except OSError as error:
+        raise DeliveryError(f"system {name}を確認できません") from error
+    if (
+        not path.is_absolute() or path.parent != Path("/usr/bin")
+        or stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_mode & 0o022 or parent.st_mode & 0o022
+        or not os.access(path, os.X_OK)
+    ):
+        raise DeliveryError(f"system {name}が安全な実行fileではありません")
+    return str(path)
+
+
+def _git_command(*args: str) -> list[str]:
+    return [_trusted_binary(GIT_BINARY, "Git"), "-c", "core.hooksPath=/dev/null", *args]
 
 
 def _run(
@@ -82,6 +130,12 @@ def _run(
 ) -> subprocess.CompletedProcess[str]:
     if not command or any(not isinstance(item, str) or not item for item in command):
         raise DeliveryError("外部commandを安全に構成できません")
+    deadline = getattr(_DEADLINES, "value", None)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DeliveryError("delivery操作全体がtimeoutしました")
+        timeout = min(timeout, max(0.001, remaining))
     try:
         result = subprocess.run(
             command, cwd=cwd, check=False, stdout=subprocess.PIPE,
@@ -100,14 +154,14 @@ def _run(
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> str:
-    result = _run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=cwd)
+    result = _run(_git_command(*args), cwd=cwd)
     if result.returncode != 0 and check:
         raise DeliveryError("Git commandに失敗しました")
     return result.stdout
 
 
 def _gh(cwd: Path, *args: str, check: bool = True) -> str:
-    result = _run(["gh", *args], cwd=cwd)
+    result = _run([_trusted_binary(GH_BINARY, "GitHub CLI"), *args], cwd=cwd)
     if result.returncode != 0 and check:
         raise DeliveryError("GitHub CLI commandに失敗しました")
     return result.stdout
@@ -289,7 +343,7 @@ def _task_lock(repository: str, task_id: str) -> Iterator[None]:
 def _github_repository(remote: str) -> str | None:
     value = remote.strip().rstrip("/")
     prefixes = (
-        "https://github.com/", "http://github.com/", "ssh://git@github.com/",
+        "https://github.com/", "ssh://git@github.com/",
         "git@github.com:",
     )
     for prefix in prefixes:
@@ -344,7 +398,7 @@ def _manifest(root: Path, task_id: str, repository: str) -> tuple[dict[str, Any]
     ):
         raise DeliveryError("worktree manifestの値がcurrent repositoryと一致しません")
     branch_check = _run(
-        ["git", "-c", "core.hooksPath=/dev/null", "check-ref-format", "--branch", payload["branch"]],
+        _git_command("check-ref-format", "--branch", payload["branch"]),
         cwd=root,
     )
     if branch_check.returncode != 0:
@@ -370,7 +424,10 @@ def _worktree(root: Path, manifest: dict[str, Any], expected: Path) -> None:
 
 
 def _worktree_clean_head(worktree: Path, expected_head: str) -> None:
-    if _git(worktree, "status", "--porcelain=v1", "--untracked-files=all"):
+    if _git(
+        worktree, "status", "--porcelain=v1", "--untracked-files=all",
+        "--ignored=matching",
+    ):
         raise DeliveryError("managed worktreeがcleanではありません")
     if _oid(_git(worktree, "rev-parse", "HEAD").strip(), name="managed worktree head") != _oid(expected_head):
         raise DeliveryError("managed worktree headがreceiptと一致しません")
@@ -579,43 +636,43 @@ def _graphql(root: Path, repository: str, query: str, variables: dict[str, Any])
 
 
 THREAD_QUERY = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{isResolved}pageInfo{hasNextPage,endCursor}}}}}"""
-REVIEW_QUERY = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviews(first:100,after:$cursor){nodes{state}pageInfo{hasNextPage,endCursor}}}}}"""
+DECISION_QUERY = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision}}}"""
 
 
 def _review_safety(root: Path, repository: str, pr: int) -> None:
-    for query, connection, label in ((THREAD_QUERY, "reviewThreads", "review thread"), (REVIEW_QUERY, "reviews", "review")):
-        cursor: str | None = None
-        pages = 0
-        items = 0
-        while True:
-            data = _graphql(root, repository, query, {"number": pr, "cursor": cursor})
-            try:
-                pull = data["repository"]["pullRequest"]
-                connection_data = pull[connection]
-                nodes = connection_data["nodes"]
-                info = connection_data["pageInfo"]
-            except (KeyError, TypeError) as error:
-                raise DeliveryError(f"{label}のGraphQL schemaが不正です") from error
-            if not isinstance(nodes, list) or not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
-                raise DeliveryError(f"{label}のpaginationが不正です")
-            pages += 1
-            items += len(nodes)
-            if pages > MAX_PAGES or items > MAX_ITEMS:
-                raise DeliveryError(f"{label}のpagination上限を超えました")
-            if connection == "reviewThreads":
-                if any(not isinstance(node, dict) or node.get("isResolved") is not True for node in nodes):
-                    raise DeliveryError("未解決review threadがあります")
-            else:
-                if any(not isinstance(node, dict) or node.get("state") == "CHANGES_REQUESTED" for node in nodes):
-                    raise DeliveryError("CHANGES_REQUESTED reviewがあります")
-                if any(not isinstance(node, dict) or not isinstance(node.get("state"), str) for node in nodes):
-                    raise DeliveryError("review stateが不正です")
-            if not info["hasNextPage"]:
-                break
-            next_cursor = info.get("endCursor")
-            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
-                raise DeliveryError(f"{label} pagination cursorが不正です")
-            cursor = next_cursor
+    cursor: str | None = None
+    pages = 0
+    items = 0
+    while True:
+        data = _graphql(root, repository, THREAD_QUERY, {"number": pr, "cursor": cursor})
+        try:
+            connection = data["repository"]["pullRequest"]["reviewThreads"]
+            nodes = connection["nodes"]
+            info = connection["pageInfo"]
+        except (KeyError, TypeError) as error:
+            raise DeliveryError("review threadのGraphQL schemaが不正です") from error
+        if not isinstance(nodes, list) or not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+            raise DeliveryError("review threadのpaginationが不正です")
+        pages += 1
+        items += len(nodes)
+        if pages > MAX_PAGES or items > MAX_ITEMS:
+            raise DeliveryError("review threadのpagination上限を超えました")
+        if any(not isinstance(node, dict) or node.get("isResolved") is not True for node in nodes):
+            raise DeliveryError("未解決review threadがあります")
+        if not info["hasNextPage"]:
+            break
+        next_cursor = info.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            raise DeliveryError("review thread pagination cursorが不正です")
+        cursor = next_cursor
+
+    decision_data = _graphql(root, repository, DECISION_QUERY, {"number": pr})
+    try:
+        decision = decision_data["repository"]["pullRequest"]["reviewDecision"]
+    except (KeyError, TypeError) as error:
+        raise DeliveryError("review decisionのGraphQL schemaが不正です") from error
+    if decision not in {None, "APPROVED"}:
+        raise DeliveryError("現在有効なreview decisionがdeliveryを許可していません")
 
 
 def _ruleset(root: Path, repository: str) -> None:
@@ -707,7 +764,7 @@ def _validate_delivery(
     _default_branch(root, repository)
     live_main = _fetch_main(root)
     ancestor = _run(
-        ["git", "-c", "core.hooksPath=/dev/null", "merge-base", "--is-ancestor", live_main, head],
+        _git_command("merge-base", "--is-ancestor", live_main, head),
         cwd=root,
     )
     if ancestor.returncode != 0:
@@ -727,6 +784,18 @@ def _match_cli_receipt(
         raise DeliveryError("指定headがreceiptと一致しません")
     if plan is not None and receipt.get("plan_id") != plan:
         raise DeliveryError("指定Plan IDがreceiptと一致しません")
+
+
+def _validate_receipt_evidence(
+    worktree: Path, manifest: dict[str, Any], receipt: dict[str, Any],
+) -> None:
+    changed = _changed_files(worktree, manifest["base_oid"], receipt["head_sha"])
+    if changed != receipt["changed_files"]:
+        raise DeliveryError("receiptのchanged-filesが固定headの差分と一致しません")
+    if receipt["risk"] in {"low", "medium"} and any(_is_safety_path(path) for path in changed):
+        raise DeliveryError("安全境界差分をlow/medium receiptでdeliveryできません")
+    if receipt["risk"] in {"high", "critical"} and receipt["human_approved"] is not True:
+        raise DeliveryError("high/critical receiptにはhuman approvalが必要です")
 
 
 def _deliver_locked(
@@ -752,39 +821,55 @@ def _deliver_locked(
     with _task_lock(repository, task_id):
         _worktree(root, manifest, worktree)
         _worktree_clean_head(worktree, receipt["head_sha"])
+        _validate_receipt_evidence(worktree, manifest, receipt)
         # Draftでも変更前の全remote preflightを完了してからReadyへ移行する。
         _validate_delivery(root, receipt, allow_draft=True, expected_branch=manifest["branch"])
         initial = _pr_view(root, receipt["repository"], receipt["pr"])
         if initial["isDraft"]:
             _gh(root, "pr", "ready", str(receipt["pr"]), "--repo", receipt["repository"])
         _validate_delivery(root, receipt, allow_draft=False, expected_branch=manifest["branch"])
-        # ready/checks/reviews/rulesetの検査後にもPR headを固定してraceを検出する。
+        # ready/checks/reviews/rulesetの検査後にもPR identity全体を再取得してrace窓を縮める。
         latest = _pr_view(root, receipt["repository"], receipt["pr"])
-        if latest["state"] != "OPEN" or _oid(latest["headRefOid"], name="PR head") != receipt["head_sha"]:
-            raise DeliveryError("merge直前にPR head/stateが変化しました")
+        if (
+            latest["state"] != "OPEN" or latest["isDraft"]
+            or _oid(latest["headRefOid"], name="PR head") != receipt["head_sha"]
+            or latest.get("headRefName") != manifest["branch"]
+            or latest.get("baseRefName") != "main"
+            or latest.get("isCrossRepository") is not False
+            or not _same_head_repository(latest, repository)
+            or latest.get("autoMergeRequest") is not None
+            or latest.get("mergeable") != "MERGEABLE"
+            or latest.get("mergeStateStatus") != "CLEAN"
+        ):
+            raise DeliveryError("merge直前にPR identity/mergeabilityが変化しました")
         _worktree(root, manifest, worktree)
         _worktree_clean_head(worktree, receipt["head_sha"])
+        _validate_receipt_evidence(worktree, manifest, receipt)
+        state_path = _state_path(repository, task_id)
+        if state_path.exists() or state_path.is_symlink():
+            state = _load_state(repository, task_id, receipt, manifest["branch"])
+            if state["stage"] != "merge_started":
+                raise DeliveryError("既存delivery stateがmerge再試行可能ではありません")
+            state = _save_stage(repository, task_id, state, "merge_started")
+        else:
+            state = {
+                "version": STATE_VERSION, "kind": "delivery", "task_id": task_id,
+                "repository": receipt["repository"], "pr": receipt["pr"],
+                "head_sha": receipt["head_sha"], "branch": manifest["branch"],
+                "stage": "merge_started", "updated_at": _now(), "last_error": "",
+            }
+            _atomic_json(state_path, state)
         _gh(root, "pr", "merge", str(receipt["pr"]), "--repo", receipt["repository"], "--merge", "--match-head-commit", receipt["head_sha"])
         merged = _pr_view(root, receipt["repository"], receipt["pr"])
         if merged.get("state") != "MERGED" or _oid(merged.get("headRefOid"), name="merged PR head") != receipt["head_sha"]:
             raise DeliveryError("PR merge後のstate/headを確認できません")
-        state = {
-            "version": STATE_VERSION, "kind": "delivery", "task_id": task_id,
-            "repository": receipt["repository"], "pr": receipt["pr"], "head_sha": receipt["head_sha"],
-            "branch": manifest["branch"], "stage": "merged", "updated_at": _now(), "last_error": "",
-        }
-        _atomic_json(_state_path(repository, task_id), state)
-        return state
+        return _save_stage(repository, task_id, state, "merged")
 
 
 def _load_state(repository: str, task_id: str, receipt: dict[str, Any], branch: str) -> dict[str, Any]:
     path = _state_path(repository, task_id)
     if not path.exists():
-        return {
-            "version": STATE_VERSION, "kind": "delivery", "task_id": task_id,
-            "repository": receipt["repository"], "pr": receipt["pr"], "head_sha": receipt["head_sha"],
-            "branch": branch, "stage": "merged", "updated_at": _now(), "last_error": "",
-        }
+        raise DeliveryError("delivery stateが存在しません")
     _safe_regular(path)
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
@@ -797,7 +882,7 @@ def _load_state(repository: str, task_id: str, receipt: dict[str, Any], branch: 
         state["version"] != STATE_VERSION or state["kind"] != "delivery" or state["task_id"] != task_id
         or state["repository"] != receipt["repository"] or state["pr"] != receipt["pr"]
         or state["head_sha"] != receipt["head_sha"] or state["branch"] != branch
-        or state["stage"] not in {"merged", "main_synced", "remote_delete_started", "remote_deleted", "worktree_unlock_started", "worktree_removed", "completed"}
+        or state["stage"] not in {"merge_started", "merged", "main_synced", "remote_delete_started", "remote_deleted", "worktree_unlock_started", "worktree_removed", "completed"}
         or not isinstance(state["last_error"], str)
     ):
         raise DeliveryError("delivery stateがreceipt/manifestと一致しません")
@@ -814,7 +899,7 @@ def _save_stage(repository: str, task_id: str, state: dict[str, Any], stage: str
 
 
 def _fetch_main(root: Path) -> str:
-    if _run(["git", "-c", "core.hooksPath=/dev/null", "fetch", "origin", "main"], cwd=root).returncode != 0:
+    if _run(_git_command("fetch", "origin", "main"), cwd=root).returncode != 0:
         raise DeliveryError("origin/mainをfetchできません")
     remote = _git(root, "rev-parse", "refs/remotes/origin/main").strip()
     return _oid(remote, name="origin/main")
@@ -896,11 +981,19 @@ def _finish_locked(
         ):
             raise DeliveryError("PRがreceiptのhead/branch/sourceでmergedされていません")
         _default_branch(root, repository)
+        if state["stage"] == "merge_started":
+            _worktree(root, manifest, worktree)
+            _worktree_clean_head(worktree, receipt["head_sha"])
+            _validate_receipt_evidence(worktree, manifest, receipt)
+            _check_required_ci(root, repository, receipt["head_sha"])
+            _review_safety(root, repository, receipt["pr"])
+            _ruleset(root, repository)
+            state = _save_stage(repository, task_id, state, "merged")
         _assert_main_clean(root)
         if state["stage"] == "completed":
             if _remote_branch(root, manifest["branch"]) is not None or worktree.exists() or worktree.is_symlink():
                 raise DeliveryError("completed stateのcleanup対象が再出現しました")
-            local = _run(["git", "-c", "core.hooksPath=/dev/null", "show-ref", "--verify", "--quiet", f"refs/heads/{manifest['branch']}"], cwd=root)
+            local = _run(_git_command("show-ref", "--verify", "--quiet", f"refs/heads/{manifest['branch']}"), cwd=root)
             if local.returncode == 0:
                 raise DeliveryError("completed stateのlocal branchが再出現しました")
             if local.returncode != 1:
@@ -908,15 +1001,18 @@ def _finish_locked(
             return state
         if state["stage"] == "merged":
             remote_main = _fetch_main(root)
-            ancestor = _run(["git", "-c", "core.hooksPath=/dev/null", "merge-base", "--is-ancestor", receipt["head_sha"], "refs/remotes/origin/main"], cwd=root)
+            ancestor = _run(_git_command("merge-base", "--is-ancestor", receipt["head_sha"], "refs/remotes/origin/main"), cwd=root)
             if ancestor.returncode != 0:
                 raise DeliveryError("origin/mainがmerged headへ到達していません")
             _assert_main_clean(root)
             before = _git(root, "rev-parse", "HEAD").strip()
-            ancestry = _run(["git", "-c", "core.hooksPath=/dev/null", "merge-base", "--is-ancestor", before, remote_main], cwd=root)
+            ancestry = _run(_git_command("merge-base", "--is-ancestor", before, remote_main), cwd=root)
             if ancestry.returncode != 0:
                 raise DeliveryError("人間用mainに未pushのlocal commitがあります")
-            merged = _run(["git", "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "refs/remotes/origin/main"], cwd=root)
+            _assert_main_clean(root)
+            if _git(root, "rev-parse", "HEAD").strip() != before:
+                raise DeliveryError("main同期直前に人間用checkoutのHEADが変化しました")
+            merged = _run(_git_command("merge", "--ff-only", "refs/remotes/origin/main"), cwd=root)
             if merged.returncode != 0:
                 raise DeliveryError("人間用mainをff-only syncできません")
             _assert_main_synced(root)
@@ -935,14 +1031,11 @@ def _finish_locked(
             if len(target_records) != 1 or len(branch_records) != 1:
                 raise DeliveryError("task worktreeまたはbranchの使用状況が一意ではありません")
             _worktree(root, manifest, worktree)
-            if _git(worktree, "status", "--porcelain=v1", "--untracked-files=all"):
-                raise DeliveryError("task worktreeがcleanではありません")
-            head = _oid(_git(worktree, "rev-parse", "HEAD").strip(), name="worktree head")
-            if head != receipt["head_sha"]:
-                raise DeliveryError("task worktree headがreceiptと一致しません")
+            _worktree_clean_head(worktree, receipt["head_sha"])
             if remote is not None:
                 state = _save_stage(repository, task_id, state, "remote_delete_started")
-                _git(root, "push", "origin", "--delete", manifest["branch"])
+                lease = f"--force-with-lease=refs/heads/{manifest['branch']}:{receipt['head_sha']}"
+                _git(root, "push", lease, "origin", "--delete", manifest["branch"])
                 if _remote_branch(root, manifest["branch"]) is not None:
                     raise DeliveryError("remote task branchを削除後も確認できました")
             state = _save_stage(repository, task_id, state, "remote_deleted")
@@ -963,10 +1056,7 @@ def _finish_locked(
                 if state["stage"] == "worktree_unlock_started" and lock_reason not in {None, f"codex-task:{task_id}"}:
                     raise DeliveryError("unlock後のworktree lock reasonが想定外です")
                 _worktree(root, manifest, worktree)
-                if _git(worktree, "status", "--porcelain=v1", "--untracked-files=all"):
-                    raise DeliveryError("cleanup前のtask worktreeがcleanではありません")
-                if _oid(_git(worktree, "rev-parse", "HEAD").strip(), name="cleanup worktree head") != receipt["head_sha"]:
-                    raise DeliveryError("cleanup worktree headがreceiptと一致しません")
+                _worktree_clean_head(worktree, receipt["head_sha"])
                 if lock_reason is not None:
                     state = _save_stage(repository, task_id, state, "worktree_unlock_started")
                     _git(root, "worktree", "unlock", "--", str(worktree))
@@ -976,10 +1066,7 @@ def _finish_locked(
                         raise DeliveryError("worktree unlock後のlock状態を確認できません")
                     _assert_main_synced(root)
                     _worktree(root, manifest, worktree)
-                    if _git(worktree, "status", "--porcelain=v1", "--untracked-files=all"):
-                        raise DeliveryError("worktree unlock後にdirtyになりました")
-                    if _oid(_git(worktree, "rev-parse", "HEAD").strip(), name="unlock後worktree head") != receipt["head_sha"]:
-                        raise DeliveryError("worktree unlock後にheadが変化しました")
+                    _worktree_clean_head(worktree, receipt["head_sha"])
                 _git(root, "worktree", "remove", "--", str(worktree))
             elif worktree.exists() or worktree.is_symlink():
                 raise DeliveryError("Git metadataにないworktree実体を削除しません")
@@ -987,7 +1074,7 @@ def _finish_locked(
         if state["stage"] == "worktree_removed":
             if _remote_branch(root, manifest["branch"]) is not None:
                 raise DeliveryError("remote task branchがcleanup中に再出現しました")
-            branch = _run(["git", "-c", "core.hooksPath=/dev/null", "show-ref", "--verify", "--quiet", f"refs/heads/{manifest['branch']}"], cwd=root)
+            branch = _run(_git_command("show-ref", "--verify", "--quiet", f"refs/heads/{manifest['branch']}"), cwd=root)
             if branch.returncode == 0:
                 local_head = _oid(_git(root, "rev-parse", f"refs/heads/{manifest['branch']}").strip(), name="local task branch")
                 if local_head != receipt["head_sha"]:
@@ -1006,7 +1093,7 @@ def deliver(
     task_id = _task_id(task_id)
     repository = _repository(root)
     # manifest/receipt/stateを読む前にtask専用lockを取得してTOCTOUを閉じる。
-    with _task_lock(repository, task_id):
+    with _operation_deadline(), _task_lock(repository, task_id):
         return _deliver_locked(
             root, task_id, expected_pr=expected_pr, expected_head=expected_head,
             expected_plan=expected_plan,
@@ -1020,7 +1107,7 @@ def finish(
     task_id = _task_id(task_id)
     repository = _repository(root)
     # manifest/stateはlock取得後に読み、途中で別manifestへ差し替えられないようにする。
-    with _task_lock(repository, task_id):
+    with _operation_deadline(), _task_lock(repository, task_id):
         return _finish_locked(
             root, task_id, expected_pr=expected_pr, expected_head=expected_head,
             expected_plan=expected_plan,
@@ -1053,7 +1140,21 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _require_canonical_invocation() -> None:
+    installed = shutil.which("codex-delivery")
+    if not installed:
+        raise DeliveryError("codex-deliveryのcanonical install先をPATHから確認できません")
+    try:
+        invoked = Path(sys.argv[0]).resolve(strict=True)
+        canonical = Path(installed).resolve(strict=True)
+    except OSError as error:
+        raise DeliveryError("codex-deliveryの実行pathを確認できません") from error
+    if invoked != canonical:
+        raise DeliveryError("codex-deliveryはcanonical install先から直接実行してください")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _require_canonical_invocation()
     args = _parser().parse_args(argv)
     root = Path.cwd().resolve()
     if args.command == "record-review":

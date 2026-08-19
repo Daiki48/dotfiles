@@ -89,7 +89,10 @@ merge、main同期、managed cleanupは専用[`codex-delivery` helper](docs/code
 dirty、stale、conflict、判定不能時はPR、branch、worktreeを保持します。任意の削除が必要な場合、
 Codexは対象を`.codex-trash/<timestamp>/`へ移し、そのdirectoryをstageまたは自動削除しません。
 managed root内でmerged、main到達性、clean、未pushなしを厳格に証明したcleanupだけが自律削除の例外です。
-The guard checks direct Bash invocations; arbitrary programs and same-user races remain outside its security boundary.
+そのcleanupではreview済みSHAをleaseにしたremote task branch削除だけを限定的に許可します。
+ignored artifactもdirtyとして停止し、stateをatomic保存して途中から再検証・再開します。
+The guard checks direct Bash invocations; arbitrary programs, privileged concurrent PR/repository
+mutations, and same-user races remain outside its security boundary.
 
 The repository declares a required `required-ci` GitHub Actions job and the intended remote
 `main` Ruleset in `.github/rulesets/main.json`. The declaration does not prove that the remote

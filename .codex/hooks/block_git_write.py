@@ -1259,7 +1259,10 @@ def _worktree_helper_invocation_reason(tokens):
 def _delivery_helper_invocation_reason(tokens):
     """codex-deliveryを固定したtask・PR・head・planへ拘束する。"""
     start = _command_start(tokens)
+    mentions_helper = any(os.path.basename(token) == "codex-delivery" for token in tokens)
     if start is None or os.path.basename(tokens[start]) != "codex-delivery":
+        if mentions_helper:
+            return "delivery helperはinterpreterやwrapper経由で実行できません"
         return None
     if tokens[start] != "codex-delivery" or start != 0:
         return "delivery helperはPATHから直接実行してください"

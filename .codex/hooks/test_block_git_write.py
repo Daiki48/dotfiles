@@ -298,6 +298,8 @@ class GuardTest(unittest.TestCase):
         for command in (
             "./codex-delivery deliver --task-id issue-24",
             "command codex-delivery deliver --task-id issue-24",
+            "python3 .codex/helpers/codex-delivery approve-review --task-id issue-24",
+            "python3 /home/user/.local/bin/codex-delivery deliver --task-id issue-24",
             f"codex-delivery record-review --task-id issue-24 --pr 27 --head {head} "
             "--risk high --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
             f"codex-delivery approve-review --task-id issue-24 --pr 27 --head {head} "

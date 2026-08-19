@@ -28,6 +28,12 @@ codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --pl
 `review-branch`は読み取り専用です。reviewerはreceipt、Issue、PR、Git、worktreeを変更せず、
 呼び出し元がreview結果を`record-review`へ渡します。
 
+helperはcanonical install先から直接起動し、`/usr/bin/git`と`/usr/bin/gh`だけを使います。
+`PATH`、`GH_HOST`、`GH_REPO`、`GH_CONFIG_DIR`、Git環境変数による対象・実行fileの差し替えを
+拒否または無効化し、1回の`deliver`/`finish`全体を5分でfail closedにします。この境界は
+同一userが任意programを実行してhelperやmanaged stateそのものを書き換える攻撃を防ぐsandboxでは
+ありません。その権限を持つ主体と、repository設定やPRを同時変更できる管理者は信頼境界内です。
+
 ## DELIVERY-01: 固定SHAのreview receipt
 
 Draft PRを作成したら、次の対象を固定します。
@@ -41,6 +47,11 @@ Draft PRを作成したら、次の対象を固定します。
 receiptは対象SHAに束縛します。review後にcommitをpushしてhead SHAが変わった場合、以前の
 receipt、CI、review、確認を新SHAへ引き継ぎません。新しいSHAでCIと独立reviewを実行し、
 新しいreceiptを記録します。
+
+receiptのreview/test flagは、定めた手順を完了したことをmachine-readableに束縛する構造証拠であり、
+review品質を暗号学的に証明するものではありません。helperはdelivery直前にbase SHAと固定head SHAの
+実差分を再計算し、receiptのchanged-filesと順序も含めて完全一致させます。安全境界pathを含む差分は
+low/mediumへ分類できません。
 
 required checkは文字通り`success`だけを成功とします。`skipped`、`cancelled`、`timed out`、
 `neutral`、`pending`、取得不能、判定不能は成功として扱いません。check名が同じでもworkflowの
@@ -62,7 +73,8 @@ commit、pushを自律的に行います。そのpushでSHAが変わるため、
 2. 現在のhead SHAがreceiptのreview済みSHAと一致する。
 3. required CIがすべて文字通り`success`で、失敗、skip、cancel、timeout、neutral、pending、
    取得不能がない。
-4. actionableな指摘が0件で、GitHub review conversationの未解決件数が0件である。
+4. actionableな指摘が0件で、GitHub review conversationの全pageに未解決threadがなく、現在有効な
+   `reviewDecision`が`CHANGES_REQUESTED`、`REVIEW_REQUIRED`、不明値ではない。
 5. merge conflictがなく、branchが最新baseの要件を満たす。
 6. 実行時点のlive Ruleset gateがactiveで、required CI、PR経由、conversation解決、merge method、
    force push/branch deletion禁止などのrepository正本と一致する。
@@ -93,6 +105,14 @@ low/medium、または`approve-review`済みのhigh/critical/判定不能だけ�
 merge methodでmergeします。Ready化やmergeの前後でhead SHA、PR状態、Ruleset、CIを取り直し、
 raceやstale状態を検出したら停止します。
 
+merge直前にはrepository、PR番号、open/Ready、base=`main`、head branch、head SHA、同一repository、
+auto-merge無効、mergeable/CLEANを再取得します。merge commandは
+`gh pr merge <number> --repo <owner/repo> --merge --match-head-commit <review済みSHA>`だけです。
+GitHubが提供するcompare-and-swapはhead SHAに対するものなので、直前readとmergeの間に権限主体が
+base branchやrepository設定を同時変更する競合をatomicには拘束できません。その同時変更は上記の
+信頼境界内とし、通常の外部状態変化は直前readback、Ruleset、固定head条件で縮小・検出します。
+`--admin`、`--auto`、`--delete-branch`、squash/rebaseは使いません。
+
 確認できない状態を成功扱いしません。失敗、timeout、pending、dirty、stale、conflict、mergeable
 不明、network/auth障害、Ruleset readback不一致ではdeliverしません。PR、remote/local branch、
 worktree、receiptを保持し、再開時に状態を再取得します。
@@ -117,7 +137,7 @@ finishの最後に、管理root内の対象worktreeだけをcleanupできます�
 
 - manifestのrepository、task ID、worktree path、branchが対象PRと一致する。
 - PRがmergedで、receiptのhead commitがmainへ到達している。
-- worktreeがcleanで、未push commitがなく、別taskのworktreeではない。
+- worktreeがignored artifactも含めてcleanで、未push commitがなく、別taskのworktreeではない。
 - cleanup対象が`$CODEX_HOME/worktrees`のmanaged root内にあり、pathやGit登録を再解決できる。
 
 この証明を満たしたmanaged cleanupだけが、自律的なworktree・対応branch削除の例外です。証明が
@@ -125,6 +145,15 @@ finishの最後に、管理root内の対象worktreeだけをcleanupできます�
 保持します。管理root外や任意のファイル・directory・branchの削除は従来どおりDaikiの確認を得て、
 プロジェクト直下の`.codex-trash/<timestamp>/`へ退避してから扱います。直接`rm`や直接GitHub API
 削除で代替してはいけません。
+
+cleanupはrepository-wide lifecycle lockとtask単位のmanifest/stateを使う再開可能なstate machineです。
+`merge_started`、`merged`、`main_synced`、`remote_delete_started`、`remote_deleted`、
+`worktree_unlock_started`、`worktree_removed`、`completed`をatomic保存し、state欠落・schema不一致を
+成功扱いしません。remote branch削除だけは、削除直前に確認したreview済みSHAを
+`--force-with-lease=refs/heads/<branch>:<SHA>`へ固定して競合更新を拒否します。これはbranch内容を
+上書きするforce pushの許可ではなく、managed finish内部のexpected-SHA付き削除に限る例外です。
+`rm`、`prune`、`branch -D`は使いません。途中失敗時はstateと未完了の対象を残し、同じtaskだけを
+再検証して再開します。
 
 ## 停止と再開
 

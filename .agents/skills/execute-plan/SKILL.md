@@ -97,7 +97,9 @@ Draft PR作成後は、専用`codex-delivery` helperだけをreceipt、delivery�
    helperがReady化と許可されたmergeを行う。直接の`gh pr ready`/`gh pr merge`はこの経路を迂回するため禁止する。
 6. merge後は`codex-delivery finish ...`でmerged状態、head commitの`origin/main`到達性、人間用checkoutのmain・clean、
    fetch後の`git merge --ff-only origin/main`によるlocal main=`origin/main`を確認する。管理rootの対象worktreeについて、repository、task、
-   branch、PR、merged状態、head到達性、clean、未pushなしを厳格に証明できた場合だけmanaged cleanupを行う。
+   branch、PR、merged状態、head到達性、ignored artifactを含むclean、未pushなしを厳格に証明できた場合だけmanaged cleanupを行う。
+   remote task branch削除だけはreview済みSHAをexpected leaseに固定し、競合更新時は停止する。内容を上書きする
+   force push、`rm`、`prune`、`branch -D`は行わない。
 
 失敗、timeout、pending、dirty、stale、conflict、network障害、判定不能ではdeliver/finishを中断し、PR、branch、
 worktreeを保持する。再開時はreceipt、head SHA、CI/review状態を再取得し、直接cleanupや直接mergeで復旧しない。
