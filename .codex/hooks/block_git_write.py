@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import time
+import urllib.parse
 
 
 GIT_READ_ONLY = {
@@ -74,21 +75,24 @@ GH_GLOBAL_OPTS_WITH_VALUE = {"-R", "--repo", "--hostname"}
 DESTRUCTIVE_COMMANDS = {"rm", "rmdir", "unlink", "shred"}
 SHELLS = {"bash", "dash", "sh", "zsh"}
 COMMAND_WRAPPERS = {"command", "env", "exec", "nice", "nohup", "sudo", "timeout", "xargs"}
-ENV_OPTS_WITH_VALUE = {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
+ENV_OPTS_WITH_VALUE = {
+    "-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-a", "--argv0",
+}
 EXEC_OPTS_WITH_VALUE = {"-a"}
 NICE_OPTS_WITH_VALUE = {"-n", "--adjustment"}
 TIMEOUT_OPTS_WITH_VALUE = {"-k", "--kill-after", "-s", "--signal"}
 XARGS_OPTS_WITH_VALUE = {
     "-a", "--arg-file", "-d", "--delimiter", "-E", "--eof", "-I", "--replace",
     "-L", "--max-lines", "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars",
+    "--process-slot-var",
 }
 PYTHON_SCRIPT_OPTS_WITH_VALUE = {
     "-c", "-m", "-W", "-X", "--check-hash-based-pycs",
 }
 SUDO_OPTS_WITH_VALUE = {
     "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
-    "-C", "--chdir", "-R", "--chroot", "-T", "--command-timeout", "-r",
-    "--role", "-t", "--type",
+    "-C", "-D", "--chdir", "-R", "--chroot", "-T", "--command-timeout", "-r",
+    "--role", "-t", "--type", "-U", "--other-user",
 }
 # 改行もshellのcommand separatorとして扱う。shlexの既定では改行が単なる
 # whitespaceになり、前後のcommandが1 segmentへ結合されるため、読み取りの
@@ -216,6 +220,56 @@ def _command_start(tokens):
             # timeoutのdurationは実行commandではないため1 token読み飛ばす。
             index += 1
     return None
+
+
+def _has_ambiguous_wrapper_options(tokens):
+    """wrapperの未知optionで実行command位置を誤認し得る場合にTrue。"""
+    index = 0
+    while index < len(tokens):
+        basename = os.path.basename(tokens[index])
+        if basename not in COMMAND_WRAPPERS:
+            return False
+        if (
+            basename == "command"
+            and index + 1 < len(tokens)
+            and tokens[index + 1] in {"-v", "-V"}
+        ):
+            return False
+        index += 1
+        options_with_value = {
+            "env": ENV_OPTS_WITH_VALUE,
+            "exec": EXEC_OPTS_WITH_VALUE,
+            "nice": NICE_OPTS_WITH_VALUE,
+            "sudo": SUDO_OPTS_WITH_VALUE,
+            "timeout": TIMEOUT_OPTS_WITH_VALUE,
+            "xargs": XARGS_OPTS_WITH_VALUE,
+        }.get(basename, frozenset())
+        while index < len(tokens):
+            option = tokens[index]
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", option):
+                index += 1
+                continue
+            if option == "--":
+                index += 1
+                break
+            if option in options_with_value:
+                if index + 1 >= len(tokens):
+                    return True
+                index += 2
+                continue
+            if any(
+                option.startswith(f"{item}=")
+                for item in options_with_value
+                if item.startswith("--")
+            ):
+                index += 1
+                continue
+            if option.startswith("-"):
+                return True
+            break
+        if basename == "timeout" and index < len(tokens):
+            index += 1
+    return False
 
 
 def _is_protected_branch(branch):
@@ -735,11 +789,33 @@ def _gh_api_endpoint(args):
 
 
 def _gh_api_is_graphql_endpoint(endpoint):
-    """先頭slash、末尾slash、query、fragmentを含むGraphQL endpointを識別する。"""
+    """encoding、dot segment、query等を正規化してGraphQL endpointを識別する。"""
     if not isinstance(endpoint, str):
         return False
-    path = endpoint.split("#", 1)[0].split("?", 1)[0]
-    return path.strip("/").casefold() == "graphql"
+    decoded = endpoint
+    try:
+        for _ in range(8):
+            if re.search(r"%(?![0-9A-Fa-f]{2})", decoded):
+                return True
+            unquoted = urllib.parse.unquote(decoded, errors="strict")
+            if unquoted == decoded:
+                break
+            decoded = unquoted
+        else:
+            return True
+    except UnicodeError:
+        return True
+    path = decoded.split("#", 1)[0].split("?", 1)[0]
+    parts = []
+    for part in path.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return len(parts) == 1 and parts[0].casefold() == "graphql"
 
 
 def _required_option(args, short, long):
@@ -1881,8 +1957,13 @@ def _command_segments(command):
 
 RESTRICTED_COMMANDS = {"git", "gh", "codex-worktree", "codex-delivery"}
 SHELL_COMPOUND_PREFIXES = {
-    "!", "{", "case", "coproc", "do", "elif", "else", "for", "function",
-    "if", "noglob", "select", "then", "time", "until", "while",
+    "!", "-", "{", "case", "coproc", "do", "elif", "else", "end", "for",
+    "foreach", "function", "if", "nocorrect", "noglob", "repeat", "select",
+    "then", "time", "until", "while",
+}
+SHELL_COMMAND_PREFIXES = {
+    "!", "-", "{", "do", "elif", "else", "if", "nocorrect", "noglob",
+    "then", "until", "while",
 }
 
 
@@ -1930,6 +2011,44 @@ def _has_unquoted_shell_control(command):
     return _has_unquoted_shell_character(command, {";", "&", "|", "(", ")", "\n"})
 
 
+def _has_shell_argument_expansion(command):
+    """Git optionへ変化し得るparameter/brace/glob expansionを検出する。"""
+    quote = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                quote = None
+            elif char == "$":
+                return True
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "#" and (index == 0 or command[index - 1].isspace()):
+            newline = command.find("\n", index)
+            index = len(command) if newline == -1 else newline + 1
+            continue
+        if char in {"$", "{", "}", "*", "?", "["}:
+            return True
+        index += 1
+    return False
+
+
 def _has_shell_context_mutation(tokens):
     """後続commandの環境またはcwdを変え得るshell segmentならTrue。"""
     if not tokens:
@@ -1940,8 +2059,10 @@ def _has_shell_context_mutation(tokens):
     if start is None:
         return False
     return os.path.basename(tokens[start]) in {
-        "alias", "builtin", "cd", "declare", "eval", "export", "function", "local",
-        "popd", "pushd", "set", "typeset", "unalias", "unset",
+        "alias", "autoload", "builtin", "cd", "chdir", "declare", "emulate",
+        "enable", "eval", "export", "float", "function", "hash", "integer",
+        "local", "popd", "pushd", "readonly", "rehash", "set", "setopt",
+        "typeset", "unalias", "unset", "unsetopt",
     }
 
 
@@ -1949,7 +2070,32 @@ def _has_unparsed_guarded_command(tokens):
     """shell予約語の後ろにguard対象commandがある未解析構文を検出する。"""
     if not tokens or tokens[0] not in SHELL_COMPOUND_PREFIXES:
         return False
-    arguments = tokens[1:]
+    arguments = list(tokens)
+    while arguments:
+        while arguments and re.match(
+            r"^[A-Za-z_][A-Za-z0-9_]*=", arguments[0]
+        ):
+            arguments.pop(0)
+        if not arguments:
+            return False
+        prefix = arguments[0]
+        if prefix in SHELL_COMMAND_PREFIXES:
+            arguments.pop(0)
+            continue
+        if prefix == "time":
+            arguments.pop(0)
+            while arguments and arguments[0] in {"-p", "--"}:
+                arguments.pop(0)
+            continue
+        if prefix == "repeat":
+            if len(arguments) < 2:
+                return False
+            arguments = arguments[2:]
+            continue
+        if prefix == "coproc":
+            arguments.pop(0)
+            continue
+        break
     start = _command_start(arguments)
     if start is None:
         return False
@@ -1958,7 +2104,9 @@ def _has_unparsed_guarded_command(tokens):
     }
     if os.path.basename(arguments[start]) in guarded:
         return True
-    return _python_helper_invocation_reason(arguments) is not None
+    if _python_helper_invocation_reason(arguments) is not None:
+        return True
+    return False
 
 
 def _contains_restricted_command(tokens, depth=0):
@@ -1991,6 +2139,14 @@ def blocked_reason(command, cwd=None, depth=0):
     )
     if has_restricted and has_compound_shell:
         return "shell複合構文とGit/GitHub/helper commandを同じ入力で実行できません"
+    if (
+        has_restricted
+        and len(segments) > 1
+        and not all(_contains_restricted_command(tokens) for tokens in segments)
+    ):
+        return "Git/GitHub/helper commandを他のshell segmentと連結できません"
+    if has_restricted and _has_shell_argument_expansion(command):
+        return "Git/GitHub/helper commandでは未引用のshell展開を使用できません"
     if _has_unquoted_shell_redirection(command) and has_restricted:
         return "Git/GitHub/helper commandではshell redirectionを使用できません"
     has_write = any(_has_write_operation(tokens) for tokens in segments)
@@ -2008,6 +2164,16 @@ def blocked_reason(command, cwd=None, depth=0):
         return "Git/GitHub書き込みでshell展開は使用できません"
 
     for tokens in segments:
+        if _has_ambiguous_wrapper_options(tokens) and (
+            _has_shell_argument_expansion(command)
+            or any(
+                os.path.basename(token) in (
+                    RESTRICTED_COMMANDS | DESTRUCTIVE_COMMANDS | SHELLS | {"find"}
+                )
+                for token in tokens
+            )
+        ):
+            return "wrapperの未知optionを含むguard対象commandは安全に検査できません"
         start = _command_start(tokens)
         if start is not None and any(char in tokens[start] for char in "$`"):
             return "shell展開で実行commandを決定する操作は許可されていません"

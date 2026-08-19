@@ -245,6 +245,12 @@ class GuardTest(unittest.TestCase):
             "git -C /workspace add -- README.md",
             "env -u TOKEN git reset --hard HEAD",
             "sudo -u root git push -u origin HEAD:refs/heads/main",
+            "sudo -D /tmp git reset --hard HEAD",
+            "sudo -U root git reset --hard HEAD",
+            "xargs --process-slot-var SLOT git reset --hard HEAD",
+            "env -a ARG0 git reset --hard HEAD",
+            "sudo --future-option value git reset --hard HEAD",
+            "sudo --future-option value $GIT reset --hard HEAD",
             "exec rm README.md",
             "nice rm README.md",
             "timeout 1 rm README.md",
@@ -721,6 +727,11 @@ class GuardTest(unittest.TestCase):
             "GraphQL#fragment",
             "graphql?query=query%20%7Bviewer%7Blogin%7D%7D",
             "/graphql/?query=query%20%7Bviewer%7Blogin%7D%7D",
+            "%67raphql?query=query%20%7Bviewer%7Blogin%7D%7D",
+            "foo/../graphql",
+            "graphql%2f",
+            "foo/%2e%2e/%2567raphql",
+            "graphql%",
         ):
             with self.subTest(endpoint=endpoint):
                 self.assert_blocked(f"gh api '{endpoint}'", "/workspace")
@@ -866,6 +877,11 @@ class GuardTest(unittest.TestCase):
             "eval 'export GH_HOST=evil.example' && gh pr view 1",
             "eval 'export GIT_CONFIG_GLOBAL=/tmp/evil' && git status",
             "eval 'cd /tmp/other-repository' && git status",
+            "hash git=/bin/echo; git status",
+            "chdir /tmp/other-repository && git status",
+            "autoload -Uz helper; git status",
+            "readonly GIT_CONFIG_GLOBAL=/tmp/evil; git status",
+            "integer GIT_CONFIG_COUNT=1; git status",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
@@ -882,6 +898,17 @@ class GuardTest(unittest.TestCase):
             "if export GIT_CONFIG_GLOBAL=/tmp/evil; then true; fi; git status",
             "for x in /tmp/other-repository; do cd \"$x\"; done; git status",
             "f(){ cd /tmp/other-repository; }; f; git status",
+            "if noglob git add -- README.md; then true; fi",
+            "if time git reset --hard HEAD; then true; fi",
+            "if ! gh pr close 1 --repo attacker/repo; then true; fi",
+            "while noglob codex-worktree create --issue 1; do true; done",
+            "repeat 1 git reset --hard HEAD",
+            "nocorrect git reset --hard HEAD",
+            "if nocorrect gh issue delete 1 --repo attacker/repo; then true; fi",
+            "repeat 1 codex-worktree create --issue 1",
+            "if time -p gh pr close 1 --repo owner/repo; then true; fi",
+            "coproc gh pr close 1 --repo owner/repo",
+            "- git reset --hard HEAD",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
@@ -890,9 +917,30 @@ class GuardTest(unittest.TestCase):
             "if echo git; then true; fi",
             "if echo codex-delivery; then true; fi",
             "if rg --files /tmp/codex-delivery; then true; fi",
+            "repeat 1 echo git",
+            "coproc echo git",
         ):
             with self.subTest(command=command):
                 self.assert_allowed(command)
+
+    def test_restricted_commands_reject_unquoted_shell_expansion(self):
+        for command in (
+            "git diff ${:---output=/tmp/hook-bypass}",
+            "git diff $GIT_DIFF_ARGS",
+            "git diff \"$GIT_DIFF_ARGS\"",
+            "git diff {--stat,--output=/tmp/hook-bypass}",
+            "git diff *",
+            "git branch --list feature/?",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
+        for command in (
+            "git branch --list 'feature/*'",
+            "git diff -- '*'",
+            r"git diff \*",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "/workspace")
 
     def test_push_preflight_rejects_pushurl_and_dirty_worktree(self):
         with mock.patch.object(
