@@ -683,6 +683,8 @@ def _git_invocation_reason(tokens, cwd=None):
         if token == "commit":
             return _staged_secret_reason(effective_cwd)
         return None
+    if explicit_cwd is not None:
+        return "git -Cでは検証可能なread-only subcommandを明示してください"
     return None
 
 
@@ -730,6 +732,14 @@ def _gh_api_endpoint(args):
             continue
         return token
     return None
+
+
+def _gh_api_is_graphql_endpoint(endpoint):
+    """先頭slash、末尾slash、query、fragmentを含むGraphQL endpointを識別する。"""
+    if not isinstance(endpoint, str):
+        return False
+    path = endpoint.split("#", 1)[0].split("?", 1)[0]
+    return path.strip("/").casefold() == "graphql"
 
 
 def _required_option(args, short, long):
@@ -1349,7 +1359,7 @@ def _gh_invocation_reason(tokens, cwd=None):
         return "許可されていないGitHub Issue操作です"
     if command == "api":
         endpoint = _gh_api_endpoint(args)
-        if endpoint == "graphql":
+        if _gh_api_is_graphql_endpoint(endpoint):
             return "gh api graphqlはquery、mutation、subscriptionを問わず直接実行できません"
         if any(
             token in {"-H", "--header"}
@@ -1795,8 +1805,22 @@ def _has_write_operation(tokens):
 
     start = _command_start(tokens)
     if start is not None and os.path.basename(tokens[start]) == "codex-worktree":
+        if (
+            tokens[start + 1:] in (["--help"], ["-h"])
+            or len(tokens) == start + 3
+            and tokens[start + 1] in {"list", "doctor", "resume", "recover", "create"}
+            and tokens[start + 2] in {"--help", "-h"}
+        ):
+            return False
         return len(tokens) > start + 1 and tokens[start + 1] in {"create", "recover"}
     if start is not None and os.path.basename(tokens[start]) == "codex-delivery":
+        if (
+            tokens[start + 1:] in (["--help"], ["-h"])
+            or len(tokens) == start + 3
+            and tokens[start + 1] in {"record-review", "approve-review", "deliver", "finish"}
+            and tokens[start + 2] in {"--help", "-h"}
+        ):
+            return False
         return len(tokens) > start + 1 and tokens[start + 1] in {
             "record-review", "approve-review", "deliver", "finish",
         }
@@ -1858,8 +1882,8 @@ def _command_segments(command):
 RESTRICTED_COMMANDS = {"git", "gh", "codex-worktree", "codex-delivery"}
 
 
-def _has_unquoted_shell_redirection(command):
-    """quoted/escaped文字を除き、shell redirection記号の有無だけを調べる。"""
+def _has_unquoted_shell_character(command, characters):
+    """quoted/escaped文字とcommentを除き、指定shell文字の有無を調べる。"""
     quote = None
     index = 0
     while index < len(command):
@@ -1888,10 +1912,33 @@ def _has_unquoted_shell_redirection(command):
             newline = command.find("\n", index)
             index = len(command) if newline == -1 else newline + 1
             continue
-        if char in {"<", ">"}:
+        if char in characters:
             return True
         index += 1
     return False
+
+
+def _has_unquoted_shell_redirection(command):
+    return _has_unquoted_shell_character(command, {"<", ">"})
+
+
+def _has_unquoted_shell_control(command):
+    return _has_unquoted_shell_character(command, {";", "&", "|", "\n"})
+
+
+def _has_shell_context_mutation(tokens):
+    """後続commandの環境またはcwdを変え得るshell segmentならTrue。"""
+    if not tokens:
+        return False
+    if all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token) for token in tokens):
+        return True
+    start = _command_start(tokens)
+    if start is None:
+        return False
+    return os.path.basename(tokens[start]) in {
+        "alias", "builtin", "cd", "declare", "export", "function", "local",
+        "popd", "pushd", "set", "typeset", "unalias", "unset",
+    }
 
 
 def _contains_restricted_command(tokens, depth=0):
@@ -1916,11 +1963,18 @@ def blocked_reason(command, cwd=None, depth=0):
     if "$(" in command or "`" in command:
         return "command substitutionを含むcommandは安全に検査できません"
     segments = list(_command_segments(command))
-    if _has_unquoted_shell_redirection(command) and any(
-        _contains_restricted_command(tokens) for tokens in segments
-    ):
+    has_restricted = any(_contains_restricted_command(tokens) for tokens in segments)
+    if _has_unquoted_shell_redirection(command) and has_restricted:
         return "Git/GitHub/helper commandではshell redirectionを使用できません"
     has_write = any(_has_write_operation(tokens) for tokens in segments)
+    if has_write and _has_unquoted_shell_control(command):
+        return "Git/GitHub書き込みはshell control operatorなしの直接commandで実行してください"
+    if (
+        has_restricted
+        and len(segments) > 1
+        and any(_has_shell_context_mutation(tokens) for tokens in segments)
+    ):
+        return "Git/GitHub/helper commandの前後でshell環境やcwdを変更できません"
     if has_write and (depth > 0 or len(segments) != 1):
         return "Git/GitHub書き込みは単一の直接commandで実行してください"
     if has_write and ("$" in command or "`" in command):

@@ -402,6 +402,19 @@ class GuardTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
 
+    def test_canonical_helper_help_does_not_require_repository_context(self):
+        for command in (
+            "codex-worktree create --help",
+            "codex-worktree recover -h",
+            "codex-delivery record-review --help",
+            "codex-delivery deliver -h",
+        ):
+            with self.subTest(command=command):
+                tokens = next(GUARD._command_segments(command))
+                self.assertFalse(GUARD._has_write_operation(tokens))
+                self.assertIsNone(GUARD._write_context_reason(command, "/tmp"))
+                self.assert_allowed(command, "/tmp")
+
     def test_direct_ready_is_blocked_but_return_to_draft_is_allowed(self):
         with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
             self.assert_blocked(
@@ -702,6 +715,15 @@ class GuardTest(unittest.TestCase):
             with self.subTest(query=query):
                 self.assert_blocked(command, "/workspace")
         self.assert_blocked("gh api --method GET graphql", "/workspace")
+        for endpoint in (
+            "/graphql",
+            "graphql/",
+            "GraphQL#fragment",
+            "graphql?query=query%20%7Bviewer%7Blogin%7D%7D",
+            "/graphql/?query=query%20%7Bviewer%7Blogin%7D%7D",
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.assert_blocked(f"gh api '{endpoint}'", "/workspace")
 
     def test_run_cancel_requires_exact_shape_and_rest_readback(self):
         payload = {
@@ -741,6 +763,8 @@ class GuardTest(unittest.TestCase):
             "gh run cancel 123 --repo github.com/owner/repo",
             "gh run cancel --help",
             "gh run cancel 123 --repo owner/repo && gh run view 123",
+            "gh run cancel 123 --repo owner/repo;",
+            "gh run cancel 123 --repo owner/repo &",
             "gh run cancel $RUN_ID --repo owner/repo",
             "gh run cancel 123 --repo owner/repo > /tmp/cancel",
             "gh run cancel 123 --repo owner/repo | tee /tmp/cancel",
@@ -829,6 +853,18 @@ class GuardTest(unittest.TestCase):
         kwargs = run.call_args.kwargs
         self.assertIs(kwargs["stdin"], GUARD.subprocess.DEVNULL)
         self.assertEqual(kwargs["env"]["GH_PROMPT_DISABLED"], "1")
+
+    def test_restricted_commands_reject_prior_shell_context_mutation(self):
+        for command in (
+            "export GIT_CONFIG_GLOBAL=/tmp/evil && git status",
+            "export GIT_SSH_COMMAND=/tmp/evil && git ls-remote --branches origin refs/heads/feature/example",
+            "export GH_HOST=evil.example && gh pr view 1",
+            "GIT_CONFIG_GLOBAL=/tmp/evil && git status",
+            "cd /tmp/other-repository && git status",
+            "pushd /tmp/other-repository && git log --all",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
 
     def test_push_preflight_rejects_pushurl_and_dirty_worktree(self):
         with mock.patch.object(
@@ -1447,6 +1483,7 @@ class GuardTest(unittest.TestCase):
                 (f"git -C {repository} status", str(repository)),
                 (f"git -C {other} status", str(linked)),
                 (f"git -C {linked} --no-pager status", str(repository)),
+                (f"git -C {linked} --show-toplevel", str(repository)),
                 ("git -C relative status", str(repository)),
                 (f"git -C {linked} -C {other} status", str(repository)),
             ):

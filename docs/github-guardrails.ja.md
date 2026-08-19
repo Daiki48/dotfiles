@@ -59,7 +59,9 @@ read-back後にrunが完了するraceではcancel側が失敗するだけで、�
 GitHub GraphQLは`query`でもfield指定によりPOSTになるため、直接の
 `gh api graphql -f/-F ...`を読み取りとして一括許可しません。固定queryと対象検証を持つ
 専用helperだけを信頼経路にします。helper名が検索commandや`command -v`の引数に現れるだけでは
-実行と扱いませんが、wrapperやinterpreterからhelper scriptを起動する形は引き続き拒否します。
+実行と扱いませんが、wrapperやPython interpreterのscript operandからhelperを起動する形は
+引き続き拒否します。任意program内部から生成されるcommandまでは解析しないため、sandboxやrulesとの
+多層防御を維持します。
 
 Codexの[`PreToolUse` hook](https://learn.chatgpt.com/docs/hooks)は現時点で承認要求を新規に
 発生させられません。そのため、危険操作を
