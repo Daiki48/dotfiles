@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::utils::{create_symlink, run_command};
 
@@ -14,6 +15,8 @@ const CODEX_FILES: &[(&str, &str)] = &[
 ];
 const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/block_git_write.py";
 const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/block_git_write.py";
+const MANAGED_HELPER_SOURCE: &str = ".codex/helpers/codex-worktree";
+const MANAGED_HELPER_DESTINATION: &str = ".local/bin/codex-worktree";
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 
 // Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
@@ -388,6 +391,15 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     sync_managed_hook(template, &merged)
 }
 
+fn merge_managed_config_with_root(
+    template: &str,
+    existing: &str,
+    managed_root: &Path,
+) -> Result<String> {
+    let merged = merge_managed_config(template, existing);
+    ensure_managed_writable_root(&merged, managed_root)
+}
+
 fn sync_managed_hook(template: &str, existing: &str) -> String {
     let cleaned = remove_retired_managed_hook(existing);
     if !template.contains(MANAGED_HOOK_COMMAND)
@@ -398,6 +410,42 @@ fn sync_managed_hook(template: &str, existing: &str) -> String {
         return cleaned;
     }
     format!("{}\n\n{MANAGED_HOOK_CONFIG}\n", cleaned.trim_end())
+}
+
+fn ensure_managed_writable_root(contents: &str, managed_root: &Path) -> Result<String> {
+    let root = managed_root.to_str().with_context(|| {
+        format!(
+            "Managed worktree root is not valid UTF-8: {}",
+            managed_root.display()
+        )
+    })?;
+    if !managed_root.is_absolute() {
+        anyhow::bail!("Managed worktree root must be absolute: {root}");
+    }
+    let mut document = contents
+        .parse::<DocumentMut>()
+        .context("Codex config must be valid TOML before adding writable_roots")?;
+    let sandbox = document
+        .entry("sandbox_workspace_write")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .context("sandbox_workspace_write must be a TOML table")?;
+    let roots = sandbox
+        .entry("writable_roots")
+        .or_insert_with(|| value(Array::new()))
+        .as_array_mut()
+        .context("writable_roots must be a TOML string array")?;
+    if roots.iter().any(|item| item.as_str().is_none()) {
+        anyhow::bail!("writable_roots must contain only TOML strings");
+    }
+    if !roots.iter().any(|item| item.as_str() == Some(root)) {
+        roots.push(root);
+    }
+    let mut rendered = document.to_string();
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    Ok(rendered)
 }
 
 fn backup_legacy_config(codex_dir: &Path) -> Result<()> {
@@ -503,16 +551,45 @@ fn regular_file_exists(path: &Path) -> Result<bool> {
     }
 }
 
+fn reject_symlink_directory_components(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "Symlink directory component is not allowed: {}",
+                    current.display()
+                )
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                anyhow::bail!(
+                    "Managed path component is not a directory: {}",
+                    current.display()
+                )
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_managed_hook(source: &Path, destination: &Path) -> Result<()> {
-    if let Some(parent) = destination.parent()
-        && !parent.exists()
-    {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create managed hook directory {}",
-                parent.display()
-            )
-        })?;
+    if let Some(parent) = destination.parent() {
+        reject_symlink_directory_components(parent)?;
+        if !parent.exists() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create managed hook directory {}",
+                    parent.display()
+                )
+            })?;
+        }
     }
     let source_contents = fs::read_to_string(source)
         .with_context(|| format!("Failed to read managed hook source {}", source.display()))?;
@@ -652,6 +729,15 @@ fn ensure_config_unchanged(
 }
 
 fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) -> Result<()> {
+    let managed_root = canonical_or_absolute(&codex_dir.join("worktrees"))?;
+    migrate_managed_config_from_template_with_root(codex_dir, template_path, &managed_root)
+}
+
+fn migrate_managed_config_from_template_with_root(
+    codex_dir: &Path,
+    template_path: &Path,
+    managed_root: &Path,
+) -> Result<()> {
     let config_path = codex_dir.join("config.toml");
     let metadata = match fs::symlink_metadata(&config_path) {
         Ok(metadata) => Some(metadata),
@@ -666,7 +752,31 @@ fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) 
         .is_some_and(|metadata| metadata.file_type().is_symlink());
 
     if metadata.is_none() {
-        copy_file_exclusive(template_path, &config_path)?;
+        let template = fs::read_to_string(template_path)
+            .with_context(|| format!("Failed to read {}", template_path.display()))?;
+        let default_root = home::home_dir().map(|home| home.join(".codex/worktrees"));
+        let installed = if default_root
+            .as_deref()
+            .and_then(|root| canonical_or_absolute(root).ok())
+            .is_some_and(|root| root == managed_root)
+        {
+            template.clone()
+        } else {
+            ensure_managed_writable_root(&template, managed_root)?
+        };
+        let permissions = fs::metadata(template_path)
+            .with_context(|| {
+                format!(
+                    "Failed to inspect permissions for {}",
+                    template_path.display()
+                )
+            })?
+            .permissions();
+        if installed == template {
+            copy_file_exclusive(template_path, &config_path)?;
+        } else {
+            write_file_exclusive(&config_path, &installed, permissions)?;
+        }
         println!("- Installed base config: {}", config_path.display());
         return Ok(());
     }
@@ -675,7 +785,7 @@ fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) 
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
     let template = fs::read_to_string(template_path)
         .with_context(|| format!("Failed to read {}", template_path.display()))?;
-    let migrated = merge_managed_config(&template, &existing);
+    let migrated = merge_managed_config_with_root(&template, &existing, managed_root)?;
     if migrated == existing && !is_symlink {
         println!("- Shared Codex settings are up to date.");
         return Ok(());
@@ -765,6 +875,106 @@ fn archive_retired_profiles(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_absolute_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("CODEX_HOME must be an absolute path: {}", path.display());
+    }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        anyhow::bail!(
+            "CODEX_HOME must not contain parent traversal: {}",
+            path.display()
+        );
+    }
+
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "symlink path component is not allowed: {}",
+                    current.display()
+                );
+            }
+            Ok(metadata) if !metadata.file_type().is_dir() && current != path => {
+                anyhow::bail!("path component is not a directory: {}", current.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect path {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_codex_home(home: &Path) -> Result<PathBuf> {
+    let configured = std::env::var_os("CODEX_HOME");
+    let candidate = configured
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    validate_absolute_path(&candidate)?;
+    if let Ok(metadata) = fs::symlink_metadata(&candidate) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("CODEX_HOME must not be a symlink: {}", candidate.display());
+        }
+        if !metadata.file_type().is_dir() {
+            anyhow::bail!("CODEX_HOME must be a directory: {}", candidate.display());
+        }
+    }
+    Ok(candidate)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    validate_absolute_path(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "Managed directory must not be a symlink: {}",
+                path.display()
+            );
+        }
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            anyhow::bail!("Managed path must be a directory: {}", path.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .with_context(|| format!("Failed to create directory {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect directory {}", path.display()));
+        }
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to inspect directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        anyhow::bail!(
+            "Managed path must be a regular directory: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .with_context(|| format!("Failed to set private permissions on {}", path.display()))?;
+    Ok(())
+}
+
+fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        fs::canonicalize(path)
+            .with_context(|| format!("Failed to resolve managed path {}", path.display()))
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
 pub fn setup() -> Result<()> {
     println!("🧠 Setting up Codex CLI...\n");
 
@@ -778,12 +988,22 @@ pub fn setup() -> Result<()> {
     codex_check()?;
 
     let home = home::home_dir().context("Cannot find home directory")?;
-    let codex_dir = home.join(".codex");
-
-    if !codex_dir.exists() {
-        println!("\nCreating ~/.codex directory...");
-        fs::create_dir_all(&codex_dir)?;
+    let helper_directory = home.join(".local/bin");
+    let helper_on_path = std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|path| path == helper_directory));
+    if !helper_on_path {
+        anyhow::bail!(
+            "{} must be present in PATH before installing codex-worktree",
+            helper_directory.display()
+        );
     }
+    let codex_dir = resolve_codex_home(&home)?;
+    if !codex_dir.exists() {
+        println!("\nCreating CODEX_HOME directory: {}", codex_dir.display());
+    }
+    ensure_private_directory(&codex_dir)?;
+    let managed_worktree_root = codex_dir.join("worktrees");
+    ensure_private_directory(&managed_worktree_root)?;
 
     println!("\nLinking shared configuration files...");
     for (source, dest) in CODEX_FILES {
@@ -793,6 +1013,10 @@ pub fn setup() -> Result<()> {
     ensure_managed_hook(
         &dotfiles_path.join(MANAGED_HOOK_SOURCE),
         &home.join(MANAGED_HOOK_DESTINATION),
+    )?;
+    ensure_managed_hook(
+        &dotfiles_path.join(MANAGED_HELPER_SOURCE),
+        &home.join(MANAGED_HELPER_DESTINATION),
     )?;
     println!("\nLinking shared skill directories...");
     for (source, dest) in CODEX_DIRS {
@@ -809,6 +1033,7 @@ pub fn setup() -> Result<()> {
     println!("\n💡 Next steps:");
     println!("   1. Run 'codex login' if authentication is not configured");
     println!("   2. Run 'codex' (workspace-write + auto-review is the default)");
+    println!("   3. Restart Codex after installation so writable roots are reloaded");
 
     Ok(())
 }
@@ -817,8 +1042,10 @@ pub fn setup() -> Result<()> {
 mod tests {
     use super::{
         MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND, contains_legacy_profile_config,
-        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook, managed_hook_state_path,
-        merge_managed_config, migrate_managed_config_from_template, sha256, verify_managed_symlink,
+        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook,
+        ensure_managed_writable_root, ensure_private_directory, managed_hook_state_path,
+        merge_managed_config, merge_managed_config_with_root, migrate_managed_config_from_template,
+        sha256, verify_managed_symlink,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1044,6 +1271,23 @@ description = "local"
             fs::read_to_string(managed_hook_state_path(&destination)).expect("read state"),
             sha256("hook\n")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_hook_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("managed-hook-parent-symlink");
+        let source = directory.path().join("source.py");
+        let real_parent = directory.path().join("real-hooks");
+        let linked_parent = directory.path().join("linked-hooks");
+        fs::write(&source, "hook\n").expect("write source");
+        fs::create_dir(&real_parent).expect("create real parent");
+        symlink(&real_parent, &linked_parent).expect("create parent symlink");
+
+        assert!(ensure_managed_hook(&source, &linked_parent.join("hook.py")).is_err());
+        assert!(!real_parent.join("hook.py").exists());
     }
 
     #[test]
@@ -1306,6 +1550,88 @@ description = "local"
             fs::read_to_string(backup.path()).expect("read regular config backup"),
             original
         );
+    }
+
+    #[test]
+    fn writable_roots_preserve_local_values_and_are_idempotent() {
+        let directory = TestDirectory::new("writable-roots");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"model = "gpt-5.6-terra"
+
+[sandbox_workspace_write]
+network_access = true
+writable_roots = ["~/.codex/worktrees"]
+"#;
+        let existing = r#"model = "old"
+
+[sandbox_workspace_write] # local options
+network_access = false
+writable_roots = ["./relative", "/srv/other"] # keep these roots
+exclude_tmpdir_env_var = true
+"#;
+
+        let merged = merge_managed_config_with_root(template, existing, &managed_root)
+            .expect("merge writable roots");
+        assert!(merged.contains("\"./relative\""));
+        assert!(merged.contains("\"/srv/other\""));
+        assert!(merged.contains(&format!("\"{}\"", managed_root.display())));
+        assert!(merged.contains("# keep these roots"));
+        assert_eq!(
+            ensure_managed_writable_root(&merged, &managed_root).expect("repeat merge"),
+            merged
+        );
+    }
+
+    #[test]
+    fn writable_roots_accept_multiline_toml_and_preserve_comments_and_escapes() {
+        let directory = TestDirectory::new("multiline-writable-roots");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let existing = r#"[sandbox_workspace_write] # local options
+writable_roots = [
+  "/srv/other", # keep this root
+  "C:\\Users\\example",
+]
+exclude_tmpdir_env_var = true
+"#;
+
+        let merged = ensure_managed_writable_root(existing, &managed_root)
+            .expect("merge multiline writable roots");
+        assert!(merged.contains("/srv/other"));
+        assert!(merged.contains("# keep this root"));
+        assert!(merged.contains(r#"C:\\Users\\example"#));
+        assert!(merged.contains(&managed_root.to_string_lossy().to_string()));
+        assert!(merged.contains("exclude_tmpdir_env_var = true"));
+        assert_eq!(
+            ensure_managed_writable_root(&merged, &managed_root).expect("repeat merge"),
+            merged
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_worktree_directory_is_private_and_rejects_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = TestDirectory::new("managed-worktree-directory");
+        let worktrees = directory.path().join("codex").join("worktrees");
+        ensure_private_directory(&worktrees).expect("create worktree directory");
+        assert_eq!(
+            fs::metadata(&worktrees)
+                .expect("inspect worktree directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        ensure_private_directory(&worktrees).expect("repeat directory setup");
+
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        fs::create_dir(&target).expect("create symlink target");
+        symlink(&target, &link).expect("create symlink");
+        assert!(ensure_private_directory(&link).is_err());
     }
 
     #[test]

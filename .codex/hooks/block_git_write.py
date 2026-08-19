@@ -94,16 +94,19 @@ SHELL_PUNCTUATION = ";&|()`\n"
 MAX_BODY_FILE_BYTES = 256 * 1024
 MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
 GIT_COMMAND_TIMEOUT_SECONDS = 2
-GIT_WRITE_ENVIRONMENT_KEYS = {
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
-    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-}
+MAX_MANIFEST_BYTES = 256 * 1024
+# launcherが設定するpagerだけは、非対話の許可commandで外部programを起動しない。
+# その他のGIT_*は将来追加されるものも含め、repository状態・外部command・出力先を
+# 変更し得るためfail closedで拒否し、内部probeからも除去する。
+GIT_ALLOWED_ENVIRONMENT_KEYS = {"GIT_PAGER"}
+GIT_NON_PREFIX_ENVIRONMENT_KEYS = {"SSH_ASKPASS"}
+GIT_SANITIZED_WRAPPER = ("env", "-u", "SSH_ASKPASS")
 AI_ATTRIBUTION_RE = re.compile(
     r"(?i)(?:co-authored-by|generated(?:-| )by|signed-off-by)\s*:\s*.*"
     r"(?:codex|openai|chatgpt|claude|gemini|copilot|\bai(?:\s+(?:assistant|agent|bot))?\b)"
 )
 COMMIT_SUBJECT_RE = re.compile(r"^:[a-z0-9_+-]+: \S.*$")
+TASK_ID_RE = re.compile(r"^(?:issue-[1-9][0-9]*|task-[a-z0-9][a-z0-9-]{0,63})$")
 
 SECRET_PATTERNS = (
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
@@ -412,6 +415,12 @@ def _git_switch_reason(args, cwd):
     return None
 
 
+def _git_worktree_read_reason(args):
+    if args == ["list", "--porcelain", "-z"]:
+        return None
+    return "git worktreeは安定形式のlist照会だけ許可されます"
+
+
 def _git_push_reason(args, cwd):
     if any(
         arg in {"--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"}
@@ -430,17 +439,72 @@ def _git_push_reason(args, cwd):
     return _push_preflight_reason(cwd, branch)
 
 
+def _git_write_target(session_cwd, explicit_cwd):
+    """git -Cで明示されたmanaged worktreeを検証し、実行rootを返す。"""
+    if explicit_cwd is None:
+        if os.environ.get("CODEX_WORKTREE_MODE") == "single-checkout":
+            return session_cwd, None
+        session_root = _resolved_git_path(session_cwd, "--show-toplevel")
+        session_common = _resolved_git_path(session_cwd, "--git-common-dir")
+        if session_root is None or session_common is None:
+            return None, "Git書き込みのsession repositoryを確認できません"
+        main_root = session_common.parent
+        if session_root == main_root:
+            return None, "Git書き込みは専用managed worktreeで実行してください"
+        reason = _managed_worktree_reason(main_root, session_common, session_root)
+        if reason:
+            return None, reason
+        return str(session_root), None
+    if not isinstance(session_cwd, str) or not session_cwd:
+        return None, "Git書き込みのsession cwdを確認できません"
+    candidate = Path(explicit_cwd)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return None, "git -Cにはmanaged worktreeの絶対pathを指定してください"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None, "git -Cのpathを安全に解決できません"
+    if candidate != resolved:
+        return None, "git -Cではsymlinkまたは非正規pathを使用できません"
+
+    session_root = _resolved_git_path(session_cwd, "--show-toplevel")
+    session_common = _resolved_git_path(session_cwd, "--git-common-dir")
+    target_root = _resolved_git_path(resolved, "--show-toplevel")
+    target_common = _resolved_git_path(resolved, "--git-common-dir")
+    if None in {session_root, session_common, target_root, target_common}:
+        return None, "git -Cのrepositoryを確認できません"
+    if resolved != target_root:
+        return None, "git -Cにはmanaged worktree rootを指定してください"
+    if session_common != target_common:
+        return None, "git -CのworktreeがCodex sessionのrepositoryと一致しません"
+
+    main_root = session_common.parent
+    if session_root != main_root:
+        return None, "linked worktree sessionから別worktreeへ書き込むことはできません"
+    if target_root == main_root:
+        return None, "git -Cは別のmanaged worktreeを明示するときだけ使用できます"
+    reason = _managed_worktree_reason(main_root, session_common, target_root)
+    if reason:
+        return None, reason
+    return str(target_root), None
+
+
 def _git_invocation_reason(tokens, cwd=None):
     start = _command_start(tokens)
     if start is None or os.path.basename(tokens[start]) != "git":
         return None
     if tokens[start] != "git":
         return "Git commandはPATHからgitを直接実行してください"
-    if start != 0:
+    removed_environment = set()
+    if start != 0 and tuple(tokens[:start]) == GIT_SANITIZED_WRAPPER:
+        removed_environment.add("SSH_ASKPASS")
+    elif start != 0:
         return "Git commandをwrapper、環境変数、cwd変更経由で実行できません"
     git_args = tokens[start + 1:]
     skip_next = False
     global_option_used = False
+    other_global_option_used = False
+    explicit_cwd = None
     for index, token in enumerate(git_args):
         if skip_next:
             skip_next = False
@@ -451,18 +515,33 @@ def _git_invocation_reason(tokens, cwd=None):
             return "gitの設定・aliasによるコマンド上書きは許可されていません"
         if token.startswith("-c") and token != "-C":
             return "git -cによる設定・alias上書きは許可されていません"
+        if token == "-C":
+            if explicit_cwd is not None or index + 1 >= len(git_args):
+                return "git -Cはmanaged worktreeの絶対pathを1件だけ指定してください"
+            explicit_cwd = git_args[index + 1]
+            global_option_used = True
+            skip_next = True
+            continue
         if token in GIT_OPTS_WITH_VALUE:
             global_option_used = True
+            other_global_option_used = True
             skip_next = True
             continue
         if any(token.startswith(f"{option}=") for option in GIT_OPTS_WITH_VALUE):
             global_option_used = True
+            other_global_option_used = True
             continue
         if token.startswith("-"):
             global_option_used = True
+            other_global_option_used = True
             continue
 
         args = git_args[index + 1:]
+        if any(
+            key.startswith("GIT_") and key not in GIT_ALLOWED_ENVIRONMENT_KEYS
+            for key in os.environ
+        ):
+            return "Git commandではGitのrepository状態、path、外部command、出力先を変更する環境変数を使用できません"
         if token == "branch":
             if any(_branch_arg_is_write(arg) for arg in args):
                 return "git branchの変更操作は許可されていません"
@@ -472,25 +551,31 @@ def _git_invocation_reason(tokens, cwd=None):
             return None if branch_arg is None else "git branchは一覧・照会だけ許可されます"
         if token == "remote":
             return None if all(arg in REMOTE_READ_ARGS for arg in args) else "git remoteは照会だけ許可されます"
+        if token == "worktree":
+            return _git_worktree_read_reason(args)
         if token in GIT_READ_ONLY:
             return _git_read_reason(token, args, global_option_used)
         if token not in GIT_SAFE_WRITE:
             return "許可されていないGit書き込み操作です"
-        if global_option_used:
+        if token in {"pull", "switch"} and os.environ.get("CODEX_WORKTREE_MODE") != "single-checkout":
+            return "git pull/switchは明示的なsingle-checkout rollback時だけ使用できます"
+        if other_global_option_used:
             return "Git書き込みではglobal optionや別repository指定を使用できません"
+        effective_cwd, target_reason = _git_write_target(cwd, explicit_cwd)
+        if target_reason:
+            return target_reason
         if any(
-            key in GIT_WRITE_ENVIRONMENT_KEYS
-            or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+            key in GIT_NON_PREFIX_ENVIRONMENT_KEYS - removed_environment
             for key in os.environ
         ):
-            return "Git書き込みではrepositoryやconfigを変更する環境変数を使用できません"
+            return "Git書き込みではrepository、config、外部commandを変更する環境変数を使用できません"
 
         if token == "push":
-            reason = _git_push_reason(args, cwd)
+            reason = _git_push_reason(args, effective_cwd)
         elif token == "pull":
-            reason = _git_pull_reason(args, cwd)
+            reason = _git_pull_reason(args, effective_cwd)
         elif token == "switch":
-            reason = _git_switch_reason(args, cwd)
+            reason = _git_switch_reason(args, effective_cwd)
         else:
             reason = {
                 "add": _git_add_reason,
@@ -500,15 +585,15 @@ def _git_invocation_reason(tokens, cwd=None):
         if reason:
             return reason
         if token in {"add", "commit"}:
-            branch_reason = _current_work_branch_reason(cwd)
+            branch_reason = _current_work_branch_reason(effective_cwd)
             if branch_reason:
                 return branch_reason
         if token == "switch":
-            clean_reason = _clean_worktree_reason(cwd, "switch")
+            clean_reason = _clean_worktree_reason(effective_cwd, "switch")
             if clean_reason:
                 return clean_reason
         if token == "commit":
-            return _staged_secret_reason(cwd)
+            return _staged_secret_reason(effective_cwd)
         return None
     return None
 
@@ -686,40 +771,79 @@ def _pr_create_reason(args, cwd):
     return _file_secret_reason(body_file)
 
 
-def _draft_pr_preflight_reason(cwd, base, head):
-    current = _run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
-    local_head = _run_git(cwd, "rev-parse", "HEAD")
-    remote_head = _run_git(cwd, "rev-parse", "--verify", f"origin/{head}")
-    default_ref = _run_git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
-    if current is None or current.strip() != head:
-        return "Draft PRのheadはcurrent branchと一致させてください"
-    if local_head is None:
-        return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
-    if remote_head is None or default_ref is None:
-        snapshot = _remote_refs_snapshot(cwd, head)
-        if snapshot is None:
-            return "Draft PRのremote refを安全に確認できません"
-        remote_default_ref, remote_default_oid, fallback_remote_head = snapshot
-        if default_ref is None:
-            default_ref = remote_default_ref
-        elif default_ref.strip() != remote_default_ref:
-            return "Draft PRのbaseはoriginのdefault branchと一致させてください"
-        local_default_oid = _run_git(
-            cwd, "rev-parse", "--verify", f"refs/remotes/{default_ref.strip()}"
-        )
-        if (
-            local_default_oid is None
-            or local_default_oid.strip().casefold() != remote_default_oid.casefold()
+def _branch_worktree(cwd, head):
+    """明示head branchを所有する登録済みworktreeを一意に解決する。"""
+    output = _run_git(cwd, "worktree", "list", "--porcelain", "-z")
+    if output is None:
+        return None, "Draft PRの登録済みworktreeを確認できません"
+    matches = []
+    expected_branch = f"refs/heads/{head}"
+    for raw_record in output.split("\0\0"):
+        if not raw_record:
+            continue
+        fields = raw_record.split("\0")
+        paths = [field[9:] for field in fields if field.startswith("worktree ")]
+        branches = [field[7:] for field in fields if field.startswith("branch ")]
+        if branches != [expected_branch]:
+            continue
+        if len(paths) != 1 or any(
+            field == "prunable" or field.startswith("prunable ") for field in fields
         ):
-            return "Draft PRのbase remote-tracking refがremoteと一致しません"
-        if remote_head is None:
-            remote_head = fallback_remote_head
-        elif remote_head.strip().casefold() != fallback_remote_head.casefold():
-            return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
-    if remote_head is None or local_head.strip() != remote_head.strip():
-        return "Draft PRのheadはpush済みのcurrent HEADと一致させてください"
-    if default_ref is None or default_ref.strip() != f"origin/{base}":
+            return None, "Draft PRのhead worktree登録が安全な状態ではありません"
+        matches.append(paths[0])
+    if len(matches) != 1:
+        return None, "Draft PRのhead branchを所有するworktreeを一意に確認できません"
+
+    candidate = Path(matches[0])
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return None, "Draft PRのhead worktree pathを安全に解決できません"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None, "Draft PRのhead worktree pathを安全に解決できません"
+    if candidate != resolved:
+        return None, "Draft PRのhead worktreeにsymlinkまたは非正規pathは使用できません"
+    target_root = _resolved_git_path(resolved, "--show-toplevel")
+    if target_root != resolved:
+        return None, "Draft PRのhead worktree rootを確認できません"
+    return str(resolved), None
+
+
+def _draft_pr_preflight_reason(cwd, base, head):
+    head_cwd, worktree_reason = _branch_worktree(cwd, head)
+    if worktree_reason:
+        return worktree_reason
+    session_common = _resolved_git_path(cwd, "--git-common-dir")
+    head_common = _resolved_git_path(head_cwd, "--git-common-dir")
+    if session_common is None or session_common != head_common:
+        return "Draft PRのhead worktreeがsession repositoryと一致しません"
+    if _origin_repository(cwd) != _origin_repository(head_cwd):
+        return "Draft PRのhead worktreeのoriginがsession repositoryと一致しません"
+
+    current = _run_git(head_cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    local_head = _run_git(head_cwd, "rev-parse", "HEAD")
+    if current is None or current.strip() != head or local_head is None:
+        return "Draft PRのhead worktreeとbranchを確認できません"
+    status = _run_git(head_cwd, "status", "--porcelain=v1", "--untracked-files=all")
+    if status is None or status.strip():
+        return "Draft PRのhead worktreeがcleanではありません"
+
+    snapshot = _remote_refs_snapshot(head_cwd, head)
+    if snapshot is None:
+        return "Draft PRのremote refを安全に確認できません"
+    remote_default_ref, remote_default_oid, remote_head = snapshot
+    if remote_default_ref != f"origin/{base}":
         return "Draft PRのbaseはoriginのdefault branchと一致させてください"
+    local_default_oid = _run_git(
+        head_cwd, "rev-parse", "--verify", f"refs/remotes/{remote_default_ref}"
+    )
+    if (
+        local_default_oid is None
+        or local_default_oid.strip().casefold() != remote_default_oid.casefold()
+    ):
+        return "Draft PRのbase remote-tracking refがremoteと一致しません"
+    if remote_head is None or local_head.strip().casefold() != remote_head.casefold():
+        return "Draft PRのheadはpush済みのworktree HEADと一致させてください"
     return None
 
 
@@ -815,6 +939,52 @@ def _gh_invocation_reason(tokens, cwd=None):
     return "許可されていないGitHub書き込み操作です"
 
 
+def _worktree_helper_invocation_reason(tokens):
+    start = _command_start(tokens)
+    if start is None or os.path.basename(tokens[start]) != "codex-worktree":
+        return None
+    if tokens[start] != "codex-worktree" or start != 0:
+        return "worktree helperはPATHから直接実行してください"
+    args = tokens[start + 1:]
+    if args in (["--help"], ["-h"]):
+        return None
+    if not args:
+        return "worktree helperのsubcommandを指定してください"
+    command, arguments = args[0], args[1:]
+    if command == "list":
+        return None if not arguments else "codex-worktree listに引数は指定できません"
+    if command in {"doctor", "resume", "recover"}:
+        if not arguments and command == "doctor":
+            return None
+        if len(arguments) != 2 or arguments[0] != "--task-id" or not TASK_ID_RE.fullmatch(arguments[1]):
+            return f"codex-worktree {command}のtask IDを正規形で指定してください"
+        return None
+    if command != "create":
+        return "許可されていないworktree helper操作です"
+
+    values = {}
+    index = 0
+    while index < len(arguments):
+        option = arguments[index]
+        if option not in {"--branch", "--issue", "--task-id"} or option in values:
+            return "codex-worktree createでは許可された引数だけを1回ずつ指定してください"
+        if index + 1 >= len(arguments):
+            return "codex-worktree createの引数が不足しています"
+        values[option] = arguments[index + 1]
+        index += 2
+    if "--issue" in values and "--task-id" in values:
+        return "Issue番号とtask IDは同時に指定できません"
+    if "--issue" in values and (
+        not values["--issue"].isdigit() or int(values["--issue"]) < 1
+    ):
+        return "Issue番号は1以上の整数にしてください"
+    if "--task-id" in values and not TASK_ID_RE.fullmatch(values["--task-id"]):
+        return "task IDが許可形式ではありません"
+    if "--branch" in values and not _valid_work_branch(values["--branch"]):
+        return "一般的なprefixを持つ非保護作業branchを指定してください"
+    return None
+
+
 def _contains_secret(text):
     return any(pattern.search(text) for pattern in SECRET_PATTERNS)
 
@@ -860,10 +1030,7 @@ def _run_git(cwd, *args):
         return None
     environment = os.environ.copy()
     for key in list(environment):
-        if (
-            key in GIT_WRITE_ENVIRONMENT_KEYS
-            or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
-        ):
+        if key.startswith("GIT_") or key in GIT_NON_PREFIX_ENVIRONMENT_KEYS:
             environment.pop(key, None)
     process = None
     selector = None
@@ -1040,6 +1207,9 @@ def _has_write_operation(tokens):
         return True
 
     start = _command_start(tokens)
+    if start is not None and os.path.basename(tokens[start]) == "codex-worktree":
+        return len(tokens) > start + 1 and tokens[start + 1] in {"create", "recover"}
+
     if start is None or os.path.basename(tokens[start]) != "gh":
         return False
     command, args = _first_command(tokens[start + 1:], GH_GLOBAL_OPTS_WITH_VALUE)
@@ -1090,6 +1260,8 @@ def blocked_reason(command, cwd=None, depth=0):
     """連結コマンドと入れ子shellを調べ、禁止操作の理由を返す。"""
     if depth > 3:
         return "入れ子が深いshellコマンドは安全性を確認できません"
+    if "$(" in command or "`" in command:
+        return "command substitutionを含むcommandは安全に検査できません"
     segments = list(_command_segments(command))
     has_write = any(_has_write_operation(tokens) for tokens in segments)
     if has_write and (depth > 0 or len(segments) != 1):
@@ -1142,6 +1314,9 @@ def blocked_reason(command, cwd=None, depth=0):
         reason = _gh_invocation_reason(tokens, cwd)
         if reason:
             return reason
+        reason = _worktree_helper_invocation_reason(tokens)
+        if reason:
+            return reason
         for nested_command in _nested_shell_commands(tokens):
             reason = blocked_reason(nested_command, cwd, depth + 1)
             if reason:
@@ -1149,25 +1324,126 @@ def blocked_reason(command, cwd=None, depth=0):
     return None
 
 
-def _write_context_reason(command, session_cwd, requested_cwd):
+def _resolved_git_path(cwd, argument):
+    value = _run_git(cwd, "rev-parse", "--path-format=absolute", argument)
+    if value is None:
+        return None
+    try:
+        return Path(value.strip()).resolve(strict=True)
+    except OSError:
+        return None
+
+
+def _repository_key(repository):
+    normalized = repository.casefold()
+    owner, name = normalized.split("/", 1)
+    return f"{len(owner)}-{owner}--{len(name)}-{name}"
+
+
+def _managed_worktree_reason(repository_root, common_git_dir, worktree_root):
+    repository = _origin_repository(repository_root)
+    if repository is None or _origin_repository(worktree_root) != repository:
+        return "managed worktreeのoriginがsession repositoryと一致しません"
+    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    if not codex_home.is_absolute() or ".." in codex_home.parts:
+        return "CODEX_HOMEを安全に解決できません"
+    current = Path(codex_home.anchor)
+    for part in codex_home.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError:
+            return "CODEX_HOMEを安全に解決できません"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "CODEX_HOMEのsymlink componentを許可できません"
+        if current != codex_home and not stat.S_ISDIR(metadata.st_mode):
+            return "CODEX_HOMEの親がdirectoryではありません"
+    repository_key = _repository_key(repository)
+    expected_worktree = codex_home / "worktrees" / repository_key / worktree_root.name
+    if worktree_root != expected_worktree:
+        return "requested cwdが登録対象のmanaged worktreeではありません"
+    current = Path(expected_worktree.anchor)
+    for part in expected_worktree.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError:
+            return "managed worktree pathを安全に解決できません"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "managed worktree pathのsymlink componentを許可できません"
+        if not stat.S_ISDIR(metadata.st_mode):
+            return "managed worktree pathのcomponentがdirectoryではありません"
+    try:
+        managed_repository = (codex_home / "worktrees" / repository_key).resolve(strict=True)
+        worktree_root = worktree_root.resolve(strict=True)
+    except OSError:
+        return "managed worktree pathを安全に解決できません"
+    if worktree_root.parent != managed_repository or not TASK_ID_RE.fullmatch(worktree_root.name):
+        return "requested cwdが登録対象のmanaged worktreeではありません"
+
+    state_root = managed_repository / ".state"
+    manifest_path = state_root / f"{worktree_root.name}.json"
+    try:
+        state_metadata = state_root.lstat()
+        if (
+            stat.S_ISLNK(state_metadata.st_mode)
+            or not stat.S_ISDIR(state_metadata.st_mode)
+            or state_metadata.st_uid != os.getuid()
+            or state_metadata.st_mode & 0o077
+        ):
+            return "managed worktree state directoryを安全に検査できません"
+        metadata = manifest_path.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077
+            or metadata.st_size > MAX_MANIFEST_BYTES
+        ):
+            return "managed worktree manifestを安全に検査できません"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return "managed worktree manifestを安全に検査できません"
+    current = _run_git(worktree_root, "rev-parse", "--abbrev-ref", "HEAD")
+    expected = {
+        "version": 1,
+        "status": "ready",
+        "task_id": worktree_root.name,
+        "repository": str(repository_root),
+        "common_git_dir": str(common_git_dir),
+        "github_name": repository,
+        "worktree": str(worktree_root),
+    }
+    if (
+        not isinstance(manifest, dict)
+        or any(manifest.get(key) != value for key, value in expected.items())
+        or current is None
+        or manifest.get("branch") != current.strip()
+    ):
+        return "managed worktree manifestがcurrent repository状態と一致しません"
+    registered = _run_git(repository_root, "worktree", "list", "--porcelain", "-z")
+    if registered is None or f"worktree {worktree_root}\0" not in registered:
+        return "requested cwdがGit worktreeとして登録されていません"
+    return None
+
+
+def _write_context_reason(command, session_cwd):
     segments = list(_command_segments(command))
     if not any(_has_write_operation(tokens) for tokens in segments):
         return None
-    if not isinstance(session_cwd, str) or not isinstance(requested_cwd, str):
-        return "Git/GitHub書き込みのsession cwdとrequested cwdを確認できません"
-    session_root = _run_git(session_cwd, "rev-parse", "--show-toplevel")
-    requested_root = _run_git(requested_cwd, "rev-parse", "--show-toplevel")
-    if session_root is None or requested_root is None:
+    if not isinstance(session_cwd, str):
+        return "Git/GitHub書き込みのsession cwdを確認できません"
+    session_root = _resolved_git_path(session_cwd, "--show-toplevel")
+    session_common = _resolved_git_path(session_cwd, "--git-common-dir")
+    if None in {session_root, session_common}:
         return "Git/GitHub書き込みのrepository rootを確認できません"
-    try:
-        same_repository = (
-            Path(session_root.strip()).resolve(strict=True)
-            == Path(requested_root.strip()).resolve(strict=True)
-        )
-    except OSError:
-        return "Git/GitHub書き込みのrepository rootを安全に解決できません"
-    if not same_repository:
-        return "toolのrequested cwdがCodex sessionのrepositoryと一致しません"
+    main_root = session_common.parent
+    if session_root != main_root:
+        reason = _managed_worktree_reason(main_root, session_common, session_root)
+        if reason:
+            return reason
     return None
 
 
@@ -1193,12 +1469,11 @@ def main():
             raise ValueError("tool_input must be an object")
         command = tool_input.get("command") or tool_input.get("cmd") or ""
         session_cwd = data.get("cwd")
-        cwd = tool_input.get("workdir") or tool_input.get("cwd") or session_cwd
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command is required")
-        reason = _write_context_reason(command, session_cwd, cwd)
+        reason = _write_context_reason(command, session_cwd)
         if reason is None:
-            reason = blocked_reason(command, cwd)
+            reason = blocked_reason(command, session_cwd)
     except Exception:
         _deny("hook inputを安全に解析・検査できません")
         sys.exit(2)

@@ -12,3 +12,4 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1.0.98"
 sha2 = "0.10.9"
+toml_edit = "0.25.13"

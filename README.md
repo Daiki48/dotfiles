@@ -65,7 +65,7 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `tmux` | Install tmux via apt/dnf, clone [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager) into `~/.config/tmux/plugins/tpm`, and symlink `~/.config/tmux/tmux.conf`. After setup, press `Ctrl+g` then `I` (capital i) inside tmux to install plugins. | yes |
 | `mise [TOOL@VERSION]...` | Install mise from its recommended apt/dnf repository. Optional tool arguments are installed and recorded in the global mise config; with no arguments, only mise itself is installed. Shell activation is provided by the managed `.zshrc`. | yes |
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
-| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks shared instructions, safety rules, and Skills; then installs or migrates `~/.codex/config.toml` to the workspace-write + auto-review defaults. Machine-local trust and TUI settings are preserved. | no |
+| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks shared instructions, safety rules, and Skills; distributes the `codex-worktree` helper and configures its managed writable root; then idempotently installs or migrates `~/.codex/config.toml` to the workspace-write + auto-review defaults. Machine-local trust and TUI settings are preserved. | no |
 | `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`, `~/.gemini/GEMINI.md`, and `~/.gemini/policies/`. Requires `GEMINI_API_KEY` exported in your shell. | no |
 
 #### AI CLI configuration policy
@@ -73,6 +73,10 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 Codex uses a single default workflow. `workspace-write` allows implementation inside the
 workspace, while `on-request` approvals are routed through auto-review. A PreToolUse hook
 validates Git and GitHub writes before they run, and deny rules block destructive operations.
+Implementation, fix, addition, and build requests use the managed `codex-worktree` command;
+investigation, design, review, and diagnosis alone do not create a worktree. See
+[Codex worktree運用ガイド](docs/codex-worktrees.ja.md) for the lifecycle, recovery, and safety
+boundaries. The managed root follows the [OpenAI Git worktrees documentation](https://learn.chatgpt.com/docs/environments/git-worktrees).
 
 Ordinary editing and testing run inside the sandbox. Hook-validated normal commits, pushes to
 the current non-protected work branch, and Draft PR creation are allowlisted so the workflow
@@ -126,6 +130,9 @@ cargo run -- codex
 cargo run -- gemini
 ```
 
+`codex`の初回セットアップまたは更新後は、managed設定と`codex-worktree`を反映するため
+Codexを再起動してください。
+
 ##### Fedora
 
 ```sh
@@ -173,3 +180,4 @@ Config for CorvusSKK.
 - [skk](https://github.com/Daiki48/dotfiles/blob/main/docs/setup-skk.md)
 - [skkeleton](https://github.com/Daiki48/dotfiles/blob/main/docs/setup-skkeleton.md)
 - [docker](https://github.com/Daiki48/dotfiles/blob/main/docs/setup-docker.md)
+- [Codex worktree運用](docs/codex-worktrees.ja.md)

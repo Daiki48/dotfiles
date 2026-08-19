@@ -22,6 +22,7 @@ commit_attribution = ""
 
 [sandbox_workspace_write]
 network_access = true
+writable_roots = ["~/.codex/worktrees"]
 
 [agents]
 enabled = true

@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""Codex実装タスク用のGit worktreeを安全に管理する。"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+import subprocess
+import sys
+from typing import Iterable
+
+
+BRANCH_PREFIXES = {
+    "feat", "feature", "fix", "refactor", "docs", "test", "chore", "ci",
+    "build", "perf", "style", "hotfix", "update",
+}
+PROTECTED_BRANCHES = {"main", "master", "develop", "development", "trunk"}
+PROTECTED_BRANCH_PATTERNS = (re.compile(r"^release(?:/|$)"), re.compile(r"^production(?:/|$)"))
+BRANCH_RE = re.compile(r"^[a-z][a-z0-9-]*/[a-z0-9][a-z0-9._-]*$")
+TASK_ID_RE = re.compile(r"^(?:issue-[1-9][0-9]*|task-[a-z0-9][a-z0-9-]{0,63})$")
+GITHUB_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+OID_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+MANIFEST_VERSION = 1
+MAX_MANIFEST_BYTES = 256 * 1024
+
+
+class WorktreeError(RuntimeError):
+    """安全要件を満たさない操作。"""
+
+
+@dataclass(frozen=True)
+class Repository:
+    root: Path
+    common_git_dir: Path
+    github_name: str
+    default_branch: str
+    default_oid: str
+
+    @property
+    def key(self) -> str:
+        return repository_key(self.github_name)
+
+
+@dataclass(frozen=True)
+class Manifest:
+    version: int
+    status: str
+    task_id: str
+    repository: str
+    common_git_dir: str
+    github_name: str
+    branch: str
+    base: str
+    base_oid: str
+    worktree: str
+    created_at: str
+    detail: str = ""
+
+
+def repository_key(github_name: str) -> str:
+    normalized = github_name.casefold()
+    owner, name = normalized.split("/", 1)
+    return f"{len(owner)}-{owner}--{len(name)}-{name}"
+
+
+def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", *args],
+            cwd=cwd,
+            check=check,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            env=_safe_environment(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise WorktreeError(f"git {' '.join(args)} がtimeoutしました") from error
+    except OSError as error:
+        raise WorktreeError("gitを実行できません") from error
+
+
+def _safe_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for key in list(environment):
+        if key.startswith("GIT_") or key == "SSH_ASKPASS":
+            environment.pop(key, None)
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    return environment
+
+
+def _git_stdout(cwd: Path, *args: str) -> str:
+    try:
+        return _git(cwd, *args).stdout
+    except subprocess.CalledProcessError as error:
+        message = error.stderr.strip() or "Git operation failed"
+        raise WorktreeError(message) from error
+
+
+def _absolute_git_path(cwd: Path, argument: str) -> Path:
+    value = _git_stdout(cwd, "rev-parse", "--path-format=absolute", argument).strip()
+    if not value:
+        raise WorktreeError(f"Git pathを確認できません: {argument}")
+    return Path(value).resolve(strict=True)
+
+
+def _github_repository(remote: str) -> str | None:
+    value = remote.strip().rstrip("/")
+    for prefix in (
+        "https://github.com/", "http://github.com/", "ssh://git@github.com/", "git@github.com:",
+    ):
+        if value.startswith(prefix):
+            repository = value.removeprefix(prefix).removesuffix(".git")
+            return repository if GITHUB_REPOSITORY_RE.fullmatch(repository) else None
+    return None
+
+
+def _origin_identity(root: Path, *, allow_local_origin: bool = False) -> str:
+    fetch_urls = _git_stdout(root, "remote", "get-url", "--all", "origin").splitlines()
+    push_urls = _git_stdout(root, "remote", "get-url", "--push", "--all", "origin").splitlines()
+    if len(fetch_urls) != 1 or len(push_urls) != 1:
+        raise WorktreeError("originのfetch/push URLはそれぞれ1件に限定してください")
+    fetch_repository = _github_repository(fetch_urls[0])
+    push_repository = _github_repository(push_urls[0])
+    if fetch_repository is None or push_repository != fetch_repository:
+        if allow_local_origin and fetch_urls == push_urls:
+            return "test/local"
+        raise WorktreeError("originのfetch/push先は同一GitHub repositoryにしてください")
+    return fetch_repository
+
+
+def _is_protected(branch: str) -> bool:
+    return branch in PROTECTED_BRANCHES or any(pattern.match(branch) for pattern in PROTECTED_BRANCH_PATTERNS)
+
+
+def _remote_default(root: Path) -> tuple[str, str]:
+    output = _git_stdout(root, "ls-remote", "--symref", "origin", "HEAD")
+    lines = output.splitlines()
+    if len(lines) != 2:
+        raise WorktreeError("originのdefault branchを一意に確認できません")
+    ref_match = re.fullmatch(r"ref: refs/heads/([^\t]+)\tHEAD", lines[0])
+    oid_match = re.fullmatch(r"([^\t]+)\tHEAD", lines[1])
+    if ref_match is None or oid_match is None or not OID_RE.fullmatch(oid_match.group(1)):
+        raise WorktreeError("origin HEADの応答を安全に解析できません")
+    branch = ref_match.group(1)
+    if not _is_protected(branch):
+        raise WorktreeError("originのdefault branchが保護branchではありません")
+    return branch, oid_match.group(1).casefold()
+
+
+def inspect_repository(
+    cwd: Path,
+    *,
+    allow_local_origin: bool = False,
+    require_remote: bool = True,
+) -> Repository:
+    root = _absolute_git_path(cwd, "--show-toplevel")
+    common_git_dir = _absolute_git_path(cwd, "--git-common-dir")
+    if root != common_git_dir.parent:
+        raise WorktreeError("worktree作成はmain checkoutから実行してください")
+    github_name = _origin_identity(root, allow_local_origin=allow_local_origin)
+    default_branch, default_oid = _remote_default(root) if require_remote else ("", "")
+    return Repository(root, common_git_dir, github_name, default_branch, default_oid)
+
+
+def generate_task_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"task-{timestamp.casefold()}-{secrets.token_hex(4)}"
+
+
+def normalize_task_id(issue: int | None, task_id: str | None) -> str:
+    if issue is not None:
+        value = f"issue-{issue}"
+    elif task_id is not None:
+        value = task_id
+    else:
+        value = generate_task_id()
+    if not TASK_ID_RE.fullmatch(value):
+        raise WorktreeError("task IDはissue-<番号>またはtask-<安全なID>にしてください")
+    return value
+
+
+def validate_branch(branch: str, root: Path) -> None:
+    if _is_protected(branch) or not BRANCH_RE.fullmatch(branch):
+        raise WorktreeError("一般的なprefixを持つ非保護作業branchを指定してください")
+    if branch.split("/", 1)[0] not in BRANCH_PREFIXES:
+        raise WorktreeError("branch prefixが許可範囲外です")
+    result = _git(root, "check-ref-format", "--branch", branch, check=False)
+    if result.returncode != 0:
+        raise WorktreeError("Gitで無効なbranch名です")
+
+
+def _codex_home() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    candidate = Path(configured) if configured else Path.home() / ".codex"
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise WorktreeError("CODEX_HOMEは安全な絶対pathにしてください")
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise WorktreeError(f"CODEX_HOMEを安全に検査できません: {current}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise WorktreeError(f"CODEX_HOMEのsymlink componentを拒否しました: {current}")
+        if current != candidate and not stat.S_ISDIR(metadata.st_mode):
+            raise WorktreeError(f"CODEX_HOMEの親がdirectoryではありません: {current}")
+    return candidate.resolve(strict=False)
+
+
+def _ensure_directory(path: Path, parent: Path | None = None) -> None:
+    if path.is_symlink():
+        raise WorktreeError(f"symlink directoryを拒否しました: {path}")
+    if parent is not None and (path.parent != parent or not path.name or path.name in {".", ".."}):
+        raise WorktreeError("管理root外のpathを拒否しました")
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(path, 0o700)
+    except OSError as error:
+        raise WorktreeError(f"管理directoryを作成できません: {path}") from error
+    if path.is_symlink() or not path.is_dir():
+        raise WorktreeError(f"安全な管理directoryではありません: {path}")
+
+
+def _reject_symlink_components(path: Path) -> None:
+    """既存のpath componentがsymlinkまたは非directoryなら拒否する。"""
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise WorktreeError(f"管理pathを安全に検査できません: {current}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise WorktreeError(f"symlink componentを拒否しました: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise WorktreeError(f"管理pathのcomponentがdirectoryではありません: {current}")
+
+
+def _managed_paths(
+    repository: Repository,
+    task_id: str,
+    *,
+    create: bool = True,
+) -> tuple[Path, Path, Path]:
+    codex_home = _codex_home()
+    if codex_home.exists():
+        if codex_home.is_symlink() or not codex_home.is_dir():
+            raise WorktreeError("CODEX_HOMEが安全なdirectoryではありません")
+    elif create:
+        _ensure_directory(codex_home)
+    root = codex_home / "worktrees"
+    repository_root = root / repository.key
+    state_root = repository_root / ".state"
+    lock_root = repository_root / ".locks"
+    _reject_symlink_components(lock_root)
+    if create:
+        _ensure_directory(root, codex_home)
+        _ensure_directory(repository_root, root)
+        _ensure_directory(state_root, repository_root)
+        _ensure_directory(lock_root, repository_root)
+    target = repository_root / task_id
+    if target.parent != repository_root:
+        raise WorktreeError("worktree pathが管理root外です")
+    return target, state_root / f"{task_id}.json", lock_root / "lifecycle.lock"
+
+
+def _snapshot(root: Path) -> tuple[str, str, str, str, str]:
+    return (
+        _git_stdout(root, "rev-parse", "--abbrev-ref", "HEAD"),
+        _git_stdout(root, "rev-parse", "HEAD"),
+        _git_stdout(root, "status", "--porcelain=v1", "--untracked-files=all"),
+        _git_stdout(root, "diff", "--cached", "--binary", "--"),
+        _git_stdout(root, "diff", "--binary", "--"),
+    )
+
+
+def _atomic_manifest(path: Path, manifest: Manifest) -> None:
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    try:
+        with temporary.open("x", encoding="utf-8") as output:
+            json.dump(asdict(manifest), output, ensure_ascii=False, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except OSError as error:
+        raise WorktreeError(f"manifestを保存できません: {path}") from error
+
+
+@contextmanager
+def _exclusive_lock(path: Path):
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "a+", encoding="utf-8") as lock:
+            os.fchmod(lock.fileno(), 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+    except OSError as error:
+        raise WorktreeError(f"lifecycle lockを取得できません: {path}") from error
+
+
+def _worktree_records(root: Path) -> list[dict[str, str]]:
+    output = _git_stdout(root, "worktree", "list", "--porcelain", "-z")
+    records: list[dict[str, str]] = []
+    record: dict[str, str] = {}
+    for item in output.split("\0"):
+        if not item:
+            if record:
+                records.append(record)
+                record = {}
+            continue
+        key, _, value = item.partition(" ")
+        record[key] = value
+    if record:
+        records.append(record)
+    return records
+
+
+def _branch_exists(repository: Repository, branch: str) -> bool:
+    local = _git(repository.root, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+    if local.returncode == 0:
+        return True
+    remote = _git(
+        repository.root, "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}", check=False,
+    )
+    if remote.returncode not in {0, 2}:
+        raise WorktreeError("originのbranch衝突を確認できません")
+    return remote.returncode == 0
+
+
+def create_worktree(
+    cwd: Path,
+    branch: str,
+    task_id: str,
+    *,
+    allow_local_origin: bool = False,
+) -> Path:
+    repository = inspect_repository(cwd, allow_local_origin=allow_local_origin)
+    validate_branch(branch, repository.root)
+    target, manifest_path, lock_path = _managed_paths(repository, task_id)
+    before = _snapshot(repository.root)
+    created_at = datetime.now(timezone.utc).isoformat()
+    base = f"origin/{repository.default_branch}"
+
+    with _exclusive_lock(lock_path):
+        if target.exists() or target.is_symlink() or manifest_path.exists() or manifest_path.is_symlink():
+            raise WorktreeError("task IDまたはworktree pathが既に使用されています")
+        if any(record.get("worktree") == str(target) for record in _worktree_records(repository.root)):
+            raise WorktreeError("worktree pathがGit metadataに既に登録されています")
+        if _branch_exists(repository, branch):
+            raise WorktreeError("localまたはremote branchが既に存在します")
+
+        _git_stdout(repository.root, "fetch", "origin", repository.default_branch)
+        fetched_oid = _git_stdout(repository.root, "rev-parse", f"refs/remotes/{base}").strip().casefold()
+        remote_branch, remote_oid = _remote_default(repository.root)
+        if remote_branch != repository.default_branch or fetched_oid != remote_oid:
+            raise WorktreeError("fetch後のorigin default branchがremote HEADと一致しません")
+
+        creating = Manifest(
+            MANIFEST_VERSION, "creating", task_id, str(repository.root), str(repository.common_git_dir),
+            repository.github_name, branch, base, fetched_oid, str(target), created_at,
+        )
+        _atomic_manifest(manifest_path, creating)
+        try:
+            _git_stdout(
+                repository.root, "worktree", "add", "--lock", "--reason", f"codex-task:{task_id}",
+                "-b", branch, str(target), base,
+            )
+            if _absolute_git_path(target, "--git-common-dir") != repository.common_git_dir:
+                raise WorktreeError("作成したworktreeが対象repositoryに属していません")
+            if _git_stdout(target, "rev-parse", "--abbrev-ref", "HEAD").strip() != branch:
+                raise WorktreeError("作成したworktreeのbranchが一致しません")
+            if _git_stdout(target, "rev-parse", "HEAD").strip().casefold() != fetched_oid:
+                raise WorktreeError("作成したworktreeのHEADが取得済みbaseと一致しません")
+            if _git_stdout(target, "status", "--porcelain=v1", "--untracked-files=all"):
+                raise WorktreeError("作成したworktreeがcleanではありません")
+            if _snapshot(repository.root) != before:
+                raise WorktreeError("main checkoutのbranch、index、working treeが変化しました")
+        except (WorktreeError, subprocess.SubprocessError) as error:
+            _atomic_manifest(manifest_path, Manifest(**{**asdict(creating), "status": "failed", "detail": str(error)}))
+            raise
+
+        _atomic_manifest(manifest_path, Manifest(**{**asdict(creating), "status": "ready"}))
+    return target
+
+
+def _invalid_manifest(repository: Repository, path: Path, detail: str) -> Manifest:
+    return Manifest(
+        MANIFEST_VERSION, "invalid", path.stem, str(repository.root), str(repository.common_git_dir),
+        repository.github_name, "", "", "", "", "", detail,
+    )
+
+
+def _validated_manifest(repository: Repository, path: Path, payload: object) -> Manifest:
+    if not isinstance(payload, dict):
+        raise ValueError("manifest root must be an object")
+    fields = {
+        "version": int,
+        "status": str,
+        "task_id": str,
+        "repository": str,
+        "common_git_dir": str,
+        "github_name": str,
+        "branch": str,
+        "base": str,
+        "base_oid": str,
+        "worktree": str,
+        "created_at": str,
+        "detail": str,
+    }
+    if set(payload) != set(fields) or any(
+        isinstance(payload.get(name), bool) or not isinstance(payload.get(name), expected)
+        for name, expected in fields.items()
+    ):
+        raise ValueError("manifest schema mismatch")
+    manifest = Manifest(**payload)
+    if not TASK_ID_RE.fullmatch(manifest.task_id):
+        raise ValueError("invalid manifest task ID")
+    target, expected_manifest, _ = _managed_paths(repository, manifest.task_id, create=False)
+    if (
+        manifest.version != MANIFEST_VERSION
+        or manifest.status not in {"creating", "ready", "failed"}
+        or path != expected_manifest
+        or path.stem != manifest.task_id
+        or manifest.repository != str(repository.root)
+        or manifest.common_git_dir != str(repository.common_git_dir)
+        or manifest.github_name.casefold() != repository.github_name.casefold()
+        or manifest.worktree != str(target)
+        or not BRANCH_RE.fullmatch(manifest.branch)
+        or manifest.branch.split("/", 1)[0] not in BRANCH_PREFIXES
+        or _is_protected(manifest.branch)
+        or not manifest.base.startswith("origin/")
+        or not _is_protected(manifest.base.removeprefix("origin/"))
+        or not OID_RE.fullmatch(manifest.base_oid)
+        or not manifest.created_at
+    ):
+        raise ValueError("manifest values mismatch")
+    return manifest
+
+
+def _load_manifests(repository: Repository) -> Iterable[tuple[Path, Manifest]]:
+    _, sample_manifest, _ = _managed_paths(repository, "task-placeholder", create=False)
+    if not sample_manifest.parent.is_dir() or sample_manifest.parent.is_symlink():
+        return
+    for path in sorted(sample_manifest.parent.glob("*.json")):
+        try:
+            metadata = path.lstat()
+            if (
+                path.is_symlink()
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077
+                or metadata.st_size > MAX_MANIFEST_BYTES
+            ):
+                raise OSError("manifest is not a safe regular file")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            yield path, _validated_manifest(repository, path, payload)
+        except (OSError, ValueError, TypeError):
+            yield path, _invalid_manifest(repository, path, "manifestを安全に解析・検証できません")
+
+
+def diagnose(cwd: Path, task_id: str | None = None, *, allow_local_origin: bool = False) -> list[tuple[str, str, str]]:
+    repository = inspect_repository(
+        cwd, allow_local_origin=allow_local_origin, require_remote=False,
+    )
+    registered = {record.get("worktree"): record for record in _worktree_records(repository.root)}
+    results: list[tuple[str, str, str]] = []
+    found = False
+    for _, manifest in _load_manifests(repository):
+        if task_id is not None and manifest.task_id != task_id:
+            continue
+        found = True
+        status = manifest.status
+        detail = manifest.detail
+        path = Path(manifest.worktree) if manifest.worktree else None
+        record = registered.get(manifest.worktree)
+        if manifest.status == "invalid":
+            pass
+        elif manifest.version != MANIFEST_VERSION or manifest.github_name.casefold() != repository.github_name.casefold():
+            status, detail = "invalid", "manifestのrepository情報が一致しません"
+        elif path is None or path.is_symlink() or not path.exists():
+            status, detail = "missing", "worktree directoryがありません"
+        elif record is None:
+            status, detail = "unregistered", "Git worktreeとして登録されていません"
+        else:
+            try:
+                metadata = path.lstat()
+                if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+                    raise WorktreeError("worktree pathが安全なdirectoryではありません")
+                if _absolute_git_path(path, "--git-common-dir") != repository.common_git_dir:
+                    raise WorktreeError("worktreeのcommon Git dirが一致しません")
+                current = _git_stdout(path, "rev-parse", "--abbrev-ref", "HEAD").strip()
+                head = _git_stdout(path, "rev-parse", "HEAD").strip().casefold()
+                dirty = _git_stdout(path, "status", "--porcelain=v1", "--untracked-files=all")
+                if current != manifest.branch:
+                    status, detail = "branch-mismatch", f"current branch: {current}"
+                elif manifest.status == "failed":
+                    pass
+                elif manifest.status == "creating" and head != manifest.base_oid.casefold():
+                    status, detail = "diverged", "中断後にworktree HEADがbaseから変化しました"
+                elif manifest.status == "creating":
+                    status, detail = "interrupted", "作成完了前に中断しました。recoverで再検証できます"
+                elif dirty:
+                    status, detail = "dirty", "未commitまたは未追跡の変更があります"
+                elif manifest.status == "ready":
+                    status, detail = "ready", "再開可能です"
+            except (OSError, WorktreeError):
+                status, detail = "invalid", "worktree実体を安全に検証できません"
+        results.append((manifest.task_id, status, detail))
+    if task_id is not None and not found:
+        raise WorktreeError("指定taskのmanifestがありません")
+    return results
+
+
+def resume(cwd: Path, task_id: str, *, allow_local_origin: bool = False) -> Path:
+    repository = inspect_repository(
+        cwd, allow_local_origin=allow_local_origin, require_remote=False,
+    )
+    for _, manifest in _load_manifests(repository):
+        if manifest.task_id != task_id:
+            continue
+        results = diagnose(cwd, task_id, allow_local_origin=allow_local_origin)
+        if results[0][1] not in {"ready", "dirty"}:
+            raise WorktreeError(f"taskを再開できません: {results[0][1]}")
+        return Path(manifest.worktree)
+    raise WorktreeError("指定taskのmanifestがありません")
+
+
+def recover(cwd: Path, task_id: str, *, allow_local_origin: bool = False) -> Path:
+    repository = inspect_repository(
+        cwd, allow_local_origin=allow_local_origin, require_remote=False,
+    )
+    _, manifest_path, lock_path = _managed_paths(repository, task_id, create=False)
+    if not lock_path.parent.is_dir() or lock_path.parent.is_symlink():
+        raise WorktreeError("lifecycle lockを安全に確認できません")
+    with _exclusive_lock(lock_path):
+        matches = [
+            manifest
+            for _, manifest in _load_manifests(repository)
+            if manifest.task_id == task_id
+        ]
+        if len(matches) != 1:
+            raise WorktreeError("指定taskのmanifestを一意に確認できません")
+        manifest = matches[0]
+        results = diagnose(cwd, task_id, allow_local_origin=allow_local_origin)
+        if manifest.status != "creating" or results[0][1] != "interrupted":
+            raise WorktreeError(f"taskを安全にrecoverできません: {results[0][1]}")
+        recovered = Manifest(**{**asdict(manifest), "status": "ready", "detail": ""})
+        _atomic_manifest(manifest_path, recovered)
+        return Path(manifest.worktree)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    create = commands.add_parser("create", help="最新origin default branchからworktreeを作成")
+    create.add_argument("--branch")
+    identity = create.add_mutually_exclusive_group()
+    identity.add_argument("--issue", type=int)
+    identity.add_argument("--task-id")
+    commands.add_parser("list", help="管理中worktreeを一覧表示")
+    doctor = commands.add_parser("doctor", help="管理中worktreeを診断")
+    doctor.add_argument("--task-id")
+    resume_parser = commands.add_parser("resume", help="再開可能なworktree pathを表示")
+    resume_parser.add_argument("--task-id", required=True)
+    recover_parser = commands.add_parser("recover", help="中断したworktreeを再検証して復旧")
+    recover_parser.add_argument("--task-id", required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    cwd = Path.cwd()
+    if args.command == "create":
+        if args.issue is not None and args.issue < 1:
+            raise WorktreeError("Issue番号は1以上にしてください")
+        task_id = normalize_task_id(args.issue, args.task_id)
+        branch = args.branch or f"feat/{task_id}"
+        print(create_worktree(cwd, branch, task_id))
+        return 0
+    if args.command == "resume":
+        task_id = normalize_task_id(None, args.task_id)
+        print(resume(cwd, task_id))
+        return 0
+    if args.command == "recover":
+        task_id = normalize_task_id(None, args.task_id)
+        print(recover(cwd, task_id))
+        return 0
+    task_id = normalize_task_id(None, args.task_id) if getattr(args, "task_id", None) else None
+    rows = diagnose(cwd, task_id)
+    for row in rows:
+        print("\t".join(row))
+    if args.command == "list":
+        return 0
+    return 0 if all(status == "ready" for _, status, _ in rows) else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except WorktreeError as error:
+        print(f"codex-worktree: {error}", file=sys.stderr)
+        raise SystemExit(1)
