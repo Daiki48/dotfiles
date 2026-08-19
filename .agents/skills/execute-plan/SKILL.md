@@ -24,6 +24,10 @@ description: 実装依頼の全実装単位を自律的に実装・検証し、�
   delivery安全境界、auth/secrets、billing、production、不可逆migration、breaking changeを含むもの。
   security、互換性、データ損失の重大な懸念も含め、毎回会話でDaikiの明示確認を得てから
   `approve-review`を実行する。自動approval reviewだけをDaikiの確認とは扱わない。
+- **GitHub Free/private delivery**: helperの完全一致allowlistにあるrepositoryで
+  `--gate-mode github-free-private`を使う場合、実装内容が通常のlow/mediumでもdelivery riskを
+  highへ引き上げる。Rulesetなしの低保証profileなので、固定SHAごとにDaikiの確認を得て
+  `approve-review`だけでreceiptを記録する。403、404、timeoutなどからこのmodeへ自動移行しない。
 - **判定不能**: 影響範囲またはリスクを確定できないもの。highとして扱い、確認なしにdeliveryしない。
 
 Issue #24自身はdelivery安全境界を変更するhighであり、Draft PR作成後にDaikiの確認が必要です。
@@ -79,8 +83,10 @@ Issue #24自身はdelivery安全境界を変更するhighであり、Draft PR作
 
 Draft PR作成後は、専用`codex-delivery` helperだけをreceipt、delivery、finishの経路として使う。
 すべてのcommandで`--task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID>`を
-明示し、review記録では`--risk`と`--tests-passed --neutral-review-passed
---adversarial-review-passed`も指定する。
+明示し、review記録では`--risk`と`--tests-passed`、`--neutral-review-passed`、
+`--adversarial-review-passed`も指定する。明示認可されたGitHub Free/private repositoryでは
+ `approve-review`、`deliver`、`finish`の各commandへ`--gate-mode github-free-private`も指定し、
+ strict modeでは省略する。
 
 1. PRのbase、head、head SHAを固定し、`review-branch`を読み取り専用で実行する。reviewerは固定SHAの
    差分、実装計画、test結果、既存仕様を確認し、actionable件数と未解決thread件数を返す。
@@ -92,7 +98,9 @@ Draft PR作成後は、専用`codex-delivery` helperだけをreceipt、delivery�
    後続pushやSHA変更後に引き継がない。
 4. receiptのSHAと現在のPR head SHAが一致し、actionable=0、未解決thread=0、required CIが文字通り
    `success`（skipped、cancelled、timed out、neutral、pending、判定不能は不合格）、merge conflictなし、
-   branchが最新base、live Ruleset gateが成立していることをhelperで再取得する。
+   branchが最新baseであることをhelperで再取得する。strict modeはlive Ruleset gateを必須とする。
+   明示したGitHub Free/private modeはallowlist、private repository設定、human-approved high receiptを
+   必須とし、Rulesetが保証していたhelper外操作の拒否は残存リスクとして扱う。
 5. low/medium、または`approve-review`済みのhigh/critical/判定不能だけ、`codex-delivery deliver`へ進む。
    helperがReady化と許可されたmergeを行う。直接の`gh pr ready`/`gh pr merge`はこの経路を迂回するため禁止する。
 6. merge後は`codex-delivery finish ...`でmerged状態、head commitの`origin/main`到達性、人間用checkoutのmain・clean、
@@ -116,7 +124,8 @@ PRが未mergeの間はworktreeを安全な再開点として保持する。`git 
 - 未実施の手動確認、残存リスク、計画との差異
 - push・PR作成・delivery・finishを実施できなかった場合は、PR、branch、worktreeを保持した安全な再開条件
 
-low/mediumは全live gateを満たす場合だけ`codex-delivery`がdelivery・finishまで実行し、high/critical/判定不能は
+strict modeのlow/mediumは全live gateを満たす場合だけ`codex-delivery`がdelivery・finishまで実行し、
+GitHub Free/privateを含むhigh/critical/判定不能は
 `approve-review`後にのみ実行する。release、protected branchへの直接push、force push、任意削除は行わない。
 追跡Issueは、依頼された完了条件が外部状態を含めて成立したことを確認できる場合だけcloseする。Draft PR作成だけを
 実装完了とみなしてcloseしない。

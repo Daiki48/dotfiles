@@ -100,9 +100,15 @@ Ruleset is active; apply it with explicit approval and verify its readback. See
 [GitHub CI・Ruleset運用ガイド](docs/github-guardrails.ja.md) for the check mapping, application,
 verification, and rollback procedure.
 
+`codex-delivery` defaults to that strict Ruleset gate. An explicitly allowlisted GitHub Free
+private repository may instead use `--gate-mode github-free-private`; this lower-assurance mode
+still requires one successful exact-SHA `required-ci` and a human-approved high receipt on every
+delivery, but GitHub does not enforce direct-push, force-push, deletion, or helper-only merge
+constraints server-side.
+
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, Draft PRs, and the delivery
-loop are used when the task or an explicit request warrants them. low/mediumの通常タスクは、
+loop are used when the task or an explicit request warrants them. strict modeのlow/medium通常タスクは、
 固定head SHAの独立review、actionable=0、未解決thread=0、required checkの文字通りの
 `success`、live Ruleset gateを満たす場合に`codex-delivery`がReady、merge、mainのfetch後の
 `merge --ff-only`、managed cleanupまで進めます。CI/workflow、Ruleset、hook、rules、AGENTS、
@@ -112,6 +118,8 @@ Skills、helper、installerなどdelivery安全境界、auth/secrets、billing�
 確認とは扱いません。release、force push、protected-branch push、
 任意削除、material scope expansion、product decisionsは引き続き手動です。詳しい条件は
 [Codex delivery運用ガイド](docs/codex-delivery.ja.md)を参照してください。
+明示認可されたGitHub Free/private modeは通常タスクもdelivery上highとして扱い、同じ固定SHAへ
+毎回Daikiの確認を得ます。
 
 `~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
 `~/.agents/skills` are symlinked from this repository.
