@@ -27,6 +27,8 @@ cargo run -- codex
 installerは`HOME`がpassword database上のcurrent account homeと一致し、`~/.local/bin`が
 `PATH`に含まれることを事前検査します。不一致時は書き込み前に停止します。設定を反映するため、
 実行後はCodexを再起動してください。helperをcanonical pathから起動できることを確認できます。
+private helperの導入・更新中に中断した場合は、owner-onlyのpending journalと内容hashが示す
+到達可能な途中状態だけを次回setupで再開し、不整合なfileやstateは変更せず停止します。
 
 ```sh
 codex-worktree --help
