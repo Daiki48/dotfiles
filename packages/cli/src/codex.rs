@@ -15,8 +15,10 @@ const CODEX_FILES: &[(&str, &str)] = &[
 ];
 const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/block_git_write.py";
 const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/block_git_write.py";
-const MANAGED_HELPER_SOURCE: &str = ".codex/helpers/codex-worktree";
-const MANAGED_HELPER_DESTINATION: &str = ".local/bin/codex-worktree";
+const MANAGED_HELPERS: &[(&str, &str)] = &[
+    (".codex/helpers/codex-worktree", ".local/bin/codex-worktree"),
+    (".codex/helpers/codex-delivery", ".local/bin/codex-delivery"),
+];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 
 // Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
@@ -993,7 +995,7 @@ pub fn setup() -> Result<()> {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|path| path == helper_directory));
     if !helper_on_path {
         anyhow::bail!(
-            "{} must be present in PATH before installing codex-worktree",
+            "{} must be present in PATH before installing Codex helpers",
             helper_directory.display()
         );
     }
@@ -1014,10 +1016,9 @@ pub fn setup() -> Result<()> {
         &dotfiles_path.join(MANAGED_HOOK_SOURCE),
         &home.join(MANAGED_HOOK_DESTINATION),
     )?;
-    ensure_managed_hook(
-        &dotfiles_path.join(MANAGED_HELPER_SOURCE),
-        &home.join(MANAGED_HELPER_DESTINATION),
-    )?;
+    for (source, destination) in MANAGED_HELPERS {
+        ensure_managed_hook(&dotfiles_path.join(source), &home.join(destination))?;
+    }
     println!("\nLinking shared skill directories...");
     for (source, dest) in CODEX_DIRS {
         ensure_shared_symlink(source, dest)?;
@@ -1041,17 +1042,28 @@ pub fn setup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND, contains_legacy_profile_config,
-        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook,
-        ensure_managed_writable_root, ensure_private_directory, managed_hook_state_path,
-        merge_managed_config, merge_managed_config_with_root, migrate_managed_config_from_template,
-        sha256, verify_managed_symlink,
+        MANAGED_HELPERS, MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND,
+        contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
+        ensure_managed_hook, ensure_managed_writable_root, ensure_private_directory,
+        managed_hook_state_path, merge_managed_config, merge_managed_config_with_root,
+        migrate_managed_config_from_template, sha256, verify_managed_symlink,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestDirectory(PathBuf);
+
+    #[test]
+    fn managed_helpers_include_worktree_and_delivery() {
+        assert_eq!(
+            MANAGED_HELPERS,
+            &[
+                (".codex/helpers/codex-worktree", ".local/bin/codex-worktree"),
+                (".codex/helpers/codex-delivery", ".local/bin/codex-delivery"),
+            ]
+        );
+    }
 
     impl TestDirectory {
         fn new(label: &str) -> Self {

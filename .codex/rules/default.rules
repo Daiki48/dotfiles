@@ -1,5 +1,5 @@
 # 通常の作業は workspace-write sandbox と厳格なPreToolUse hookで検査する。
-# 検査済みのcommit・単一branch push・通常のIssue/PR管理を無確認で許可する。
+# 検査済みのcommit・単一branch push・通常のIssue/PR管理・low/medium deliveryを無確認で許可する。
 
 prefix_rule(pattern=["git", "push", ["--force", "-f", "--force-with-lease", "--delete", "-d", "--mirror", "--tags", "--all"]], decision="forbidden", justification="履歴改変・削除・一括pushは禁止")
 prefix_rule(pattern=["git", "commit", "-m"], decision="allow", justification="hook検査済みの通常commit")
@@ -11,6 +11,10 @@ prefix_rule(pattern=["gh", "issue", ["create", "edit", "comment", "close", "reop
 prefix_rule(pattern=["gh", "pr", ["edit", "comment", "review", "ready", "close", "reopen", "update-branch"]], decision="allow", justification="hook検査済みの単一PR管理")
 prefix_rule(pattern=["codex-worktree", "create"], decision="allow", justification="専用helperで検査済みのworktree作成")
 prefix_rule(pattern=["codex-worktree", "recover"], decision="allow", justification="中断したmanaged worktreeの検証済み復旧")
+prefix_rule(pattern=["codex-delivery", "record-review"], decision="allow", justification="固定head SHAに対するlow/medium review receiptを専用helperで記録")
+prefix_rule(pattern=["codex-delivery", "approve-review"], decision="prompt", justification="high/critical riskのdeliveryはDaikiの確認が必要")
+prefix_rule(pattern=["codex-delivery", "deliver"], decision="allow", justification="review・CI・Rulesetを再検証する専用helperだけがReady化とmergeを実行")
+prefix_rule(pattern=["codex-delivery", "finish"], decision="allow", justification="merge到達性を再検証する専用helperだけがmain同期とmanaged cleanupを実行")
 prefix_rule(pattern=["git", ["rebase", "reset", "clean", "restore", "rm", "update-ref"]], decision="forbidden", justification="履歴改変または広範囲な破棄操作は禁止")
 prefix_rule(pattern=["git", "worktree", ["add", "remove", "prune", "move", "repair", "lock", "unlock"]], decision="forbidden", justification="worktree lifecycleの書き込みは専用helperに限定する")
 prefix_rule(pattern=["git", "checkout", "--"], decision="forbidden", justification="作業中の変更を破棄するcheckoutは禁止")

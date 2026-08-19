@@ -276,6 +276,59 @@ class GuardTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
 
+    def test_delivery_helper_accepts_only_canonical_operations(self):
+        head = "a" * 40
+        evidence = (
+            "--tests-passed --neutral-review-passed --adversarial-review-passed"
+        )
+        for command in (
+            "codex-delivery --help",
+            f"codex-delivery record-review --task-id issue-24 --pr 27 --head {head} "
+            "--risk medium --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
+            f"codex-delivery approve-review --task-id issue-24 --pr 27 --head {head} "
+            "--risk high --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
+            f"codex-delivery deliver --task-id issue-24 --pr 27 --head {head} "
+            "--plan-id CODEX-COMPLETE-DELIVERY-20260819-v1",
+            f"codex-delivery finish --task-id issue-24 --pr 27 --head {head} "
+            "--plan-id CODEX-COMPLETE-DELIVERY-20260819-v1",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "/workspace")
+
+        for command in (
+            "./codex-delivery deliver --task-id issue-24",
+            "command codex-delivery deliver --task-id issue-24",
+            "python3 .codex/helpers/codex-delivery approve-review --task-id issue-24",
+            "python3 /home/user/.local/bin/codex-delivery deliver --task-id issue-24",
+            f"codex-delivery record-review --task-id issue-24 --pr 27 --head {head} "
+            "--risk high --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
+            f"codex-delivery approve-review --task-id issue-24 --pr 27 --head {head} "
+            "--risk medium --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
+            f"codex-delivery record-review --task-id issue-24 --pr 0 --head {head} "
+            "--risk low --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
+            "codex-delivery deliver --task-id ../issue-24 --pr 27 --head bad "
+            "--plan-id unsafe",
+            f"codex-delivery deliver --task-id issue-24 --pr 27 --head {head} "
+            "--plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 --admin",
+            f"codex-delivery finish --task-id issue-24 --pr 27 --head {head} "
+            "--plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 && git status",
+            f"bash -lc 'codex-delivery finish --task-id issue-24 --pr 27 --head {head} "
+            "--plan-id CODEX-COMPLETE-DELIVERY-20260819-v1'",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
+
+    def test_direct_ready_is_blocked_but_return_to_draft_is_allowed(self):
+        with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
+            self.assert_blocked(
+                "gh pr ready 27 --repo owner/repo",
+                "/workspace",
+            )
+            self.assert_allowed(
+                "gh pr ready 27 --undo --repo owner/repo",
+                "/workspace",
+            )
+
     def test_nested_shell_and_chain_are_checked(self):
         for command in (
             "zsh -lc 'git reset --hard HEAD'",
@@ -408,6 +461,8 @@ class GuardTest(unittest.TestCase):
                 + body.name + " --body-file=" + body.name,
                 "gh pr close 25 --repo owner/repo --delete-branch",
                 "gh pr update-branch 25 --repo owner/repo --rebase",
+                "gh pr merge 25 --repo owner/repo --merge --match-head-commit "
+                + "a" * 40,
                 "gh pr merge 25 --repo owner/repo --squash",
                 "gh pr edit 25 --repo owner/repo --add-project project",
                 "gh issue comment 23 --repo attacker/repo --body-file " + body.name,

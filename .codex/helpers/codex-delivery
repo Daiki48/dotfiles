@@ -1,0 +1,1257 @@
+#!/usr/bin/env python3
+"""固定したPR headを検証してmergeし、managed worktreeを安全に完了するhelper。
+
+このファイルはGitHub CLIをshellなしで呼び出す。外部応答、manifest、receiptはすべて
+fail-closedで扱い、成功したhead以外をmergeまたはcleanupしない。
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import threading
+import time
+from typing import Any, Iterator
+
+
+MANIFEST_VERSION = 1
+RECEIPT_VERSION = 1
+STATE_VERSION = 1
+MAX_FILE_BYTES = 256 * 1024
+MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_PAGE_ITEMS = 100
+MAX_PAGES = 20
+MAX_ITEMS = 10_000
+MAX_RULESETS = 20
+COMMAND_TIMEOUT = 45
+OPERATION_TIMEOUT = 300
+SYSTEM_PATH = "/usr/bin:/bin"
+GIT_BINARY = Path("/usr/bin/git")
+GH_BINARY = Path("/usr/bin/gh")
+TASK_ID_RE = re.compile(r"^(?:issue-[1-9][0-9]*|task-[a-z0-9][a-z0-9-]{0,63})$")
+BRANCH_RE = re.compile(r"^(?:feat|feature|fix|refactor|docs|test|chore|ci|build|perf|style|hotfix|update)/[a-z0-9][a-z0-9._-]*$")
+OID_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+PLAN_RE = re.compile(r"^[A-Z][A-Z0-9-]{7,127}-v[1-9][0-9]*$")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+PR_RE = re.compile(r"^[1-9][0-9]{0,8}$")
+
+# These paths change the trust boundary or the ability to install/use this helper.
+SAFETY_PATH_PREFIXES = (
+    ".github/",
+    ".codex/",
+    ".agents/skills/",
+    "packages/cli/",
+)
+SAFETY_PATHS = {
+    "AGENTS.md",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".codex/AGENTS.md",
+    ".codex/helpers/codex-delivery",
+    ".codex/helpers/test_codex_delivery.py",
+    ".codex/config.base.toml",
+    "packages/cli/src/codex.rs",
+}
+
+
+class DeliveryError(RuntimeError):
+    """安全条件を満たさないdelivery操作。"""
+
+
+_HELD_LOCKS = threading.local()
+_DEADLINES = threading.local()
+
+
+@contextmanager
+def _operation_deadline(seconds: int = OPERATION_TIMEOUT) -> Iterator[None]:
+    previous = getattr(_DEADLINES, "value", None)
+    current = time.monotonic() + seconds
+    _DEADLINES.value = min(previous, current) if previous is not None else current
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                del _DEADLINES.value
+            except AttributeError:
+                pass
+        else:
+            _DEADLINES.value = previous
+
+
+def _safe_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for key in list(environment):
+        if key.startswith("GIT_") or key in {"SSH_ASKPASS", "GIT_ASKPASS"}:
+            environment.pop(key, None)
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment.pop("GH_REPO", None)
+    environment.pop("GH_CONFIG_DIR", None)
+    environment["GH_HOST"] = "github.com"
+    environment["PATH"] = SYSTEM_PATH
+    return environment
+
+
+def _trusted_binary(path: Path, name: str) -> str:
+    try:
+        metadata = path.lstat()
+        parent = path.parent.lstat()
+    except OSError as error:
+        raise DeliveryError(f"system {name}を確認できません") from error
+    if (
+        not path.is_absolute() or path.parent != Path("/usr/bin")
+        or stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_mode & 0o022 or parent.st_mode & 0o022
+        or not os.access(path, os.X_OK)
+    ):
+        raise DeliveryError(f"system {name}が安全な実行fileではありません")
+    return str(path)
+
+
+def _git_command(*args: str) -> list[str]:
+    return [_trusted_binary(GIT_BINARY, "Git"), "-c", "core.hooksPath=/dev/null", *args]
+
+
+def _run(
+    command: list[str], *, cwd: Path, timeout: int = COMMAND_TIMEOUT,
+    max_output: int = MAX_OUTPUT_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    if not command or any(not isinstance(item, str) or not item for item in command):
+        raise DeliveryError("外部commandを安全に構成できません")
+    deadline = getattr(_DEADLINES, "value", None)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DeliveryError("delivery操作全体がtimeoutしました")
+        timeout = min(timeout, max(0.001, remaining))
+    try:
+        result = subprocess.run(
+            command, cwd=cwd, check=False, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, timeout=timeout,
+            env=_safe_environment(), shell=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise DeliveryError("外部commandがtimeoutしました") from error
+    except (OSError, ValueError) as error:
+        raise DeliveryError("外部commandを実行できません") from error
+    stdout = result.stdout if isinstance(result.stdout, str) else ""
+    stderr = result.stderr if isinstance(result.stderr, str) else ""
+    if len(stdout.encode("utf-8", "replace")) > max_output or len(stderr.encode("utf-8", "replace")) > max_output:
+        raise DeliveryError("外部commandの応答が大きすぎます")
+    return result
+
+
+def _git(cwd: Path, *args: str, check: bool = True) -> str:
+    result = _run(_git_command(*args), cwd=cwd)
+    if result.returncode != 0 and check:
+        raise DeliveryError("Git commandに失敗しました")
+    return result.stdout
+
+
+def _gh(cwd: Path, *args: str, check: bool = True) -> str:
+    result = _run([_trusted_binary(GH_BINARY, "GitHub CLI"), *args], cwd=cwd)
+    if result.returncode != 0 and check:
+        raise DeliveryError("GitHub CLI commandに失敗しました")
+    return result.stdout
+
+
+def _json(text: str, label: str) -> Any:
+    if not text or len(text.encode("utf-8", "replace")) > MAX_OUTPUT_BYTES:
+        raise DeliveryError(f"{label}の応答が空または大きすぎます")
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError) as error:
+        raise DeliveryError(f"{label}のJSONを安全に解析できません") from error
+
+
+def _gh_json(cwd: Path, *args: str) -> Any:
+    return _json(_gh(cwd, *args), "GitHub")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _oid(value: object, *, name: str = "SHA") -> str:
+    if not isinstance(value, str) or not OID_RE.fullmatch(value):
+        raise DeliveryError(f"{name}が正しいSHAではありません")
+    return value.casefold()
+
+
+def _task_id(value: object) -> str:
+    if not isinstance(value, str) or not TASK_ID_RE.fullmatch(value):
+        raise DeliveryError("task IDが安全ではありません")
+    return value
+
+
+def _repo_key(repository: str) -> str:
+    if REPO_RE.fullmatch(repository) is None:
+        raise DeliveryError("GitHub repository名が安全ではありません")
+    owner, name = repository.casefold().split("/", 1)
+    return f"{len(owner)}-{owner}--{len(name)}-{name}"
+
+
+def _codex_home() -> Path:
+    raw = os.environ.get("CODEX_HOME")
+    candidate = Path(raw) if raw else Path.home() / ".codex"
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise DeliveryError("CODEX_HOMEは安全な絶対pathにしてください")
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise DeliveryError("CODEX_HOMEを安全に検査できません") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise DeliveryError("CODEX_HOMEのsymlink componentを拒否しました")
+        if current != candidate and not stat.S_ISDIR(metadata.st_mode):
+            raise DeliveryError("CODEX_HOMEの親がdirectoryではありません")
+    return candidate.resolve(strict=False)
+
+
+def _safe_regular(path: Path, *, max_bytes: int = MAX_FILE_BYTES) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise DeliveryError("managed fileを確認できません") from error
+    if (
+        stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077
+        or metadata.st_size > max_bytes
+    ):
+        raise DeliveryError("managed fileが安全なprivate regular fileではありません")
+
+
+def _safe_directory(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise DeliveryError("managed directoryが安全ではありません")
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise DeliveryError("managed directoryを確認できません") from error
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        raise DeliveryError("managed directoryがprivateではありません")
+
+
+def _managed_root(repository: str) -> Path:
+    root = _codex_home() / "worktrees" / _repo_key(repository)
+    _safe_directory(root.parent.parent)
+    _safe_directory(root.parent)
+    _safe_directory(root)
+    return root
+
+
+def _state_root(repository: str) -> Path:
+    managed = _managed_root(repository)
+    state = managed / ".state"
+    _safe_directory(state)
+    return state
+
+
+def _snapshot_path(repository: str, task_id: str) -> Path:
+    _task_id(task_id)
+    path = _state_root(repository) / f"{task_id}.json"
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        raise DeliveryError("managed state directoryが安全ではありません")
+    return path
+
+
+def _state_path(repository: str, task_id: str) -> Path:
+    path = _state_root(repository) / f"{task_id}.delivery.json"
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        raise DeliveryError("delivery state directoryが安全ではありません")
+    return path
+
+
+def _receipt_path(repository: str, task_id: str, head_sha: str) -> Path:
+    head = _oid(head_sha)
+    path = _state_root(repository) / f"{task_id}.receipt.{head}.json"
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        raise DeliveryError("receipt directoryが安全ではありません")
+    return path
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        raise DeliveryError("state parentが安全ではありません")
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    try:
+        with temporary.open("x", encoding="utf-8") as output:
+            json.dump(payload, output, ensure_ascii=False, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except OSError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise DeliveryError("receipt/stateをatomic保存できません") from error
+
+
+def _acquire_lock(descriptor: int) -> None:
+    deadline = getattr(_DEADLINES, "value", None)
+    if deadline is None:
+        deadline = time.monotonic() + OPERATION_TIMEOUT
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeliveryError("task lifecycle lockの取得がtimeoutしました")
+            time.sleep(min(0.05, remaining))
+
+
+@contextmanager
+def _task_lock(repository: str, task_id: str) -> Iterator[None]:
+    _task_id(task_id)
+    key = (repository.casefold(), task_id)
+    held = getattr(_HELD_LOCKS, "keys", set())
+    if key in held:
+        yield
+        return
+    lock_root = _managed_root(repository) / ".locks"
+    if lock_root.is_symlink() or not lock_root.is_dir():
+        raise DeliveryError("task lifecycle lock directoryが安全ではありません")
+    # codex-worktree create/recoverも同じrepo-wide lifecycle lockを使う。
+    # task IDはmanifest/state/receiptの対象を限定するために別途検証する。
+    path = lock_root / "lifecycle.lock"
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "a+", encoding="utf-8") as lock:
+            os.fchmod(lock.fileno(), 0o600)
+            _acquire_lock(lock.fileno())
+            held = set(held)
+            held.add(key)
+            _HELD_LOCKS.keys = held
+            try:
+                yield
+            finally:
+                held.remove(key)
+                _HELD_LOCKS.keys = held
+    except OSError as error:
+        raise DeliveryError("task lifecycle lockを取得できません") from error
+
+
+def _github_repository(remote: str) -> str | None:
+    value = remote.strip().rstrip("/")
+    prefixes = (
+        "https://github.com/", "ssh://git@github.com/",
+        "git@github.com:",
+    )
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            candidate = value.removeprefix(prefix).removesuffix(".git")
+            return candidate if REPO_RE.fullmatch(candidate) else None
+    return None
+
+
+def _repository(root: Path) -> str:
+    top = _git(root, "rev-parse", "--show-toplevel").strip()
+    if not top or Path(top).resolve() != root.resolve():
+        raise DeliveryError("current checkout rootを確認できません")
+    fetch = _git(root, "remote", "get-url", "--all", "origin").splitlines()
+    push = _git(root, "remote", "get-url", "--push", "--all", "origin").splitlines()
+    if len(fetch) != 1 or len(push) != 1:
+        raise DeliveryError("originのfetch/push URLはそれぞれ1件に限定してください")
+    fetched = _github_repository(fetch[0])
+    pushed = _github_repository(push[0])
+    if fetched is None or pushed is None or fetched.casefold() != pushed.casefold():
+        raise DeliveryError("originは同一github.com repositoryに固定してください")
+    return fetched
+
+
+def _manifest(root: Path, task_id: str, repository: str) -> tuple[dict[str, Any], Path]:
+    path = _snapshot_path(repository, task_id)
+    _safe_regular(path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise DeliveryError("worktree manifestを安全に解析できません") from error
+    fields = {
+        "version", "status", "task_id", "repository", "common_git_dir", "github_name",
+        "branch", "base", "base_oid", "worktree", "created_at", "detail",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise DeliveryError("worktree manifest schemaが一致しません")
+    if any(isinstance(value, bool) or not isinstance(value, str) for key, value in payload.items() if key != "version"):
+        raise DeliveryError("worktree manifestの型が不正です")
+    if isinstance(payload.get("version"), bool) or not isinstance(payload.get("version"), int):
+        raise DeliveryError("worktree manifest versionが不正です")
+    managed = _managed_root(repository)
+    if (
+        payload["version"] != MANIFEST_VERSION or payload["status"] != "ready"
+        or payload["task_id"] != task_id or payload["repository"] != str(root)
+        or payload["github_name"].casefold() != repository.casefold()
+        or BRANCH_RE.fullmatch(payload["branch"]) is None
+        or not payload["base"].startswith("origin/")
+        or payload["base"].removeprefix("origin/") != "main"
+        or OID_RE.fullmatch(payload["base_oid"]) is None
+        or not payload["created_at"]
+    ):
+        raise DeliveryError("worktree manifestの値がcurrent repositoryと一致しません")
+    branch_check = _run(
+        _git_command("check-ref-format", "--branch", payload["branch"]),
+        cwd=root,
+    )
+    if branch_check.returncode != 0:
+        raise DeliveryError("manifest branchがGit refとして不正です")
+    expected_worktree = managed / task_id
+    if payload["worktree"] != str(expected_worktree):
+        raise DeliveryError("manifest worktreeがmanaged root外です")
+    common = _git(root, "rev-parse", "--git-common-dir").strip()
+    if not common or Path(common).resolve() != Path(payload["common_git_dir"]).resolve():
+        raise DeliveryError("manifest common git directoryが一致しません")
+    return payload, expected_worktree
+
+
+def _worktree(root: Path, manifest: dict[str, Any], expected: Path) -> None:
+    if expected.is_symlink() or not expected.is_dir():
+        raise DeliveryError("managed worktreeが安全なdirectoryではありません")
+    top = _git(expected, "rev-parse", "--show-toplevel").strip()
+    common = _git(expected, "rev-parse", "--git-common-dir").strip()
+    if Path(top).resolve() != expected.resolve() or Path(common).resolve() != Path(manifest["common_git_dir"]).resolve():
+        raise DeliveryError("managed worktreeがmanifest repositoryに属していません")
+    if _git(expected, "rev-parse", "--abbrev-ref", "HEAD").strip() != manifest["branch"]:
+        raise DeliveryError("managed worktree branchが一致しません")
+
+
+def _worktree_clean_head(worktree: Path, expected_head: str) -> None:
+    if _git(
+        worktree, "status", "--porcelain=v1", "--untracked-files=all",
+        "--ignored=matching",
+    ):
+        raise DeliveryError("managed worktreeがcleanではありません")
+    if _oid(_git(worktree, "rev-parse", "HEAD").strip(), name="managed worktree head") != _oid(expected_head):
+        raise DeliveryError("managed worktree headがreceiptと一致しません")
+
+
+def _changed_files(worktree: Path, base: str, head: str) -> list[str]:
+    output = _git(worktree, "diff", "--name-only", "--no-renames", "-z", base, head)
+    values = output.split("\0")
+    if values and values[-1] == "":
+        values.pop()
+    if len(values) > MAX_ITEMS or any(not value or "\n" in value or "\r" in value for value in values):
+        raise DeliveryError("changed-files応答を安全に解析できません")
+    return values
+
+
+def _is_safety_path(path: str) -> bool:
+    return path in SAFETY_PATHS or any(path.startswith(prefix) for prefix in SAFETY_PATH_PREFIXES)
+
+
+def _receipt(
+    payload: dict[str, Any], *, root: Path, task_id: str, head: str,
+    repository: str | None = None,
+) -> dict[str, Any]:
+    fields = {
+        "version", "kind", "task_id", "repository", "pr", "head_sha", "risk", "plan_id",
+        "actionable", "human_approved", "tests_passed", "neutral_review_passed",
+        "adversarial_review_passed", "changed_files", "created_at",
+    }
+    if set(payload) != fields or payload.get("version") != RECEIPT_VERSION or payload.get("kind") != "review":
+        raise DeliveryError("receipt schemaが一致しません")
+    current_repository = repository or _repository(root)
+    if payload.get("task_id") != task_id or payload.get("repository") != current_repository:
+        raise DeliveryError("receipt task/repositoryが一致しません")
+    if not isinstance(payload.get("pr"), int) or isinstance(payload.get("pr"), bool) or payload["pr"] < 1:
+        raise DeliveryError("receipt PR番号が不正です")
+    if payload.get("head_sha") != head or payload.get("risk") not in {"low", "medium", "high", "critical"}:
+        raise DeliveryError("receipt head/riskが不正です")
+    if not isinstance(payload.get("plan_id"), str) or PLAN_RE.fullmatch(payload["plan_id"]) is None:
+        raise DeliveryError("receipt Plan IDが不正です")
+    if payload.get("actionable") != 0 or not isinstance(payload.get("human_approved"), bool):
+        raise DeliveryError("receipt actionable/approvalが不正です")
+    if any(payload.get(key) is not True for key in ("tests_passed", "neutral_review_passed", "adversarial_review_passed")):
+        raise DeliveryError("receiptの必須検証flagが不足しています")
+    if not isinstance(payload.get("changed_files"), list) or len(payload["changed_files"]) > MAX_ITEMS:
+        raise DeliveryError("receipt changed-filesが不正です")
+    if any(not isinstance(item, str) for item in payload["changed_files"]):
+        raise DeliveryError("receipt changed-filesの型が不正です")
+    return payload
+
+
+def _load_receipt(root: Path, task_id: str, head: str, repository: str | None = None) -> dict[str, Any]:
+    repository = repository or _repository(root)
+    path = _receipt_path(repository, task_id, head)
+    _safe_regular(path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise DeliveryError("receiptを安全に解析できません") from error
+    return _receipt(payload, root=root, task_id=task_id, head=_oid(head), repository=repository)
+
+
+def _write_review_locked(
+    root: Path, task_id: str, pr: int, head: str, risk: str, plan: str,
+    approved: bool, tests_passed: bool, neutral_review_passed: bool,
+    adversarial_review_passed: bool,
+) -> dict[str, Any]:
+    if risk not in {"low", "medium", "high", "critical"}:
+        raise DeliveryError("riskはlow/medium/high/criticalのいずれかです")
+    if not isinstance(pr, int) or isinstance(pr, bool) or pr < 1 or pr > 999_999_999:
+        raise DeliveryError("PR番号が不正です")
+    head = _oid(head)
+    if not isinstance(plan, str) or PLAN_RE.fullmatch(plan) is None:
+        raise DeliveryError("Plan IDが安全ではありません")
+    if not all((tests_passed, neutral_review_passed, adversarial_review_passed)):
+        raise DeliveryError("tests/neutral/adversarial reviewの完了flagが必要です")
+    repository = _repository(root)
+    manifest, worktree = _manifest(root, task_id, repository)
+    _worktree(root, manifest, worktree)
+    current = _oid(_git(worktree, "rev-parse", "HEAD").strip(), name="current head")
+    if current != head:
+        raise DeliveryError("指定headがworktreeのcurrent HEADと一致しません")
+    _worktree_clean_head(worktree, head)
+    changed = _changed_files(worktree, manifest["base_oid"], head)
+    unsafe = [path for path in changed if _is_safety_path(path)]
+    if unsafe and not approved:
+        raise DeliveryError("安全境界差分はhuman-approvedのapprove-reviewが必要です")
+    if not approved and risk not in {"low", "medium"}:
+        raise DeliveryError("record-reviewはlow/mediumだけを許可します")
+    if approved and risk not in {"high", "critical"}:
+        raise DeliveryError("approve-reviewはhigh/criticalだけを許可します")
+    path = _receipt_path(repository, task_id, head)
+    payload = {
+        "version": RECEIPT_VERSION, "kind": "review", "task_id": task_id,
+        "repository": repository, "pr": pr, "head_sha": head, "risk": risk,
+        "plan_id": plan, "actionable": 0, "human_approved": approved,
+        "tests_passed": True, "neutral_review_passed": True, "adversarial_review_passed": True,
+        "changed_files": changed, "created_at": _now(),
+    }
+    if path.exists() or path.is_symlink():
+        existing = _load_receipt(root, task_id, head, repository)
+        immutable = {key: value for key, value in payload.items() if key != "created_at"}
+        existing_immutable = {key: value for key, value in existing.items() if key != "created_at"}
+        if approved and existing.get("risk") in {"low", "medium"} and existing.get("human_approved") is False:
+            upgrade_keys = {"version", "kind", "task_id", "repository", "pr", "head_sha", "plan_id", "actionable", "tests_passed", "neutral_review_passed", "adversarial_review_passed", "changed_files"}
+            if all(existing.get(key) == payload.get(key) for key in upgrade_keys):
+                _atomic_json(path, payload)
+                return payload
+        if existing_immutable != immutable:
+            raise DeliveryError("同じheadのreceiptが既に存在し内容が異なります")
+        return existing
+    _atomic_json(path, payload)
+    return payload
+
+
+def _write_review(
+    root: Path, task_id: str, pr: int, head: str, risk: str, plan: str,
+    approved: bool, tests_passed: bool, neutral_review_passed: bool,
+    adversarial_review_passed: bool,
+) -> dict[str, Any]:
+    task_id = _task_id(task_id)
+    repository = _repository(root)
+    with _task_lock(repository, task_id):
+        return _write_review_locked(
+            root, task_id, pr, head, risk, plan, approved, tests_passed,
+            neutral_review_passed, adversarial_review_passed,
+        )
+
+
+def _pr_view(root: Path, repository: str, pr: int) -> dict[str, Any]:
+    value = _gh_json(
+        root, "pr", "view", str(pr), "--repo", repository,
+        "--json", "number,state,isDraft,headRefOid,headRefName,baseRefName,mergeable,mergeStateStatus,mergedAt,headRepository,headRepositoryOwner,isCrossRepository,autoMergeRequest",
+    )
+    if not isinstance(value, dict):
+        raise DeliveryError("PR応答がobjectではありません")
+    required = {"number", "state", "isDraft", "headRefOid", "headRefName", "baseRefName", "mergeable", "mergeStateStatus", "mergedAt", "headRepository", "headRepositoryOwner", "isCrossRepository", "autoMergeRequest"}
+    if not required.issubset(value):
+        raise DeliveryError("PR応答の必須fieldが不足しています")
+    if value["number"] != pr or not isinstance(value["isDraft"], bool):
+        raise DeliveryError("PR番号またはdraft stateが不正です")
+    return value
+
+
+def _default_branch(root: Path, repository: str) -> None:
+    value = _gh_json(root, "api", f"repos/{repository}", "--header", "Accept: application/vnd.github+json")
+    if not isinstance(value, dict) or value.get("default_branch") != "main":
+        raise DeliveryError("live repositoryのdefault branchがmainではありません")
+
+
+def _same_head_repository(view: dict[str, Any], repository: str) -> bool:
+    source = view.get("headRepository")
+    owner = view.get("headRepositoryOwner")
+    if (
+        not isinstance(source, dict) or not isinstance(source.get("nameWithOwner"), str)
+        or not isinstance(owner, dict) or not isinstance(owner.get("login"), str)
+    ):
+        return False
+    repository_owner = repository.split("/", 1)[0]
+    return (
+        source["nameWithOwner"].casefold() == repository.casefold()
+        and owner["login"].casefold() == repository_owner.casefold()
+    )
+
+
+def _check_required_ci(root: Path, repository: str, head: str) -> None:
+    value = _gh_json(
+        root, "api", f"repos/{repository}/commits/{head}/check-runs",
+        "--paginate", "--slurp", "--header", "Accept: application/vnd.github+json",
+    )
+    if not isinstance(value, list) or len(value) > MAX_PAGES:
+        raise DeliveryError("check-runs pagination応答が不正です")
+    runs: list[Any] = []
+    for page in value:
+        if not isinstance(page, dict) or not isinstance(page.get("check_runs"), list):
+            raise DeliveryError("check-runs pageが不正です")
+        runs.extend(page["check_runs"])
+        if len(runs) > MAX_ITEMS:
+            raise DeliveryError("check-runsが多すぎます")
+    candidates = [run for run in runs if isinstance(run, dict) and run.get("name") == "required-ci"]
+    if len(candidates) != 1:
+        raise DeliveryError("required-ci checkは同名重複なしの1件である必要があります")
+    run = candidates[0]
+    app = run.get("app")
+    if (
+        not isinstance(app, dict) or app.get("id") != 15368
+        or run.get("head_sha") != head or run.get("status") != "completed"
+        or run.get("conclusion") != "success" or not run.get("completed_at")
+    ):
+        raise DeliveryError("required-ciのapp/status/conclusion/headが安全条件に一致しません")
+
+
+def _graphql(root: Path, repository: str, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    owner, name = repository.split("/", 1)
+    args = ["api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}", "-F", f"name={name}"]
+    for key, value in variables.items():
+        if value is None:
+            continue
+        flag = "-F" if isinstance(value, int) else "-f"
+        args.extend([flag, f"{key}={value}"])
+    data = _gh_json(root, *args)
+    if not isinstance(data, dict) or data.get("errors"):
+        raise DeliveryError("GraphQL応答にerrorがあります")
+    if not isinstance(data.get("data"), dict):
+        raise DeliveryError("GraphQL応答のdataが不正です")
+    return data["data"]
+
+
+THREAD_QUERY = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{isResolved}pageInfo{hasNextPage,endCursor}}}}}"""
+REVIEW_QUERY = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviews(first:100,after:$cursor){nodes{id,state,submittedAt,author{login}}pageInfo{hasNextPage,endCursor}}}}}"""
+DECISION_QUERY = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision}}}"""
+
+
+def _review_safety(root: Path, repository: str, pr: int) -> None:
+    cursor: str | None = None
+    pages = 0
+    items = 0
+    while True:
+        data = _graphql(root, repository, THREAD_QUERY, {"number": pr, "cursor": cursor})
+        try:
+            connection = data["repository"]["pullRequest"]["reviewThreads"]
+            nodes = connection["nodes"]
+            info = connection["pageInfo"]
+        except (KeyError, TypeError) as error:
+            raise DeliveryError("review threadのGraphQL schemaが不正です") from error
+        if not isinstance(nodes, list) or not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+            raise DeliveryError("review threadのpaginationが不正です")
+        pages += 1
+        items += len(nodes)
+        if pages > MAX_PAGES or items > MAX_ITEMS:
+            raise DeliveryError("review threadのpagination上限を超えました")
+        if any(not isinstance(node, dict) or node.get("isResolved") is not True for node in nodes):
+            raise DeliveryError("未解決review threadがあります")
+        if not info["hasNextPage"]:
+            break
+        next_cursor = info.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            raise DeliveryError("review thread pagination cursorが不正です")
+        cursor = next_cursor
+
+    cursor = None
+    pages = 0
+    items = 0
+    effective: dict[str, tuple[str, str]] = {}
+    while True:
+        data = _graphql(root, repository, REVIEW_QUERY, {"number": pr, "cursor": cursor})
+        try:
+            connection = data["repository"]["pullRequest"]["reviews"]
+            nodes = connection["nodes"]
+            info = connection["pageInfo"]
+        except (KeyError, TypeError) as error:
+            raise DeliveryError("reviewのGraphQL schemaが不正です") from error
+        if not isinstance(nodes, list) or not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+            raise DeliveryError("reviewのpaginationが不正です")
+        pages += 1
+        items += len(nodes)
+        if pages > MAX_PAGES or items > MAX_ITEMS:
+            raise DeliveryError("reviewのpagination上限を超えました")
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("state") not in {
+                "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED",
+            }:
+                raise DeliveryError("review stateが不明または未確定です")
+            author = node.get("author")
+            submitted = node.get("submittedAt")
+            if (
+                not isinstance(author, dict) or not isinstance(author.get("login"), str)
+                or not author["login"] or not isinstance(submitted, str) or not submitted
+            ):
+                raise DeliveryError("review author/submittedAtが不正です")
+            if node["state"] == "COMMENTED":
+                continue
+            login = author["login"].casefold()
+            previous = effective.get(login)
+            if previous is not None and previous[0] == submitted and previous[1] != node["state"]:
+                raise DeliveryError("同一reviewerの有効review順序を確定できません")
+            if previous is None or submitted > previous[0]:
+                effective[login] = (submitted, node["state"])
+        if not info["hasNextPage"]:
+            break
+        next_cursor = info.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            raise DeliveryError("review pagination cursorが不正です")
+        cursor = next_cursor
+    if any(state == "CHANGES_REQUESTED" for _, state in effective.values()):
+        raise DeliveryError("現在有効なCHANGES_REQUESTED reviewがあります")
+
+    decision_data = _graphql(root, repository, DECISION_QUERY, {"number": pr})
+    try:
+        decision = decision_data["repository"]["pullRequest"]["reviewDecision"]
+    except (KeyError, TypeError) as error:
+        raise DeliveryError("review decisionのGraphQL schemaが不正です") from error
+    if decision not in {None, "APPROVED"}:
+        raise DeliveryError("現在有効なreview decisionがdeliveryを許可していません")
+
+
+def _ruleset(root: Path, repository: str) -> None:
+    value = _gh_json(root, "api", f"repos/{repository}/rulesets?includes_parents=true", "--header", "Accept: application/vnd.github+json")
+    if not isinstance(value, list) or len(value) > MAX_ITEMS:
+        raise DeliveryError("Ruleset応答が不正です")
+    candidates: list[int] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise DeliveryError("Ruleset itemが不正です")
+        if item.get("target") == "branch" and item.get("enforcement") == "active":
+            identifier = item.get("id")
+            if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier < 1:
+                raise DeliveryError("active Rulesetのnumeric IDが不正です")
+            candidates.append(identifier)
+    if len(candidates) > MAX_RULESETS:
+        raise DeliveryError("Ruleset候補が多すぎます")
+    matches = []
+    for identifier in candidates:
+        detail = _gh_json(root, "api", f"repos/{repository}/rulesets/{identifier}?includes_parents=true", "--header", "Accept: application/vnd.github+json")
+        if not isinstance(detail, dict):
+            raise DeliveryError("Ruleset detailがobjectではありません")
+        source = detail.get("source")
+        if (
+            detail.get("id") != identifier
+            or not isinstance(source, str)
+            or source.casefold() != repository.casefold()
+            or detail.get("source_type") != "Repository"
+        ):
+            raise DeliveryError("Ruleset detailのID/sourceがcurrent repositoryと一致しません")
+        conditions = detail.get("conditions")
+        refs = conditions.get("ref_name") if isinstance(conditions, dict) else None
+        if (
+            detail.get("target") == "branch" and detail.get("enforcement") == "active"
+            and isinstance(refs, dict) and refs.get("include") == ["~DEFAULT_BRANCH"]
+            and refs.get("exclude") == []
+        ):
+            matches.append(detail)
+    if len(matches) != 1:
+        raise DeliveryError("default branch向けactive Rulesetを一意に確認できません")
+    selected = matches[0]
+    if selected.get("bypass_actors") != [] or selected.get("current_user_can_bypass") != "never":
+        raise DeliveryError("Ruleset bypass actorは許可されません")
+    rules = selected.get("rules")
+    if not isinstance(rules, list):
+        raise DeliveryError("Ruleset rulesが不正です")
+    by_type = {rule.get("type"): rule for rule in rules if isinstance(rule, dict) and isinstance(rule.get("type"), str)}
+    if len(by_type) != len(rules) or not {"deletion", "non_fast_forward", "pull_request", "required_status_checks"}.issubset(by_type):
+        raise DeliveryError("Rulesetの必須ruleが不足または重複しています")
+    pull = by_type["pull_request"].get("parameters")
+    if not isinstance(pull, dict) or pull.get("allowed_merge_methods") != ["merge"] or pull.get("required_review_thread_resolution") is not True:
+        raise DeliveryError("Rulesetがmerge-only/thread resolutionではありません")
+    checks = by_type["required_status_checks"].get("parameters")
+    required = checks.get("required_status_checks") if isinstance(checks, dict) else None
+    if (
+        not isinstance(checks, dict) or checks.get("strict_required_status_checks_policy") is not True
+        or not isinstance(required, list) or len(required) != 1
+        or not isinstance(required[0], dict) or required[0].get("context") != "required-ci"
+        or required[0].get("integration_id") != 15368
+    ):
+        raise DeliveryError("Ruleset required-ci strict/appが不正です")
+
+
+def _validate_delivery(
+    root: Path, receipt: dict[str, Any], *, allow_draft: bool = False,
+    expected_branch: str | None = None,
+) -> dict[str, Any]:
+    repository = receipt["repository"]
+    pr = receipt["pr"]
+    head = receipt["head_sha"]
+    view = _pr_view(root, repository, pr)
+    status_ok = (
+        view.get("mergeStateStatus") in {"DRAFT", "CLEAN"}
+        if allow_draft and view.get("isDraft")
+        else view.get("mergeStateStatus") == "CLEAN"
+    )
+    if (
+        view["state"] != "OPEN" or (view["isDraft"] and not allow_draft)
+        or _oid(view["headRefOid"], name="PR head") != head
+        or view.get("baseRefName") != "main"
+        or (expected_branch is not None and view.get("headRefName") != expected_branch)
+        or view.get("isCrossRepository") is not False
+        or not _same_head_repository(view, repository)
+        or view.get("autoMergeRequest") is not None
+        or view.get("mergeable") != "MERGEABLE"
+        or not status_ok
+    ):
+        raise DeliveryError("PR state/head/base/source/auto-merge/mergeabilityが安全条件に一致しません")
+    _default_branch(root, repository)
+    live_main = _fetch_main(root)
+    ancestor = _run(
+        _git_command("merge-base", "--is-ancestor", live_main, head),
+        cwd=root,
+    )
+    if ancestor.returncode != 0:
+        raise DeliveryError("live origin/mainがreceipt headのancestorではありません")
+    _check_required_ci(root, repository, head)
+    _review_safety(root, repository, pr)
+    _ruleset(root, repository)
+    return view
+
+
+def _match_cli_receipt(
+    receipt: dict[str, Any], *, pr: int | None, head: str | None, plan: str | None,
+) -> None:
+    if pr is not None and receipt.get("pr") != pr:
+        raise DeliveryError("指定PRがreceiptと一致しません")
+    if head is not None and receipt.get("head_sha") != _oid(head, name="指定head"):
+        raise DeliveryError("指定headがreceiptと一致しません")
+    if plan is not None and receipt.get("plan_id") != plan:
+        raise DeliveryError("指定Plan IDがreceiptと一致しません")
+
+
+def _validate_receipt_evidence(
+    worktree: Path, manifest: dict[str, Any], receipt: dict[str, Any],
+) -> None:
+    changed = _changed_files(worktree, manifest["base_oid"], receipt["head_sha"])
+    if changed != receipt["changed_files"]:
+        raise DeliveryError("receiptのchanged-filesが固定headの差分と一致しません")
+    if receipt["risk"] in {"low", "medium"} and any(_is_safety_path(path) for path in changed):
+        raise DeliveryError("安全境界差分をlow/medium receiptでdeliveryできません")
+    if receipt["risk"] in {"high", "critical"} and receipt["human_approved"] is not True:
+        raise DeliveryError("high/critical receiptにはhuman approvalが必要です")
+
+
+def _deliver_locked(
+    root: Path, task_id: str, *, expected_pr: int | None = None,
+    expected_head: str | None = None, expected_plan: str | None = None,
+) -> dict[str, Any]:
+    task_id = _task_id(task_id)
+    repository = _repository(root)
+    manifest, worktree = _manifest(root, task_id, repository)
+    # 一つのtaskについてreceiptを曖昧に選ばず、head SHAを固定する。
+    if expected_head is None:
+        raise DeliveryError("deliverには固定head SHAが必要です")
+    receipt = _load_receipt(root, task_id, _oid(expected_head, name="指定head"), repository)
+    _match_cli_receipt(receipt, pr=expected_pr, head=expected_head, plan=expected_plan)
+    if receipt["risk"] in {"high", "critical"} and receipt["human_approved"] is not True:
+        raise DeliveryError("high/critical receiptにはhuman approvalが必要です")
+    if receipt["risk"] not in {"low", "medium", "high", "critical"}:
+        raise DeliveryError("receipt riskが不正です")
+    if receipt["actionable"] != 0:
+        raise DeliveryError("actionable reviewはdeliveryできません")
+    if receipt["head_sha"] == manifest["base_oid"]:
+        raise DeliveryError("baseと同じheadはdeliveryできません")
+    with _task_lock(repository, task_id):
+        _worktree(root, manifest, worktree)
+        _worktree_clean_head(worktree, receipt["head_sha"])
+        _validate_receipt_evidence(worktree, manifest, receipt)
+        # Draftでも変更前の全remote preflightを完了してからReadyへ移行する。
+        _validate_delivery(root, receipt, allow_draft=True, expected_branch=manifest["branch"])
+        initial = _pr_view(root, receipt["repository"], receipt["pr"])
+        if initial["isDraft"]:
+            _gh(root, "pr", "ready", str(receipt["pr"]), "--repo", receipt["repository"])
+        _validate_delivery(root, receipt, allow_draft=False, expected_branch=manifest["branch"])
+        # ready/checks/reviews/rulesetの検査後にもPR identity全体を再取得してrace窓を縮める。
+        latest = _pr_view(root, receipt["repository"], receipt["pr"])
+        if (
+            latest["state"] != "OPEN" or latest["isDraft"]
+            or _oid(latest["headRefOid"], name="PR head") != receipt["head_sha"]
+            or latest.get("headRefName") != manifest["branch"]
+            or latest.get("baseRefName") != "main"
+            or latest.get("isCrossRepository") is not False
+            or not _same_head_repository(latest, repository)
+            or latest.get("autoMergeRequest") is not None
+            or latest.get("mergeable") != "MERGEABLE"
+            or latest.get("mergeStateStatus") != "CLEAN"
+        ):
+            raise DeliveryError("merge直前にPR identity/mergeabilityが変化しました")
+        _worktree(root, manifest, worktree)
+        _worktree_clean_head(worktree, receipt["head_sha"])
+        _validate_receipt_evidence(worktree, manifest, receipt)
+        state_path = _state_path(repository, task_id)
+        if state_path.exists() or state_path.is_symlink():
+            state = _load_state(repository, task_id, receipt, manifest["branch"])
+            if state["stage"] != "merge_started":
+                raise DeliveryError("既存delivery stateがmerge再試行可能ではありません")
+            state = _save_stage(repository, task_id, state, "merge_started")
+        else:
+            state = {
+                "version": STATE_VERSION, "kind": "delivery", "task_id": task_id,
+                "repository": receipt["repository"], "pr": receipt["pr"],
+                "head_sha": receipt["head_sha"], "branch": manifest["branch"],
+                "stage": "merge_started", "updated_at": _now(), "last_error": "",
+            }
+            _atomic_json(state_path, state)
+        _gh(root, "pr", "merge", str(receipt["pr"]), "--repo", receipt["repository"], "--merge", "--match-head-commit", receipt["head_sha"])
+        merged = _pr_view(root, receipt["repository"], receipt["pr"])
+        if merged.get("state") != "MERGED" or _oid(merged.get("headRefOid"), name="merged PR head") != receipt["head_sha"]:
+            raise DeliveryError("PR merge後のstate/headを確認できません")
+        return _save_stage(repository, task_id, state, "merged")
+
+
+def _load_state(repository: str, task_id: str, receipt: dict[str, Any], branch: str) -> dict[str, Any]:
+    path = _state_path(repository, task_id)
+    if not path.exists():
+        raise DeliveryError("delivery stateが存在しません")
+    _safe_regular(path)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise DeliveryError("delivery stateを安全に解析できません") from error
+    expected = {"version", "kind", "task_id", "repository", "pr", "head_sha", "branch", "stage", "updated_at", "last_error"}
+    if not isinstance(state, dict) or set(state) != expected:
+        raise DeliveryError("delivery state schemaが不正です")
+    if (
+        state["version"] != STATE_VERSION or state["kind"] != "delivery" or state["task_id"] != task_id
+        or state["repository"] != receipt["repository"] or state["pr"] != receipt["pr"]
+        or state["head_sha"] != receipt["head_sha"] or state["branch"] != branch
+        or state["stage"] not in {"merge_started", "merged", "main_synced", "remote_delete_started", "remote_deleted", "worktree_unlock_started", "worktree_removed", "completed"}
+        or not isinstance(state["last_error"], str)
+    ):
+        raise DeliveryError("delivery stateがreceipt/manifestと一致しません")
+    return state
+
+
+def _save_stage(repository: str, task_id: str, state: dict[str, Any], stage: str, error: str = "") -> dict[str, Any]:
+    state = dict(state)
+    state["stage"] = stage
+    state["last_error"] = error
+    state["updated_at"] = _now()
+    _atomic_json(_state_path(repository, task_id), state)
+    return state
+
+
+def _fetch_main(root: Path) -> str:
+    if _run(_git_command("fetch", "origin", "main"), cwd=root).returncode != 0:
+        raise DeliveryError("origin/mainをfetchできません")
+    remote = _git(root, "rev-parse", "refs/remotes/origin/main").strip()
+    return _oid(remote, name="origin/main")
+
+
+def _assert_main_clean(root: Path) -> None:
+    if _git(root, "symbolic-ref", "--short", "HEAD").strip() != "main":
+        raise DeliveryError("人間用checkoutがmainではありません")
+    if _git(root, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise DeliveryError("人間用checkoutがcleanではありません")
+
+
+def _assert_main_synced(root: Path) -> None:
+    _assert_main_clean(root)
+    remote_main = _fetch_main(root)
+    current = _oid(_git(root, "rev-parse", "HEAD").strip(), name="人間用main head")
+    if current != remote_main:
+        raise DeliveryError("人間用mainがorigin/mainと一致しません")
+
+
+def _remote_branch(root: Path, branch: str) -> str | None:
+    output = _git(root, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
+    lines = output.splitlines()
+    if len(lines) == 0:
+        return None
+    if len(lines) != 1:
+        raise DeliveryError("remote branch応答が重複しています")
+    parts = lines[0].split("\t")
+    if len(parts) != 2 or parts[1] != f"refs/heads/{branch}":
+        raise DeliveryError("remote branch応答を安全に解析できません")
+    return _oid(parts[0], name="remote branch")
+
+
+def _worktree_records(root: Path) -> list[dict[str, str]]:
+    output = _git(root, "worktree", "list", "--porcelain", "-z")
+    records: list[dict[str, str]] = []
+    record: dict[str, str] = {}
+    for item in output.split("\0"):
+        if not item:
+            if record:
+                records.append(record)
+                record = {}
+            continue
+        key, separator, value = item.partition(" ")
+        if not separator or key in record:
+            raise DeliveryError("worktree metadataを安全に解析できません")
+        record[key] = value
+    if record:
+        records.append(record)
+    if len(records) > MAX_ITEMS:
+        raise DeliveryError("worktreeが多すぎます")
+    return records
+
+
+def _finish_locked(
+    root: Path, task_id: str, *, expected_pr: int | None = None,
+    expected_head: str | None = None, expected_plan: str | None = None,
+) -> dict[str, Any]:
+    task_id = _task_id(task_id)
+    repository = _repository(root)
+    manifest, worktree = _manifest(root, task_id, repository)
+    # finishはreceiptのhead/PRを再利用し、別headのcleanupを決して許可しない。
+    if expected_head is None:
+        raise DeliveryError("finishには固定head SHAが必要です")
+    receipt = _load_receipt(root, task_id, _oid(expected_head, name="指定head"), repository)
+    _match_cli_receipt(receipt, pr=expected_pr, head=expected_head, plan=expected_plan)
+    state = _load_state(repository, task_id, receipt, manifest["branch"])
+    with _task_lock(repository, task_id):
+        # PRは毎回merged/head一致を確認し、途中で別PR/別headへ差し替えられないようにする。
+        view = _pr_view(root, repository, receipt["pr"])
+        if (
+            view.get("state") != "MERGED"
+            or _oid(view.get("headRefOid"), name="merged PR head") != receipt["head_sha"]
+            or view.get("headRefName") != manifest["branch"]
+            or view.get("baseRefName") != "main"
+            or view.get("isCrossRepository") is not False
+            or not _same_head_repository(view, repository)
+            or view.get("autoMergeRequest") is not None
+        ):
+            raise DeliveryError("PRがreceiptのhead/branch/sourceでmergedされていません")
+        _default_branch(root, repository)
+        if state["stage"] == "merge_started":
+            _worktree(root, manifest, worktree)
+            _worktree_clean_head(worktree, receipt["head_sha"])
+            _validate_receipt_evidence(worktree, manifest, receipt)
+            _check_required_ci(root, repository, receipt["head_sha"])
+            _review_safety(root, repository, receipt["pr"])
+            _ruleset(root, repository)
+            state = _save_stage(repository, task_id, state, "merged")
+        _assert_main_clean(root)
+        if state["stage"] == "completed":
+            if _remote_branch(root, manifest["branch"]) is not None or worktree.exists() or worktree.is_symlink():
+                raise DeliveryError("completed stateのcleanup対象が再出現しました")
+            local = _run(_git_command("show-ref", "--verify", "--quiet", f"refs/heads/{manifest['branch']}"), cwd=root)
+            if local.returncode == 0:
+                raise DeliveryError("completed stateのlocal branchが再出現しました")
+            if local.returncode != 1:
+                raise DeliveryError("completed stateのlocal branchを確認できません")
+            return state
+        if state["stage"] == "merged":
+            remote_main = _fetch_main(root)
+            ancestor = _run(_git_command("merge-base", "--is-ancestor", receipt["head_sha"], "refs/remotes/origin/main"), cwd=root)
+            if ancestor.returncode != 0:
+                raise DeliveryError("origin/mainがmerged headへ到達していません")
+            _assert_main_clean(root)
+            before = _git(root, "rev-parse", "HEAD").strip()
+            ancestry = _run(_git_command("merge-base", "--is-ancestor", before, remote_main), cwd=root)
+            if ancestry.returncode != 0:
+                raise DeliveryError("人間用mainに未pushのlocal commitがあります")
+            _assert_main_clean(root)
+            if _git(root, "rev-parse", "HEAD").strip() != before:
+                raise DeliveryError("main同期直前に人間用checkoutのHEADが変化しました")
+            merged = _run(_git_command("merge", "--ff-only", "refs/remotes/origin/main"), cwd=root)
+            if merged.returncode != 0:
+                raise DeliveryError("人間用mainをff-only syncできません")
+            _assert_main_synced(root)
+            state = _save_stage(repository, task_id, state, "main_synced")
+        else:
+            # 中断後もorigin/main到達条件を再検証する。保存stateだけを信頼しない。
+            _assert_main_synced(root)
+        if state["stage"] in {"main_synced", "remote_delete_started"}:
+            _assert_main_synced(root)
+            remote = _remote_branch(root, manifest["branch"])
+            if remote is not None and remote != receipt["head_sha"]:
+                raise DeliveryError("remote task branchがreceipt headから変化しています")
+            records = _worktree_records(root)
+            target_records = [record for record in records if record.get("worktree") == str(worktree)]
+            branch_records = [record for record in records if record.get("branch") == f"refs/heads/{manifest['branch']}" or record.get("branch") == manifest["branch"]]
+            if len(target_records) != 1 or len(branch_records) != 1:
+                raise DeliveryError("task worktreeまたはbranchの使用状況が一意ではありません")
+            _worktree(root, manifest, worktree)
+            _worktree_clean_head(worktree, receipt["head_sha"])
+            if remote is not None:
+                state = _save_stage(repository, task_id, state, "remote_delete_started")
+                lease = f"--force-with-lease=refs/heads/{manifest['branch']}:{receipt['head_sha']}"
+                _git(root, "push", lease, "origin", "--delete", manifest["branch"])
+                if _remote_branch(root, manifest["branch"]) is not None:
+                    raise DeliveryError("remote task branchを削除後も確認できました")
+            state = _save_stage(repository, task_id, state, "remote_deleted")
+        if state["stage"] in {"remote_deleted", "worktree_unlock_started"}:
+            _assert_main_synced(root)
+            if _remote_branch(root, manifest["branch"]) is not None:
+                raise DeliveryError("remote task branchがcleanup中に再出現しました")
+            records = _worktree_records(root)
+            target_records = [record for record in records if record.get("worktree") == str(worktree)]
+            branch_records = [record for record in records if record.get("branch") == f"refs/heads/{manifest['branch']}" or record.get("branch") == manifest["branch"]]
+            if target_records:
+                if len(target_records) != 1 or len(branch_records) != 1:
+                    raise DeliveryError("cleanup対象worktreeの使用状況が一意ではありません")
+                target_record = target_records[0]
+                lock_reason = target_record.get("locked")
+                if state["stage"] == "remote_deleted" and lock_reason != f"codex-task:{task_id}":
+                    raise DeliveryError("task worktreeのlock reasonが一致しません")
+                if state["stage"] == "worktree_unlock_started" and lock_reason not in {None, f"codex-task:{task_id}"}:
+                    raise DeliveryError("unlock後のworktree lock reasonが想定外です")
+                _worktree(root, manifest, worktree)
+                _worktree_clean_head(worktree, receipt["head_sha"])
+                if lock_reason is not None:
+                    state = _save_stage(repository, task_id, state, "worktree_unlock_started")
+                    _git(root, "worktree", "unlock", "--", str(worktree))
+                    records_after_unlock = _worktree_records(root)
+                    unlocked = [record for record in records_after_unlock if record.get("worktree") == str(worktree)]
+                    if len(unlocked) != 1 or unlocked[0].get("locked") is not None:
+                        raise DeliveryError("worktree unlock後のlock状態を確認できません")
+                    _assert_main_synced(root)
+                    _worktree(root, manifest, worktree)
+                    _worktree_clean_head(worktree, receipt["head_sha"])
+                _git(root, "worktree", "remove", "--", str(worktree))
+            elif worktree.exists() or worktree.is_symlink():
+                raise DeliveryError("Git metadataにないworktree実体を削除しません")
+            state = _save_stage(repository, task_id, state, "worktree_removed")
+        if state["stage"] == "worktree_removed":
+            if _remote_branch(root, manifest["branch"]) is not None:
+                raise DeliveryError("remote task branchがcleanup中に再出現しました")
+            branch = _run(_git_command("show-ref", "--verify", "--quiet", f"refs/heads/{manifest['branch']}"), cwd=root)
+            if branch.returncode == 0:
+                local_head = _oid(_git(root, "rev-parse", f"refs/heads/{manifest['branch']}").strip(), name="local task branch")
+                if local_head != receipt["head_sha"]:
+                    raise DeliveryError("再出現したlocal branchがreceipt headと一致しません")
+                _git(root, "branch", "-d", "--", manifest["branch"])
+            elif branch.returncode != 1:
+                raise DeliveryError("local task branchの存在を確認できません")
+            state = _save_stage(repository, task_id, state, "completed")
+        return state
+
+
+def deliver(
+    root: Path, task_id: str, *, expected_pr: int | None = None,
+    expected_head: str | None = None, expected_plan: str | None = None,
+) -> dict[str, Any]:
+    task_id = _task_id(task_id)
+    with _operation_deadline():
+        repository = _repository(root)
+        # manifest/receipt/stateを読む前にtask専用lockを取得してTOCTOUを閉じる。
+        with _task_lock(repository, task_id):
+            return _deliver_locked(
+                root, task_id, expected_pr=expected_pr, expected_head=expected_head,
+                expected_plan=expected_plan,
+            )
+
+
+def finish(
+    root: Path, task_id: str, *, expected_pr: int | None = None,
+    expected_head: str | None = None, expected_plan: str | None = None,
+) -> dict[str, Any]:
+    task_id = _task_id(task_id)
+    with _operation_deadline():
+        repository = _repository(root)
+        # manifest/stateはlock取得後に読み、途中で別manifestへ差し替えられないようにする。
+        with _task_lock(repository, task_id):
+            return _finish_locked(
+                root, task_id, expected_pr=expected_pr, expected_head=expected_head,
+                expected_plan=expected_plan,
+            )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name, risks in (("record-review", ("low", "medium")), ("approve-review", ("high", "critical"))):
+        command = commands.add_parser(name)
+        command.add_argument("--task-id", required=True)
+        command.add_argument("--pr", required=True, type=int)
+        command.add_argument("--head", required=True)
+        command.add_argument("--risk", required=True, choices=risks)
+        command.add_argument("--plan-id", required=True)
+        command.add_argument("--tests-passed", action="store_true")
+        command.add_argument("--neutral-review-passed", action="store_true")
+        command.add_argument("--adversarial-review-passed", action="store_true")
+    deliver_parser = commands.add_parser("deliver")
+    deliver_parser.add_argument("--task-id", required=True)
+    deliver_parser.add_argument("--pr", required=True, type=int)
+    deliver_parser.add_argument("--head", required=True)
+    deliver_parser.add_argument("--plan-id", required=True)
+    finish_parser = commands.add_parser("finish")
+    finish_parser.add_argument("--task-id", required=True)
+    finish_parser.add_argument("--pr", required=True, type=int)
+    finish_parser.add_argument("--head", required=True)
+    finish_parser.add_argument("--plan-id", required=True)
+    return parser
+
+
+def _canonical_helper_path() -> Path:
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError) as error:
+        raise DeliveryError("current userのhome directoryを確認できません") from error
+    return Path(home) / ".local" / "bin" / "codex-delivery"
+
+
+def _require_canonical_invocation() -> None:
+    canonical = _canonical_helper_path()
+    try:
+        metadata = canonical.lstat()
+    except OSError as error:
+        raise DeliveryError("codex-deliveryのcanonical install先を確認できません") from error
+    if (
+        Path(sys.argv[0]) != canonical or canonical.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077 or not os.access(canonical, os.X_OK)
+    ):
+        raise DeliveryError("codex-deliveryはcanonical install先から直接実行してください")
+
+
+def main(argv: list[str] | None = None) -> int:
+    _require_canonical_invocation()
+    args = _parser().parse_args(argv)
+    root = Path.cwd().resolve()
+    if args.command == "record-review":
+        payload = _write_review(
+            root, _task_id(args.task_id), args.pr, args.head, args.risk, args.plan_id, False,
+            args.tests_passed, args.neutral_review_passed, args.adversarial_review_passed,
+        )
+    elif args.command == "approve-review":
+        payload = _write_review(
+            root, _task_id(args.task_id), args.pr, args.head, args.risk, args.plan_id, True,
+            args.tests_passed, args.neutral_review_passed, args.adversarial_review_passed,
+        )
+    elif args.command == "deliver":
+        payload = deliver(root, _task_id(args.task_id), expected_pr=args.pr, expected_head=args.head, expected_plan=args.plan_id)
+    else:
+        payload = finish(root, _task_id(args.task_id), expected_pr=args.pr, expected_head=args.head, expected_plan=args.plan_id)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except DeliveryError as error:
+        print(f"codex-delivery: {error}", file=sys.stderr)
+        raise SystemExit(1)
