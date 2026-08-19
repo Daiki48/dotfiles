@@ -94,6 +94,7 @@ SHELL_PUNCTUATION = ";&|()`\n"
 MAX_BODY_FILE_BYTES = 256 * 1024
 MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
 GIT_COMMAND_TIMEOUT_SECONDS = 2
+GH_COMMAND_TIMEOUT_SECONDS = 5
 MAX_MANIFEST_BYTES = 256 * 1024
 # launcherが設定するpagerだけは、非対話の許可commandで外部programを起動しない。
 # その他のGIT_*は将来追加されるものも含め、repository状態・外部command・出力先を
@@ -721,6 +722,61 @@ def _remote_refs_snapshot(cwd, head=None):
     return f"origin/{default_match.group(1)}", default_oid_match.group(1), remote_head
 
 
+def _run_gh_json(cwd, *args):
+    """固定したread-only gh commandをtimeout付きで実行し、JSON objectを返す。"""
+    environment = os.environ.copy()
+    for key in {"GH_HOST", "GH_REPO", "GH_FORCE_TTY", "GH_PAGER", "PAGER"}:
+        environment.pop(key, None)
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            cwd=cwd,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=GH_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if result.returncode != 0 or len(result.stdout) > MAX_BODY_FILE_BYTES:
+            return None
+        payload = json.loads(result.stdout.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _pr_update_branch_preflight_reason(cwd, repository, number):
+    """update対象がcurrent repository内のopenな非保護branchかreadbackする。"""
+    payload = _run_gh_json(
+        cwd,
+        "pr", "view", number,
+        "--repo", repository,
+        "--json", "number,state,isCrossRepository,headRepository,headRefName,headRefOid",
+    )
+    if payload is None:
+        return "PR update-branchのremote対象を確認できません"
+    head_repository = payload.get("headRepository")
+    if (
+        payload.get("number") != int(number)
+        or payload.get("state") != "OPEN"
+        or payload.get("isCrossRepository") is not False
+        or not isinstance(head_repository, dict)
+        or not isinstance(head_repository.get("nameWithOwner"), str)
+        or head_repository["nameWithOwner"].casefold() != repository.casefold()
+    ):
+        return "PR update-branchはcurrent repository内のopen PRだけ許可されます"
+    head = payload.get("headRefName")
+    oid = payload.get("headRefOid")
+    if (
+        not isinstance(head, str)
+        or not _valid_work_branch(head)
+        or not isinstance(oid, str)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", oid) is None
+    ):
+        return "PR update-branchのhead branchまたはSHAが許可範囲外です"
+    return None
+
+
 def _repository_reason(repository, cwd):
     origin_repository = _origin_repository(cwd)
     if origin_repository is None:
@@ -916,8 +972,12 @@ def _issue_write_reason(issue_command, issue_args, cwd):
         target_reason = _github_target_reason(positional, "Issue編集")
         if target_reason:
             return target_reason
-        body_file = _required_option(issue_args, "-F", "--body-file")
-        title = _required_option(issue_args, "-t", "--title")
+        body_files = _option_values(issue_args, "-F", "--body-file")
+        titles = _option_values(issue_args, "-t", "--title")
+        if body_files is None or len(body_files) > 1 or titles is None or len(titles) > 1:
+            return "Issue編集のtitleとbody-fileはそれぞれ1件までです"
+        body_file = body_files[0] if body_files else None
+        title = titles[0] if titles else None
         mutation = bool(title or body_file or "--remove-milestone" in issue_args)
         metadata_pairs = (
             (None, "--add-label"), (None, "--remove-label"),
@@ -993,8 +1053,12 @@ def _pr_write_reason(pr_command, pr_args, cwd):
         target_reason = _github_target_reason(positional, "PR編集")
         if target_reason:
             return target_reason
-        title = _required_option(pr_args, "-t", "--title")
-        body_file = _required_option(pr_args, "-F", "--body-file")
+        titles = _option_values(pr_args, "-t", "--title")
+        body_files = _option_values(pr_args, "-F", "--body-file")
+        if titles is None or len(titles) > 1 or body_files is None or len(body_files) > 1:
+            return "PR編集のtitleとbody-fileはそれぞれ1件までです"
+        title = titles[0] if titles else None
+        body_file = body_files[0] if body_files else None
         mutation = bool(title or body_file or "--remove-milestone" in pr_args)
         metadata_pairs = (
             (None, "--add-label"), (None, "--remove-label"),
@@ -1043,7 +1107,10 @@ def _pr_write_reason(pr_command, pr_args, cwd):
         actions = [switch for switch in switches if switch in pr_args]
         if len(actions) != 1:
             return "PR reviewのactionは1件だけ明示してください"
-        body_file = _required_option(pr_args, "-F", "--body-file")
+        body_files = _option_values(pr_args, "-F", "--body-file")
+        if body_files is None or len(body_files) > 1:
+            return "PR reviewのbody-fileは1件までです"
+        body_file = body_files[0] if body_files else None
         return _github_body_file_reason(body_file, "PR body") if body_file else None
 
     if pr_command == "ready":
@@ -1054,7 +1121,12 @@ def _pr_write_reason(pr_command, pr_args, cwd):
         return "許可されていないGitHub PR操作です"
     if positional is None:
         return "PR lifecycleでは許可された引数だけを正規形で指定してください"
-    return _github_target_reason(positional, f"PR {pr_command}")
+    target_reason = _github_target_reason(positional, f"PR {pr_command}")
+    if target_reason:
+        return target_reason
+    if pr_command == "update-branch":
+        return _pr_update_branch_preflight_reason(cwd, repository, positional[0])
+    return None
 
 
 def _gh_invocation_reason(tokens, cwd=None):
@@ -1065,6 +1137,14 @@ def _gh_invocation_reason(tokens, cwd=None):
         return "GitHub commandはPATHからghを直接実行してください"
     if start != 0:
         return "GitHub commandをwrapper、環境変数、cwd変更経由で実行できません"
+    if any("$" in token or "`" in token for token in tokens):
+        return "GitHub commandでshell展開を使用できません"
+    if os.environ.get("GH_HOST", "github.com").casefold() != "github.com":
+        return "GitHub接続先hostを環境変数で変更できません"
+    if "--hostname" in tokens or any(
+        token.startswith("--hostname=") for token in tokens
+    ):
+        return "GitHub接続先hostを変更できません"
     if "--help" in tokens[start + 1:] or "-h" in tokens[start + 1:]:
         return None
     command, args = _first_command(tokens[start + 1:], GH_GLOBAL_OPTS_WITH_VALUE)
@@ -1088,6 +1168,13 @@ def _gh_invocation_reason(tokens, cwd=None):
             return "GitHub Issueの削除は許可されていません"
         return "許可されていないGitHub Issue操作です"
     if command == "api":
+        if any(
+            token in {"-H", "--header"}
+            or token.startswith(("-H", "--header="))
+            or token.startswith(("//", "http://", "https://"))
+            for token in args
+        ):
+            return "gh apiではhostまたは認証headerを変更できません"
         return "gh apiはGETの読み取り専用利用に限られます" if _gh_api_is_write(args) else None
     if command == "pr":
         subcommand, pr_args = _first_command(args, GH_GLOBAL_OPTS_WITH_VALUE)

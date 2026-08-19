@@ -88,8 +88,9 @@ arbitrary GitHub API mutations, and repository mismatches. When a deletion is re
 The guard checks direct Bash invocations; arbitrary programs and same-user races remain
 outside its security boundary.
 
-Remote `main` is protected by the required `required-ci` GitHub Actions job and the declarative
-Ruleset in `.github/rulesets/main.json`. See
+The repository declares a required `required-ci` GitHub Actions job and the intended remote
+`main` Ruleset in `.github/rulesets/main.json`. The declaration does not prove that the remote
+Ruleset is active; apply it with explicit approval and verify its readback. See
 [GitHub CI・Ruleset運用ガイド](docs/github-guardrails.ja.md) for the check mapping, application,
 verification, and rollback procedure.
 

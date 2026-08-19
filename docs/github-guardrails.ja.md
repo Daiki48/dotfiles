@@ -46,11 +46,16 @@ Codexの[`PreToolUse` hook](https://learn.chatgpt.com/docs/hooks)は現時点で
 
 required review数は0です。個人repositoryで同一actorの形式的なself approvalを要求せず、
 review済みhead SHAの固定とrisk-based reviewは後続Issue #24の完了フローで担保します。
+この構成だけでは、PR作者が`required-ci` workflow自体を変更する攻撃をGitHub上で完全には
+防げません。#24ではworkflow差分を含む固定head SHAを独立reviewし、check名だけでなく実行内容も
+確認します。独立したreview identityを用意できる場合は、CODEOWNERSとrequired approvalを再検討します。
 
 ## 適用
 
 Ruleset変更はrepository全体へ影響するため、Daikiの明示確認後だけ実行します。
 今回のIssue #23実装では2026-08-19の依頼を適用承認として記録しています。
+ただし、このJSONをcommitしただけではremoteへ適用されません。readbackと`gh ruleset check`が
+完了するまでは、remote `main`が保護済みとは扱いません。
 
 適用前に既存設定を保存します。
 
