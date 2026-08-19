@@ -20,7 +20,7 @@ description: 実装依頼の全実装単位を自律的に実装・検証し、�
 2. 人間用checkoutでrepository、origin、default branch、current branch、HEAD、index、working treeを読み取り、snapshotとして記録する。Daikiの未commit変更があっても変更・退避・削除せず、作成後にsnapshotが不変であることを確認する。
 3. branch名、commit、PRの形式を最近の関連commitと過去PRから確認する。慣例がなければ日本語と一般的なbranch prefixを使い、`codex/`prefixを使わない。
 4. Issue番号があれば `codex-worktree create --issue <番号> --branch <branch>`、なければ `codex-worktree create --branch <branch>` を人間用checkoutで実行する。helperが生成したtask ID、`$CODEX_HOME/worktrees`配下のpath、latest `origin/<default-branch>`起点、clean状態を確認する。既に同じtaskを再開する場合は `codex-worktree doctor --task-id <task-id>` と `codex-worktree resume --task-id <task-id>` でmanifest、branch、pathを照合する。`interrupted`だけは`codex-worktree recover --task-id <task-id>`で再検証してから再開する。
-5. 作成後の全編集とtestは専用worktreeを明示した`workdir`で行う。Codex hookの`cwd`はsession開始directoryのままなので、Git書き込みは`git -C <専用worktreeの絶対path> ...`で実行先を明示する。GitHub操作はrepository、base、headを明示し、人間用checkoutのbranchを切り替えず、同一sessionから別taskのworktreeへ書き込まない。
+5. 作成後の全編集とtestは専用worktreeを明示した`workdir`で行う。Codex hookの`cwd`はsession開始directoryのままなので、Git書き込みは`git -C <専用worktreeの絶対path> ...`で実行先を明示する。launcher環境に`SSH_ASKPASS`がある場合は、`env -u SSH_ASKPASS git -C ...`の正規形で実Gitから除去する。GitHub操作はrepository、base、headを明示し、人間用checkoutのbranchを切り替えず、同一sessionから別taskのworktreeへ書き込まない。
 6. protected branch、既存branch・worktree・directoryとの衝突、管理root外path、想定外のupstreamでは進めない。`origin/<default-branch>`を起点に新規作成した直後は、そのbaseをupstreamとして追跡する状態を正常とする。初回push後は作業branch自身の`origin/<branch>`だけをupstreamとして扱う。
 7. `CODEX_WORKTREE_MODE=single-checkout`がDaikiにより明示された場合だけ、rollbackとして従来のcleanな単一checkout flowを使う。既存worktree、manifest、branchを自動削除せず、停止理由と手動復旧方法を残す。
 
@@ -35,7 +35,7 @@ description: 実装依頼の全実装単位を自律的に実装・検証し、�
 3. 変更箇所に近いテスト、lint、型検査、buildから実行し、リスクに応じて範囲を広げる。
 4. 差分を正しさ、互換性、セキュリティ、堅牢性、性能、不要変更の観点でself-reviewする。
 5. 変更ファイル名と追加行をsecret検査し、認証情報、local state、個人情報、AI帰属がないことを確認する。
-6. `git -C <専用worktree> add -- <明示パス...>`だけでstageし、同じ専用worktreeで`git diff --cached`とstage対象を再確認する。
+6. `git -C <専用worktree> add -- <明示パス...>`だけでstageし、同じ専用worktreeで`git diff --cached`とstage対象を再確認する。`SSH_ASKPASS`がある環境では前述の`env -u SSH_ASKPASS`を先頭に付ける。
 7. repositoryの慣例に沿う`:gitmoji: 短い要約`を1件決め、author・signoff・AI帰属を上書きせずcommitする。
 8. commit hash、実装単位、検証結果、残存事項を記録し、次の単位へ進む。Daikiのcommit確認は待たない。
 
@@ -56,7 +56,7 @@ description: 実装依頼の全実装単位を自律的に実装・検証し、�
 
 1. 専用worktreeがclean、current branch、task manifest、remoteが計画どおりで、全実装単位とreview修正がcommit済みであることを確認する。人間用checkoutの事前snapshotも不変であることを再確認する。
 2. baseからHEADまでのcommit列、全差分、テスト、secret検査、AI帰属の不在、不要ファイルの不在を再確認する。
-3. `git -C <専用worktree> push -u origin HEAD:refs/heads/<work-branch>`で、明示した単一作業branchだけを通常pushする。force、削除、tag、protected branchへのpushは行わない。
+3. `git -C <専用worktree> push -u origin HEAD:refs/heads/<work-branch>`で、明示した単一作業branchだけを通常pushする。`SSH_ASKPASS`がある環境では前述の`env -u SSH_ASKPASS`を先頭に付ける。force、削除、tag、protected branchへのpushは行わない。
 4. repository、base、headを明示し、日本語を既定とした詳細なPR body fileを`/tmp`へ作る。概要、変更内容、commit・実装単位、検証結果、レビュー結果、リスク・残存事項を含め、AI生成表記やlocal機密情報を含めない。
 5. `gh pr create --draft`でDraft PRだけを作成する。Ready化、編集、review投稿、merge、closeは行わない。
 

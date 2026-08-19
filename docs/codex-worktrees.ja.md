@@ -59,7 +59,7 @@ IDにしてください。branchは `feat/`、`fix/`、`docs/` などの許可�
 
 コマンドは作成したworktreeの絶対pathを標準出力へ返します。安全hookは`create`をshellの
 command substitutionやchain内で実行することを拒否するため、helperは必ず単独で実行し、
-返されたpathを次の操作の`workdir`として明示して実装、testを行います。Codex hookの`cwd`はsession開始directoryを示すため、Git書き込みでは`git -C <返された絶対path> ...`として対象worktreeもcommand内で明示します。
+返されたpathを次の操作の`workdir`として明示して実装、testを行います。Codex hookの`cwd`はsession開始directoryを示すため、Git書き込みでは`git -C <返された絶対path> ...`として対象worktreeもcommand内で明示します。launcher環境に`SSH_ASKPASS`がある場合は、外部command実行の境界を明確にするため`env -u SSH_ASKPASS git -C ...`の正規形で実Gitから除去します。
 
 Draft PR作成時は`--head`を必ず明示します。guardはそのbranchを所有する登録済みworktreeを解決し、同一repository、clean、push済みHEADであることを確認してから`gh pr create --draft`を許可します。
 

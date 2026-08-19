@@ -19,6 +19,17 @@ SPEC.loader.exec_module(GUARD)
 
 
 class GuardTest(unittest.TestCase):
+    def setUp(self):
+        self.git_environment = {
+            key: GUARD.os.environ.pop(key)
+            for key in list(GUARD.os.environ)
+            if key in GUARD.GIT_SANITIZED_ENVIRONMENT_KEYS
+            or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+        }
+
+    def tearDown(self):
+        GUARD.os.environ.update(self.git_environment)
+
     def assert_allowed(self, command, cwd=None):
         self.assertIsNone(GUARD.blocked_reason(command, cwd), command)
 
@@ -94,6 +105,48 @@ class GuardTest(unittest.TestCase):
 
         with mock.patch.dict(GUARD.os.environ, {"GIT_DIR": "/tmp/other/.git"}):
             self.assert_blocked("git add -- README.md", "/workspace")
+
+    def test_git_write_rejects_command_bearing_environment(self):
+        with (
+            mock.patch.object(GUARD, "_git_write_target", return_value=("/workspace", None)),
+            mock.patch.object(GUARD, "_current_work_branch_reason", return_value=None),
+        ):
+            for key in (
+                "GIT_EXEC_PATH",
+                "GIT_SSH",
+                "GIT_SSH_COMMAND",
+                "GIT_ASKPASS",
+                "SSH_ASKPASS",
+                "GIT_PROXY_COMMAND",
+            ):
+                with self.subTest(key=key), mock.patch.dict(
+                    GUARD.os.environ, {key: "/tmp/untrusted-command"}
+                ):
+                    self.assert_blocked("git add -- README.md", "/workspace")
+
+    def test_exact_wrapper_removes_inherited_ssh_askpass(self):
+        with (
+            mock.patch.dict(
+                GUARD.os.environ, {"SSH_ASKPASS": "/trusted/launcher/askpass"}
+            ),
+            mock.patch.object(GUARD, "_git_write_target", return_value=("/workspace", None)),
+            mock.patch.object(GUARD, "_current_work_branch_reason", return_value=None),
+        ):
+            self.assert_allowed(
+                "env -u SSH_ASKPASS git -C /workspace add -- README.md",
+                "/session",
+            )
+            self.assert_blocked(
+                "env -u GIT_SSH_COMMAND git -C /workspace add -- README.md",
+                "/session",
+            )
+            with mock.patch.dict(
+                GUARD.os.environ, {"GIT_SSH_COMMAND": "/tmp/untrusted-command"}
+            ):
+                self.assert_blocked(
+                    "env -u SSH_ASKPASS git -C /workspace add -- README.md",
+                    "/session",
+                )
 
     def test_unsafe_git_writes_are_blocked(self):
         for command in (

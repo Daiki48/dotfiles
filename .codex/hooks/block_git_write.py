@@ -104,6 +104,7 @@ GIT_SANITIZED_ENVIRONMENT_KEYS = GIT_WRITE_ENVIRONMENT_KEYS | {
     "GIT_EXEC_PATH", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS",
     "SSH_ASKPASS", "GIT_PROXY_COMMAND",
 }
+GIT_SANITIZED_WRAPPER = ("env", "-u", "SSH_ASKPASS")
 AI_ATTRIBUTION_RE = re.compile(
     r"(?i)(?:co-authored-by|generated(?:-| )by|signed-off-by)\s*:\s*.*"
     r"(?:codex|openai|chatgpt|claude|gemini|copilot|\bai(?:\s+(?:assistant|agent|bot))?\b)"
@@ -498,7 +499,10 @@ def _git_invocation_reason(tokens, cwd=None):
         return None
     if tokens[start] != "git":
         return "Git commandはPATHからgitを直接実行してください"
-    if start != 0:
+    removed_environment = set()
+    if start != 0 and tuple(tokens[:start]) == GIT_SANITIZED_WRAPPER:
+        removed_environment.add("SSH_ASKPASS")
+    elif start != 0:
         return "Git commandをwrapper、環境変数、cwd変更経由で実行できません"
     git_args = tokens[start + 1:]
     skip_next = False
@@ -560,11 +564,11 @@ def _git_invocation_reason(tokens, cwd=None):
         if target_reason:
             return target_reason
         if any(
-            key in GIT_WRITE_ENVIRONMENT_KEYS
+            key in GIT_SANITIZED_ENVIRONMENT_KEYS - removed_environment
             or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
             for key in os.environ
         ):
-            return "Git書き込みではrepositoryやconfigを変更する環境変数を使用できません"
+            return "Git書き込みではrepository、config、外部commandを変更する環境変数を使用できません"
 
         if token == "push":
             reason = _git_push_reason(args, effective_cwd)
