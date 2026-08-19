@@ -679,11 +679,15 @@ impl ManagedTransaction {
             }
             _ => anyhow::bail!("Invalid managed transaction operation"),
         };
-        Ok(Self {
+        let transaction = Self {
             kind,
             previous_hash,
             target_hash: lines[3].to_owned(),
-        })
+        };
+        if transaction.serialize()? != contents {
+            anyhow::bail!("Managed transaction journal is not canonical");
+        }
+        Ok(transaction)
     }
 }
 
@@ -1716,6 +1720,23 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn managed_transaction_requires_canonical_byte_format() {
+        let transaction = ManagedTransaction {
+            kind: ManagedTransactionKind::Install,
+            previous_hash: None,
+            target_hash: sha256("target\n"),
+        };
+        let canonical = transaction.serialize().expect("serialize transaction");
+        assert_eq!(
+            ManagedTransaction::parse(&canonical).expect("parse canonical transaction"),
+            transaction
+        );
+        assert!(ManagedTransaction::parse(canonical.trim_end_matches('\n')).is_err());
+        assert!(ManagedTransaction::parse(&canonical.replace('\n', "\r\n")).is_err());
+        assert!(ManagedTransaction::parse(&format!("{canonical}\n")).is_err());
     }
 
     impl TestDirectory {
