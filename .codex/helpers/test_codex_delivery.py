@@ -300,6 +300,28 @@ class DeliveryTest(unittest.TestCase):
                     HELPER._run(["git", "status"], cwd=self.root)
         run.assert_not_called()
 
+    def test_public_delivery_deadline_includes_repository_resolution(self) -> None:
+        observed: list[float | None] = []
+
+        def repository(_: Path) -> str:
+            observed.append(getattr(HELPER._DEADLINES, "value", None))
+            return "owner/repo"
+
+        for operation, locked_name in (
+            (HELPER.deliver, "_deliver_locked"),
+            (HELPER.finish, "_finish_locked"),
+        ):
+            with self.subTest(operation=operation.__name__), \
+                 mock.patch.object(HELPER.time, "monotonic", return_value=100.0), \
+                 mock.patch.object(HELPER, "_repository", side_effect=repository), \
+                 mock.patch.object(HELPER, "_task_lock", return_value=nullcontext()), \
+                 mock.patch.object(HELPER, locked_name, return_value={}):
+                operation(
+                    self.root, "issue-24", expected_pr=24, expected_head="b" * 40,
+                    expected_plan="CODEX-DELIVERY-TEST-v1",
+                )
+        self.assertEqual(observed, [400.0, 400.0])
+
     def test_lifecycle_lock_wait_honors_operation_timeout(self) -> None:
         with mock.patch.object(HELPER.time, "monotonic", side_effect=[0.0, 301.0]), \
              mock.patch.object(HELPER.fcntl, "flock", side_effect=BlockingIOError):

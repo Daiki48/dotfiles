@@ -1154,13 +1154,14 @@ def deliver(
     expected_head: str | None = None, expected_plan: str | None = None,
 ) -> dict[str, Any]:
     task_id = _task_id(task_id)
-    repository = _repository(root)
-    # manifest/receipt/stateを読む前にtask専用lockを取得してTOCTOUを閉じる。
-    with _operation_deadline(), _task_lock(repository, task_id):
-        return _deliver_locked(
-            root, task_id, expected_pr=expected_pr, expected_head=expected_head,
-            expected_plan=expected_plan,
-        )
+    with _operation_deadline():
+        repository = _repository(root)
+        # manifest/receipt/stateを読む前にtask専用lockを取得してTOCTOUを閉じる。
+        with _task_lock(repository, task_id):
+            return _deliver_locked(
+                root, task_id, expected_pr=expected_pr, expected_head=expected_head,
+                expected_plan=expected_plan,
+            )
 
 
 def finish(
@@ -1168,13 +1169,14 @@ def finish(
     expected_head: str | None = None, expected_plan: str | None = None,
 ) -> dict[str, Any]:
     task_id = _task_id(task_id)
-    repository = _repository(root)
-    # manifest/stateはlock取得後に読み、途中で別manifestへ差し替えられないようにする。
-    with _operation_deadline(), _task_lock(repository, task_id):
-        return _finish_locked(
-            root, task_id, expected_pr=expected_pr, expected_head=expected_head,
-            expected_plan=expected_plan,
-        )
+    with _operation_deadline():
+        repository = _repository(root)
+        # manifest/stateはlock取得後に読み、途中で別manifestへ差し替えられないようにする。
+        with _task_lock(repository, task_id):
+            return _finish_locked(
+                root, task_id, expected_pr=expected_pr, expected_head=expected_head,
+                expected_plan=expected_plan,
+            )
 
 
 def _parser() -> argparse.ArgumentParser:
