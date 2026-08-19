@@ -9,3 +9,6 @@ clap = { version = "4.5.39", features = ["derive"] }
 home = "0.5.11"
 sha2.workspace = true
 toml_edit.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
