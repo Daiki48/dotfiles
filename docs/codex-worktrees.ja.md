@@ -143,10 +143,18 @@ codex-worktree resume --task-id issue-22
 だけが検証済み状態へ進めます。helperは同じrepository管理rootのlifecycle lockを取得して、
 同じtask ID、path、branchの競合を防ぎます。
 
-PRが未mergeの間はworktreeを自動削除しません。`remove`、`prune`、branch削除、自動cleanup
-はこのIssueの対象外です。未commit・未push・dirtyな変更を破壊する操作も実装しません。
-不要になったworktreeがあっても、まず作業内容とPRの状態を確認し、対象を明示した別の
-運用判断なしにdirectoryやGit metadataを削除しないでください。
+PRが未mergeの間はworktreeを自動削除しません。`codex-worktree`は作成・診断・再開だけを
+担当し、Ready化、merge、main同期、finishのcleanupは専用`codex-delivery`へ委ねます。
+`gh pr merge`や`git worktree remove/prune`などの直接delivery・cleanupは禁止です。
+未commit・未push・dirtyな変更を破壊する操作も実装しません。失敗、timeout、pending、dirty、
+stale、conflict、判定不能の場合はPR・branch・worktreeを保持し、`list`と`doctor`で再開点を
+確認します。
+
+`codex-delivery finish`が、管理root内の対象についてrepository、task、branch、PR、merged状態、
+head commitのmain到達性、clean、未pushなしを厳格に証明できた場合だけmanaged cleanupを許可します。
+これは任意削除の許可ではありません。管理root外や証明できない対象の削除は、Daikiの確認を得て
+従来どおり`.codex-trash/<timestamp>/`へ退避し、直接削除しないでください。deliveryの固定SHA、
+review、CI、Ruleset、risk確認は[Codex delivery運用ガイド](codex-delivery.ja.md)を正本とします。
 
 ## rollback
 
@@ -156,10 +164,30 @@ PRが未mergeの間はworktreeを自動削除しません。`remove`、`prune`�
 既存taskの変更やPRを失わせるためにreset、clean、branch削除、worktree削除を行わないで
 ください。
 
+## deliveryとの境界
+
+Draft PR後のdeliveryは、専用`codex-delivery` helperの次の経路だけを使います。
+各commandでは`--task-id`、`--pr`、`--head`、`--plan-id`を明示します。review記録では
+`--risk`と3つの検証完了flagも必須です。
+
+```text
+record-review  ->  (high/critical/判定不能だけ approve-review)  ->  deliver  ->  finish
+```
+
+`record-review`は、repository、PR、固定head SHA、Plan ID、risk分類、testと独立reviewの完了証拠を
+receiptとして記録します。low/mediumは指摘を自律修正して新SHAでreviewとCIをやり直し、
+high/critical/判定不能は毎回Daikiの確認を得ます。receiptと現在のSHAが一致し、delivery直前に
+再取得したCIが文字通り`success`、actionable=0、未解決thread=0、live Ruleset gateが成立した
+場合だけ`deliver`へ進みます。
+
+Issue #24はdelivery安全境界を変更するhighのため、Draft PR作成後にDaikiの確認が必要です。
+確認待ちやdelivery途中の異常で、PR、branch、worktreeを自動cleanupしません。
+
 ## 安全境界
 
-- lifecycleのGit書き込みは `codex-worktree` に限定します。`git worktree add/remove/prune`
-  などを直接実行して状態を合わせようとしないでください。
+- 作成・診断・再開・recoverのworktree lifecycle書き込みは `codex-worktree` に限定します。
+  merge後のmanaged cleanupだけは`codex-delivery finish`が厳格な証明後に実行します。`git worktree
+  add/remove/prune`などを直接実行して状態を合わせようとしないでください。
 - 親checkoutのbranch切り替え、index、working treeを変更しないことを作成前後に検証します。
 - `origin` のfetch/push先とrepository identityを検証し、最新default branchのOIDを確認して
   からbranchを作成します。
@@ -173,8 +201,8 @@ PRが未mergeの間はworktreeを自動削除しません。`remove`、`prune`�
 
 Issue #22では、worktree間のbuild output、port、test database、cache、その他のruntime
 resource分離は扱いません。task間でこれらを分離する仕組みは別途設計・実装が必要です。
-merge、release、protected branchへのpush、worktreeやbranchの削除も、この運用の自動処理
-には含めません。
+release、protected branchへのpush、任意のworktreeやbranchの削除は、この運用の自動処理には
+含めません。mergeとmanaged cleanupは`codex-delivery`のlive gateを通った場合だけ行います。
 
 関連するOpenAI公式のmanaged worktree rootの説明は、[Git worktrees](https://learn.chatgpt.com/docs/environments/git-worktrees)
 を参照してください。

@@ -65,7 +65,7 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `tmux` | Install tmux via apt/dnf, clone [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager) into `~/.config/tmux/plugins/tpm`, and symlink `~/.config/tmux/tmux.conf`. After setup, press `Ctrl+g` then `I` (capital i) inside tmux to install plugins. | yes |
 | `mise [TOOL@VERSION]...` | Install mise from its recommended apt/dnf repository. Optional tool arguments are installed and recorded in the global mise config; with no arguments, only mise itself is installed. Shell activation is provided by the managed `.zshrc`. | yes |
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
-| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks shared instructions, safety rules, and Skills; distributes the `codex-worktree` helper and configures its managed writable root; then idempotently installs or migrates `~/.codex/config.toml` to the workspace-write + auto-review defaults. Machine-local trust and TUI settings are preserved. | no |
+| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks shared instructions, safety rules, and Skills; distributes the `codex-worktree` and `codex-delivery` helpers and configures their managed writable root; then idempotently installs or migrates `~/.codex/config.toml` to the workspace-write + auto-review defaults. Machine-local trust and TUI settings are preserved. | no |
 | `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`, `~/.gemini/GEMINI.md`, and `~/.gemini/policies/`. Requires `GEMINI_API_KEY` exported in your shell. | no |
 
 #### AI CLI configuration policy
@@ -83,10 +83,13 @@ the current non-protected work branch, Draft PR creation, and reversible Issue/P
 updates are allowlisted so the workflow does not pause for approval. The hook validates the
 current repository, explicit target IDs, canonical arguments, metadata, and detected secrets.
 It continues to reject protected-branch or force/delete/tag pushes, destructive cleanup,
-arbitrary GitHub API mutations, and repository mismatches. When a deletion is required, Codex first moves the target to
-`.codex-trash/<timestamp>/` and never stages or automatically removes that directory.
-The guard checks direct Bash invocations; arbitrary programs and same-user races remain
-outside its security boundary.
+arbitrary GitHub API mutations, and repository mismatches. Draft PR後のreview receipt、Ready化、
+merge、main同期、managed cleanupは専用[`codex-delivery` helper](docs/codex-delivery.ja.md)だけを
+経路とし、直接の`gh pr merge`や`git worktree remove/prune`は行いません。失敗、timeout、pending、
+dirty、stale、conflict、判定不能時はPR、branch、worktreeを保持します。任意の削除が必要な場合、
+Codexは対象を`.codex-trash/<timestamp>/`へ移し、そのdirectoryをstageまたは自動削除しません。
+managed root内でmerged、main到達性、clean、未pushなしを厳格に証明したcleanupだけが自律削除の例外です。
+The guard checks direct Bash invocations; arbitrary programs and same-user races remain outside its security boundary.
 
 The repository declares a required `required-ci` GitHub Actions job and the intended remote
 `main` Ruleset in `.github/rulesets/main.json`. The declaration does not prove that the remote
@@ -95,10 +98,17 @@ Ruleset is active; apply it with explicit approval and verify its readback. See
 verification, and rollback procedure.
 
 For a change, build, or fix request, Codex autonomously investigates, implements, and
-verifies the requested scope. Plans, subagents, commits, pushes, and Draft PRs are used
-when the task or an explicit request warrants them. Merge, release, force push,
-protected-branch push, deletion, material scope expansion, and product decisions remain
-manual.
+verifies the requested scope. Plans, subagents, commits, pushes, Draft PRs, and the delivery
+loop are used when the task or an explicit request warrants them. low/mediumの通常タスクは、
+固定head SHAの独立review、actionable=0、未解決thread=0、required checkの文字通りの
+`success`、live Ruleset gateを満たす場合に`codex-delivery`がReady、merge、mainのfetch後の
+`merge --ff-only`、managed cleanupまで進めます。CI/workflow、Ruleset、hook、rules、AGENTS、
+Skills、helper、installerなどdelivery安全境界、auth/secrets、billing、production、
+不可逆migration、breaking change、および判定不能なriskはhighとして、毎回会話でDaikiの明示確認を
+得てから`approve-review`を実行し、その後だけdeliveryします。自動approval reviewだけをDaikiの
+確認とは扱いません。release、force push、protected-branch push、
+任意削除、material scope expansion、product decisionsは引き続き手動です。詳しい条件は
+[Codex delivery運用ガイド](docs/codex-delivery.ja.md)を参照してください。
 
 `~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
 `~/.agents/skills` are symlinked from this repository.
@@ -137,7 +147,7 @@ cargo run -- codex
 cargo run -- gemini
 ```
 
-`codex`の初回セットアップまたは更新後は、managed設定と`codex-worktree`を反映するため
+`codex`の初回セットアップまたは更新後は、managed設定と2つのhelperを反映するため
 Codexを再起動してください。
 
 ##### Fedora
@@ -188,3 +198,4 @@ Config for CorvusSKK.
 - [skkeleton](https://github.com/Daiki48/dotfiles/blob/main/docs/setup-skkeleton.md)
 - [docker](https://github.com/Daiki48/dotfiles/blob/main/docs/setup-docker.md)
 - [Codex worktree運用](docs/codex-worktrees.ja.md)
+- [Codex delivery運用](docs/codex-delivery.ja.md)

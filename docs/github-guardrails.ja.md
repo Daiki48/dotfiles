@@ -45,10 +45,46 @@ Codexの[`PreToolUse` hook](https://learn.chatgpt.com/docs/hooks)は現時点で
 - bypass actorなし
 
 required review数は0です。個人repositoryで同一actorの形式的なself approvalを要求せず、
-review済みhead SHAの固定とrisk-based reviewは後続Issue #24の完了フローで担保します。
+review済みhead SHAの固定とrisk-based reviewは`codex-delivery`による完了フローで担保します。
 この構成だけでは、PR作者が`required-ci` workflow自体を変更する攻撃をGitHub上で完全には
 防げません。#24ではworkflow差分を含む固定head SHAを独立reviewし、check名だけでなく実行内容も
 確認します。独立したreview identityを用意できる場合は、CODEOWNERSとrequired approvalを再検討します。
+
+## Delivery gate（Issue #24）
+
+Draft PR作成後は、PRのrepository、base branch、head branch、head SHAを固定し、固定SHAに対する
+testと独立reviewの完了証拠をreceiptへ記録し、CIとGitHub review状態はdelivery直前にも再取得します。
+review後にpushされた場合、以前のreceipt、review、CIを
+再利用せず、新しいSHAで最初からやり直します。`review-branch`は読み取り専用であり、receiptの記録と
+delivery判断は呼び出し元の専用`codex-delivery` helperが担当します。
+
+low/mediumの通常タスクでは、actionableな指摘を自律修正して再pushし、同じloopを繰り返します。
+次の条件が同一SHAで同時に成立した場合だけReady化・merge候補になります。
+
+- required-ciなどrequired checkがすべて文字通り`success`である（skipped、cancelled、timed out、
+  neutral、pending、判定不能は成功と扱わない）
+- actionableな指摘が0件、GitHub review conversationの未解決件数が0件
+- PRがopen、baseがdefault branch、headがreceiptのSHAと一致し、merge conflictがない
+- branchが最新baseを満たし、実行時点のlive Ruleset gateがrequired CI、PR必須、conversation解決、
+  merge-only、force push/branch deletion禁止などの正本と一致する
+
+high/critical、または判定不能なriskでは、上記条件を満たしても毎回会話でDaikiの明示確認を得た後だけ
+`codex-delivery approve-review`を実行します。commandのpromptや自動approval reviewだけをDaikiの
+確認とは扱いません。CI/workflow、Ruleset、hook、rules、AGENTS、Skills、helper、installerなど
+delivery安全境界の変更、auth/secrets、billing、production、不可逆migration、breaking changeはhighです。
+Issue #24自身もhighで、Draft PR後にDaikiの確認を要します。確認済みreceiptは後続pushやSHA変更へ
+引き継ぎません。
+
+Ready化、merge、main同期、cleanupは`codex-delivery deliver`と`finish`だけが行う経路です。
+直接の`gh pr merge`、直接のReady化、`git worktree remove/prune`や任意branch削除でこのgateを
+迂回しません。merge後は人間用checkoutをmain・cleanに確認し、fetch後の`git merge --ff-only origin/main`だけで同期して
+local main=`origin/main`を検証します（`ff-only`はlocal同期の条件であり、Rulesetのmerge methodを
+変更するものではありません）。
+
+`finish`はmerge済み、head commitのmain到達性、対象worktreeがmanaged root内、clean、未pushなし、
+別taskと競合しないことを証明できた場合だけmanaged cleanupを許可します。失敗、timeout、pending、
+dirty、stale、conflict、判定不能時はPR、branch、worktreeを保持します。任意削除はDaikiの確認を得て
+`.codex-trash/<timestamp>/`へ退避する従来の規則に従います。
 
 ## 適用
 
