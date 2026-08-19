@@ -1282,7 +1282,7 @@ def _delivery_helper_invocation_reason(tokens):
         switches = {
             "--tests-passed", "--neutral-review-passed", "--adversarial-review-passed",
         }
-    if command in {"approve-review", "deliver", "finish"}:
+    if command in {"record-review", "approve-review", "deliver", "finish"}:
         value_options.add("--gate-mode")
 
     values = {}
@@ -1315,10 +1315,10 @@ def _delivery_helper_invocation_reason(tokens):
         return "delivery helperのhead SHAが許可形式ではありません"
     if not PLAN_ID_RE.fullmatch(values["--plan-id"]):
         return "delivery helperのPlan IDが許可形式ではありません"
-    if command == "record-review" and values["--risk"] not in {"low", "medium"}:
-        return "自律deliveryへ記録できるriskはlowまたはmediumだけです"
-    if command == "approve-review" and values["--risk"] not in {"high", "critical"}:
-        return "確認付きdeliveryのriskはhighまたはcriticalにしてください"
+    if command in {"record-review", "approve-review"} and values["--risk"] not in {
+        "low", "medium", "high", "critical",
+    }:
+        return "delivery riskはlow、medium、high、criticalのいずれかにしてください"
     return None
 
 

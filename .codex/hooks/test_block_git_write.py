@@ -285,8 +285,15 @@ class GuardTest(unittest.TestCase):
             "codex-delivery --help",
             f"codex-delivery record-review --task-id issue-24 --pr 27 --head {head} "
             "--risk medium --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
+            f"codex-delivery record-review --task-id issue-24 --pr 27 --head {head} "
+            "--risk high --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
+            f"codex-delivery record-review --task-id issue-24 --pr 27 --head {head} "
+            "--risk critical --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 "
+            "--gate-mode github-free-private " + evidence,
             f"codex-delivery approve-review --task-id issue-24 --pr 27 --head {head} "
             "--risk high --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
+            f"codex-delivery approve-review --task-id issue-24 --pr 27 --head {head} "
+            "--risk low --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
             f"codex-delivery approve-review --task-id issue-24 --pr 27 --head {head} "
             "--risk high --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 "
             "--gate-mode github-free-private " + evidence,
@@ -310,14 +317,9 @@ class GuardTest(unittest.TestCase):
             "python3 .codex/helpers/codex-delivery approve-review --task-id issue-24",
             "python3 /home/user/.local/bin/codex-delivery deliver --task-id issue-24",
             f"codex-delivery record-review --task-id issue-24 --pr 27 --head {head} "
-            "--risk high --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
-            f"codex-delivery approve-review --task-id issue-24 --pr 27 --head {head} "
-            "--risk medium --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
+            "--risk unknown --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
             f"codex-delivery record-review --task-id issue-24 --pr 0 --head {head} "
             "--risk low --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
-            f"codex-delivery record-review --task-id issue-24 --pr 27 --head {head} "
-            "--risk medium --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 "
-            "--gate-mode github-free-private " + evidence,
             f"codex-delivery approve-review --task-id issue-24 --pr 27 --head {head} "
             "--risk high --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 "
             "--gate-mode automatic " + evidence,
