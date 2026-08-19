@@ -139,6 +139,9 @@ class DeliveryTest(unittest.TestCase):
         with self.assertRaises(HELPER.DeliveryError):
             HELPER._receipt({**base, "human_approved": True}, root=self.root, task_id="issue-24", head="b" * 40,
                             repository="owner/repo")
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._receipt({**base, "risk": []}, root=self.root, task_id="issue-24", head="b" * 40,
+                            repository="owner/repo")
 
     def test_free_private_repository_policy_requires_exact_live_readback(self) -> None:
         good = {
@@ -369,6 +372,17 @@ class DeliveryTest(unittest.TestCase):
         approved = {"repository": {"pullRequest": {"reviewDecision": "APPROVED"}}}
         with mock.patch.object(HELPER, "_graphql", side_effect=[resolved, no_reviews, approved]):
             HELPER._review_safety(self.root, "owner/repo", 24)
+        invalid_reviews = {"repository": {"pullRequest": {"reviews": {
+            "nodes": [{"state": [], "submittedAt": "now", "author": {"login": "reviewer"}}],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        }}}}
+        with mock.patch.object(HELPER, "_graphql", side_effect=[resolved, invalid_reviews, approved]):
+            with self.assertRaises(HELPER.DeliveryError):
+                HELPER._review_safety(self.root, "owner/repo", 24)
+        invalid_decision = {"repository": {"pullRequest": {"reviewDecision": []}}}
+        with mock.patch.object(HELPER, "_graphql", side_effect=[resolved, no_reviews, invalid_decision]):
+            with self.assertRaises(HELPER.DeliveryError):
+                HELPER._review_safety(self.root, "owner/repo", 24)
 
     def test_current_effective_individual_review_state_is_fail_closed(self) -> None:
         resolved = {"repository": {"pullRequest": {"reviewThreads": {
@@ -592,6 +606,12 @@ class DeliveryTest(unittest.TestCase):
             "pr": 24, "head_sha": "b" * 40, "branch": "feat/issue-24", "stage": "merged",
             "updated_at": "now", "last_error": "",
         }), encoding="utf-8")
+        with self.assertRaises(HELPER.DeliveryError):
+            HELPER._load_state("owner/repo", "issue-24", receipt, "feat/issue-24")
+        invalid = json.loads(path.read_text(encoding="utf-8"))
+        invalid["version"] = 1
+        invalid["stage"] = []
+        path.write_text(json.dumps(invalid), encoding="utf-8")
         with self.assertRaises(HELPER.DeliveryError):
             HELPER._load_state("owner/repo", "issue-24", receipt, "feat/issue-24")
 
