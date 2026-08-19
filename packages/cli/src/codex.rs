@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +14,8 @@ const CODEX_FILES: &[(&str, &str)] = &[
 ];
 const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/block_git_write.py";
 const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/block_git_write.py";
+const MANAGED_HELPER_SOURCE: &str = ".codex/helpers/codex-worktree";
+const MANAGED_HELPER_DESTINATION: &str = ".local/bin/codex-worktree";
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 
 // Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
@@ -388,6 +390,15 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     sync_managed_hook(template, &merged)
 }
 
+fn merge_managed_config_with_root(
+    template: &str,
+    existing: &str,
+    managed_root: &Path,
+) -> Result<String> {
+    let merged = merge_managed_config(template, existing);
+    ensure_managed_writable_root(&merged, managed_root)
+}
+
 fn sync_managed_hook(template: &str, existing: &str) -> String {
     let cleaned = remove_retired_managed_hook(existing);
     if !template.contains(MANAGED_HOOK_COMMAND)
@@ -398,6 +409,156 @@ fn sync_managed_hook(template: &str, existing: &str) -> String {
         return cleaned;
     }
     format!("{}\n\n{MANAGED_HOOK_CONFIG}\n", cleaned.trim_end())
+}
+
+fn toml_string_array(line: &str, key: &str) -> Result<(Vec<String>, usize)> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix(key)
+        .filter(|rest| rest.trim_start().starts_with('='))
+        .and_then(|rest| rest.trim_start().strip_prefix('='))
+        .map(str::trim_start)
+        .with_context(|| format!("Invalid {key} assignment"))?;
+    let open = rest
+        .find('[')
+        .with_context(|| format!("{key} must be a TOML string array"))?;
+    let close = rest
+        .rfind(']')
+        .with_context(|| format!("{key} must be a TOML string array"))?;
+    if close < open {
+        anyhow::bail!("{key} must be a single-line TOML string array");
+    }
+    let suffix = rest[close + 1..].trim_start();
+    if !suffix.is_empty() && !suffix.starts_with('#') {
+        anyhow::bail!("{key} must be a single-line TOML string array");
+    }
+
+    let mut values = Vec::new();
+    let mut chars = rest[open + 1..close].chars().peekable();
+    loop {
+        while chars
+            .peek()
+            .is_some_and(|character| character.is_whitespace())
+        {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let quote = chars
+            .next()
+            .filter(|character| *character == '"' || *character == '\'')
+            .with_context(|| format!("{key} contains an unquoted value"))?;
+        let mut value = String::new();
+        loop {
+            let character = chars
+                .next()
+                .with_context(|| format!("{key} contains an unterminated string"))?;
+            if character == quote {
+                break;
+            }
+            if character == '\\' && quote == '"' {
+                let escaped = chars
+                    .next()
+                    .with_context(|| format!("{key} contains an invalid escape"))?;
+                value.push(match escaped {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '\\' => '\\',
+                    '"' => '"',
+                    other => other,
+                });
+            } else {
+                value.push(character);
+            }
+        }
+        values.push(value);
+        while chars
+            .peek()
+            .is_some_and(|character| character.is_whitespace())
+        {
+            chars.next();
+        }
+        match chars.next() {
+            None => break,
+            Some(',') => {}
+            Some(_) => anyhow::bail!("{key} must contain comma-separated strings"),
+        }
+    }
+    Ok((values, close))
+}
+
+fn toml_escape_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn managed_root_assignment(root: &Path) -> String {
+    format!(
+        "writable_roots = [\"{}\"]",
+        toml_escape_string(&root.to_string_lossy())
+    )
+}
+
+fn ensure_managed_writable_root(contents: &str, managed_root: &Path) -> Result<String> {
+    let root = managed_root.to_str().with_context(|| {
+        format!(
+            "Managed worktree root is not valid UTF-8: {}",
+            managed_root.display()
+        )
+    })?;
+    if !managed_root.is_absolute() {
+        anyhow::bail!("Managed worktree root must be absolute: {root}");
+    }
+    let assignment = managed_root_assignment(managed_root);
+    let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    let section_start = lines
+        .iter()
+        .position(|line| table_header(line) == Some("[sandbox_workspace_write]"));
+    let Some(section_start) = section_start else {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("[sandbox_workspace_write]".to_owned());
+        lines.push(assignment);
+        return Ok(format!("{}\n", lines.join("\n")));
+    };
+    let section_end = lines
+        .iter()
+        .enumerate()
+        .skip(section_start + 1)
+        .find_map(|(index, line)| table_header(line).map(|_| index))
+        .unwrap_or(lines.len());
+    let writable_roots_line = lines[section_start + 1..section_end]
+        .iter()
+        .position(|line| is_assignment_for(line, &["writable_roots"]))
+        .map(|offset| section_start + 1 + offset);
+    if let Some(index) = writable_roots_line {
+        let (mut roots, close) = toml_string_array(&lines[index], "writable_roots")?;
+        if !roots.iter().any(|existing| existing == root) {
+            roots.push(root.to_owned());
+        }
+        let indentation = &lines[index][..lines[index].len() - lines[index].trim_start().len()];
+        let trimmed = lines[index].trim_start();
+        let rest = trimmed
+            .strip_prefix("writable_roots")
+            .and_then(|value| value.trim_start().strip_prefix('='))
+            .map(str::trim_start)
+            .expect("writable_roots assignment was already identified");
+        let suffix = &rest[close + 1..];
+        let values = roots
+            .iter()
+            .map(|value| format!("\"{}\"", toml_escape_string(value)))
+            .collect::<Vec<_>>();
+        lines[index] = format!(
+            "{indentation}writable_roots = [{}]{}",
+            values.join(", "),
+            suffix
+        );
+    } else {
+        lines.insert(section_start + 1, assignment);
+    }
+    Ok(format!("{}\n", lines.join("\n")))
 }
 
 fn backup_legacy_config(codex_dir: &Path) -> Result<()> {
@@ -652,6 +813,15 @@ fn ensure_config_unchanged(
 }
 
 fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) -> Result<()> {
+    let managed_root = canonical_or_absolute(&codex_dir.join("worktrees"))?;
+    migrate_managed_config_from_template_with_root(codex_dir, template_path, &managed_root)
+}
+
+fn migrate_managed_config_from_template_with_root(
+    codex_dir: &Path,
+    template_path: &Path,
+    managed_root: &Path,
+) -> Result<()> {
     let config_path = codex_dir.join("config.toml");
     let metadata = match fs::symlink_metadata(&config_path) {
         Ok(metadata) => Some(metadata),
@@ -666,7 +836,31 @@ fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) 
         .is_some_and(|metadata| metadata.file_type().is_symlink());
 
     if metadata.is_none() {
-        copy_file_exclusive(template_path, &config_path)?;
+        let template = fs::read_to_string(template_path)
+            .with_context(|| format!("Failed to read {}", template_path.display()))?;
+        let default_root = home::home_dir().map(|home| home.join(".codex/worktrees"));
+        let installed = if default_root
+            .as_deref()
+            .and_then(|root| canonical_or_absolute(root).ok())
+            .is_some_and(|root| root == managed_root)
+        {
+            template.clone()
+        } else {
+            ensure_managed_writable_root(&template, managed_root)?
+        };
+        let permissions = fs::metadata(template_path)
+            .with_context(|| {
+                format!(
+                    "Failed to inspect permissions for {}",
+                    template_path.display()
+                )
+            })?
+            .permissions();
+        if installed == template {
+            copy_file_exclusive(template_path, &config_path)?;
+        } else {
+            write_file_exclusive(&config_path, &installed, permissions)?;
+        }
         println!("- Installed base config: {}", config_path.display());
         return Ok(());
     }
@@ -675,7 +869,7 @@ fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) 
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
     let template = fs::read_to_string(template_path)
         .with_context(|| format!("Failed to read {}", template_path.display()))?;
-    let migrated = merge_managed_config(&template, &existing);
+    let migrated = merge_managed_config_with_root(&template, &existing, managed_root)?;
     if migrated == existing && !is_symlink {
         println!("- Shared Codex settings are up to date.");
         return Ok(());
@@ -765,6 +959,106 @@ fn archive_retired_profiles(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_absolute_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("CODEX_HOME must be an absolute path: {}", path.display());
+    }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        anyhow::bail!(
+            "CODEX_HOME must not contain parent traversal: {}",
+            path.display()
+        );
+    }
+
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "symlink path component is not allowed: {}",
+                    current.display()
+                );
+            }
+            Ok(metadata) if !metadata.file_type().is_dir() && current != path => {
+                anyhow::bail!("path component is not a directory: {}", current.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect path {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_codex_home(home: &Path) -> Result<PathBuf> {
+    let configured = std::env::var_os("CODEX_HOME");
+    let candidate = configured
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    validate_absolute_path(&candidate)?;
+    if let Ok(metadata) = fs::symlink_metadata(&candidate) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("CODEX_HOME must not be a symlink: {}", candidate.display());
+        }
+        if !metadata.file_type().is_dir() {
+            anyhow::bail!("CODEX_HOME must be a directory: {}", candidate.display());
+        }
+    }
+    Ok(candidate)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    validate_absolute_path(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "Managed directory must not be a symlink: {}",
+                path.display()
+            );
+        }
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            anyhow::bail!("Managed path must be a directory: {}", path.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .with_context(|| format!("Failed to create directory {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect directory {}", path.display()));
+        }
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to inspect directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        anyhow::bail!(
+            "Managed path must be a regular directory: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .with_context(|| format!("Failed to set private permissions on {}", path.display()))?;
+    Ok(())
+}
+
+fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        fs::canonicalize(path)
+            .with_context(|| format!("Failed to resolve managed path {}", path.display()))
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
 pub fn setup() -> Result<()> {
     println!("🧠 Setting up Codex CLI...\n");
 
@@ -778,12 +1072,13 @@ pub fn setup() -> Result<()> {
     codex_check()?;
 
     let home = home::home_dir().context("Cannot find home directory")?;
-    let codex_dir = home.join(".codex");
-
+    let codex_dir = resolve_codex_home(&home)?;
     if !codex_dir.exists() {
-        println!("\nCreating ~/.codex directory...");
-        fs::create_dir_all(&codex_dir)?;
+        println!("\nCreating CODEX_HOME directory: {}", codex_dir.display());
     }
+    ensure_private_directory(&codex_dir)?;
+    let managed_worktree_root = codex_dir.join("worktrees");
+    ensure_private_directory(&managed_worktree_root)?;
 
     println!("\nLinking shared configuration files...");
     for (source, dest) in CODEX_FILES {
@@ -793,6 +1088,10 @@ pub fn setup() -> Result<()> {
     ensure_managed_hook(
         &dotfiles_path.join(MANAGED_HOOK_SOURCE),
         &home.join(MANAGED_HOOK_DESTINATION),
+    )?;
+    ensure_managed_hook(
+        &dotfiles_path.join(MANAGED_HELPER_SOURCE),
+        &home.join(MANAGED_HELPER_DESTINATION),
     )?;
     println!("\nLinking shared skill directories...");
     for (source, dest) in CODEX_DIRS {
@@ -809,6 +1108,7 @@ pub fn setup() -> Result<()> {
     println!("\n💡 Next steps:");
     println!("   1. Run 'codex login' if authentication is not configured");
     println!("   2. Run 'codex' (workspace-write + auto-review is the default)");
+    println!("   3. Restart Codex after installation so writable roots are reloaded");
 
     Ok(())
 }
@@ -817,8 +1117,10 @@ pub fn setup() -> Result<()> {
 mod tests {
     use super::{
         MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND, contains_legacy_profile_config,
-        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook, managed_hook_state_path,
-        merge_managed_config, migrate_managed_config_from_template, sha256, verify_managed_symlink,
+        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook,
+        ensure_managed_writable_root, ensure_private_directory, managed_hook_state_path,
+        merge_managed_config, merge_managed_config_with_root, migrate_managed_config_from_template,
+        sha256, verify_managed_symlink,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1306,6 +1608,62 @@ description = "local"
             fs::read_to_string(backup.path()).expect("read regular config backup"),
             original
         );
+    }
+
+    #[test]
+    fn writable_roots_preserve_local_values_and_are_idempotent() {
+        let directory = TestDirectory::new("writable-roots");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"model = "gpt-5.6-terra"
+
+[sandbox_workspace_write]
+network_access = true
+writable_roots = ["~/.codex/worktrees"]
+"#;
+        let existing = r#"model = "old"
+
+[sandbox_workspace_write] # local options
+network_access = false
+writable_roots = ["./relative", "/srv/other"] # keep these roots
+exclude_tmpdir_env_var = true
+"#;
+
+        let merged = merge_managed_config_with_root(template, existing, &managed_root)
+            .expect("merge writable roots");
+        assert!(merged.contains("\"./relative\""));
+        assert!(merged.contains("\"/srv/other\""));
+        assert!(merged.contains(&format!("\"{}\"", managed_root.display())));
+        assert!(merged.contains("# keep these roots"));
+        assert_eq!(
+            ensure_managed_writable_root(&merged, &managed_root).expect("repeat merge"),
+            merged
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_worktree_directory_is_private_and_rejects_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = TestDirectory::new("managed-worktree-directory");
+        let worktrees = directory.path().join("codex").join("worktrees");
+        ensure_private_directory(&worktrees).expect("create worktree directory");
+        assert_eq!(
+            fs::metadata(&worktrees)
+                .expect("inspect worktree directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        ensure_private_directory(&worktrees).expect("repeat directory setup");
+
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        fs::create_dir(&target).expect("create symlink target");
+        symlink(&target, &link).expect("create symlink");
+        assert!(ensure_private_directory(&link).is_err());
     }
 
     #[test]
