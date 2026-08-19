@@ -148,13 +148,49 @@ class DeliveryTest(unittest.TestCase):
         resolved = {"repository": {"pullRequest": {"reviewThreads": {
             "nodes": [{"isResolved": True}], "pageInfo": {"hasNextPage": False, "endCursor": None},
         }}}}
+        no_reviews = {"repository": {"pullRequest": {"reviews": {
+            "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None},
+        }}}}
         changes_requested = {"repository": {"pullRequest": {"reviewDecision": "CHANGES_REQUESTED"}}}
-        with mock.patch.object(HELPER, "_graphql", side_effect=[resolved, changes_requested]):
+        with mock.patch.object(HELPER, "_graphql", side_effect=[resolved, no_reviews, changes_requested]):
             with self.assertRaises(HELPER.DeliveryError):
                 HELPER._review_safety(self.root, "owner/repo", 24)
         approved = {"repository": {"pullRequest": {"reviewDecision": "APPROVED"}}}
-        with mock.patch.object(HELPER, "_graphql", side_effect=[resolved, approved]):
+        with mock.patch.object(HELPER, "_graphql", side_effect=[resolved, no_reviews, approved]):
             HELPER._review_safety(self.root, "owner/repo", 24)
+
+    def test_current_effective_individual_review_state_is_fail_closed(self) -> None:
+        resolved = {"repository": {"pullRequest": {"reviewThreads": {
+            "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None},
+        }}}}
+        decision = {"repository": {"pullRequest": {"reviewDecision": None}}}
+
+        def reviews(nodes: list[dict[str, object]]) -> dict[str, object]:
+            return {"repository": {"pullRequest": {"reviews": {
+                "nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}}}
+
+        requested = {
+            "id": "r1", "state": "CHANGES_REQUESTED", "submittedAt": "2026-08-19T01:00:00Z",
+            "author": {"login": "reviewer"},
+        }
+        with mock.patch.object(HELPER, "_graphql", side_effect=[resolved, reviews([requested]), decision]):
+            with self.assertRaises(HELPER.DeliveryError):
+                HELPER._review_safety(self.root, "owner/repo", 24)
+
+        approved = {
+            "id": "r2", "state": "APPROVED", "submittedAt": "2026-08-19T02:00:00Z",
+            "author": {"login": "Reviewer"},
+        }
+        with mock.patch.object(
+            HELPER, "_graphql", side_effect=[resolved, reviews([requested, approved]), decision],
+        ):
+            HELPER._review_safety(self.root, "owner/repo", 24)
+
+        pending = {**requested, "state": "PENDING"}
+        with mock.patch.object(HELPER, "_graphql", side_effect=[resolved, reviews([pending])]):
+            with self.assertRaises(HELPER.DeliveryError):
+                HELPER._review_safety(self.root, "owner/repo", 24)
 
     def test_draft_preflight_never_changes_ready_state_when_remote_check_fails(self) -> None:
         view = {
@@ -264,12 +300,40 @@ class DeliveryTest(unittest.TestCase):
                     HELPER._run(["git", "status"], cwd=self.root)
         run.assert_not_called()
 
+    def test_lifecycle_lock_wait_honors_operation_timeout(self) -> None:
+        with mock.patch.object(HELPER.time, "monotonic", side_effect=[0.0, 301.0]), \
+             mock.patch.object(HELPER.fcntl, "flock", side_effect=BlockingIOError):
+            with self.assertRaises(HELPER.DeliveryError):
+                HELPER._acquire_lock(1)
+
     def test_canonical_invocation_rejects_interpreter_path(self) -> None:
         installed = Path(self.directory.name) / "bin" / "codex-delivery"
         installed.parent.mkdir()
         installed.write_text("#!/bin/sh\n", encoding="utf-8")
-        with mock.patch.object(HELPER.shutil, "which", return_value=str(installed)), \
+        installed.chmod(0o700)
+        with mock.patch.object(HELPER, "_canonical_helper_path", return_value=installed), \
              mock.patch.object(HELPER.sys, "argv", [str(MODULE_PATH)]):
+            with self.assertRaises(HELPER.DeliveryError):
+                HELPER._require_canonical_invocation()
+        with mock.patch.object(HELPER, "_canonical_helper_path", return_value=installed), \
+             mock.patch.object(HELPER.sys, "argv", [str(installed)]):
+            HELPER._require_canonical_invocation()
+
+    def test_canonical_path_does_not_trust_home_environment(self) -> None:
+        account = mock.Mock(pw_dir="/trusted/home")
+        with mock.patch.dict("os.environ", {"HOME": "/attacker/home"}), \
+             mock.patch.object(HELPER.pwd, "getpwuid", return_value=account):
+            self.assertEqual(
+                HELPER._canonical_helper_path(),
+                Path("/trusted/home/.local/bin/codex-delivery"),
+            )
+
+    def test_canonical_invocation_rejects_symlink_even_when_it_resolves_to_source(self) -> None:
+        installed = Path(self.directory.name) / "bin" / "codex-delivery"
+        installed.parent.mkdir()
+        installed.symlink_to(MODULE_PATH)
+        with mock.patch.object(HELPER, "_canonical_helper_path", return_value=installed), \
+             mock.patch.object(HELPER.sys, "argv", [str(installed)]):
             with self.assertRaises(HELPER.DeliveryError):
                 HELPER._require_canonical_invocation()
 

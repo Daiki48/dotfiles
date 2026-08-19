@@ -14,9 +14,9 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
@@ -306,6 +306,21 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         raise DeliveryError("receipt/stateをatomic保存できません") from error
 
 
+def _acquire_lock(descriptor: int) -> None:
+    deadline = getattr(_DEADLINES, "value", None)
+    if deadline is None:
+        deadline = time.monotonic() + OPERATION_TIMEOUT
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeliveryError("task lifecycle lockの取得がtimeoutしました")
+            time.sleep(min(0.05, remaining))
+
+
 @contextmanager
 def _task_lock(repository: str, task_id: str) -> Iterator[None]:
     _task_id(task_id)
@@ -327,7 +342,7 @@ def _task_lock(repository: str, task_id: str) -> Iterator[None]:
         descriptor = os.open(path, flags, 0o600)
         with os.fdopen(descriptor, "a+", encoding="utf-8") as lock:
             os.fchmod(lock.fileno(), 0o600)
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            _acquire_lock(lock.fileno())
             held = set(held)
             held.add(key)
             _HELD_LOCKS.keys = held
@@ -636,6 +651,7 @@ def _graphql(root: Path, repository: str, query: str, variables: dict[str, Any])
 
 
 THREAD_QUERY = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{isResolved}pageInfo{hasNextPage,endCursor}}}}}"""
+REVIEW_QUERY = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviews(first:100,after:$cursor){nodes{id,state,submittedAt,author{login}}pageInfo{hasNextPage,endCursor}}}}}"""
 DECISION_QUERY = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision}}}"""
 
 
@@ -665,6 +681,53 @@ def _review_safety(root: Path, repository: str, pr: int) -> None:
         if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
             raise DeliveryError("review thread pagination cursorが不正です")
         cursor = next_cursor
+
+    cursor = None
+    pages = 0
+    items = 0
+    effective: dict[str, tuple[str, str]] = {}
+    while True:
+        data = _graphql(root, repository, REVIEW_QUERY, {"number": pr, "cursor": cursor})
+        try:
+            connection = data["repository"]["pullRequest"]["reviews"]
+            nodes = connection["nodes"]
+            info = connection["pageInfo"]
+        except (KeyError, TypeError) as error:
+            raise DeliveryError("reviewのGraphQL schemaが不正です") from error
+        if not isinstance(nodes, list) or not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+            raise DeliveryError("reviewのpaginationが不正です")
+        pages += 1
+        items += len(nodes)
+        if pages > MAX_PAGES or items > MAX_ITEMS:
+            raise DeliveryError("reviewのpagination上限を超えました")
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("state") not in {
+                "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED",
+            }:
+                raise DeliveryError("review stateが不明または未確定です")
+            author = node.get("author")
+            submitted = node.get("submittedAt")
+            if (
+                not isinstance(author, dict) or not isinstance(author.get("login"), str)
+                or not author["login"] or not isinstance(submitted, str) or not submitted
+            ):
+                raise DeliveryError("review author/submittedAtが不正です")
+            if node["state"] == "COMMENTED":
+                continue
+            login = author["login"].casefold()
+            previous = effective.get(login)
+            if previous is not None and previous[0] == submitted and previous[1] != node["state"]:
+                raise DeliveryError("同一reviewerの有効review順序を確定できません")
+            if previous is None or submitted > previous[0]:
+                effective[login] = (submitted, node["state"])
+        if not info["hasNextPage"]:
+            break
+        next_cursor = info.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            raise DeliveryError("review pagination cursorが不正です")
+        cursor = next_cursor
+    if any(state == "CHANGES_REQUESTED" for _, state in effective.values()):
+        raise DeliveryError("現在有効なCHANGES_REQUESTED reviewがあります")
 
     decision_data = _graphql(root, repository, DECISION_QUERY, {"number": pr})
     try:
@@ -1140,16 +1203,25 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _require_canonical_invocation() -> None:
-    installed = shutil.which("codex-delivery")
-    if not installed:
-        raise DeliveryError("codex-deliveryのcanonical install先をPATHから確認できません")
+def _canonical_helper_path() -> Path:
     try:
-        invoked = Path(sys.argv[0]).resolve(strict=True)
-        canonical = Path(installed).resolve(strict=True)
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError) as error:
+        raise DeliveryError("current userのhome directoryを確認できません") from error
+    return Path(home) / ".local" / "bin" / "codex-delivery"
+
+
+def _require_canonical_invocation() -> None:
+    canonical = _canonical_helper_path()
+    try:
+        metadata = canonical.lstat()
     except OSError as error:
-        raise DeliveryError("codex-deliveryの実行pathを確認できません") from error
-    if invoked != canonical:
+        raise DeliveryError("codex-deliveryのcanonical install先を確認できません") from error
+    if (
+        Path(sys.argv[0]) != canonical or canonical.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077 or not os.access(canonical, os.X_OK)
+    ):
         raise DeliveryError("codex-deliveryはcanonical install先から直接実行してください")
 
 

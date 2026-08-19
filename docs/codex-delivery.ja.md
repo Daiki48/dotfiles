@@ -28,11 +28,15 @@ codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --pl
 `review-branch`は読み取り専用です。reviewerはreceipt、Issue、PR、Git、worktreeを変更せず、
 呼び出し元がreview結果を`record-review`へ渡します。
 
-helperはcanonical install先から直接起動し、`/usr/bin/git`と`/usr/bin/gh`だけを使います。
+helperは固定した`~/.local/bin/codex-delivery`のprivate regular fileから直接起動し、
+`/usr/bin/git`と`/usr/bin/gh`だけを使います。
 `PATH`、`GH_HOST`、`GH_REPO`、`GH_CONFIG_DIR`、Git環境変数による対象・実行fileの差し替えを
 拒否または無効化し、1回の`deliver`/`finish`全体を5分でfail closedにします。この境界は
 同一userが任意programを実行してhelperやmanaged stateそのものを書き換える攻撃を防ぐsandboxでは
 ありません。その権限を持つ主体と、repository設定やPRを同時変更できる管理者は信頼境界内です。
+したがって`approve-review` receipt自体はDaiki確認の暗号学的証明ではなく、会話上の確認を守る
+Codexのinstructionとtool promptに対する構造証拠です。同一userの任意programによる子process起動や
+state直接改変を防ぐものとは説明しません。
 
 ## DELIVERY-01: 固定SHAのreview receipt
 
@@ -72,8 +76,9 @@ commit、pushを自律的に行います。そのpushでSHAが変わるため、
 2. 現在のhead SHAがreceiptのreview済みSHAと一致する。
 3. required CIがすべて文字通り`success`で、失敗、skip、cancel、timeout、neutral、pending、
    取得不能がない。
-4. actionableな指摘が0件で、GitHub review conversationの全pageに未解決threadがなく、現在有効な
-   `reviewDecision`が`CHANGES_REQUESTED`、`REVIEW_REQUIRED`、不明値ではない。
+4. actionableな指摘が0件で、GitHub review conversationの全pageに未解決threadがなく、reviewerごとの
+   現在有効な個別reviewに`CHANGES_REQUESTED`がなく、`reviewDecision`も`CHANGES_REQUESTED`、
+   `REVIEW_REQUIRED`、不明値ではない。
 5. merge conflictがなく、branchが最新baseの要件を満たす。
 6. 実行時点のlive Ruleset gateがactiveで、required CI、PR経由、conversation解決、merge method、
    force push/branch deletion禁止などのrepository正本と一致する。
@@ -145,7 +150,8 @@ finishの最後に、管理root内の対象worktreeだけをcleanupできます�
 プロジェクト直下の`.codex-trash/<timestamp>/`へ退避してから扱います。直接`rm`や直接GitHub API
 削除で代替してはいけません。
 
-cleanupはrepository-wide lifecycle lockとtask単位のmanifest/stateを使う再開可能なstate machineです。
+cleanupは5分のdeadline付きrepository-wide lifecycle lockとtask単位のmanifest/stateを使う再開可能な
+state machineです。lock取得待ちもdeadlineへ含め、競合processが停止していても無期限には待ちません。
 `merge_started`、`merged`、`main_synced`、`remote_delete_started`、`remote_deleted`、
 `worktree_unlock_started`、`worktree_removed`、`completed`をatomic保存し、state欠落・schema不一致を
 成功扱いしません。remote branch削除だけは、削除直前に確認したreview済みSHAを
