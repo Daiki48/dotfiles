@@ -2123,7 +2123,8 @@ def _has_shell_argument_expansion(command):
 def _command_word_has_expansion(token):
     """実行command名そのものを変更し得るshell expansionならTrue。"""
     return (
-        any(char in token for char in {"$", "`", "*", "?"})
+        token.startswith("=")
+        or any(char in token for char in {"$", "`", "*", "?"})
         or (any(char in token for char in {"{", "}"}) and token not in {"{", "}"})
         or ("[" in token and token != "[")
     )
