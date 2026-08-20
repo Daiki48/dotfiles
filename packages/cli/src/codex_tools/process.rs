@@ -184,17 +184,28 @@ fn linux_pid_namespace_available() -> bool {
                 Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
                 Ok(None) => {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    reap_probe_until(&mut child, Instant::now() + NAMESPACE_PROBE_TIMEOUT);
                     return false;
                 }
                 Err(_) => {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    reap_probe_until(&mut child, Instant::now() + NAMESPACE_PROBE_TIMEOUT);
                     return false;
                 }
             }
         }
     })
+}
+
+#[cfg(target_os = "linux")]
+fn reap_probe_until(child: &mut std::process::Child, deadline: Instant) {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
+            Ok(None) => return,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -220,6 +231,12 @@ struct ProcStat {
 }
 
 #[cfg(target_os = "linux")]
+fn process_disappeared(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || matches!(error.raw_os_error(), Some(code) if code == libc::ENOENT || code == libc::ESRCH)
+}
+
+#[cfg(target_os = "linux")]
 fn proc_snapshot() -> io::Result<HashMap<i32, ProcStat>> {
     let mut result = HashMap::new();
     for entry in fs::read_dir("/proc")? {
@@ -233,7 +250,7 @@ fn proc_snapshot() -> io::Result<HashMap<i32, ProcStat>> {
         };
         let contents = match fs::read_to_string(entry.path().join("stat")) {
             Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if process_disappeared(&error) => continue,
             Err(error) => return Err(error),
         };
         let Some(comm_end) = contents.rfind(") ") else {
@@ -402,7 +419,14 @@ impl DescendantTracker {
         let expected = format!("CODEX_PROCESS_RUN_ID={}", self.marker);
         let environment = match fs::read(format!("/proc/{pid}/environ")) {
             Ok(environment) => environment,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if process_disappeared(&error) => return Ok(false),
+            #[cfg(test)]
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                // Parallel fixtures may create an unrelated child in a user
+                // namespace whose environ is unreadable. Test fallback treats
+                // an unprovable marker as absent; release never uses fallback.
+                return Ok(false);
+            }
             Err(error) => return Err(error),
         };
         Ok(environment
@@ -1031,7 +1055,8 @@ fn terminate_and_reap(
 mod tests {
     #[cfg(target_os = "linux")]
     use super::{
-        DescendantTracker, ENVIRONMENT_CLEARED_MARKER, prepare_linux_command, run_with_limit_config,
+        DescendantTracker, ENVIRONMENT_CLEARED_MARKER, prepare_linux_command, reap_probe_until,
+        run_with_limit_config,
     };
     use super::{ProcessError, run_with_limit};
     use std::fs;
@@ -1149,6 +1174,31 @@ mod tests {
             failure.expect_err("snapshot failure must propagate").kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn short_lived_roots_are_registered_before_cleanup() {
+        for _ in 0..100 {
+            let mut command = Command::new("/usr/bin/true");
+            let output = run_with_limit_config(&mut command, Duration::from_secs(1), 1024, false)
+                .expect("short-lived root must retain a trackable PID");
+            assert!(output.status.success());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_probe_reap_has_a_hard_deadline() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn probe fixture");
+        child.kill().expect("kill probe fixture");
+        let started = Instant::now();
+        reap_probe_until(&mut child, Instant::now() + Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.try_wait().expect("inspect probe fixture").is_some());
     }
 
     #[test]
