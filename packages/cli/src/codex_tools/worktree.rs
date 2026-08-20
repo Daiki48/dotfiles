@@ -626,6 +626,8 @@ fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Result<Command, Workt
         .arg("-c")
         .arg("http.sslVerify=true")
         .arg("-c")
+        .arg("http.extraHeader=")
+        .arg("-c")
         .arg("http.followRedirects=initial")
         .arg("-c")
         .arg("remote.origin.uploadpack=git-upload-pack")
@@ -2293,6 +2295,7 @@ mod tests {
         for expected in [
             "credential.helper=",
             "core.askPass=",
+            "http.extraHeader=",
             "submodule.recurse=false",
             "fetch.recurseSubmodules=false",
             "push.recurseSubmodules=no",
