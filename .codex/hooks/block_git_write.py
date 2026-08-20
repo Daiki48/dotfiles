@@ -2223,6 +2223,8 @@ def _has_unparsed_guarded_command(tokens):
             os.path.basename(token) in guarded or _command_word_has_expansion(token)
             for token in arguments
         )
+    if _has_command_resolution_mutation(arguments):
+        return True
     if _env_uses_split_string(arguments):
         return True
     start = _command_start(arguments)
