@@ -2148,12 +2148,56 @@ def _has_unquoted_shell_control(command):
     return _has_unquoted_shell_character(command, {";", "&", "|", "(", ")", "\n"})
 
 
+def _without_unquoted_redirection_fds(command):
+    """演算子へ空白なしで隣接するshell FD番号だけを取り除く。"""
+    result = []
+    quote = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            result.append(char)
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            result.append(char)
+            if index + 1 < len(command):
+                result.append(command[index + 1])
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            quote = char if quote is None else None if quote == char else quote
+            result.append(char)
+            index += 1
+            continue
+        if quote is None and char.isdigit() and (
+            index == 0
+            or command[index - 1].isspace()
+            or command[index - 1] in ";&|()"
+        ):
+            end = index
+            while end < len(command) and command[end].isdigit():
+                end += 1
+            if end < len(command) and command[end] in "<>":
+                index = end
+                continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
 def _leading_redirection_wraps_guarded_command(command, cwd=None, depth=0):
     """commandより前のredirectionでguard対象の実行位置を隠していればTrue。"""
     if not _has_unquoted_shell_redirection(command):
         return False
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>\n")
+        lexer = shlex.shlex(
+            _without_unquoted_redirection_fds(command),
+            posix=True,
+            punctuation_chars=";&|()<>\n",
+        )
         lexer.whitespace_split = True
         lexer.commenters = ""
         tokens = list(lexer)
@@ -2178,12 +2222,6 @@ def _leading_redirection_wraps_guarded_command(command, cwd=None, depth=0):
         consumed = False
         index = 0
         while index < len(chunk):
-            if (
-                index + 1 < len(chunk)
-                and chunk[index].isdigit()
-                and any(char in "<>" for char in chunk[index + 1])
-            ):
-                index += 1
             operator = chunk[index] if index < len(chunk) else ""
             if (
                 operator

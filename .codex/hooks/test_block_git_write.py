@@ -86,6 +86,12 @@ class GuardTest(unittest.TestCase):
             "env > /tmp/status gh issue delete 1 --repo owner/repo",
             "nice 2>&1 git reset --hard HEAD",
             "if command > /tmp/status git reset --hard HEAD; then true; fi",
+            "timeout 1 > /tmp/status git reset --hard HEAD",
+            "nice -n 1 > /tmp/status rm -rf README.md",
+            "sudo --close-from 3 > /tmp/status git reset --hard HEAD",
+            "xargs -n 1 > /tmp/status git reset --hard HEAD",
+            "env -u 1 > /tmp/status git reset --hard HEAD",
+            "exec -a 1 > /tmp/status git reset --hard HEAD",
             "> /tmp/status =git reset --hard HEAD",
             "> /tmp/status g{it,} reset --hard HEAD",
             "> /tmp/status $CMD reset --hard HEAD",
@@ -111,6 +117,8 @@ class GuardTest(unittest.TestCase):
             "bash -c 'printf ok' > /tmp/status",
             "find . -maxdepth 0 -print > /tmp/status",
             "eval 'printf ok' > /tmp/status",
+            "timeout 1 > /tmp/status printf ok",
+            "nice -n 1 > /tmp/status printf ok",
         ):
             with self.subTest(command=command):
                 self.assert_allowed(command)
