@@ -2146,6 +2146,81 @@ def _has_unquoted_shell_control(command):
     return _has_unquoted_shell_character(command, {";", "&", "|", "(", ")", "\n"})
 
 
+def _leading_redirection_wraps_guarded_command(command):
+    """commandより前のredirectionでguard対象の実行位置を隠していればTrue。"""
+    if not _has_unquoted_shell_redirection(command):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>\n")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return True
+
+    chunks = []
+    chunk = []
+    for token in tokens:
+        if token and all(char in ";&|()\n" for char in token):
+            if chunk:
+                chunks.append(chunk)
+                chunk = []
+            continue
+        chunk.append(token)
+    if chunk:
+        chunks.append(chunk)
+
+    guarded = RESTRICTED_COMMANDS | DESTRUCTIVE_COMMANDS | SHELLS | {
+        ".", "eval", "find", "source",
+    }
+    for chunk in chunks:
+        arguments = list(chunk)
+        while arguments and (
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", arguments[0])
+            or arguments[0] in SHELL_COMMAND_PREFIXES
+        ):
+            arguments.pop(0)
+        if arguments and arguments[0] == "time":
+            arguments.pop(0)
+            while arguments and arguments[0] in {"-p", "--"}:
+                arguments.pop(0)
+        if arguments and arguments[0] == "repeat":
+            arguments = arguments[2:] if len(arguments) >= 2 else []
+
+        consumed = False
+        while arguments:
+            if (
+                len(arguments) >= 2
+                and arguments[0].isdigit()
+                and any(char in "<>" for char in arguments[1])
+            ):
+                arguments.pop(0)
+            operator = arguments[0] if arguments else ""
+            if (
+                not operator
+                or not all(char in "<>&|" for char in operator)
+                or not any(char in "<>" for char in operator)
+            ):
+                break
+            consumed = True
+            arguments.pop(0)
+            if arguments:
+                arguments.pop(0)
+        if not consumed or not arguments:
+            continue
+        start = _command_start(arguments)
+        if start is None:
+            continue
+        executable = arguments[start]
+        if (
+            os.path.basename(executable) in guarded
+            or _is_git_subcommand_executable(executable)
+            or _contains_restricted_command(arguments)
+        ):
+            return True
+    return False
+
+
 def _has_shell_argument_expansion(command):
     """Git optionへ変化し得るparameter/brace/glob expansionを検出する。"""
     quote = None
@@ -2343,6 +2418,8 @@ def blocked_reason(command, cwd=None, depth=0):
         return "backslash-newlineによるshell token連結は安全に検査できません"
     if "$(" in command or "`" in command:
         return "command substitutionを含むcommandは安全に検査できません"
+    if _leading_redirection_wraps_guarded_command(command):
+        return "先頭redirectionを伴うGit/GitHub/helper commandは実行できません"
     segments = list(_command_segments(command))
     if len(segments) > 1 and any(
         _has_command_resolution_mutation(tokens) for tokens in segments

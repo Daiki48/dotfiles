@@ -78,6 +78,10 @@ class GuardTest(unittest.TestCase):
             "git status < /tmp/status",
             "git status <<EOF\nignored\nEOF",
             "git status <(printf x)",
+            "> /tmp/status git status",
+            "> /tmp/status rm -rf README.md",
+            "2>&1 git reset --hard HEAD",
+            "if > /tmp/status git reset --hard HEAD; then true; fi",
             "gh pr view 1 > /tmp/pr",
             "codex-delivery --help > /tmp/help",
         ):
@@ -89,6 +93,8 @@ class GuardTest(unittest.TestCase):
             'git status ">" /tmp/status',
             "git status # a comment containing > is not redirection",
             "printf '%s' 'git status > /tmp/status'",
+            "> /tmp/status printf '%s' git",
+            "printf '%s' git > /tmp/status",
             "rg --files /tmp/git > /tmp/path",
         ):
             with self.subTest(command=command):
