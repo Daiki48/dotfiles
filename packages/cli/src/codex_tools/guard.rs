@@ -6066,7 +6066,31 @@ mod tests {
 
     #[test]
     fn allowed_git_commands_are_rewritten_with_fixed_execution_boundaries() {
-        let cwd = std::env::current_dir().expect("current test repository");
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-guard-boundaries-{suffix}"));
+        fs::create_dir(&root).expect("create Git boundary fixture");
+        for arguments in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "Codex Test"],
+            vec!["config", "user.email", "codex@example.invalid"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Daiki48/dotfiles.git",
+            ],
+        ] {
+            let status = Command::new(SYSTEM_GIT)
+                .current_dir(&root)
+                .args(arguments)
+                .status()
+                .expect("configure Git boundary fixture");
+            assert!(status.success());
+        }
+        let cwd = root;
         let cwd = cwd.to_str().expect("UTF-8 test repository");
         let command = format!("env -u SSH_ASKPASS git -C {cwd} commit -m ':bug: fix'");
         let commit = rewrite_git_safety_command(&command, Some(cwd))
@@ -6141,6 +6165,7 @@ mod tests {
         assert!(status.contains("core.fsmonitor=false"));
         assert!(status.contains("diff.external="));
         assert!(status.contains("GIT_CONFIG_GLOBAL=/dev/null"));
+        fs::remove_dir_all(cwd).expect("remove Git boundary fixture");
     }
 
     #[cfg(unix)]
