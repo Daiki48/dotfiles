@@ -1087,8 +1087,19 @@ def _gh_transport_reason(cwd):
     ):
         return "gh run cancelのGitHub transport設定を確認できません"
     try:
-        lines = result.stdout.decode("utf-8").splitlines()
+        output = result.stdout.decode("utf-8")
     except UnicodeError:
+        return "gh run cancelのGitHub transport設定を確認できません"
+    if (
+        not output.endswith("\n")
+        or any(ord(char) < 32 and char != "\n" for char in output)
+    ):
+        return "gh run cancelのGitHub transport設定を確認できません"
+    lines = output[:-1].split("\n")
+    if not lines or any(
+        not line or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", line) is None
+        for line in lines
+    ):
         return "gh run cancelのGitHub transport設定を確認できません"
     socket_values = [
         line.split("=", 1)[1]

@@ -984,16 +984,31 @@ class GuardTest(unittest.TestCase):
         whitespace = GUARD.subprocess.CompletedProcess(
             ["gh"], 0, b"http_unix_socket= \t\n", b""
         )
+        carriage_return = GUARD.subprocess.CompletedProcess(
+            ["gh"], 0, b"http_unix_socket=\r\n", b""
+        )
+        extra_line = GUARD.subprocess.CompletedProcess(
+            ["gh"], 0, b"http_unix_socket=\n\n", b""
+        )
+        vertical_tab = GUARD.subprocess.CompletedProcess(
+            ["gh"], 0, b"http_unix_socket=\x0b\n", b""
+        )
         with (
             mock.patch.dict(GUARD.os.environ, {}, clear=True),
             mock.patch.object(
                 GUARD.subprocess,
                 "run",
-                side_effect=(configured, safe, failed, missing, whitespace),
+                side_effect=(
+                    configured, safe, failed, missing, whitespace,
+                    carriage_return, extra_line, vertical_tab,
+                ),
             ) as run,
         ):
             self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
             self.assertIsNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
             self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
             self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
             self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
