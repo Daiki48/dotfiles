@@ -272,6 +272,13 @@ class GuardTest(unittest.TestCase):
             "=gh issue delete 1 --repo owner/repo",
             "=codex-delivery deliver",
             "=rm -rf README.md",
+            "~gitcmd reset --hard HEAD",
+            "~ghcmd issue delete 1 --repo owner/repo",
+            "~rmcmd -rf README.md",
+            "g\\\nit reset --hard HEAD",
+            "g\\\nh issue delete 1 --repo owner/repo",
+            "r\\\nm -rf README.md",
+            "bash -c 'g\\\nit reset --hard HEAD'",
             "x=gh; \"$x\" issue comment 9 --repo attacker/repo",
             "eval 'rm README.md'",
             "printf 'rm README.md\\n' | bash",
@@ -948,6 +955,8 @@ class GuardTest(unittest.TestCase):
             "if ${GIT} add -- README.md; then true; fi",
             "if g* add -- README.md; then true; fi",
             "if =git reset --hard HEAD; then true; fi",
+            "if ~gitcmd reset --hard HEAD; then true; fi",
+            "if g\\\nit reset --hard HEAD; then true; fi",
             "if env -S 'git reset --hard HEAD'; then true; fi",
             "if env --split-string 'git add -- README.md'; then true; fi",
             "if env -S \"$CMD\"; then true; fi",
@@ -962,6 +971,7 @@ class GuardTest(unittest.TestCase):
             "if echo codex-delivery; then true; fi",
             "if rg --files /tmp/codex-delivery; then true; fi",
             "repeat 1 echo git",
+            "printf '%s' 'g\\\nit reset --hard HEAD'",
         ):
             with self.subTest(command=command):
                 self.assert_allowed(command)

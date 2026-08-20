@@ -2120,10 +2120,35 @@ def _has_shell_argument_expansion(command):
     return False
 
 
+def _has_shell_line_continuation(command):
+    """single quote外のbackslash-newlineによるtoken連結を検出する。"""
+    quote = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            if index + 1 < len(command) and command[index + 1] == "\n":
+                return True
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        index += 1
+    return False
+
+
 def _command_word_has_expansion(token):
     """実行command名そのものを変更し得るshell expansionならTrue。"""
     return (
-        token.startswith("=")
+        token.startswith(("=", "~"))
         or any(char in token for char in {"$", "`", "*", "?"})
         or (any(char in token for char in {"{", "}"}) and token not in {"{", "}"})
         or ("[" in token and token != "[")
@@ -2225,6 +2250,8 @@ def blocked_reason(command, cwd=None, depth=0):
     """連結コマンドと入れ子shellを調べ、禁止操作の理由を返す。"""
     if depth > 3:
         return "入れ子が深いshellコマンドは安全性を確認できません"
+    if _has_shell_line_continuation(command):
+        return "backslash-newlineによるshell token連結は安全に検査できません"
     if "$(" in command or "`" in command:
         return "command substitutionを含むcommandは安全に検査できません"
     segments = list(_command_segments(command))
