@@ -1543,7 +1543,7 @@ def _python_helper_invocation_reason(tokens):
         module, arguments_start = module_operand
         if module in {"codex-worktree", "codex-delivery"}:
             return "helperはPython moduleまたはinterpreter経由で実行できません"
-        if module == "runpy" and any(
+        if any(
             os.path.basename(argument) in {"codex-worktree", "codex-delivery"}
             for argument in tokens[arguments_start:]
         ):

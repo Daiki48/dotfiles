@@ -301,6 +301,9 @@ class GuardTest(unittest.TestCase):
             "python3 -B -m codex-delivery deliver",
             "python3 -X dev -m codex-worktree list",
             "python3 -B -m runpy /home/user/.local/bin/codex-delivery",
+            "python3 -B -m cProfile /home/user/.local/bin/codex-delivery deliver",
+            "python3 -B -m trace --trace /home/user/.local/bin/codex-worktree create --issue 1",
+            "python3 -m pdb /home/user/.local/bin/codex-delivery deliver",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command)
