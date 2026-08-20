@@ -35,6 +35,16 @@ const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(unix)]
+const TRUSTED_GIT_COMMAND: &str = "/usr/bin/git";
+#[cfg(not(unix))]
+const TRUSTED_GIT_COMMAND: &str = "git";
+#[cfg(unix)]
+const TRUSTED_SSH_COMMAND: &str = "/usr/bin/ssh";
+#[cfg(not(unix))]
+const TRUSTED_SSH_COMMAND: &str = "ssh";
+const SYSTEM_PATH: &str = "/usr/bin:/bin";
+
 const BRANCH_PREFIXES: &[&str] = &[
     "feat", "feature", "fix", "refactor", "docs", "test", "chore", "ci", "build", "perf", "style",
     "hotfix", "update",
@@ -524,21 +534,155 @@ struct GitOutput {
 fn safe_environment(command: &mut Command) {
     command.env_remove("SSH_ASKPASS");
     // `env_clear` would drop PATH and locale, so explicitly remove only Git's
-    // environment controls. GIT_CONFIG_NOSYSTEM makes system config inert.
+    // environment controls. GIT_CONFIG_NOSYSTEM and an empty global config
+    // keep system/global configuration out of every internal Git invocation.
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
+        let text = key.to_string_lossy();
+        if text.starts_with("GIT_")
+            || text.eq_ignore_ascii_case("HTTP_PROXY")
+            || text.eq_ignore_ascii_case("HTTPS_PROXY")
+            || text.eq_ignore_ascii_case("ALL_PROXY")
+            || text.eq_ignore_ascii_case("NO_PROXY")
+            || text.eq_ignore_ascii_case("SSL_CERT_FILE")
+            || text.eq_ignore_ascii_case("SSL_CERT_DIR")
+        {
             command.env_remove(key);
         }
     }
-    let overridden_git_keys: Vec<OsString> = command
+    let overridden_keys: Vec<OsString> = command
         .get_envs()
-        .filter(|(key, value)| value.is_some() && key.to_string_lossy().starts_with("GIT_"))
+        .filter(|(key, value)| {
+            let text = key.to_string_lossy();
+            value.is_some()
+                && (text.starts_with("GIT_")
+                    || text.eq_ignore_ascii_case("HTTP_PROXY")
+                    || text.eq_ignore_ascii_case("HTTPS_PROXY")
+                    || text.eq_ignore_ascii_case("ALL_PROXY")
+                    || text.eq_ignore_ascii_case("NO_PROXY")
+                    || text.eq_ignore_ascii_case("SSL_CERT_FILE")
+                    || text.eq_ignore_ascii_case("SSL_CERT_DIR"))
+        })
         .map(|(key, _)| key.to_os_string())
         .collect();
-    for key in overridden_git_keys {
+    for key in overridden_keys {
         command.env_remove(key);
     }
     command.env("GIT_CONFIG_NOSYSTEM", "1");
+    #[cfg(unix)]
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    #[cfg(windows)]
+    command.env("GIT_CONFIG_GLOBAL", "NUL");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env("GIT_PAGER", "cat");
+    command.env("PATH", SYSTEM_PATH);
+}
+
+fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Command {
+    let mut command = Command::new(TRUSTED_GIT_COMMAND);
+    // Command-line config has higher precedence than repository-local config.
+    // Values that can select or execute another process are therefore pinned
+    // for every Git subcommand, including network operations.
+    command
+        .current_dir(cwd)
+        .arg("--no-pager")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg(format!("core.sshCommand={TRUSTED_SSH_COMMAND}"))
+        .arg("-c")
+        .arg("core.gitProxy=")
+        .arg("-c")
+        .arg("core.fsmonitor=")
+        .arg("-c")
+        .arg("credential.helper=")
+        .arg("-c")
+        .arg("http.proxy=")
+        .arg("-c")
+        .arg("https.proxy=")
+        .arg("-c")
+        .arg("protocol.ext.allow=never")
+        .arg("-c")
+        .arg("remote.origin.uploadpack=git-upload-pack")
+        .arg("-c")
+        .arg("remote.origin.receivepack=git-receive-pack")
+        .arg("-c")
+        .arg("core.bare=false")
+        .arg("--work-tree")
+        .arg(cwd)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    safe_environment(&mut command);
+    command
+}
+
+fn local_config_keys(cwd: &Path) -> Result<Vec<String>, WorktreeError> {
+    let mut command = isolated_git_command(
+        cwd,
+        &[
+            "config",
+            "--local",
+            "--includes",
+            "--name-only",
+            "--null",
+            "--list",
+        ],
+    );
+    let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
+        .map_err(|cause| error(format!("repository configを確認できません: {cause}")))?;
+    if !output.status.success() {
+        return Err(error("repository configを安全に確認できません"));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| error("repository configのkeyがUTF-8ではありません"))?;
+    Ok(text
+        .split('\0')
+        .filter(|key| !key.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect())
+}
+
+fn unsafe_local_config_key(key: &str) -> bool {
+    key == "include.path"
+        || key.starts_with("includeif.")
+        || key == "core.sshcommand"
+        || key == "core.gitproxy"
+        || key == "core.fsmonitor"
+        || key == "credential.helper"
+        || key == "http.proxy"
+        || key == "https.proxy"
+        || key == "protocol.ext.allow"
+        || key.starts_with("url.")
+            && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof"))
+        || key.starts_with("http.")
+            && (key.ends_with(".proxy")
+                || key.ends_with(".extraheader")
+                || key.ends_with(".proxycommand"))
+        || key.starts_with("remote.")
+            && (key.ends_with(".uploadpack")
+                || key.ends_with(".receivepack")
+                || key.ends_with(".proxy"))
+        || key.starts_with("filter.")
+            && (key.ends_with(".process") || key.ends_with(".clean") || key.ends_with(".smudge"))
+        || key == "diff.external"
+        || key.starts_with("diff.") && (key.ends_with(".command") || key.ends_with(".textconv"))
+        || key.starts_with("merge.") && key.ends_with(".driver")
+        || key == "interactive.difffilter"
+        || key == "gc.recentobjectshook"
+        || key == "core.alternaterefscommand"
+}
+
+fn validate_local_config(cwd: &Path) -> Result<(), WorktreeError> {
+    if let Some(key) = local_config_keys(cwd)?
+        .into_iter()
+        .find(|key| unsafe_local_config_key(key))
+    {
+        return Err(error(format!(
+            "repository configの実行・transport設定を安全に隔離できません: {key}"
+        )));
+    }
+    Ok(())
 }
 
 trait EmptyFallback {
@@ -555,16 +699,8 @@ impl EmptyFallback for String {
 }
 
 fn git(cwd: &Path, arguments: &[&str]) -> Result<GitOutput, WorktreeError> {
-    let mut command = Command::new("git");
-    command
-        .current_dir(cwd)
-        .arg("-c")
-        .arg("core.hooksPath=/dev/null")
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    safe_environment(&mut command);
+    validate_local_config(cwd)?;
+    let mut command = isolated_git_command(cwd, arguments);
     let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
         .map_err(|cause| error(format!("gitを実行できません: {cause}")))?;
     let stdout =
@@ -582,16 +718,8 @@ fn git(cwd: &Path, arguments: &[&str]) -> Result<GitOutput, WorktreeError> {
 fn git_allow_failure(cwd: &Path, arguments: &[&str]) -> Result<(i32, GitOutput), WorktreeError> {
     // Branch existence checks need the exit status. The same bounded runner is
     // used, but non-zero output is not converted into WorktreeError here.
-    let mut command = Command::new("git");
-    command
-        .current_dir(cwd)
-        .arg("-c")
-        .arg("core.hooksPath=/dev/null")
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    safe_environment(&mut command);
+    validate_local_config(cwd)?;
+    let mut command = isolated_git_command(cwd, arguments);
     let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
         .map_err(|cause| error(format!("gitを実行できません: {cause}")))?;
     let stdout =
@@ -606,6 +734,73 @@ fn git_allow_failure(cwd: &Path, arguments: &[&str]) -> Result<(i32, GitOutput),
 
 fn git_stdout(cwd: &Path, arguments: &[&str]) -> Result<String, WorktreeError> {
     Ok(git(cwd, arguments)?.stdout)
+}
+
+fn local_config_values(cwd: &Path, key: &str) -> Result<Vec<String>, WorktreeError> {
+    let mut command = isolated_git_command(
+        cwd,
+        &[
+            "config",
+            "--local",
+            "--includes",
+            "--null",
+            "--get-all",
+            key,
+        ],
+    );
+    let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
+        .map_err(|cause| error(format!("repository configを確認できません: {cause}")))?;
+    if !output.status.success() {
+        if output.status.code() == Some(1) {
+            return Ok(Vec::new());
+        }
+        return Err(error(format!(
+            "repository configの{key}を安全に確認できません"
+        )));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| error(format!("repository configの{key}がUTF-8ではありません")))?;
+    Ok(text
+        .split('\0')
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn safe_local_origin(url: &str) -> bool {
+    let value = url.trim();
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return false;
+    }
+    let path = Path::new(value);
+    path.is_absolute()
+        || (!value.contains("://") && !value.starts_with("git@") && !value.contains(':'))
+}
+
+fn origin_urls(root: &Path) -> Result<(String, String), WorktreeError> {
+    validate_local_config(root)?;
+    let fetch_urls = local_config_values(root, "remote.origin.url")?;
+    let push_urls = local_config_values(root, "remote.origin.pushurl")?;
+    if fetch_urls.len() != 1 || push_urls.len() > 1 {
+        return Err(error(
+            "originのfetch/push URLはそれぞれ1件に限定してください",
+        ));
+    }
+    let fetch = fetch_urls
+        .into_iter()
+        .next()
+        .ok_or_else(|| error("originのfetch URLを安全に確認できません"))?
+        .trim()
+        .to_string();
+    let push = push_urls
+        .into_iter()
+        .next()
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|| fetch.clone());
+    Ok((fetch, push))
 }
 
 fn absolute_git_path(cwd: &Path, argument: &str) -> Result<PathBuf, WorktreeError> {
@@ -642,19 +837,11 @@ fn valid_github_byte(byte: u8) -> bool {
 }
 
 fn origin_identity(root: &Path, allow_local_origin: bool) -> Result<String, WorktreeError> {
-    let fetch = git_stdout(root, &["remote", "get-url", "--all", "origin"])?;
-    let push = git_stdout(root, &["remote", "get-url", "--push", "--all", "origin"])?;
-    let fetch_urls: Vec<&str> = fetch.lines().collect();
-    let push_urls: Vec<&str> = push.lines().collect();
-    if fetch_urls.len() != 1 || push_urls.len() != 1 {
-        return Err(error(
-            "originのfetch/push URLはそれぞれ1件に限定してください",
-        ));
-    }
-    let fetch_repository = github_repository(fetch_urls[0]);
-    let push_repository = github_repository(push_urls[0]);
+    let (fetch, push) = origin_urls(root)?;
+    let fetch_repository = github_repository(&fetch);
+    let push_repository = github_repository(&push);
     if fetch_repository.is_none() || push_repository != fetch_repository {
-        if allow_local_origin && fetch_urls == push_urls {
+        if allow_local_origin && fetch == push && safe_local_origin(&fetch) {
             return Ok("test/local".to_string());
         }
         return Err(error(
@@ -679,7 +866,15 @@ fn valid_oid(value: &str) -> bool {
 }
 
 fn remote_default(root: &Path) -> Result<(String, String), WorktreeError> {
-    let output = git_stdout(root, &["ls-remote", "--symref", "origin", "HEAD"])?;
+    let (origin, _) = origin_urls(root)?;
+    let arguments = [
+        "ls-remote",
+        "--upload-pack=git-upload-pack",
+        "--symref",
+        origin.as_str(),
+        "HEAD",
+    ];
+    let output = git_stdout(root, &arguments)?;
     let lines: Vec<&str> = output.lines().collect();
     if lines.len() != 2 {
         return Err(error("originのdefault branchを一意に確認できません"));
@@ -1154,16 +1349,17 @@ fn branch_exists(repository: &Repository, branch: &str) -> Result<bool, Worktree
     if local_code == 0 {
         return Ok(true);
     }
-    let (remote_code, output) = git_allow_failure(
-        &repository.root,
-        &[
-            "ls-remote",
-            "--exit-code",
-            "--heads",
-            "origin",
-            &format!("refs/heads/{branch}"),
-        ],
-    )?;
+    let (origin, _) = origin_urls(&repository.root)?;
+    let remote_ref = format!("refs/heads/{branch}");
+    let arguments = [
+        "ls-remote",
+        "--exit-code",
+        "--upload-pack=git-upload-pack",
+        "--heads",
+        origin.as_str(),
+        remote_ref.as_str(),
+    ];
+    let (remote_code, output) = git_allow_failure(&repository.root, &arguments)?;
     if remote_code != 0 && remote_code != 2 {
         return Err(error(
             output
@@ -1205,10 +1401,19 @@ fn create_worktree(
     if branch_exists(&repository, branch)? {
         return Err(error("localまたはremote branchが既に存在します"));
     }
-    git_stdout(
-        &repository.root,
-        &["fetch", "origin", &repository.default_branch],
-    )?;
+    let (origin, _) = origin_urls(&repository.root)?;
+    let refspec = format!(
+        "+refs/heads/{}:refs/remotes/origin/{}",
+        repository.default_branch, repository.default_branch
+    );
+    let fetch_arguments = [
+        "fetch",
+        "--no-tags",
+        "--upload-pack=git-upload-pack",
+        origin.as_str(),
+        refspec.as_str(),
+    ];
+    git_stdout(&repository.root, &fetch_arguments)?;
     let fetched_oid = git_stdout(
         &repository.root,
         &["rev-parse", &format!("refs/remotes/{base}")],
@@ -1976,14 +2181,54 @@ mod tests {
     #[test]
     fn safe_environment_removes_git_controls() {
         let mut command = Command::new("env");
-        command.env("GIT_SSH_COMMAND", "unsafe");
+        command
+            .env("GIT_SSH_COMMAND", "unsafe")
+            .env("HTTPS_PROXY", "http://proxy.invalid")
+            .env("SSL_CERT_FILE", "/tmp/untrusted.pem");
         safe_environment(&mut command);
-        assert!(
-            command
-                .get_envs()
-                .find(|(key, value)| *key == OsStr::new("GIT_SSH_COMMAND") && value.is_some())
-                .is_none()
+        let values: BTreeMap<OsString, Option<OsString>> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsString::from)))
+            .collect();
+        assert_eq!(values.get(OsStr::new("GIT_SSH_COMMAND")), Some(&None));
+        assert_eq!(values.get(OsStr::new("HTTPS_PROXY")), Some(&None));
+        assert_eq!(values.get(OsStr::new("SSL_CERT_FILE")), Some(&None));
+        assert_eq!(
+            values.get(OsStr::new("PATH")),
+            Some(&Some(OsString::from(SYSTEM_PATH)))
         );
+    }
+
+    #[test]
+    fn unsafe_repository_config_keys_are_fail_closed() {
+        for key in [
+            "include.path",
+            "core.sshCommand",
+            "http.example.proxy",
+            "url.safe.insteadOf",
+            "filter.lfs.process",
+            "diff.external",
+            "merge.custom.driver",
+        ] {
+            assert!(unsafe_local_config_key(&key.to_ascii_lowercase()), "{key}");
+        }
+        assert!(!unsafe_local_config_key("remote.origin.url"));
+        assert!(!unsafe_local_config_key("user.name"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malicious_repository_ssh_command_is_rejected_without_execution() {
+        let fixture = TemporaryRepository::new();
+        let marker = fixture.directory.join("ssh-command-ran");
+        let command = format!("sh -c 'touch {}'", marker.display());
+        run_git(
+            &fixture.repository,
+            &["config", "core.sshCommand", command.as_str()],
+        );
+
+        assert!(create_worktree(&fixture.repository, "feat/ssh", "task-ssh", true).is_err());
+        assert!(!marker.exists());
     }
 
     #[test]

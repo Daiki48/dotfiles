@@ -9,7 +9,7 @@ use std::env;
 use std::ffi::{CStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -279,7 +279,7 @@ fn remaining(timeout: Duration) -> Result<Duration> {
     })
 }
 
-fn safe_environment(command: &mut Command) {
+fn safe_environment(command: &mut Command, gh_config: Option<&Path>) {
     let removes: Vec<OsString> = env::vars_os()
         .filter_map(|(key, _)| {
             let key_text = key.to_string_lossy();
@@ -287,18 +287,53 @@ fn safe_environment(command: &mut Command) {
                 || key_text == "SSH_ASKPASS"
                 || key_text == "GIT_ASKPASS"
                 || key_text == "GH_REPO"
-                || key_text == "GH_CONFIG_DIR")
-                .then_some(key)
+                || key_text == "GH_CONFIG_DIR"
+                || key_text.eq_ignore_ascii_case("HTTP_PROXY")
+                || key_text.eq_ignore_ascii_case("HTTPS_PROXY")
+                || key_text.eq_ignore_ascii_case("ALL_PROXY")
+                || key_text.eq_ignore_ascii_case("NO_PROXY")
+                || key_text.eq_ignore_ascii_case("SSL_CERT_FILE")
+                || key_text.eq_ignore_ascii_case("SSL_CERT_DIR"))
+            .then_some(key)
         })
         .collect();
     for key in removes {
         command.env_remove(key);
     }
+    let overridden: Vec<OsString> = command
+        .get_envs()
+        .filter(|(key, value)| {
+            value.is_some()
+                && (key.to_string_lossy().starts_with("GIT_")
+                    || key.to_string_lossy() == "SSH_ASKPASS"
+                    || key.to_string_lossy() == "GIT_ASKPASS"
+                    || key.to_string_lossy() == "GH_REPO"
+                    || key.to_string_lossy() == "GH_CONFIG_DIR"
+                    || key.to_string_lossy().eq_ignore_ascii_case("HTTP_PROXY")
+                    || key.to_string_lossy().eq_ignore_ascii_case("HTTPS_PROXY")
+                    || key.to_string_lossy().eq_ignore_ascii_case("ALL_PROXY")
+                    || key.to_string_lossy().eq_ignore_ascii_case("NO_PROXY")
+                    || key.to_string_lossy().eq_ignore_ascii_case("SSL_CERT_FILE")
+                    || key.to_string_lossy().eq_ignore_ascii_case("SSL_CERT_DIR"))
+        })
+        .map(|(key, _)| key.to_os_string())
+        .collect();
+    for key in overridden {
+        command.env_remove(key);
+    }
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_HOST", "github.com")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
         .env("PATH", SYSTEM_PATH);
+    if let Some(path) = gh_config {
+        command.env("GH_CONFIG_DIR", path);
+    }
 }
 
 fn trusted_binary(path: &str, name: &str) -> Result<String> {
@@ -336,10 +371,37 @@ fn trusted_binary(path: &str, name: &str) -> Result<String> {
     Ok(path.display().to_string())
 }
 fn git_command(args: &[String]) -> Result<Vec<String>> {
+    trusted_binary(GH_BINARY, "GitHub CLI")?;
     let mut result = vec![
         trusted_binary(GIT_BINARY, "Git")?,
         "-c".into(),
         "core.hooksPath=/dev/null".into(),
+        "-c".into(),
+        "core.sshCommand=/usr/bin/ssh".into(),
+        "-c".into(),
+        "core.gitProxy=none".into(),
+        "-c".into(),
+        "core.askPass=".into(),
+        "-c".into(),
+        "core.fsmonitor=false".into(),
+        "-c".into(),
+        "core.pager=cat".into(),
+        "-c".into(),
+        "credential.helper=!/usr/bin/gh auth git-credential".into(),
+        "-c".into(),
+        "diff.external=".into(),
+        "-c".into(),
+        "protocol.ext.allow=never".into(),
+        "-c".into(),
+        "protocol.file.allow=never".into(),
+        "-c".into(),
+        "protocol.git.allow=never".into(),
+        "-c".into(),
+        "remote.origin.uploadpack=git-upload-pack".into(),
+        "-c".into(),
+        "remote.origin.receivepack=git-receive-pack".into(),
+        "-c".into(),
+        "remote.origin.proxy=".into(),
     ];
     if args.iter().any(|arg| arg.is_empty()) {
         return Err(error("外部commandを安全に構成できません"));
@@ -353,13 +415,34 @@ struct Captured {
     stdout: String,
 }
 fn run(command: &[String], cwd: &Path, timeout: Duration, max_output: usize) -> Result<Captured> {
+    run_with_config(command, cwd, timeout, max_output, None)
+}
+fn run_with_config(
+    command: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    max_output: usize,
+    gh_config: Option<&Path>,
+) -> Result<Captured> {
     if command.is_empty() || command.iter().any(String::is_empty) {
         return Err(error("外部commandを安全に構成できません"));
     }
+    let git_command = command.first().is_some_and(|value| value == GIT_BINARY);
+    if git_command {
+        validate_local_git_config(cwd)?;
+    }
+    let automatic_sandbox = if git_command && gh_config.is_none() {
+        let sandbox = GhSandbox::create(cwd)?;
+        sandbox.snapshot_args(&[])?;
+        Some(sandbox)
+    } else {
+        None
+    };
+    let gh_config = gh_config.or_else(|| automatic_sandbox.as_ref().map(|v| v.path.as_path()));
     let timeout = remaining(timeout)?;
     let mut command_builder = Command::new(&command[0]);
     command_builder.args(&command[1..]).current_dir(cwd);
-    safe_environment(&mut command_builder);
+    safe_environment(&mut command_builder, gh_config);
     let output = process::run_with_limit(&mut command_builder, timeout, max_output)
         .map_err(|_| error("外部commandの実行またはcaptureに失敗しました"))?;
     Ok(Captured {
@@ -383,18 +466,91 @@ fn git(cwd: &Path, args: &[&str], check: bool) -> Result<String> {
     Ok(result.stdout)
 }
 fn gh(cwd: &Path, args: &[String], check: bool) -> Result<String> {
+    let sandbox = GhSandbox::create(cwd)?;
+    let args = sandbox.snapshot_args(args)?;
     let mut command = vec![trusted_binary(GH_BINARY, "GitHub CLI")?];
-    command.extend(args.iter().cloned());
-    let result = run(
+    command.extend(args);
+    let result = run_with_config(
         &command,
         cwd,
         Duration::from_secs(COMMAND_TIMEOUT),
         MAX_OUTPUT_BYTES,
+        Some(&sandbox.path),
     )?;
     if check && !result.status.success() {
         return Err(error("GitHub CLI commandに失敗しました"));
     }
     Ok(result.stdout)
+}
+
+fn dangerous_local_git_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "include.path"
+        || key.starts_with("includeif.")
+        || key == "core.sshcommand"
+        || key == "core.gitproxy"
+        || key == "core.fsmonitor"
+        || key == "core.askpass"
+        || key == "core.pager"
+        || key == "diff.external"
+        || key == "credential.helper"
+        || key == "http.proxy"
+        || key == "http.sslcainfo"
+        || key == "http.sslverify"
+        || key.starts_with("pager.")
+        || key.starts_with("filter.")
+            && (key.ends_with(".process")
+                || key.ends_with(".clean")
+                || key.ends_with(".smudge")
+                || key.ends_with(".required"))
+        || key.starts_with("merge.") && key.ends_with(".driver")
+        || key.starts_with("remote.")
+            && (key.ends_with(".proxy")
+                || key.ends_with(".uploadpack")
+                || key.ends_with(".receivepack")
+                || key.ends_with(".pushurl"))
+        || key.starts_with("url.")
+            && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof"))
+        || key.starts_with("protocol.") && key.ends_with(".allow")
+}
+
+fn validate_local_git_config(cwd: &Path) -> Result<()> {
+    let mut command = Command::new(GIT_BINARY);
+    command
+        .current_dir(cwd)
+        .arg("config")
+        .arg("--local")
+        .arg("--null")
+        .arg("--name-only")
+        .arg("--get-regexp")
+        .arg(".*")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    safe_environment(&mut command, None);
+    let output = process::run_with_limit(
+        &mut command,
+        remaining(Duration::from_secs(COMMAND_TIMEOUT))?,
+        MAX_OUTPUT_BYTES,
+    )
+    .map_err(|_| error("local Git configの検査に失敗しました"))?;
+    // `git config --local` exits 1 when no key matches. Every other
+    // non-success status is an unreadable local config.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(error("local Git configを安全に検査できません"));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| error("local Git configの応答がUTF-8ではありません"))?;
+    if text
+        .split('\0')
+        .filter(|key| !key.is_empty())
+        .any(dangerous_local_git_key)
+    {
+        return Err(error(
+            "local Git configに外部実行またはtransport変更設定があります",
+        ));
+    }
+    Ok(())
 }
 fn parse_json(text: &str, label: &str) -> Result<Value> {
     if text.is_empty() || text.len() > MAX_OUTPUT_BYTES {
@@ -406,31 +562,43 @@ fn gh_json(cwd: &Path, args: &[String]) -> Result<Value> {
     parse_json(&gh(cwd, args, true)?, "GitHub")
 }
 
+fn current_user_home() -> Result<PathBuf> {
+    #[cfg(unix)]
+    let candidate = unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        if entry.is_null() {
+            None
+        } else {
+            CStr::from_ptr((*entry).pw_dir)
+                .to_str()
+                .ok()
+                .map(PathBuf::from)
+        }
+    };
+    #[cfg(not(unix))]
+    let candidate = env::var_os("HOME").map(PathBuf::from);
+    let candidate =
+        candidate.ok_or_else(|| error("current userのhome directoryを確認できません"))?;
+    validate_absolute_path(&candidate, "home directory")
+}
+
+fn validate_absolute_path(path: &Path, label: &str) -> Result<PathBuf> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(error(format!("{label}は安全な絶対pathにしてください")));
+    }
+    Ok(path.to_path_buf())
+}
+
 fn codex_home() -> Result<PathBuf> {
     let candidate = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            #[cfg(unix)]
-            {
-                unsafe {
-                    let uid = libc::getuid();
-                    let entry = libc::getpwuid(uid);
-                    if entry.is_null() {
-                        None
-                    } else {
-                        CStr::from_ptr((*entry).pw_dir)
-                            .to_str()
-                            .ok()
-                            .map(PathBuf::from)
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                env::var_os("HOME").map(PathBuf::from)
-            }
-        })
-        .ok_or_else(|| error("current userのhome directoryを確認できません"))?;
+        .map(|path| validate_absolute_path(&path, "CODEX_HOME"))
+        .transpose()?
+        .unwrap_or(current_user_home()?);
     if !candidate.is_absolute()
         || candidate
             .components()
@@ -506,8 +674,17 @@ fn receipt_path(repository: &str, task: &str, head: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn safe_regular(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| error("managed fileを確認できません"))?;
+fn open_private_regular(path: &Path, label: &str) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .map_err(|_| error(format!("{label}を安全に開けません")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| error(format!("{label}を安全に検査できません")))?;
     #[cfg(unix)]
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -515,26 +692,246 @@ fn safe_regular(path: &Path) -> Result<()> {
         || metadata.mode() & 0o077 != 0
         || metadata.len() > MAX_FILE_BYTES
     {
-        return Err(error(
-            "managed fileが安全なprivate regular fileではありません",
-        ));
+        return Err(error(format!(
+            "{label}が安全なprivate regular fileではありません"
+        )));
     }
     #[cfg(not(unix))]
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-        return Err(error(
-            "managed fileが安全なprivate regular fileではありません",
-        ));
+        return Err(error(format!(
+            "{label}が安全なprivate regular fileではありません"
+        )));
     }
-    Ok(())
+    Ok(file)
 }
+
+fn read_private_bytes(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let mut file = open_private_regular(path, label)?;
+    let before = file
+        .metadata()
+        .map_err(|_| error(format!("{label}を安全に検査できません")))?;
+    let mut bytes = Vec::with_capacity(before.len().min(MAX_FILE_BYTES) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|_| error(format!("{label}を安全に読み込めません")))?;
+    let after = file
+        .metadata()
+        .map_err(|_| error(format!("{label}を安全に検査できません")))?;
+    if before.len() != after.len() || bytes.len() as u64 != after.len() {
+        return Err(error(format!("{label}の読み込み中に内容が変化しました")));
+    }
+    Ok(bytes)
+}
+
+fn read_private_text(path: &Path, label: &str) -> Result<String> {
+    let bytes = read_private_bytes(path, label)?;
+    String::from_utf8(bytes).map_err(|_| error(format!("{label}がUTF-8ではありません")))
+}
+
 fn read_json_file(path: &Path, label: &str) -> Result<Value> {
-    safe_regular(path)?;
-    let text =
-        fs::read_to_string(path).map_err(|_| error(format!("{label}を安全に解析できません")))?;
+    let text = read_private_text(path, label)?;
     parse_json(&text, label)
 }
+
+#[cfg(unix)]
+fn sync_directory(path: &Path, label: &str) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let directory = options
+        .open(path)
+        .map_err(|_| error(format!("{label}のparent directoryを開けません")))?;
+    directory.sync_all().map_err(|_| {
+        error(format!(
+            "{label}のparent directoryをdurableに保存できません"
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path, _label: &str) -> Result<()> {
+    Ok(())
+}
+
+fn private_temp_parent() -> Result<PathBuf> {
+    #[cfg(unix)]
+    let path = PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let path = env::temp_dir();
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| error("private temporary directoryを確認できません"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(error("private temporary directoryが安全ではありません"));
+    }
+    Ok(path)
+}
+
+fn gh_config_candidates() -> Result<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    if let Some(value) = env::var_os("GH_CONFIG_DIR")
+        && let Ok(path) = validate_absolute_path(&PathBuf::from(value), "GH_CONFIG_DIR")
+    {
+        candidates.push(path);
+    }
+    if let Some(value) = env::var_os("XDG_CONFIG_HOME")
+        && let Ok(path) = validate_absolute_path(&PathBuf::from(value), "XDG_CONFIG_HOME")
+    {
+        candidates.push(path.join("gh"));
+    }
+    candidates.push(current_user_home()?.join(".config/gh"));
+    Ok(candidates)
+}
+
+fn gh_auth_hosts() -> Result<Option<Vec<u8>>> {
+    for directory in gh_config_candidates()? {
+        let source = directory.join("hosts.yml");
+        if source.exists() {
+            return read_private_bytes(&source, "GitHub auth hosts.yml").map(Some);
+        }
+    }
+    Ok(None)
+}
+
+struct GhSandbox {
+    path: PathBuf,
+}
+
+impl GhSandbox {
+    fn create(_cwd: &Path) -> Result<Self> {
+        // Keep the sandbox in the OS temporary directory rather than under a
+        // repository-controlled path. `cwd` is retained in the signature so
+        // Git and GitHub invocations share one construction contract.
+        let parent = private_temp_parent()?;
+        let suffix = format!(
+            "codex-delivery-gh-{}-{}",
+            std::process::id(),
+            now().replace(|c: char| !c.is_ascii_digit(), "")
+        );
+        let mut path = parent.join(suffix);
+        let mut created = false;
+        for attempt in 0..8 {
+            if attempt > 0 {
+                path = parent.join(format!(
+                    "{}-{attempt}",
+                    path.file_name()
+                        .and_then(|v| v.to_str())
+                        .unwrap_or("sandbox")
+                ));
+            }
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    created = true;
+                    break;
+                }
+                Err(cause) if cause.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => break,
+            }
+        }
+        if !created {
+            return Err(error(
+                "GitHub CLIのprivate config directoryを作成できません",
+            ));
+        }
+        let sandbox = Self { path };
+        #[cfg(unix)]
+        fs::set_permissions(&sandbox.path, fs::Permissions::from_mode(0o700))
+            .map_err(|_| error("GitHub CLIのprivate config directoryを保護できません"))?;
+        if let Some(hosts) = gh_auth_hosts()? {
+            sandbox.write_private("hosts.yml", &hosts, "GitHub auth hosts.yml")?;
+        }
+        sync_directory(&sandbox.path, "GitHub CLI private config")?;
+        Ok(sandbox)
+    }
+
+    fn write_private(&self, name: &str, bytes: &[u8], label: &str) -> Result<PathBuf> {
+        let path = self.path.join(name);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o400);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|_| error(format!("{label}のprivate snapshotを作成できません")))?;
+        file.write_all(bytes)
+            .map_err(|_| error(format!("{label}のprivate snapshotを作成できません")))?;
+        file.sync_all().map_err(|_| {
+            error(format!(
+                "{label}のprivate snapshotをdurableに保存できません"
+            ))
+        })?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o400))
+            .map_err(|_| error(format!("{label}のprivate snapshotを固定できません")))?;
+        Ok(path)
+    }
+
+    fn snapshot_args(&self, args: &[String]) -> Result<Vec<String>> {
+        let mut result = Vec::with_capacity(args.len());
+        let mut index = 0;
+        while index < args.len() {
+            let argument = &args[index];
+            if argument == "--body-file" {
+                let source = args
+                    .get(index + 1)
+                    .ok_or_else(|| error("GitHub CLI body-fileのpathが不足しています"))?;
+                let bytes = read_private_bytes(Path::new(source), "GitHub CLI body-file")?;
+                let snapshot_name = format!("body-file-{index}");
+                let snapshot =
+                    self.write_private(&snapshot_name, &bytes, "GitHub CLI body-file")?;
+                result.push(argument.clone());
+                result.push(snapshot.display().to_string());
+                index += 2;
+                continue;
+            }
+            if let Some(source) = argument.strip_prefix("--body-file=") {
+                if source.is_empty() {
+                    return Err(error("GitHub CLI body-fileのpathが不足しています"));
+                }
+                let bytes = read_private_bytes(Path::new(source), "GitHub CLI body-file")?;
+                let snapshot_name = format!("body-file-{index}");
+                let snapshot =
+                    self.write_private(&snapshot_name, &bytes, "GitHub CLI body-file")?;
+                result.push(format!("--body-file={}", snapshot.display()));
+            } else {
+                result.push(argument.clone());
+            }
+            index += 1;
+        }
+        sync_directory(&self.path, "GitHub CLI private snapshot")?;
+        #[cfg(unix)]
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o500))
+            .map_err(|_| error("GitHub CLIのprivate config directoryを固定できません"))?;
+        Ok(result)
+    }
+}
+
+impl Drop for GhSandbox {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 fn atomic_json(path: &Path, value: &Value) -> Result<()> {
-    if path.parent().is_none() || !path.parent().is_some_and(|v| v.is_dir() && !v.is_symlink()) {
+    let parent = path
+        .parent()
+        .filter(|value| value.is_dir() && !value.is_symlink())
+        .ok_or_else(|| error("state parentが安全ではありません"))?;
+    #[cfg(unix)]
+    let parent_handle = {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options
+            .open(parent)
+            .map_err(|_| error("state parentをdurableに保存できません"))?
+    };
+    if path.file_name().is_none() {
         return Err(error("state parentが安全ではありません"));
     }
     let suffix = format!(
@@ -564,6 +961,10 @@ fn atomic_json(path: &Path, value: &Value) -> Result<()> {
         file.sync_all()
             .map_err(|_| error("receipt/stateをatomic保存できません"))?;
         fs::rename(&temporary, path).map_err(|_| error("receipt/stateをatomic保存できません"))?;
+        #[cfg(unix)]
+        parent_handle
+            .sync_all()
+            .map_err(|_| error("receipt/stateのparent directoryをdurableに保存できません"))?;
         Ok(())
     })();
     if result.is_err() {
@@ -2595,7 +2996,7 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::sync::{Mutex, OnceLock};
 
@@ -2920,7 +3321,7 @@ mod tests {
             #[cfg(unix)]
             std::os::unix::fs::symlink(&target, &state).unwrap();
             #[cfg(unix)]
-            assert!(safe_regular(&state).is_err());
+            assert!(open_private_regular(&state, "managed file").is_err());
         });
     }
 
@@ -3036,5 +3437,115 @@ mod tests {
         assert_eq!(MAX_OUTPUT_BYTES, 4 * 1024 * 1024);
         assert_eq!(COMMAND_TIMEOUT, 45);
         assert_eq!(OPERATION_TIMEOUT, 300);
+    }
+
+    #[test]
+    fn local_git_execution_and_transport_keys_fail_closed() {
+        for key in [
+            "include.path",
+            "includeIf.gitdir:path",
+            "core.sshCommand",
+            "credential.helper",
+            "core.fsmonitor",
+            "diff.external",
+            "filter.lfs.process",
+            "remote.origin.uploadpack",
+            "remote.origin.pushurl",
+            "url.ssh://evil/.insteadOf",
+            "protocol.ext.allow",
+        ] {
+            assert!(dangerous_local_git_key(key), "{key} must be rejected");
+        }
+        assert!(!dangerous_local_git_key("remote.origin.url"));
+    }
+
+    #[test]
+    fn external_environment_isolated_from_proxy_and_user_github_config() {
+        let mut command = Command::new("/bin/true");
+        command
+            .env("GH_CONFIG_DIR", "/tmp/user-config")
+            .env("HTTPS_PROXY", "http://proxy.invalid")
+            .env("GIT_SSH_COMMAND", "/tmp/ssh");
+        let private = Path::new("/tmp/codex-delivery-private-gh");
+        safe_environment(&mut command, Some(private));
+        let values: HashMap<OsString, Option<OsString>> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsString::from)))
+            .collect();
+        assert_eq!(
+            values.get(OsStr::new("GH_CONFIG_DIR")),
+            Some(&Some(private.into()))
+        );
+        assert_eq!(
+            values.get(OsStr::new("GH_HOST")),
+            Some(&Some("github.com".into()))
+        );
+        assert_eq!(values.get(OsStr::new("HTTPS_PROXY")), Some(&None));
+        assert_eq!(values.get(OsStr::new("GIT_SSH_COMMAND")), Some(&None));
+    }
+
+    #[test]
+    fn atomic_json_reopens_after_rename_and_leaves_no_temporary_file() {
+        with_codex_home(|home| {
+            let state = home
+                .join("worktrees")
+                .join(repo_key("owner/repo").unwrap())
+                .join(".state/durability.json");
+            let value = object([
+                ("version", Value::Number(1.into())),
+                ("kind", string("delivery")),
+            ]);
+            atomic_json(&state, &value).unwrap();
+            assert_eq!(read_json_file(&state, "durability").unwrap(), value);
+            let temporary = fs::read_dir(state.parent().unwrap())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("durability.json.tmp")
+                });
+            assert!(!temporary, "atomic temporary file must not remain");
+        });
+    }
+
+    #[test]
+    fn gh_body_file_is_copied_to_a_private_snapshot_before_execution() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("codex-delivery-body-{suffix}"));
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = root.join("body.md");
+        fs::write(&source, b"safe body").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        let sandbox_path = root.join("sandbox");
+        fs::create_dir(&sandbox_path).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&sandbox_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let sandbox = GhSandbox { path: sandbox_path };
+        let args = vec![
+            "pr".into(),
+            "create".into(),
+            "--body-file".into(),
+            source.display().to_string(),
+        ];
+        let rewritten = sandbox.snapshot_args(&args).unwrap();
+        fs::write(&source, b"secret replacement").unwrap();
+        let snapshot = rewritten.last().unwrap();
+        assert_eq!(fs::read(snapshot).unwrap(), b"safe body");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(snapshot).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        drop(sandbox);
+        fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 }

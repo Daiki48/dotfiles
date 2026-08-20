@@ -58,6 +58,16 @@ const LEGACY_CODEX_WORKTREE_SHA256: &str =
     "fd18804aff104ea79efd7ab76497ad008e93b8f6c8d88b78704c05141e4ce6c4";
 const LEGACY_CODEX_DELIVERY_SHA256: &str =
     "1ff878b7e0d50f6ece82c13a55dcdc53193df738bba4f9cc41cbee0367162b47";
+const LEGACY_PYTHON_HOOKS: &[(&str, &str)] = &[
+    (
+        "block_git_write.py",
+        "087e4b7cf0fd2cc227a8bcf694874849657a1ae34dc786a85de65c2891cff115",
+    ),
+    (
+        "prevent_irreversible_git.py",
+        "f5c94e69e1e704ed21b46a28fcec30f80c36bd82c5115d6fb6a2e4a6b54e6e37",
+    ),
+];
 
 // Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
 // ディレクトリごとリンクすることで、Skill の追加時に CLI 側の列挙を更新せずに済む。
@@ -1581,6 +1591,95 @@ fn archive_retired_profiles(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn archive_legacy_python_hook(path: &Path, expected_hash: &str) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect legacy hook {}", path.display()));
+        }
+    };
+    verify_current_user_regular_file(path, &metadata)?;
+    let contents =
+        fs::read(path).with_context(|| format!("Failed to read legacy hook {}", path.display()))?;
+    if sha256(&contents) != expected_hash {
+        println!(
+            "- Left non-managed legacy hook path unchanged: {}.",
+            path.display()
+        );
+        return Ok(false);
+    }
+
+    let state = managed_hook_state_path(path);
+    let archive_state = match fs::symlink_metadata(&state) {
+        Ok(state_metadata) => {
+            verify_current_user_regular_file(&state, &state_metadata)?;
+            let recorded = fs::read_to_string(&state)
+                .with_context(|| format!("Failed to read legacy hook state {}", state.display()))?;
+            recorded.trim() == expected_hash
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to inspect legacy hook state {}", state.display())
+            });
+        }
+    };
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before UNIX_EPOCH")?
+        .as_nanos();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Legacy hook file name is not UTF-8")?;
+    let backup = path.with_file_name(format!("{file_name}.bak.rust-migration.{timestamp}"));
+    if backup.exists() {
+        anyhow::bail!("Legacy hook backup already exists: {}", backup.display());
+    }
+    fs::rename(path, &backup).with_context(|| {
+        format!(
+            "Failed to archive legacy hook {} to {}",
+            path.display(),
+            backup.display()
+        )
+    })?;
+    sync_parent_directory(&backup)?;
+
+    if archive_state {
+        let state_name = state
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Legacy hook state file name is not UTF-8")?;
+        let state_backup =
+            state.with_file_name(format!("{state_name}.bak.rust-migration.{timestamp}"));
+        fs::rename(&state, &state_backup).with_context(|| {
+            format!(
+                "Failed to archive legacy hook state {} to {}",
+                state.display(),
+                state_backup.display()
+            )
+        })?;
+        sync_parent_directory(&state_backup)?;
+    }
+    println!(
+        "- Archived retired Python hook {} to {}.",
+        path.display(),
+        backup.display()
+    );
+    Ok(true)
+}
+
+fn archive_legacy_python_hooks(codex_dir: &Path) -> Result<()> {
+    let hooks = codex_dir.join("hooks");
+    for (name, expected_hash) in LEGACY_PYTHON_HOOKS {
+        archive_legacy_python_hook(&hooks.join(name), expected_hash)?;
+    }
+    Ok(())
+}
+
 fn validate_absolute_path(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         anyhow::bail!("CODEX_HOME must be an absolute path: {}", path.display());
@@ -1839,6 +1938,7 @@ pub fn setup() -> Result<()> {
 
     println!("\nMigrating shared Codex settings...");
     migrate_managed_config(&codex_dir)?;
+    archive_legacy_python_hooks(&codex_dir)?;
 
     println!("\n✅ Codex CLI setup completed!");
     println!("\n💡 Next steps:");
@@ -1857,12 +1957,13 @@ mod tests {
         LEGACY_CODEX_DELIVERY_SHA256, LEGACY_CODEX_WORKTREE_SHA256, MANAGED_BINARY_DESTINATIONS,
         MANAGED_HOOK_COMMAND, MANAGED_HOOK_DESTINATION, ManagedInstallMode, ManagedTransaction,
         ManagedTransactionKind, PYTHON_MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND,
-        begin_managed_transaction, contains_legacy_profile_config, copy_file_exclusive,
-        ensure_config_unchanged, ensure_managed_hook, ensure_managed_hook_with_legacy_hash,
-        ensure_managed_writable_root, ensure_private_directory, legacy_hash_for_destination,
-        managed_hook_state_path, managed_transaction_path, merge_managed_config,
-        merge_managed_config_with_root, migrate_managed_config_from_template,
-        publish_regular_file_exclusive, sha256, validate_setup_home, verify_managed_symlink,
+        archive_legacy_python_hook, begin_managed_transaction, contains_legacy_profile_config,
+        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook,
+        ensure_managed_hook_with_legacy_hash, ensure_managed_writable_root,
+        ensure_private_directory, legacy_hash_for_destination, managed_hook_state_path,
+        managed_transaction_path, merge_managed_config, merge_managed_config_with_root,
+        migrate_managed_config_from_template, publish_regular_file_exclusive, sha256,
+        validate_setup_home, verify_managed_symlink,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2437,6 +2538,49 @@ description = "local"
             Some(LEGACY_CODEX_DELIVERY_SHA256)
         );
         assert_eq!(legacy_hash_for_destination(MANAGED_HOOK_DESTINATION), None);
+    }
+
+    #[test]
+    fn exact_legacy_python_hook_and_matching_state_are_archived() {
+        let directory = TestDirectory::new("legacy-python-hook");
+        let hooks = directory.path().join("hooks");
+        fs::create_dir(&hooks).expect("create hooks directory");
+        let hook = hooks.join("block_git_write.py");
+        let contents = b"legacy Python hook fixture\n";
+        let expected_hash = sha256(contents);
+        fs::write(&hook, contents).expect("write legacy hook");
+        fs::write(managed_hook_state_path(&hook), &expected_hash).expect("write legacy state");
+
+        assert!(archive_legacy_python_hook(&hook, &expected_hash).expect("archive legacy hook"));
+        assert!(!hook.exists());
+        assert!(!managed_hook_state_path(&hook).exists());
+        let archived = fs::read_dir(&hooks)
+            .expect("read hooks directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(archived.len(), 2);
+        assert!(
+            archived
+                .iter()
+                .any(|name| { name.starts_with("block_git_write.py.bak.rust-migration.") })
+        );
+        assert!(archived.iter().any(|name| {
+            name.starts_with("block_git_write.py.managed.sha256.bak.rust-migration.")
+        }));
+        assert!(!archive_legacy_python_hook(&hook, &expected_hash).expect("idempotent archive"));
+    }
+
+    #[test]
+    fn unrecognized_legacy_hook_is_left_unchanged() {
+        let directory = TestDirectory::new("custom-python-hook");
+        let hook = directory.path().join("custom.py");
+        fs::write(&hook, b"user managed contents\n").expect("write custom hook");
+        assert!(!archive_legacy_python_hook(&hook, &sha256(b"different\n")).expect("inspect"));
+        assert_eq!(
+            fs::read(&hook).expect("read custom hook"),
+            b"user managed contents\n"
+        );
     }
 
     #[cfg(unix)]

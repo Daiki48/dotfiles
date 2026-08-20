@@ -5,12 +5,18 @@
 //! closed.  Process lifecycle is delegated to the shared process runner.
 
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsString;
+use std::ffi::CStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use crate::codex_tools::process;
 use serde::Deserializer;
@@ -23,6 +29,14 @@ const MAX_HOOK_INPUT_BYTES: usize = 1024 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const GH_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+const BODY_SNAPSHOT_DIR_PREFIX: &str = ".codex-hook-body-";
+const BODY_SNAPSHOT_MAX_RETAINED: usize = 128;
+const BODY_SNAPSHOT_TTL: Duration = Duration::from_secs(60 * 60);
+const SYSTEM_GIT: &str = "/usr/bin/git";
+const SYSTEM_GH: &str = "/usr/bin/gh";
+const SYSTEM_PATH: &str = "/usr/bin:/bin";
+
+static BODY_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const GIT_READ_ONLY: &[&str] = &[
     "status",
@@ -901,19 +915,119 @@ fn valid_commit_subject(message: &str) -> bool {
             .is_some_and(|character| !character.is_whitespace())
 }
 
+fn dangerous_local_git_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "include.path"
+        || key.starts_with("includeif.")
+        || key == "core.sshcommand"
+        || key == "core.gitproxy"
+        || key == "core.fsmonitor"
+        || key == "core.askpass"
+        || key == "core.pager"
+        || key == "diff.external"
+        || key == "credential.helper"
+        || key == "http.proxy"
+        || key == "http.sslcainfo"
+        || key == "http.sslverify"
+        || key.starts_with("http.")
+            && (key.ends_with(".proxy")
+                || key.ends_with(".extraheader")
+                || key.ends_with(".proxycommand")
+                || key.ends_with(".sslcainfo")
+                || key.ends_with(".sslverify"))
+        || key.starts_with("pager.")
+        || key.starts_with("filter.")
+            && (key.ends_with(".process")
+                || key.ends_with(".clean")
+                || key.ends_with(".smudge")
+                || key.ends_with(".required"))
+        || key.starts_with("diff.") && (key.ends_with(".command") || key.ends_with(".textconv"))
+        || key.starts_with("merge.") && key.ends_with(".driver")
+        || key.starts_with("remote.")
+            && (key.ends_with(".proxy")
+                || key.ends_with(".uploadpack")
+                || key.ends_with(".receivepack")
+                || key.ends_with(".pushurl"))
+        || key.starts_with("url.")
+            && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof"))
+        || key.starts_with("protocol.") && key.ends_with(".allow")
+        || key == "interactive.difffilter"
+        || key == "gc.recentobjectshook"
+        || key == "core.alternaterefscommand"
+}
+
+fn isolate_git_environment(command: &mut Command) {
+    command
+        .env_clear()
+        .envs(std::env::vars_os().filter(|(key, _)| {
+            let key = key.to_string_lossy();
+            !key.starts_with("GIT_")
+                && key != "SSH_ASKPASS"
+                && !key.eq_ignore_ascii_case("HTTP_PROXY")
+                && !key.eq_ignore_ascii_case("HTTPS_PROXY")
+                && !key.eq_ignore_ascii_case("ALL_PROXY")
+                && !key.eq_ignore_ascii_case("NO_PROXY")
+                && !key.eq_ignore_ascii_case("SSL_CERT_FILE")
+                && !key.eq_ignore_ascii_case("SSL_CERT_DIR")
+        }));
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("PATH", SYSTEM_PATH);
+}
+
+fn local_git_config_is_safe(cwd: &str) -> bool {
+    let mut command = Command::new(SYSTEM_GIT);
+    command.current_dir(cwd).args([
+        "config",
+        "--local",
+        "--null",
+        "--name-only",
+        "--get-regexp",
+        ".*",
+    ]);
+    isolate_git_environment(&mut command);
+    let Ok(output) = process::run_with_limit(
+        &mut command,
+        GIT_COMMAND_TIMEOUT,
+        MAX_MANIFEST_BYTES as usize,
+    ) else {
+        return false;
+    };
+    if !output.status.success() && output.status.code() != Some(1) {
+        return false;
+    }
+    String::from_utf8(output.stdout).is_ok_and(|keys| {
+        !keys
+            .split('\0')
+            .filter(|key| !key.is_empty())
+            .any(dangerous_local_git_key)
+    })
+}
+
 fn run_git(cwd: &str, args: &[&str]) -> Option<String> {
-    if cwd.is_empty() {
+    if cwd.is_empty() || !local_git_config_is_safe(cwd) {
         return None;
     }
-    let mut command = Command::new("git");
-    command.args(args).current_dir(cwd);
-    let vars: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(key, _)| {
-            let key = key.to_string_lossy();
-            !key.starts_with("GIT_") && key != "SSH_ASKPASS"
-        })
-        .collect();
-    command.env_clear().envs(vars);
+    let mut command = Command::new(SYSTEM_GIT);
+    command
+        .args([
+            "--no-pager",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "diff.external=",
+        ])
+        .args(args)
+        .current_dir(cwd);
+    isolate_git_environment(&mut command);
     let output =
         process::run_with_limit(&mut command, GIT_COMMAND_TIMEOUT, MAX_GIT_OUTPUT_BYTES).ok()?;
     if !output.status.success() {
@@ -922,37 +1036,116 @@ fn run_git(cwd: &str, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+struct GuardGhSandbox {
+    path: PathBuf,
+}
+
+impl GuardGhSandbox {
+    #[cfg(unix)]
+    fn create() -> Option<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let root = fs::canonicalize("/tmp").ok()?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let mut path = None;
+        for _ in 0..32 {
+            let counter = BODY_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = root.join(format!(
+                ".codex-hook-gh-{}-{timestamp}-{counter}",
+                std::process::id()
+            ));
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&candidate) {
+                Ok(()) => {
+                    path = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return None,
+            }
+        }
+        let sandbox = Self { path: path? };
+
+        let account_home = unsafe {
+            let entry = libc::getpwuid(libc::getuid());
+            if entry.is_null() {
+                None
+            } else {
+                CStr::from_ptr((*entry).pw_dir)
+                    .to_str()
+                    .ok()
+                    .map(PathBuf::from)
+            }
+        }?;
+        let source = account_home.join(".config/gh/hosts.yml");
+        if source.exists() {
+            let mut options = fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let mut source_file = options.open(source).ok()?;
+            let metadata = source_file.metadata().ok()?;
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::getuid() }
+                || metadata.mode() & 0o077 != 0
+                || metadata.len() > MAX_MANIFEST_BYTES
+            {
+                return None;
+            }
+            let mut contents = Vec::with_capacity(metadata.len() as usize);
+            source_file.read_to_end(&mut contents).ok()?;
+            if contents.len() as u64 != metadata.len() {
+                return None;
+            }
+            let destination = sandbox.path.join("hosts.yml");
+            let mut destination_file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o400)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(destination)
+                .ok()?;
+            destination_file.write_all(&contents).ok()?;
+            destination_file.sync_all().ok()?;
+        }
+        sync_body_snapshot_directory(&sandbox.path).ok()?;
+        fs::set_permissions(&sandbox.path, fs::Permissions::from_mode(0o500)).ok()?;
+        Some(sandbox)
+    }
+
+    #[cfg(not(unix))]
+    fn create() -> Option<Self> {
+        None
+    }
+}
+
+impl Drop for GuardGhSandbox {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o700));
+        }
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 fn run_gh(cwd: &str, args: &[&str]) -> Option<(i32, Vec<u8>)> {
     if cwd.is_empty() {
         return None;
     }
-    let mut command = Command::new("gh");
+    let sandbox = GuardGhSandbox::create()?;
+    let mut command = Command::new(SYSTEM_GH);
     command.args(args).current_dir(cwd);
-    let unsafe_keys = [
-        "GH_HOST",
-        "GH_REPO",
-        "GH_FORCE_TTY",
-        "GH_PAGER",
-        "PAGER",
-        "GH_CONFIG_DIR",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-    ];
-    let vars: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(key, _)| !unsafe_keys.contains(&key.to_string_lossy().as_ref()))
-        .collect();
     command
         .env_clear()
-        .envs(vars)
-        .env("GH_PROMPT_DISABLED", "1");
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_HOST", "github.com")
+        .env("GH_CONFIG_DIR", &sandbox.path)
+        .env("PATH", SYSTEM_PATH);
     let output = process::run_with_limit(
         &mut command,
         GH_COMMAND_TIMEOUT,
@@ -2381,54 +2574,367 @@ fn github_text_reason(values: &[String], label: &str) -> Option<String> {
     None
 }
 
-fn file_secret_reason(path: &str, label: &str) -> Option<String> {
-    if path == "-" {
-        return Some(format!("{label}は検査可能なファイルで指定してください"));
-    }
-    let candidate = Path::new(path);
-    let metadata = match fs::symlink_metadata(candidate) {
-        Ok(value) => value,
-        Err(_) => return Some(format!("{label} fileを安全に検査できません")),
-    };
-    if metadata.file_type().is_symlink() {
-        return Some(format!("{label} fileにsymlinkは使用できません"));
-    }
-    let resolved = match fs::canonicalize(candidate) {
-        Ok(value) => value,
-        Err(_) => return Some(format!("{label} fileを安全に検査できません")),
-    };
-    let tmp = match fs::canonicalize("/tmp") {
-        Ok(value) => value,
-        Err(_) => return Some(format!("{label} fileを安全に検査できません")),
-    };
-    let resolved_name = match resolved.to_str() {
-        Some(value) => value,
-        None => return Some(format!("{label} fileを安全に検査できません")),
-    };
-    if !resolved.starts_with(&tmp)
-        || !metadata.is_file()
-        || !uid_is_current(&metadata)
-        || metadata.len() > MAX_BODY_FILE_BYTES
-        || sensitive_path(resolved_name)
-    {
-        return Some(format!("{label} fileを安全に検査できません"));
-    }
-    let contents = match fs::read_to_string(resolved) {
-        Ok(value) => value,
-        Err(_) => return Some(format!("{label} fileを安全に検査できません")),
-    };
-    if contains_secret(&contents) {
+fn body_content_reason(contents: &str, label: &str) -> Option<String> {
+    if contains_secret(contents) {
         return Some(format!("{label}に秘密情報らしい値が含まれています"));
     }
-    if ai_attribution(&contents) {
+    if ai_attribution(contents) {
         return Some(format!(
             "{label}にCodexまたはOpenAIのAI帰属が含まれています"
         ));
     }
-    if contains_copilot_mention(&contents) {
+    if contains_copilot_mention(contents) {
         return Some(format!("{label}に@copilot mentionを含めることはできません"));
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn opened_fd_path(file: &std::fs::File) -> Option<PathBuf> {
+    let link = PathBuf::from("/proc/self/fd").join(file.as_raw_fd().to_string());
+    let path = fs::read_link(link).ok()?;
+    if path.to_string_lossy().ends_with(" (deleted)") {
+        return None;
+    }
+    fs::canonicalize(path).ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn opened_fd_path(_file: &std::fs::File) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn safe_body_file_contents(path: &str, label: &str) -> Result<String, String> {
+    if path == "-" {
+        return Err(format!("{label}は検査可能なファイルで指定してください"));
+    }
+    let candidate = Path::new(path);
+    let metadata = fs::symlink_metadata(candidate)
+        .map_err(|_| format!("{label} fileを安全に検査できません"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} fileにsymlinkは使用できません"));
+    }
+    let resolved =
+        fs::canonicalize(candidate).map_err(|_| format!("{label} fileを安全に検査できません"))?;
+    let tmp =
+        fs::canonicalize("/tmp").map_err(|_| format!("{label} fileを安全に検査できません"))?;
+    let resolved_name = resolved
+        .to_str()
+        .ok_or_else(|| format!("{label} fileを安全に検査できません"))?;
+    if !resolved.starts_with(&tmp) || sensitive_path(resolved_name) {
+        return Err(format!("{label} fileを安全に検査できません"));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(&resolved)
+        .map_err(|_| format!("{label} fileを安全に検査できません"))?;
+    let opened =
+        opened_fd_path(&file).ok_or_else(|| format!("{label} fileを安全に検査できません"))?;
+    if opened != resolved || !opened.starts_with(&tmp) {
+        return Err(format!("{label} fileを安全に検査できません"));
+    }
+    let opened_metadata = file
+        .metadata()
+        .map_err(|_| format!("{label} fileを安全に検査できません"))?;
+    if !opened_metadata.is_file()
+        || !uid_is_current(&opened_metadata)
+        || opened_metadata.len() > MAX_BODY_FILE_BYTES
+    {
+        return Err(format!("{label} fileを安全に検査できません"));
+    }
+    let mut bytes = Vec::with_capacity(opened_metadata.len().min(64 * 1024) as usize);
+    file.take(MAX_BODY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| format!("{label} fileを安全に検査できません"))?;
+    if bytes.len() as u64 > MAX_BODY_FILE_BYTES {
+        return Err(format!("{label} fileを安全に検査できません"));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{label} fileを安全に検査できません"))
+}
+
+#[cfg(not(unix))]
+fn safe_body_file_contents(_path: &str, label: &str) -> Result<String, String> {
+    Err(format!("{label} fileを安全に検査できません"))
+}
+
+fn file_secret_reason(path: &str, label: &str) -> Option<String> {
+    let contents = match safe_body_file_contents(path, label) {
+        Ok(contents) => contents,
+        Err(reason) => return Some(reason),
+    };
+    body_content_reason(&contents, label)
+}
+
+#[cfg(unix)]
+fn body_snapshot_directory() -> Result<PathBuf, String> {
+    let root = fs::canonicalize("/tmp")
+        .map_err(|_| "body-file snapshot directoryを安全に作成できません".to_string())?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    cleanup_body_snapshots(&root, timestamp)?;
+    for _ in 0..32 {
+        let counter = BODY_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = root.join(format!(
+            "{BODY_SNAPSHOT_DIR_PREFIX}{}-{timestamp}-{counter}",
+            std::process::id()
+        ));
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&directory) {
+            Ok(()) => {
+                sync_body_snapshot_directory(&root)?;
+                return Ok(directory);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                return Err("body-file snapshot directoryを安全に作成できません".into());
+            }
+        }
+    }
+    Err("body-file snapshot directoryを一意に作成できません".into())
+}
+
+#[cfg(unix)]
+fn sync_body_snapshot_directory(path: &Path) -> Result<(), String> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options
+        .open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "body-file snapshot directoryをdurableに保存できません".to_string())
+}
+
+#[cfg(unix)]
+fn snapshot_timestamp(name: &str) -> Option<u128> {
+    let suffix = name.strip_prefix(BODY_SNAPSHOT_DIR_PREFIX)?;
+    let mut parts = suffix.split('-');
+    let pid = parts.next()?;
+    let timestamp = parts.next()?;
+    let counter = parts.next()?;
+    if parts.next().is_some()
+        || pid.is_empty()
+        || counter.is_empty()
+        || !pid.bytes().all(|byte| byte.is_ascii_digit())
+        || !counter.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    timestamp.parse().ok()
+}
+
+#[cfg(unix)]
+fn remove_expired_body_snapshot(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = fs::symlink_metadata(path)
+        .map_err(|_| "expired body-file snapshotを検査できません".to_string())?;
+    if !directory.is_dir()
+        || directory.file_type().is_symlink()
+        || directory.uid() != unsafe { libc::getuid() }
+        || directory.mode() & 0o077 != 0
+    {
+        return Err("expired body-file snapshotを安全に検査できません".into());
+    }
+    let mut entries =
+        fs::read_dir(path).map_err(|_| "expired body-file snapshotを検査できません".to_string())?;
+    let entry = entries
+        .next()
+        .transpose()
+        .map_err(|_| "expired body-file snapshotを検査できません".to_string())?
+        .ok_or_else(|| "expired body-file snapshotが空です".to_string())?;
+    if entry.file_name() != "body" || entries.next().is_some() {
+        return Err("expired body-file snapshotの構造が不正です".into());
+    }
+    let body = entry.path();
+    let metadata = fs::symlink_metadata(&body)
+        .map_err(|_| "expired body-file snapshotを検査できません".to_string())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != unsafe { libc::getuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o400
+        || metadata.len() > MAX_BODY_FILE_BYTES
+    {
+        return Err("expired body-file snapshotを安全に検査できません".into());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "expired body-file snapshotを安全に削除できません".to_string())?;
+    let result = fs::remove_file(&body).and_then(|()| fs::remove_dir(path));
+    if result.is_err() {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o500));
+    }
+    result.map_err(|_| "expired body-file snapshotを安全に削除できません".to_string())
+}
+
+#[cfg(unix)]
+fn cleanup_body_snapshots(root: &Path, now_nanos: u128) -> Result<(), String> {
+    let ttl_nanos = BODY_SNAPSHOT_TTL.as_nanos();
+    let mut retained = 0usize;
+    let mut removed = false;
+    let entries = fs::read_dir(root)
+        .map_err(|_| "body-file snapshot directoryを検査できません".to_string())?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|_| "body-file snapshot directoryを検査できません".to_string())?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(timestamp) = snapshot_timestamp(&name) else {
+            continue;
+        };
+        if now_nanos.saturating_sub(timestamp) >= ttl_nanos
+            && remove_expired_body_snapshot(&entry.path()).is_ok()
+        {
+            removed = true;
+            continue;
+        }
+        retained = retained.saturating_add(1);
+    }
+    if removed {
+        sync_body_snapshot_directory(root)?;
+    }
+    if retained >= BODY_SNAPSHOT_MAX_RETAINED {
+        return Err("body-file snapshotの保持上限に達しました".into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn snapshot_body_file(path: &str, label: &str) -> Result<PathBuf, String> {
+    let contents = safe_body_file_contents(path, label)?;
+    if let Some(reason) = body_content_reason(&contents, label) {
+        return Err(reason);
+    }
+    let directory = body_snapshot_directory()?;
+    let snapshot = directory.join("body");
+    let mut options = fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600);
+    let mut output = options
+        .open(&snapshot)
+        .map_err(|_| "body-file snapshotを安全に作成できません".to_string())?;
+    output
+        .write_all(contents.as_bytes())
+        .and_then(|_| output.sync_all())
+        .map_err(|_| "body-file snapshotを安全に作成できません".to_string())?;
+    let metadata = output
+        .metadata()
+        .map_err(|_| "body-file snapshotを安全に検証できません".to_string())?;
+    if !metadata.is_file() || !uid_is_current(&metadata) || metadata.len() != contents.len() as u64
+    {
+        return Err("body-file snapshotを安全に検証できません".into());
+    }
+    fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o400))
+        .map_err(|_| "body-file snapshotをimmutableにできません".to_string())?;
+    sync_body_snapshot_directory(&directory)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o500))
+        .map_err(|_| "body-file snapshot directoryを固定できません".to_string())?;
+    if let Some(root) = directory.parent() {
+        sync_body_snapshot_directory(root)?;
+    }
+    Ok(snapshot)
+}
+
+#[cfg(not(unix))]
+fn snapshot_body_file(_path: &str, label: &str) -> Result<PathBuf, String> {
+    Err(format!("{label} fileを安全にsnapshot化できません"))
+}
+
+fn shell_quote_token(token: &str) -> String {
+    format!("'{}'", token.replace('\'', "'\\''"))
+}
+
+fn rewrite_body_file_command(command: &str, cwd: Option<&str>) -> Result<Option<String>, String> {
+    let segments = command_segments(command);
+    if segments.len() != 1 {
+        return Ok(None);
+    }
+    let mut tokens = segments.into_iter().next().unwrap_or_default();
+    if tokens.first().map(String::as_str) != Some("gh") {
+        return Ok(None);
+    }
+    let Some((top_level, top_args)) = ({
+        let (command, args) = first_command(&tokens[1..], GH_GLOBAL_VALUE_OPTIONS);
+        command.map(|command| (command, args))
+    }) else {
+        return Ok(None);
+    };
+    let Some((subcommand, _)) = ({
+        let (command, args) = first_command(&top_args, GH_GLOBAL_VALUE_OPTIONS);
+        command.map(|command| (command, args))
+    }) else {
+        return Ok(None);
+    };
+    let body_label = match (top_level.as_str(), subcommand.as_str()) {
+        ("issue", "create" | "edit" | "comment") => "Issue body",
+        ("pr", "create" | "edit" | "comment" | "review") => "PR body",
+        _ => return Ok(None),
+    };
+
+    // Keep the option spelling and replace only its path value.  The command
+    // has already passed the strict lifecycle parser, so a malformed option
+    // here is treated as a deny rather than being silently ignored.
+    let mut locations: Vec<(usize, Option<usize>, String)> = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if token == "-F" || token == "--body-file" {
+            let Some(value_index) = index.checked_add(1).filter(|value| *value < tokens.len())
+            else {
+                return Err(format!("{body_label} file optionの値を確認できません"));
+            };
+            locations.push((index, Some(value_index), String::new()));
+            index += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--body-file=") {
+            locations.push((index, None, value.to_string()));
+        } else if token.starts_with("-F") && token.len() > 2 {
+            locations.push((index, None, token[2..].to_string()));
+        }
+        index += 1;
+    }
+    if locations.is_empty() {
+        return Ok(None);
+    }
+
+    for (option_index, value_index, attached_value) in locations {
+        let path = value_index
+            .map(|value_index| tokens[value_index].clone())
+            .unwrap_or(attached_value);
+        let snapshot = snapshot_body_file(&path, body_label)?;
+        let snapshot = snapshot
+            .to_str()
+            .ok_or_else(|| format!("{body_label} snapshot pathを確認できません"))?;
+        if let Some(value_index) = value_index {
+            tokens[value_index] = snapshot.to_string();
+        } else if tokens[option_index].starts_with("--body-file=") {
+            tokens[option_index] = format!("--body-file={snapshot}");
+        } else {
+            tokens[option_index] = format!("-F{snapshot}");
+        }
+    }
+    let rewritten = tokens
+        .iter()
+        .map(|token| shell_quote_token(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(reason) = blocked_reason(&rewritten, cwd, 0) {
+        return Err(format!(
+            "body-file snapshot後のcommandを再検証できません: {reason}"
+        ));
+    }
+    Ok(Some(rewritten))
 }
 
 fn contains_copilot_mention(value: &str) -> bool {
@@ -3772,6 +4278,16 @@ fn blocked_reason(command: &str, cwd: Option<&str>, depth: usize) -> Option<Stri
                 return Some(reason);
             }
         }
+        let is_git = command_start(tokens)
+            .and_then(|index| tokens.get(index))
+            .is_some_and(|value| basename(value) == "git");
+        if is_git
+            && cwd
+                .filter(|value| !value.is_empty())
+                .is_some_and(|value| !local_git_config_is_safe(value))
+        {
+            return Some("repository local Git configの安全性を確認できません".into());
+        }
         if let Some(reason) = git_invocation_reason(tokens, cwd) {
             return Some(reason);
         }
@@ -4013,6 +4529,16 @@ fn deny(reason: &str) {
     let _ = writeln!(stderr, "{full}");
 }
 
+fn allow_updated_input(command: &str) {
+    let payload = format!(
+        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"updatedInput\":{{\"command\":{}}}}}}}",
+        json_string(command)
+    );
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(payload.as_bytes());
+    let _ = stdout.flush();
+}
+
 /// Run the hook protocol.  `0` means allow, `2` means deny or malformed input.
 pub fn entrypoint() -> i32 {
     let mut input = Vec::with_capacity(8 * 1024);
@@ -4062,6 +4588,14 @@ pub fn entrypoint() -> i32 {
         deny(&reason);
         return 2;
     }
+    match rewrite_body_file_command(command, cwd) {
+        Ok(Some(updated_command)) => allow_updated_input(&updated_command),
+        Ok(None) => {}
+        Err(reason) => {
+            deny(&reason);
+            return 2;
+        }
+    }
     0
 }
 
@@ -4084,6 +4618,27 @@ mod tests {
         assert!(blocked_reason("git status $(printf x)", None, 0).is_some());
         assert!(blocked_reason("rm -rf README.md", None, 0).is_some());
         assert!(blocked_reason("git-reset --hard HEAD", None, 0).is_some());
+    }
+
+    #[test]
+    fn repository_config_execution_and_transport_keys_fail_closed() {
+        for key in [
+            "include.path",
+            "core.sshCommand",
+            "core.fsmonitor",
+            "credential.helper",
+            "http.example.proxy",
+            "url.safe.insteadOf",
+            "remote.origin.pushurl",
+            "protocol.ext.allow",
+            "filter.lfs.process",
+            "diff.external",
+            "merge.custom.driver",
+        ] {
+            assert!(dangerous_local_git_key(key), "{key}");
+        }
+        assert!(!dangerous_local_git_key("remote.origin.url"));
+        assert!(!dangerous_local_git_key("user.name"));
     }
 
     #[test]
@@ -4402,6 +4957,91 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn body_file_snapshot_keeps_the_checked_bytes_and_private_modes() {
+        use std::os::unix::fs::MetadataExt;
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let source_root = std::env::temp_dir().join(format!("codex-guard-body-source-{suffix}"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&source_root)
+            .expect("create body source directory");
+        let source = source_root.join("body.md");
+        let mut source_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&source)
+            .expect("create body source");
+        source_file
+            .write_all(b"checked body")
+            .expect("write body source");
+
+        let snapshot = snapshot_body_file(source.to_str().expect("UTF-8 source"), "PR body")
+            .expect("create checked snapshot");
+        fs::write(&source, b"replacement after check").expect("replace source");
+        assert_eq!(fs::read(&snapshot).expect("read snapshot"), b"checked body");
+        let snapshot_metadata = fs::metadata(&snapshot).expect("snapshot metadata");
+        assert_eq!(snapshot_metadata.mode() & 0o777, 0o400);
+        let snapshot_root = snapshot.parent().expect("snapshot parent");
+        assert_eq!(
+            fs::metadata(snapshot_root)
+                .expect("snapshot directory metadata")
+                .mode()
+                & 0o777,
+            0o500
+        );
+
+        remove_expired_body_snapshot(snapshot_root).expect("remove owned snapshot");
+        fs::remove_file(&source).expect("remove body source");
+        fs::remove_dir(&source_root).expect("remove body source directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn body_snapshot_gc_removes_only_expired_valid_snapshots() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-guard-body-gc-{suffix}"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("create GC fixture root");
+        let expired = root.join(format!("{BODY_SNAPSHOT_DIR_PREFIX}1-1-1"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&expired)
+            .expect("create expired snapshot");
+        let body = expired.join("body");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(&body)
+            .expect("create expired body");
+        file.write_all(b"expired").expect("write expired body");
+        file.sync_all().expect("sync expired body");
+        fs::set_permissions(&expired, fs::Permissions::from_mode(0o500))
+            .expect("protect expired snapshot");
+        let unrelated = root.join(format!("{BODY_SNAPSHOT_DIR_PREFIX}not-managed"));
+        fs::create_dir(&unrelated).expect("create unrelated directory");
+
+        cleanup_body_snapshots(&root, BODY_SNAPSHOT_TTL.as_nanos() + 2)
+            .expect("clean expired snapshots");
+        assert!(!expired.exists());
+        assert!(unrelated.exists());
+
+        fs::remove_dir(&unrelated).expect("remove unrelated directory");
+        fs::remove_dir(&root).expect("remove GC fixture root");
     }
 
     #[test]
