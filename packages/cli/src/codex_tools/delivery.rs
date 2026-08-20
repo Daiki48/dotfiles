@@ -285,10 +285,11 @@ fn safe_environment(command: &mut Command, gh_config: Option<&Path>) {
         .filter_map(|(key, _)| {
             let key_text = key.to_string_lossy();
             (key_text.starts_with("GIT_")
+                || key_text.starts_with("GH_")
+                || key_text == "GITHUB_TOKEN"
+                || key_text == "GITHUB_ENTERPRISE_TOKEN"
                 || key_text == "SSH_ASKPASS"
                 || key_text == "GIT_ASKPASS"
-                || key_text == "GH_REPO"
-                || key_text == "GH_CONFIG_DIR"
                 || key_text.eq_ignore_ascii_case("HTTP_PROXY")
                 || key_text.eq_ignore_ascii_case("HTTPS_PROXY")
                 || key_text.eq_ignore_ascii_case("ALL_PROXY")
@@ -306,10 +307,11 @@ fn safe_environment(command: &mut Command, gh_config: Option<&Path>) {
         .filter(|(key, value)| {
             value.is_some()
                 && (key.to_string_lossy().starts_with("GIT_")
+                    || key.to_string_lossy().starts_with("GH_")
+                    || key.to_string_lossy() == "GITHUB_TOKEN"
+                    || key.to_string_lossy() == "GITHUB_ENTERPRISE_TOKEN"
                     || key.to_string_lossy() == "SSH_ASKPASS"
                     || key.to_string_lossy() == "GIT_ASKPASS"
-                    || key.to_string_lossy() == "GH_REPO"
-                    || key.to_string_lossy() == "GH_CONFIG_DIR"
                     || key.to_string_lossy().eq_ignore_ascii_case("HTTP_PROXY")
                     || key.to_string_lossy().eq_ignore_ascii_case("HTTPS_PROXY")
                     || key.to_string_lossy().eq_ignore_ascii_case("ALL_PROXY")
@@ -3471,6 +3473,11 @@ mod tests {
         let mut command = Command::new("/bin/true");
         command
             .env("GH_CONFIG_DIR", "/tmp/user-config")
+            .env("GH_TOKEN", "untrusted-token")
+            .env("GITHUB_TOKEN", "untrusted-token")
+            .env("GITHUB_ENTERPRISE_TOKEN", "untrusted-token")
+            .env("GH_DEBUG", "api")
+            .env("GH_FORCE_TTY", "1")
             .env("HTTPS_PROXY", "http://proxy.invalid")
             .env("GIT_SSH_COMMAND", "/tmp/ssh");
         let private = Path::new("/tmp/codex-delivery-private-gh");
@@ -3487,6 +3494,15 @@ mod tests {
             values.get(OsStr::new("GH_HOST")),
             Some(&Some("github.com".into()))
         );
+        for key in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GH_DEBUG",
+            "GH_FORCE_TTY",
+        ] {
+            assert_eq!(values.get(OsStr::new(key)), Some(&None), "{key}");
+        }
         assert_eq!(values.get(OsStr::new("HTTPS_PROXY")), Some(&None));
         assert_eq!(values.get(OsStr::new("GIT_SSH_COMMAND")), Some(&None));
     }

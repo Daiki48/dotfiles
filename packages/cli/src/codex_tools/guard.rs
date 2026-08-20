@@ -927,6 +927,8 @@ fn dangerous_local_git_key(key: &str) -> bool {
         || key == "core.fsmonitor"
         || key == "core.askpass"
         || key == "core.pager"
+        || key == "gpg.program"
+        || key.starts_with("gpg.") && key.ends_with(".program")
         || key == "diff.external"
         || key == "credential.helper"
         || key == "http.proxy"
@@ -1310,6 +1312,157 @@ fn verified_origin(cwd: &str) -> Option<(String, String)> {
         return None;
     }
     Some((github_repository_from_url(value)?, value.to_string()))
+}
+
+#[cfg(unix)]
+fn account_home() -> Result<PathBuf, String> {
+    // SAFETY: getpwuid returns process-account data owned by libc.
+    unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        if entry.is_null() {
+            None
+        } else {
+            CStr::from_ptr((*entry).pw_dir)
+                .to_str()
+                .ok()
+                .map(PathBuf::from)
+        }
+    }
+    .ok_or_else(|| "account homeを確認できません".to_string())
+}
+
+#[cfg(not(unix))]
+fn account_home() -> Result<PathBuf, String> {
+    Err("account homeの信頼検証はUnixだけに対応しています".into())
+}
+
+fn global_git_value(key: &str) -> Result<Option<String>, String> {
+    let git = trust::trusted_system_binary(SYSTEM_GIT, "Git")?;
+    let mut command = Command::new(git);
+    process::clear_environment(&mut command);
+    command
+        .env("HOME", account_home()?)
+        .env("PATH", SYSTEM_PATH)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["config", "--global", "--null", "--get-all", key]);
+    let output = process::run_with_limit(
+        &mut command,
+        GIT_COMMAND_TIMEOUT,
+        MAX_MANIFEST_BYTES as usize,
+    )
+    .map_err(|_| "global Git identity設定を安全に取得できません".to_string())?;
+    single_git_config_value(output, "global Git identity設定")
+}
+
+fn single_git_config_value(
+    output: process::Output,
+    description: &str,
+) -> Result<Option<String>, String> {
+    if output.status.code() == Some(1) && output.stdout.is_empty() {
+        return Ok(None);
+    }
+    if !output.status.success() || !output.stdout.ends_with(&[0]) {
+        return Err(format!("{description}を安全に取得できません"));
+    }
+    let values = output.stdout[..output.stdout.len() - 1]
+        .split(|byte| *byte == 0)
+        .collect::<Vec<_>>();
+    if values.len() != 1 {
+        return Err(format!("{description}が重複しています"));
+    }
+    String::from_utf8(values[0].to_vec())
+        .map(Some)
+        .map_err(|_| format!("{description}がUTF-8ではありません"))
+}
+
+fn local_git_value(cwd: &str, key: &str) -> Result<Option<String>, String> {
+    if !local_git_config_is_safe(cwd) {
+        return Err("repository Git設定の安全性を確認できません".into());
+    }
+    let git = trust::trusted_system_binary(SYSTEM_GIT, "Git")?;
+    let mut command = Command::new(git);
+    command
+        .args([
+            "--no-pager",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "diff.external=",
+            "config",
+            "--local",
+            "--null",
+            "--get-all",
+            key,
+        ])
+        .current_dir(cwd);
+    isolate_git_environment(&mut command);
+    let output = process::run_with_limit(
+        &mut command,
+        GIT_COMMAND_TIMEOUT,
+        MAX_MANIFEST_BYTES as usize,
+    )
+    .map_err(|_| "repository Git identity設定を安全に取得できません".to_string())?;
+    single_git_config_value(output, "repository Git identity設定")
+}
+
+fn effective_identity_value(cwd: &str, key: &str) -> Result<Option<String>, String> {
+    match local_git_value(cwd, key)? {
+        Some(value) => Ok(Some(value)),
+        None => global_git_value(key),
+    }
+}
+
+fn safe_identity_text(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value
+            .chars()
+            .all(|character| !character.is_control() && character != '\u{7f}')
+}
+
+fn commit_identity_configs(cwd: &str) -> Result<Vec<String>, String> {
+    let name = effective_identity_value(cwd, "user.name")?
+        .filter(|value| safe_identity_text(value, 256))
+        .ok_or_else(|| "Git user.nameを安全に固定できません".to_string())?;
+    let email = effective_identity_value(cwd, "user.email")?
+        .filter(|value| safe_identity_text(value, 320))
+        .ok_or_else(|| "Git user.emailを安全に固定できません".to_string())?;
+    let mut configs = vec![
+        "-c".into(),
+        format!("user.name={name}"),
+        "-c".into(),
+        format!("user.email={email}"),
+        "-c".into(),
+        "user.useConfigOnly=true".into(),
+    ];
+    if let Some(key) = effective_identity_value(cwd, "user.signingkey")? {
+        if !safe_identity_text(&key, 8192) {
+            return Err("Git user.signingkeyを安全に固定できません".into());
+        }
+        configs.extend(["-c".into(), format!("user.signingkey={key}")]);
+    }
+    if let Some(format) = effective_identity_value(cwd, "gpg.format")? {
+        let format = format.to_ascii_lowercase();
+        if !["openpgp", "ssh", "x509"].contains(&format.as_str()) {
+            return Err("Git gpg.formatを安全に固定できません".into());
+        }
+        configs.extend(["-c".into(), format!("gpg.format={format}")]);
+    }
+    if let Some(sign) = effective_identity_value(cwd, "commit.gpgsign")? {
+        let sign = match sign.to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => "true",
+            "false" | "no" | "off" | "0" => "false",
+            _ => return Err("Git commit.gpgSignをbooleanとして確認できません".into()),
+        };
+        configs.extend(["-c".into(), format!("commit.gpgSign={sign}")]);
+    }
+    Ok(configs)
 }
 
 fn current_work_branch_reason(cwd: &str) -> Option<String> {
@@ -3046,11 +3199,16 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
         .as_ref()
         .map(|(_, index, _)| *index)
         .unwrap_or(git_index + 1);
-    let subcommand = subcommand.as_ref().map(|(_, _, value)| *value);
-    let write = subcommand.is_some_and(|value| GIT_SAFE_WRITE.contains(&value));
-    let network =
-        subcommand.is_some_and(|value| ["fetch", "pull", "push", "ls-remote"].contains(&value));
-    let isolate_environment = network || !write;
+    let subcommand = subcommand
+        .as_ref()
+        .map(|(_, _, value)| (*value).to_string());
+    let execution_cwd = tokens[git_index + 1..subcommand_index]
+        .windows(2)
+        .find_map(|pair| (pair[0] == "-C").then(|| pair[1].clone()))
+        .or_else(|| cwd.map(str::to_string));
+    let network = subcommand
+        .as_deref()
+        .is_some_and(|value| ["fetch", "pull", "push", "ls-remote"].contains(&value));
 
     let git = trust::trusted_system_binary(SYSTEM_GIT, "Git")?;
     tokens[git_index] = git;
@@ -3066,10 +3224,18 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
     ]
     .map(str::to_string)
     .into();
+    if subcommand.as_deref() == Some("commit") {
+        let cwd = execution_cwd
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "git commitのidentity取得元を確認できません".to_string())?;
+        configs.extend(commit_identity_configs(cwd)?);
+    }
     let mut gh_snapshot = None;
     if network {
         trust::trusted_system_binary(SYSTEM_SSH, "SSH")?;
-        let cwd = cwd
+        let cwd = execution_cwd
+            .as_deref()
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "network Gitのrepository cwdを確認できません".to_string())?;
         let (_, origin) = verified_origin(cwd)
@@ -3116,68 +3282,66 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
         }
     }
     tokens.splice(subcommand_index..subcommand_index, configs);
-    if isolate_environment {
-        trust::trusted_system_binary(SYSTEM_ENV, "Env")?;
-        if git_index != 0 && tokens[..git_index] != ["env", "-u", "SSH_ASKPASS"] {
-            return Err("Git wrapperを安全に再構成できません".into());
-        }
-        let mut environment = [
-            SYSTEM_ENV,
-            "-u",
-            "SSH_ASKPASS",
-            "-u",
-            "SSH_ASKPASS_REQUIRE",
-            "-u",
-            "HTTP_PROXY",
-            "-u",
-            "HTTPS_PROXY",
-            "-u",
-            "ALL_PROXY",
-            "-u",
-            "NO_PROXY",
-            "-u",
-            "http_proxy",
-            "-u",
-            "https_proxy",
-            "-u",
-            "all_proxy",
-            "-u",
-            "no_proxy",
-            "-u",
-            "SSL_CERT_FILE",
-            "-u",
-            "SSL_CERT_DIR",
-            "-u",
-            "GH_CONFIG_DIR",
-            "-u",
-            "GH_HOST",
-            "-u",
-            "GH_REPO",
-            "-u",
-            "GH_TOKEN",
-            "-u",
-            "GITHUB_TOKEN",
-            "-u",
-            "GH_ENTERPRISE_TOKEN",
-            "-u",
-            "GH_DEBUG",
-            "GIT_CONFIG_NOSYSTEM=1",
-            "GIT_CONFIG_GLOBAL=/dev/null",
-            "GIT_CONFIG_SYSTEM=/dev/null",
-            "GIT_TERMINAL_PROMPT=0",
-            "GIT_PAGER=cat",
-            "GH_HOST=github.com",
-            "GH_PROMPT_DISABLED=1",
-            "GH_NO_UPDATE_NOTIFIER=1",
-            "PATH=/usr/bin:/bin",
-        ]
-        .map(str::to_string)
-        .to_vec();
-        if let Some(snapshot) = gh_snapshot {
-            environment.push(format!("GH_CONFIG_DIR={snapshot}"));
-        }
-        tokens.splice(0..git_index, environment);
+    trust::trusted_system_binary(SYSTEM_ENV, "Env")?;
+    if git_index != 0 && tokens[..git_index] != ["env", "-u", "SSH_ASKPASS"] {
+        return Err("Git wrapperを安全に再構成できません".into());
     }
+    let mut environment = [
+        SYSTEM_ENV,
+        "-u",
+        "SSH_ASKPASS",
+        "-u",
+        "SSH_ASKPASS_REQUIRE",
+        "-u",
+        "HTTP_PROXY",
+        "-u",
+        "HTTPS_PROXY",
+        "-u",
+        "ALL_PROXY",
+        "-u",
+        "NO_PROXY",
+        "-u",
+        "http_proxy",
+        "-u",
+        "https_proxy",
+        "-u",
+        "all_proxy",
+        "-u",
+        "no_proxy",
+        "-u",
+        "SSL_CERT_FILE",
+        "-u",
+        "SSL_CERT_DIR",
+        "-u",
+        "GH_CONFIG_DIR",
+        "-u",
+        "GH_HOST",
+        "-u",
+        "GH_REPO",
+        "-u",
+        "GH_TOKEN",
+        "-u",
+        "GITHUB_TOKEN",
+        "-u",
+        "GH_ENTERPRISE_TOKEN",
+        "-u",
+        "GH_DEBUG",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_CONFIG_SYSTEM=/dev/null",
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_PAGER=cat",
+        "GH_HOST=github.com",
+        "GH_PROMPT_DISABLED=1",
+        "GH_NO_UPDATE_NOTIFIER=1",
+        "PATH=/usr/bin:/bin",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    if let Some(snapshot) = gh_snapshot {
+        environment.push(format!("GH_CONFIG_DIR={snapshot}"));
+    }
+    tokens.splice(0..git_index, environment);
     Ok(Some(
         tokens
             .iter()
@@ -5297,6 +5461,8 @@ mod tests {
             "include.path",
             "core.sshCommand",
             "core.fsmonitor",
+            "gpg.program",
+            "gpg.ssh.program",
             "credential.helper",
             "http.example.proxy",
             "http.https://github.com/.sslVerify",
@@ -5768,19 +5934,20 @@ mod tests {
 
     #[test]
     fn allowed_git_commands_are_rewritten_with_fixed_execution_boundaries() {
-        let commit = rewrite_git_safety_command(
-            "env -u SSH_ASKPASS git -C /managed/worktree commit -m ':bug: fix'",
-            None,
-        )
-        .expect("rewrite commit")
-        .expect("commit requires a rewrite");
-        assert!(commit.contains("'/usr/bin/git' '-C' '/managed/worktree'"));
+        let cwd = std::env::current_dir().expect("current test repository");
+        let cwd = cwd.to_str().expect("UTF-8 test repository");
+        let command = format!("env -u SSH_ASKPASS git -C {cwd} commit -m ':bug: fix'");
+        let commit = rewrite_git_safety_command(&command, Some(cwd))
+            .expect("rewrite commit")
+            .expect("commit requires a rewrite");
+        assert!(commit.starts_with("'/usr/bin/env'"));
+        assert!(commit.contains(&format!("'/usr/bin/git' '-C' '{cwd}'")));
         assert!(commit.contains("'core.hooksPath=/dev/null'"));
+        assert!(commit.contains("'user.useConfigOnly=true'"));
+        assert!(commit.contains("'GIT_CONFIG_GLOBAL=/dev/null'"));
         assert!(commit.ends_with("'commit' '-m' ':bug: fix'"));
         assert!(!commit.contains("core.sshCommand"));
 
-        let cwd = std::env::current_dir().expect("current test repository");
-        let cwd = cwd.to_str().expect("UTF-8 test repository");
         for command in [
             "git fetch --no-tags origin refs/heads/feature/example",
             "git push -u origin feature/example",
@@ -5942,9 +6109,10 @@ mod tests {
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))
             .expect("make repository hook executable");
 
-        let rewritten = rewrite_git_safety_command("git commit -m ':test_tube: fixture'", None)
-            .expect("rewrite commit")
-            .expect("commit requires a rewrite");
+        let rewritten =
+            rewrite_git_safety_command("git commit -m ':test_tube: fixture'", root.to_str())
+                .expect("rewrite commit")
+                .expect("commit requires a rewrite");
         let status = Command::new("/bin/sh")
             .current_dir(&root)
             .args(["-c", &rewritten])
@@ -5953,6 +6121,63 @@ mod tests {
         assert!(status.success());
         assert!(!marker.exists(), "repository pre-commit hook was executed");
         fs::remove_dir_all(root).expect("remove Git hook fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewritten_add_does_not_execute_a_global_filter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-guard-global-filter-{suffix}"));
+        fs::create_dir(&root).expect("create global filter fixture");
+        let run_git = |arguments: &[&str]| {
+            let status = Command::new(SYSTEM_GIT)
+                .current_dir(&root)
+                .args(arguments)
+                .status()
+                .expect("run fixture Git command");
+            assert!(status.success(), "Git fixture failed: {arguments:?}");
+        };
+        run_git(&["init", "-q"]);
+
+        let marker = root.join("filter-ran");
+        let filter = root.join("evil-filter");
+        fs::write(
+            &filter,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+        )
+        .expect("write malicious global filter");
+        fs::set_permissions(&filter, fs::Permissions::from_mode(0o700))
+            .expect("make malicious global filter executable");
+        let global = root.join("global.gitconfig");
+        fs::write(
+            &global,
+            format!(
+                "[filter \"evil\"]\n\tclean = {}\n\trequired = true\n",
+                filter.display()
+            ),
+        )
+        .expect("write malicious global Git config");
+        fs::write(root.join(".gitattributes"), b"*.txt filter=evil\n")
+            .expect("write filter attributes");
+        fs::write(root.join("tracked.txt"), b"fixture\n").expect("write tracked fixture");
+
+        let rewritten = rewrite_git_safety_command("git add -- tracked.txt", root.to_str())
+            .expect("rewrite add")
+            .expect("add requires a rewrite");
+        let status = Command::new("/bin/sh")
+            .current_dir(&root)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .args(["-c", &rewritten])
+            .status()
+            .expect("run rewritten add");
+        assert!(status.success());
+        assert!(!marker.exists(), "global Git clean filter was executed");
+        fs::remove_dir_all(root).expect("remove global filter fixture");
     }
 
     #[test]
