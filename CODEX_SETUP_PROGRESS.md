@@ -1,5 +1,8 @@
 # Codex 自律モード設定 作業記録（2026-05-30）
 
+> この文書は2026-05-30時点の履歴です。現行のhook/helperはRustへ移行済みです。
+> 現在の構成と検証方法は[`docs/codex-rust-guardrails.ja.md`](docs/codex-rust-guardrails.ja.md)を参照してください。
+
 ## ステータス
 
 **ほぼ完成。** 端末非依存の設定（profile v2 / モード判定 / rules / hook / テンプレート分離 / モデル統一）は

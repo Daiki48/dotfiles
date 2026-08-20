@@ -21,17 +21,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Run Python hook tests
-        run: python3 -m unittest discover -s .codex/hooks -p 'test_*.py'
-
-      - name: Run Python helper tests
-        run: python3 -m unittest discover -s .codex/helpers -p 'test_*.py'
-
-      - name: Run GitHub Ruleset tests
-        run: python3 -m unittest discover -s .github/rulesets -p 'test_*.py'
-
       - name: Run Rust tests
         run: cargo test --workspace --locked
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
+
+      - name: Lint Rust without warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

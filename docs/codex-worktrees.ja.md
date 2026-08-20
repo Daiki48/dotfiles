@@ -17,7 +17,7 @@ worktreeの管理rootは、OpenAIのGit worktree運用に合わせて `$CODEX_HO
 
 ## 初回インストール
 
-CLIとhelperの配布、managed writable rootの設定・移行は次のコマンドで行います。何度実行
+CLIとRust製hook/helperのrelease build・配布、managed writable rootの設定・移行は次のコマンドで行います。何度実行
 しても既存のローカル設定や認証情報を壊さない冪等な移行です。
 
 ```sh
@@ -26,7 +26,9 @@ cargo run -- codex
 
 installerは`HOME`がpassword database上のcurrent account homeと一致し、`~/.local/bin`が
 `PATH`に含まれることを事前検査します。不一致時は書き込み前に停止します。設定を反映するため、
-実行後はCodexを再起動してください。helperをcanonical pathから起動できることを確認できます。
+実行後はCodexを再起動してください。同じmulti-call binaryをowner-onlyのregular fileとして
+hookとhelperのcanonical pathへatomic installし、内容hashで更新を管理します。
+helperをcanonical pathから起動できることを確認できます。
 private helperの導入・更新中に中断した場合は、owner-onlyのpending journalと内容hashが示す
 到達可能な途中状態だけを次回setupで再開し、不整合なfileやstateは変更せず停止します。
 
