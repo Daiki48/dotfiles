@@ -972,23 +972,31 @@ class GuardTest(unittest.TestCase):
 
     def test_gh_transport_rejects_unix_socket_and_fails_closed(self):
         configured = GUARD.subprocess.CompletedProcess(
-            ["gh"], 0, b"/tmp/gh.sock\n", b""
+            ["gh"], 0, b"http_unix_socket=/tmp/gh.sock\n", b""
         )
-        missing = GUARD.subprocess.CompletedProcess(["gh"], 1, b"", b"")
+        safe = GUARD.subprocess.CompletedProcess(
+            ["gh"], 0, b"git_protocol=https\nhttp_unix_socket=\n", b""
+        )
         failed = GUARD.subprocess.CompletedProcess(["gh"], 2, b"", b"")
+        missing = GUARD.subprocess.CompletedProcess(
+            ["gh"], 0, b"git_protocol=https\n", b""
+        )
         with (
             mock.patch.dict(GUARD.os.environ, {}, clear=True),
             mock.patch.object(
-                GUARD.subprocess, "run", side_effect=(configured, missing, failed)
+                GUARD.subprocess,
+                "run",
+                side_effect=(configured, safe, failed, missing),
             ) as run,
         ):
             self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
             self.assertIsNone(GUARD._gh_transport_reason("/workspace"))
             self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
         args, kwargs = run.call_args_list[0]
         self.assertEqual(
             args[0],
-            ["gh", "config", "get", "http_unix_socket", "--host", "github.com"],
+            ["gh", "config", "list", "--host", "github.com"],
         )
         self.assertIs(kwargs["stdin"], GUARD.subprocess.DEVNULL)
         for key in GUARD.GH_UNSAFE_TRANSPORT_ENVIRONMENT_KEYS:

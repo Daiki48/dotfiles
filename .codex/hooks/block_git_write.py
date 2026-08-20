@@ -1069,26 +1069,37 @@ def _gh_transport_reason(cwd):
     environment["GH_PROMPT_DISABLED"] = "1"
     try:
         result = subprocess.run(
-            ["gh", "config", "get", "http_unix_socket", "--host", "github.com"],
+            ["gh", "config", "list", "--host", "github.com"],
             cwd=cwd,
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             timeout=GH_COMMAND_TIMEOUT_SECONDS,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return "gh run cancelのGitHub transport設定を確認できません"
-    if len(result.stdout) > MAX_BODY_FILE_BYTES:
+    if (
+        result.returncode != 0
+        or len(result.stdout) > MAX_BODY_FILE_BYTES
+        or len(result.stderr) > MAX_BODY_FILE_BYTES
+    ):
         return "gh run cancelのGitHub transport設定を確認できません"
-    if result.returncode == 0:
-        if result.stdout.strip():
-            return "gh run cancelではhttp_unix_socketを使用できません"
-        return None
-    if result.returncode == 1 and not result.stdout:
-        return None
-    return "gh run cancelのGitHub transport設定を確認できません"
+    try:
+        lines = result.stdout.decode("utf-8").splitlines()
+    except UnicodeError:
+        return "gh run cancelのGitHub transport設定を確認できません"
+    socket_values = [
+        line.split("=", 1)[1]
+        for line in lines
+        if line.startswith("http_unix_socket=")
+    ]
+    if len(socket_values) != 1:
+        return "gh run cancelのGitHub transport設定を確認できません"
+    if socket_values[0].strip():
+        return "gh run cancelではhttp_unix_socketを使用できません"
+    return None
 
 
 def _pr_update_branch_preflight_reason(cwd, repository, number):
