@@ -947,18 +947,53 @@ class GuardTest(unittest.TestCase):
                 tokens = next(GUARD._command_segments(command))
                 self.assertTrue(GUARD._has_write_operation(tokens))
 
-    def test_run_gh_json_disables_prompt_and_stdin(self):
-        completed = GUARD.subprocess.CompletedProcess(
-            ["gh"], 0, b'{"ok": true}', b""
-        )
-        with mock.patch.object(GUARD.subprocess, "run", return_value=completed) as run:
+    def test_run_gh_json_uses_bounded_read(self):
+        with mock.patch.object(
+            GUARD, "_run_gh_bytes", return_value=(0, b'{"ok": true}')
+        ) as run:
             self.assertEqual(
                 GUARD._run_gh_json("/workspace", "api", "--method", "GET", "/user"),
                 {"ok": True},
             )
-        kwargs = run.call_args.kwargs
+        run.assert_called_once_with(
+            "/workspace", "api", "--method", "GET", "/user"
+        )
+
+    def test_run_gh_bytes_disables_prompt_and_stdin(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b'{"ok": true}')
+        os.close(write_fd)
+        stream = os.fdopen(read_fd, "rb")
+        process = mock.Mock(stdout=stream)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with mock.patch.object(GUARD.subprocess, "Popen", return_value=process) as popen:
+            self.assertEqual(
+                GUARD._run_gh_bytes(
+                    "/workspace", "api", "--method", "GET", "/user"
+                ),
+                (0, b'{"ok": true}'),
+            )
+        stream.close()
+        kwargs = popen.call_args.kwargs
         self.assertIs(kwargs["stdin"], GUARD.subprocess.DEVNULL)
         self.assertEqual(kwargs["env"]["GH_PROMPT_DISABLED"], "1")
+
+    def test_run_gh_bytes_stops_at_output_cap(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"12345")
+        os.close(write_fd)
+        stream = os.fdopen(read_fd, "rb")
+        process = mock.Mock(stdout=stream)
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        with (
+            mock.patch.object(GUARD, "MAX_BODY_FILE_BYTES", 4),
+            mock.patch.object(GUARD.subprocess, "Popen", return_value=process),
+        ):
+            self.assertIsNone(GUARD._run_gh_bytes("/workspace", "api", "/user"))
+        stream.close()
+        process.kill.assert_called_once_with()
 
     def test_run_cancel_rejects_unsafe_github_transport(self):
         command = "gh run cancel 123 --repo owner/repo"
@@ -971,35 +1006,21 @@ class GuardTest(unittest.TestCase):
                     self.assert_blocked(command, "/workspace")
 
     def test_gh_transport_rejects_unix_socket_and_fails_closed(self):
-        configured = GUARD.subprocess.CompletedProcess(
-            ["gh"], 0, b"http_unix_socket=/tmp/gh.sock\n", b""
-        )
-        safe = GUARD.subprocess.CompletedProcess(
-            ["gh"], 0, b"git_protocol=https\nhttp_unix_socket=\n", b""
-        )
-        failed = GUARD.subprocess.CompletedProcess(["gh"], 2, b"", b"")
-        missing = GUARD.subprocess.CompletedProcess(
-            ["gh"], 0, b"git_protocol=https\n", b""
-        )
-        whitespace = GUARD.subprocess.CompletedProcess(
-            ["gh"], 0, b"http_unix_socket= \t\n", b""
-        )
-        carriage_return = GUARD.subprocess.CompletedProcess(
-            ["gh"], 0, b"http_unix_socket=\r\n", b""
-        )
-        extra_line = GUARD.subprocess.CompletedProcess(
-            ["gh"], 0, b"http_unix_socket=\n\n", b""
-        )
-        vertical_tab = GUARD.subprocess.CompletedProcess(
-            ["gh"], 0, b"http_unix_socket=\x0b\n", b""
-        )
+        configured = (0, b"/tmp/gh.sock\n")
+        safe = (0, b"")
+        failed = (2, b"")
+        injected = (0, b"\nfoo=bar\n")
+        whitespace = (0, b" \t\n")
+        carriage_return = (0, b"\r\n")
+        extra_line = (0, b"\n\n")
+        vertical_tab = (0, b"\x0b\n")
         with (
             mock.patch.dict(GUARD.os.environ, {}, clear=True),
             mock.patch.object(
-                GUARD.subprocess,
-                "run",
+                GUARD,
+                "_run_gh_bytes",
                 side_effect=(
-                    configured, safe, failed, missing, whitespace,
+                    configured, safe, failed, injected, whitespace,
                     carriage_return, extra_line, vertical_tab,
                 ),
             ) as run,
@@ -1015,11 +1036,12 @@ class GuardTest(unittest.TestCase):
         args, kwargs = run.call_args_list[0]
         self.assertEqual(
             args[0],
-            ["gh", "config", "list", "--host", "github.com"],
+            "/workspace",
         )
-        self.assertIs(kwargs["stdin"], GUARD.subprocess.DEVNULL)
-        for key in GUARD.GH_UNSAFE_TRANSPORT_ENVIRONMENT_KEYS:
-            self.assertNotIn(key, kwargs["env"])
+        self.assertEqual(
+            args[1:],
+            ("config", "get", "http_unix_socket", "--host", "github.com"),
+        )
 
     def test_restricted_commands_reject_prior_shell_context_mutation(self):
         for command in (

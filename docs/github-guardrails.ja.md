@@ -53,6 +53,8 @@ hookは実行前に固定したread-only REST GETで同じrepositoryとrun IDを
 repository、cancel URL、status、conclusionが一致することを確認します。公式にcancel対象として
 案内されている`queued`または
 `in_progress`だけを許可し、完了済み、別repository、取得不能、競合状態ではfail closedにします。
+`GH_CONFIG_DIR`、proxy・CA override、`http_unix_socket`による接続先変更も拒否し、probe出力は
+timeoutとサイズ上限を適用しながら読み取ります。
 read-back後にrunが完了するraceではcancel側が失敗するだけで、別runへ対象を切り替えません。
 `--force`、追加option、runのdelete・rerun、その他のGitHub writeはこの例外へ含めません。
 

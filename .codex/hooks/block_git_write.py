@@ -1030,29 +1030,71 @@ def _remote_refs_snapshot(cwd, head=None):
     return f"origin/{default_match.group(1)}", default_oid_match.group(1), remote_head
 
 
-def _run_gh_json(cwd, *args):
-    """固定したread-only gh commandをtimeout付きで実行し、JSON objectを返す。"""
+def _run_gh_bytes(cwd, *args):
+    """固定したgh commandを、出力上限とtimeout付きで実行する。"""
     environment = os.environ.copy()
     for key in {
         "GH_HOST", "GH_REPO", "GH_FORCE_TTY", "GH_PAGER", "PAGER",
     } | GH_UNSAFE_TRANSPORT_ENVIRONMENT_KEYS:
         environment.pop(key, None)
     environment["GH_PROMPT_DISABLED"] = "1"
+    process = None
+    selector = None
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             ["gh", *args],
             cwd=cwd,
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=GH_COMMAND_TIMEOUT_SECONDS,
-            check=False,
         )
-        if result.returncode != 0 or len(result.stdout) > MAX_BODY_FILE_BYTES:
+        if process.stdout is None:
             return None
-        payload = json.loads(result.stdout.decode("utf-8"))
-    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + GH_COMMAND_TIMEOUT_SECONDS
+        chunks = []
+        total = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(
+                    ["gh", *args], GH_COMMAND_TIMEOUT_SECONDS
+                )
+            if not selector.select(remaining):
+                if process.poll() is None:
+                    raise subprocess.TimeoutExpired(
+                        ["gh", *args], GH_COMMAND_TIMEOUT_SECONDS
+                    )
+                break
+            chunk = os.read(process.stdout.fileno(), 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_BODY_FILE_BYTES:
+                return None
+            chunks.append(chunk)
+        remaining = max(0.01, deadline - time.monotonic())
+        return process.wait(timeout=remaining), b"".join(chunks)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def _run_gh_json(cwd, *args):
+    """固定したread-only gh commandをtimeout付きで実行し、JSON objectを返す。"""
+    result = _run_gh_bytes(cwd, *args)
+    if result is None or result[0] != 0:
+        return None
+    try:
+        payload = json.loads(result[1].decode("utf-8"))
+    except (UnicodeError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -1061,54 +1103,12 @@ def _gh_transport_reason(cwd):
     """ghの接続先を変更し得るambient設定がないことを確認する。"""
     if any(os.environ.get(key) for key in GH_UNSAFE_TRANSPORT_ENVIRONMENT_KEYS):
         return "gh run cancelではGitHub transportを変更する環境変数を使用できません"
-    environment = os.environ.copy()
-    for key in GH_UNSAFE_TRANSPORT_ENVIRONMENT_KEYS | {
-        "GH_HOST", "GH_REPO", "GH_FORCE_TTY", "GH_PAGER", "PAGER",
-    }:
-        environment.pop(key, None)
-    environment["GH_PROMPT_DISABLED"] = "1"
-    try:
-        result = subprocess.run(
-            ["gh", "config", "list", "--host", "github.com"],
-            cwd=cwd,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=GH_COMMAND_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    result = _run_gh_bytes(
+        cwd, "config", "get", "http_unix_socket", "--host", "github.com"
+    )
+    if result is None or result[0] != 0:
         return "gh run cancelのGitHub transport設定を確認できません"
-    if (
-        result.returncode != 0
-        or len(result.stdout) > MAX_BODY_FILE_BYTES
-        or len(result.stderr) > MAX_BODY_FILE_BYTES
-    ):
-        return "gh run cancelのGitHub transport設定を確認できません"
-    try:
-        output = result.stdout.decode("utf-8")
-    except UnicodeError:
-        return "gh run cancelのGitHub transport設定を確認できません"
-    if (
-        not output.endswith("\n")
-        or any(ord(char) < 32 and char != "\n" for char in output)
-    ):
-        return "gh run cancelのGitHub transport設定を確認できません"
-    lines = output[:-1].split("\n")
-    if not lines or any(
-        not line or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", line) is None
-        for line in lines
-    ):
-        return "gh run cancelのGitHub transport設定を確認できません"
-    socket_values = [
-        line.split("=", 1)[1]
-        for line in lines
-        if line.startswith("http_unix_socket=")
-    ]
-    if len(socket_values) != 1:
-        return "gh run cancelのGitHub transport設定を確認できません"
-    if socket_values[0] != "":
+    if result[1] != b"":
         return "gh run cancelではhttp_unix_socketを使用できません"
     return None
 
