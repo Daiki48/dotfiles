@@ -930,7 +930,10 @@ fn dangerous_local_git_key(key: &str) -> bool {
         || key == "gpg.program"
         || key.starts_with("gpg.") && key.ends_with(".program")
         || key == "diff.external"
-        || key == "credential.helper"
+        || key.starts_with("credential.") && key.ends_with(".helper")
+        || key == "submodule.recurse"
+        || key == "fetch.recursesubmodules"
+        || key == "push.recursesubmodules"
         || key == "http.proxy"
         || key == "http.sslcainfo"
         || key == "http.sslverify"
@@ -3221,6 +3224,12 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
         "core.pager=cat",
         "-c",
         "diff.external=",
+        "-c",
+        "submodule.recurse=false",
+        "-c",
+        "fetch.recurseSubmodules=false",
+        "-c",
+        "push.recurseSubmodules=no",
     ]
     .map(str::to_string)
     .into();
@@ -5464,6 +5473,10 @@ mod tests {
             "gpg.program",
             "gpg.ssh.program",
             "credential.helper",
+            "credential.https://github.com/owner/repo.helper",
+            "submodule.recurse",
+            "fetch.recurseSubmodules",
+            "push.recurseSubmodules",
             "http.example.proxy",
             "http.https://github.com/.sslVerify",
             "http.https://github.com/.extraHeader",
@@ -5962,6 +5975,9 @@ mod tests {
             assert!(rewritten.contains("protocol.ext.allow=never"));
             assert!(rewritten.contains("protocol.file.allow=never"));
             assert!(rewritten.contains("protocol.git.allow=never"));
+            assert!(rewritten.contains("submodule.recurse=false"));
+            assert!(rewritten.contains("fetch.recurseSubmodules=false"));
+            assert!(rewritten.contains("push.recurseSubmodules=no"));
             assert!(rewritten.contains("http.sslVerify=true"));
             assert!(rewritten.contains("GIT_CONFIG_GLOBAL=/dev/null"));
             assert!(rewritten.contains("GIT_CONFIG_SYSTEM=/dev/null"));

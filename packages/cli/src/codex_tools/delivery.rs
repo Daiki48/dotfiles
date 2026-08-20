@@ -361,9 +361,17 @@ fn git_command(args: &[String]) -> Result<Vec<String>> {
         "-c".into(),
         "core.pager=cat".into(),
         "-c".into(),
-        "credential.helper=!/usr/bin/gh auth git-credential".into(),
+        "credential.helper=".into(),
+        "-c".into(),
+        "credential.https://github.com.helper=!/usr/bin/gh auth git-credential".into(),
         "-c".into(),
         "diff.external=".into(),
+        "-c".into(),
+        "submodule.recurse=false".into(),
+        "-c".into(),
+        "fetch.recurseSubmodules=false".into(),
+        "-c".into(),
+        "push.recurseSubmodules=no".into(),
         "-c".into(),
         "protocol.ext.allow=never".into(),
         "-c".into(),
@@ -469,7 +477,10 @@ fn dangerous_local_git_key(key: &str) -> bool {
         || key == "core.askpass"
         || key == "core.pager"
         || key == "diff.external"
-        || key == "credential.helper"
+        || key.starts_with("credential.") && key.ends_with(".helper")
+        || key == "submodule.recurse"
+        || key == "fetch.recursesubmodules"
+        || key == "push.recursesubmodules"
         || key == "http.proxy"
         || key == "http.sslcainfo"
         || key == "http.sslverify"
@@ -3453,6 +3464,10 @@ mod tests {
             "includeIf.gitdir:path",
             "core.sshCommand",
             "credential.helper",
+            "credential.https://github.com/owner/repo.helper",
+            "submodule.recurse",
+            "fetch.recurseSubmodules",
+            "push.recurseSubmodules",
             "core.fsmonitor",
             "http.https://github.com/.sslVerify",
             "http.https://github.com/.extraHeader",
@@ -3466,6 +3481,20 @@ mod tests {
             assert!(dangerous_local_git_key(key), "{key} must be rejected");
         }
         assert!(!dangerous_local_git_key("remote.origin.url"));
+
+        let command = git_command(&["fetch".into(), "origin".into()]).unwrap();
+        for expected in [
+            "credential.helper=",
+            "credential.https://github.com.helper=!/usr/bin/gh auth git-credential",
+            "submodule.recurse=false",
+            "fetch.recurseSubmodules=false",
+            "push.recurseSubmodules=no",
+        ] {
+            assert!(
+                command.iter().any(|argument| argument == expected),
+                "{expected}"
+            );
+        }
     }
 
     #[test]
