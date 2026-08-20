@@ -15,7 +15,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::process;
+use super::{process, trust};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -337,67 +337,8 @@ fn safe_environment(command: &mut Command, gh_config: Option<&Path>) {
     }
 }
 
-#[cfg(unix)]
-fn trusted_system_uid(uid: u32) -> bool {
-    if uid == 0 {
-        return true;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // A user namespace can expose host-root-owned files as the kernel's
-        // overflow UID.  Accept that exact kernel value, not an arbitrary
-        // non-current owner.
-        fs::read_to_string("/proc/sys/kernel/overflowuid")
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok())
-            == Some(uid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    false
-}
-
-#[cfg(unix)]
-fn trusted_unix_binary_metadata(metadata: &fs::Metadata, parent: &fs::Metadata) -> bool {
-    metadata.file_type().is_file()
-        && !metadata.file_type().is_symlink()
-        && metadata.uid() == parent.uid()
-        && trusted_system_uid(metadata.uid())
-        && metadata.mode() & 0o022 == 0
-        && metadata.mode() & 0o111 != 0
-        && parent.file_type().is_dir()
-        && !parent.file_type().is_symlink()
-        && parent.mode() & 0o022 == 0
-}
-
 fn trusted_binary(path: &str, name: &str) -> Result<String> {
-    let path = Path::new(path);
-    let metadata =
-        fs::symlink_metadata(path).map_err(|_| error(format!("system {name}を確認できません")))?;
-    let parent = fs::symlink_metadata(path.parent().unwrap_or_else(|| Path::new("/")))
-        .map_err(|_| error(format!("system {name}を確認できません")))?;
-    #[cfg(unix)]
-    {
-        if !path.is_absolute()
-            || path.parent() != Some(Path::new("/usr/bin"))
-            || !trusted_unix_binary_metadata(&metadata, &parent)
-        {
-            return Err(error(format!(
-                "system {name}が安全な実行fileではありません"
-            )));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        if !path.is_absolute()
-            || metadata.file_type().is_symlink()
-            || !metadata.file_type().is_file()
-        {
-            return Err(error(format!(
-                "system {name}が安全な実行fileではありません"
-            )));
-        }
-    }
-    Ok(path.display().to_string())
+    trust::trusted_system_binary(path, name).map_err(error)
 }
 fn git_command(args: &[String]) -> Result<Vec<String>> {
     trusted_binary(GH_BINARY, "GitHub CLI")?;
@@ -3487,46 +3428,6 @@ mod tests {
             assert!(dangerous_local_git_key(key), "{key} must be rejected");
         }
         assert!(!dangerous_local_git_key("remote.origin.url"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn trusted_system_binaries_require_root_owned_regular_paths() {
-        let git = fs::symlink_metadata(GIT_BINARY).expect("system Git metadata");
-        let system_directory = fs::symlink_metadata("/usr/bin").expect("system bin metadata");
-        assert!(trusted_unix_binary_metadata(&git, &system_directory));
-        assert!(trusted_binary(GIT_BINARY, "Git").is_ok());
-        assert!(trusted_binary(GH_BINARY, "GitHub CLI").is_ok());
-        assert!(trusted_binary(SSH_BINARY, "SSH").is_ok());
-
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root = env::temp_dir().join(format!("codex-delivery-system-bin-{suffix}"));
-        let target = root.join("target");
-        let linked_parent = root.join("linked-parent");
-        fs::create_dir(&root).expect("create system binary fixture");
-        fs::create_dir(&target).expect("create symlink target");
-        std::os::unix::fs::symlink(&target, &linked_parent).expect("create parent symlink");
-        let linked_parent_metadata =
-            fs::symlink_metadata(&linked_parent).expect("parent symlink metadata");
-        assert!(!trusted_unix_binary_metadata(&git, &linked_parent_metadata));
-
-        if unsafe { libc::getuid() } != 0 {
-            let fake = root.join("git");
-            fs::write(&fake, b"not a system binary").expect("write user-owned executable");
-            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755))
-                .expect("set fake executable mode");
-            assert!(!trusted_unix_binary_metadata(
-                &fs::symlink_metadata(&fake).expect("fake executable metadata"),
-                &fs::symlink_metadata(&root).expect("fixture root metadata")
-            ));
-            fs::remove_file(fake).expect("remove fake executable");
-        }
-        fs::remove_file(linked_parent).expect("remove parent symlink");
-        fs::remove_dir(target).expect("remove symlink target");
-        fs::remove_dir(root).expect("remove system binary fixture");
     }
 
     #[test]

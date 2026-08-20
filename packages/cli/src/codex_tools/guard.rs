@@ -18,7 +18,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-use crate::codex_tools::process;
+use crate::codex_tools::{process, trust};
 use serde::Deserializer;
 use serde::de::{self, MapAccess, Visitor};
 use serde_json::Value as StrictJsonValue;
@@ -980,7 +980,10 @@ fn isolate_git_environment(command: &mut Command) {
 }
 
 fn local_git_config_is_safe(cwd: &str) -> bool {
-    let mut command = Command::new(SYSTEM_GIT);
+    let Ok(git) = trust::trusted_system_binary(SYSTEM_GIT, "Git") else {
+        return false;
+    };
+    let mut command = Command::new(git);
     command.current_dir(cwd).args([
         "config",
         "--local",
@@ -1012,7 +1015,8 @@ fn run_git(cwd: &str, args: &[&str]) -> Option<String> {
     if cwd.is_empty() || !local_git_config_is_safe(cwd) {
         return None;
     }
-    let mut command = Command::new(SYSTEM_GIT);
+    let git = trust::trusted_system_binary(SYSTEM_GIT, "Git").ok()?;
+    let mut command = Command::new(git);
     command
         .args([
             "--no-pager",
@@ -1138,7 +1142,8 @@ fn run_gh(cwd: &str, args: &[&str]) -> Option<(i32, Vec<u8>)> {
         return None;
     }
     let sandbox = GuardGhSandbox::create()?;
-    let mut command = Command::new(SYSTEM_GH);
+    let gh = trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI").ok()?;
+    let mut command = Command::new(gh);
     command.args(args).current_dir(cwd);
     command
         .env_clear()

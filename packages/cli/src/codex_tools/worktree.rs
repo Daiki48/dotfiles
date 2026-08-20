@@ -16,6 +16,8 @@ use serde::Deserializer;
 use serde::de::{self, MapAccess, Visitor};
 use serde_json::{Map, Value};
 
+use super::trust;
+
 #[cfg(test)]
 use std::io::Read;
 #[cfg(test)]
@@ -577,8 +579,10 @@ fn safe_environment(command: &mut Command) {
     command.env("PATH", SYSTEM_PATH);
 }
 
-fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Command {
-    let mut command = Command::new(TRUSTED_GIT_COMMAND);
+fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Result<Command, WorktreeError> {
+    let git = trust::trusted_system_binary(TRUSTED_GIT_COMMAND, "Git").map_err(error)?;
+    let ssh = trust::trusted_system_binary(TRUSTED_SSH_COMMAND, "SSH").map_err(error)?;
+    let mut command = Command::new(git);
     // Command-line config has higher precedence than repository-local config.
     // Values that can select or execute another process are therefore pinned
     // for every Git subcommand, including network operations.
@@ -588,7 +592,7 @@ fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Command {
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-c")
-        .arg(format!("core.sshCommand={TRUSTED_SSH_COMMAND}"))
+        .arg(format!("core.sshCommand={ssh}"))
         .arg("-c")
         .arg("core.gitProxy=")
         .arg("-c")
@@ -614,7 +618,7 @@ fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     safe_environment(&mut command);
-    command
+    Ok(command)
 }
 
 fn local_config_keys(cwd: &Path) -> Result<Vec<String>, WorktreeError> {
@@ -628,7 +632,7 @@ fn local_config_keys(cwd: &Path) -> Result<Vec<String>, WorktreeError> {
             "--null",
             "--list",
         ],
-    );
+    )?;
     let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
         .map_err(|cause| error(format!("repository configを確認できません: {cause}")))?;
     if !output.status.success() {
@@ -700,7 +704,7 @@ impl EmptyFallback for String {
 
 fn git(cwd: &Path, arguments: &[&str]) -> Result<GitOutput, WorktreeError> {
     validate_local_config(cwd)?;
-    let mut command = isolated_git_command(cwd, arguments);
+    let mut command = isolated_git_command(cwd, arguments)?;
     let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
         .map_err(|cause| error(format!("gitを実行できません: {cause}")))?;
     let stdout =
@@ -719,7 +723,7 @@ fn git_allow_failure(cwd: &Path, arguments: &[&str]) -> Result<(i32, GitOutput),
     // Branch existence checks need the exit status. The same bounded runner is
     // used, but non-zero output is not converted into WorktreeError here.
     validate_local_config(cwd)?;
-    let mut command = isolated_git_command(cwd, arguments);
+    let mut command = isolated_git_command(cwd, arguments)?;
     let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
         .map_err(|cause| error(format!("gitを実行できません: {cause}")))?;
     let stdout =
@@ -747,7 +751,7 @@ fn local_config_values(cwd: &Path, key: &str) -> Result<Vec<String>, WorktreeErr
             "--get-all",
             key,
         ],
-    );
+    )?;
     let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
         .map_err(|cause| error(format!("repository configを確認できません: {cause}")))?;
     if !output.status.success() {
