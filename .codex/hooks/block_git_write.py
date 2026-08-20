@@ -1081,7 +1081,10 @@ def _run_gh_bytes(cwd, *args):
         return None
     finally:
         if selector is not None:
-            selector.close()
+            try:
+                selector.close()
+            except OSError:
+                pass
         if process is not None:
             if process.poll() is None:
                 try:
