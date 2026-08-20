@@ -108,6 +108,9 @@ class GuardTest(unittest.TestCase):
             "> /tmp/status printf '%s' git",
             "printf '%s' git > /tmp/status",
             "rg --files /tmp/git > /tmp/path",
+            "bash -c 'printf ok' > /tmp/status",
+            "find . -maxdepth 0 -print > /tmp/status",
+            "eval 'printf ok' > /tmp/status",
         ):
             with self.subTest(command=command):
                 self.assert_allowed(command)

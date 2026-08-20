@@ -2172,9 +2172,7 @@ def _leading_redirection_wraps_guarded_command(command, cwd=None, depth=0):
     if chunk:
         chunks.append(chunk)
 
-    guarded = RESTRICTED_COMMANDS | DESTRUCTIVE_COMMANDS | SHELLS | {
-        ".", "eval", "find", "source",
-    }
+    guarded = RESTRICTED_COMMANDS
     for chunk in chunks:
         arguments = []
         consumed = False
