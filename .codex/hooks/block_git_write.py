@@ -1097,7 +1097,7 @@ def _gh_transport_reason(cwd):
     ]
     if len(socket_values) != 1:
         return "gh run cancelのGitHub transport設定を確認できません"
-    if socket_values[0].strip():
+    if socket_values[0] != "":
         return "gh run cancelではhttp_unix_socketを使用できません"
     return None
 

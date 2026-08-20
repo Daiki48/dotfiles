@@ -981,16 +981,20 @@ class GuardTest(unittest.TestCase):
         missing = GUARD.subprocess.CompletedProcess(
             ["gh"], 0, b"git_protocol=https\n", b""
         )
+        whitespace = GUARD.subprocess.CompletedProcess(
+            ["gh"], 0, b"http_unix_socket= \t\n", b""
+        )
         with (
             mock.patch.dict(GUARD.os.environ, {}, clear=True),
             mock.patch.object(
                 GUARD.subprocess,
                 "run",
-                side_effect=(configured, safe, failed, missing),
+                side_effect=(configured, safe, failed, missing, whitespace),
             ) as run,
         ):
             self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
             self.assertIsNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
             self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
             self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
         args, kwargs = run.call_args_list[0]
