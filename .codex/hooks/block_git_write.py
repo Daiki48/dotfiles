@@ -1082,9 +1082,16 @@ def _run_gh_bytes(cwd, *args):
     finally:
         if selector is not None:
             selector.close()
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
+        if process is not None:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                process.wait()
+            except (OSError, subprocess.SubprocessError):
+                pass
 
 
 def _run_gh_json(cwd, *args):

@@ -987,6 +987,7 @@ class GuardTest(unittest.TestCase):
         process = mock.Mock(stdout=stream)
         process.poll.return_value = None
         process.wait.return_value = 0
+        process.kill.side_effect = ProcessLookupError
         with (
             mock.patch.object(GUARD, "MAX_BODY_FILE_BYTES", 4),
             mock.patch.object(GUARD.subprocess, "Popen", return_value=process),
@@ -994,6 +995,7 @@ class GuardTest(unittest.TestCase):
             self.assertIsNone(GUARD._run_gh_bytes("/workspace", "api", "/user"))
         stream.close()
         process.kill.assert_called_once_with()
+        process.wait.assert_called()
 
     def test_run_cancel_rejects_unsafe_github_transport(self):
         command = "gh run cancel 123 --repo owner/repo"
