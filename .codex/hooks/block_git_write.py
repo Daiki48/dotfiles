@@ -847,7 +847,9 @@ def _git_invocation_reason(tokens, cwd=None):
 
 
 def _gh_api_is_write(args):
-    mutation_flags = {"-f", "--raw-field", "-F", "--field", "--input"}
+    mutation_flags = {
+        "-f", "--raw-field", "-F", "--field", "--input", "--cache",
+    }
     index = 0
     while index < len(args):
         token = args[index]
@@ -2146,7 +2148,7 @@ def _has_unquoted_shell_control(command):
     return _has_unquoted_shell_character(command, {";", "&", "|", "(", ")", "\n"})
 
 
-def _leading_redirection_wraps_guarded_command(command):
+def _leading_redirection_wraps_guarded_command(command, cwd=None, depth=0):
     """commandより前のredirectionでguard対象の実行位置を隠していればTrue。"""
     if not _has_unquoted_shell_redirection(command):
         return False
@@ -2174,7 +2176,30 @@ def _leading_redirection_wraps_guarded_command(command):
         ".", "eval", "find", "source",
     }
     for chunk in chunks:
-        arguments = list(chunk)
+        arguments = []
+        consumed = False
+        index = 0
+        while index < len(chunk):
+            if (
+                index + 1 < len(chunk)
+                and chunk[index].isdigit()
+                and any(char in "<>" for char in chunk[index + 1])
+            ):
+                index += 1
+            operator = chunk[index] if index < len(chunk) else ""
+            if (
+                operator
+                and all(char in "<>&|" for char in operator)
+                and any(char in "<>" for char in operator)
+            ):
+                consumed = True
+                index += 2
+                continue
+            arguments.append(chunk[index])
+            index += 1
+        if not consumed or not arguments:
+            continue
+
         while arguments and (
             re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", arguments[0])
             or arguments[0] in SHELL_COMMAND_PREFIXES
@@ -2186,28 +2211,6 @@ def _leading_redirection_wraps_guarded_command(command):
                 arguments.pop(0)
         if arguments and arguments[0] == "repeat":
             arguments = arguments[2:] if len(arguments) >= 2 else []
-
-        consumed = False
-        while arguments:
-            if (
-                len(arguments) >= 2
-                and arguments[0].isdigit()
-                and any(char in "<>" for char in arguments[1])
-            ):
-                arguments.pop(0)
-            operator = arguments[0] if arguments else ""
-            if (
-                not operator
-                or not all(char in "<>&|" for char in operator)
-                or not any(char in "<>" for char in operator)
-            ):
-                break
-            consumed = True
-            arguments.pop(0)
-            if arguments:
-                arguments.pop(0)
-        if not consumed or not arguments:
-            continue
         start = _command_start(arguments)
         if start is None:
             continue
@@ -2215,8 +2218,11 @@ def _leading_redirection_wraps_guarded_command(command):
         if (
             os.path.basename(executable) in guarded
             or _is_git_subcommand_executable(executable)
+            or _command_word_has_expansion(executable)
             or _contains_restricted_command(arguments)
         ):
+            return True
+        if blocked_reason(shlex.join(arguments), cwd, depth + 1) is not None:
             return True
     return False
 
@@ -2418,7 +2424,7 @@ def blocked_reason(command, cwd=None, depth=0):
         return "backslash-newlineによるshell token連結は安全に検査できません"
     if "$(" in command or "`" in command:
         return "command substitutionを含むcommandは安全に検査できません"
-    if _leading_redirection_wraps_guarded_command(command):
+    if _leading_redirection_wraps_guarded_command(command, cwd, depth):
         return "先頭redirectionを伴うGit/GitHub/helper commandは実行できません"
     segments = list(_command_segments(command))
     if len(segments) > 1 and any(
