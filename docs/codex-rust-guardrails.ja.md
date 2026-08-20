@@ -23,7 +23,8 @@ hookのallow/deny、helperのCLI、worktree manifest、delivery receipt v1/v2/v3
 
 入力、path、schema、repository identityを検証できない場合は処理を続行せず、hookはdeny、helperは非0で
 終了します。外部commandは標準出力と標準エラーを同時に回収し、それぞれ4 MiBを上限とします。deadline
-または上限超過時はchildだけでなくprocess groupを停止し、`wait`で回収してからerrorを返します。
+または上限超過時はchildだけでなくprocess groupを停止し、`wait`で回収してからerrorを返します。process
+group外へ脱出した子孫がpipeを保持しても、capture readerはnon-blocking cancelとhard deadlineで停止します。
 managed file、manifest、receipt、stateは一時fileの同期とrenameを使い、途中状態を明示的に再開または拒否します。
 
 ## 性能と品質保証

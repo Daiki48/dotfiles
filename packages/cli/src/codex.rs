@@ -30,6 +30,7 @@ enum ManagedInstallMode {
 enum ManagedTransactionKind {
     Install,
     Migrate,
+    LegacyUpdate,
     Update,
 }
 
@@ -47,6 +48,16 @@ const MANAGED_BINARY_DESTINATIONS: &[&str] = &[
 ];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 const MANAGED_TRANSACTION_SUFFIX: &str = ".managed.pending";
+
+// These are the exact SHA-256 values of
+// `origin/main:.codex/helpers/codex-{worktree,delivery}` from the last Python
+// installer.  They are intentionally allowlisted:
+// a regular file without managed state must never be adopted merely because
+// its name or mode looks familiar.
+const LEGACY_CODEX_WORKTREE_SHA256: &str =
+    "fd18804aff104ea79efd7ab76497ad008e93b8f6c8d88b78704c05141e4ce6c4";
+const LEGACY_CODEX_DELIVERY_SHA256: &str =
+    "1ff878b7e0d50f6ece82c13a55dcdc53193df738bba4f9cc41cbee0367162b47";
 
 // Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
 // ディレクトリごとリンクすることで、Skill の追加時に CLI 側の列挙を更新せずに済む。
@@ -657,8 +668,12 @@ impl ManagedTransaction {
             ManagedTransactionKind::Migrate if self.previous_hash.is_none() => {
                 ("symlink", "symlink")
             }
-            ManagedTransactionKind::Update => (
-                "update",
+            ManagedTransactionKind::LegacyUpdate | ManagedTransactionKind::Update => (
+                if self.kind == ManagedTransactionKind::LegacyUpdate {
+                    "legacy-update"
+                } else {
+                    "update"
+                },
                 self.previous_hash
                     .as_deref()
                     .filter(|hash| valid_sha256(hash))
@@ -680,6 +695,10 @@ impl ManagedTransaction {
         let (kind, previous_hash) = match (lines[1], lines[2]) {
             ("install", "absent") => (ManagedTransactionKind::Install, None),
             ("symlink", "symlink") => (ManagedTransactionKind::Migrate, None),
+            ("legacy-update", previous) if valid_sha256(previous) => (
+                ManagedTransactionKind::LegacyUpdate,
+                Some(previous.to_owned()),
+            ),
             ("update", previous) if valid_sha256(previous) => {
                 (ManagedTransactionKind::Update, Some(previous.to_owned()))
             }
@@ -721,6 +740,26 @@ fn verify_current_user_regular_file(path: &Path, metadata: &fs::Metadata) -> Res
         );
     }
     Ok(())
+}
+
+fn verify_legacy_helper_file(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    verify_current_user_regular_file(path, metadata)?;
+    #[cfg(unix)]
+    if metadata.mode() & 0o7777 != 0o755 {
+        anyhow::bail!(
+            "Legacy managed helper must have executable mode 0755: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn legacy_hash_for_destination(relative_destination: &str) -> Option<&'static str> {
+    match relative_destination {
+        ".local/bin/codex-worktree" => Some(LEGACY_CODEX_WORKTREE_SHA256),
+        ".local/bin/codex-delivery" => Some(LEGACY_CODEX_DELIVERY_SHA256),
+        _ => None,
+    }
 }
 
 fn read_managed_transaction(path: &Path) -> Result<Option<ManagedTransaction>> {
@@ -959,6 +998,48 @@ fn resume_owner_executable_transaction(
                     destination.display()
                 ),
             },
+            ManagedTransactionKind::LegacyUpdate => {
+                let previous_hash = transaction
+                    .previous_hash
+                    .as_deref()
+                    .context("Legacy managed update is missing previous hash")?;
+                match (&destination_state, &managed_state) {
+                    (ManagedDestinationState::Regular(hash), None) if hash == previous_hash => {
+                        let metadata = fs::symlink_metadata(destination).with_context(|| {
+                            format!("Failed to inspect legacy helper {}", destination.display())
+                        })?;
+                        verify_legacy_helper_file(destination, &metadata)?;
+                        replace_regular_file(
+                            destination,
+                            source_contents,
+                            destination_permissions.clone(),
+                        )?;
+                        sync_parent_directory(destination)?;
+                        continue;
+                    }
+                    (ManagedDestinationState::Regular(hash), None) if hash == source_hash => {
+                        publish_regular_file_exclusive(
+                            state_path,
+                            source_hash,
+                            state_permissions.clone(),
+                        )?;
+                        continue;
+                    }
+                    (ManagedDestinationState::Regular(hash), Some(state))
+                        if hash == source_hash && state == previous_hash =>
+                    {
+                        replace_regular_file(state_path, source_hash, state_permissions.clone())?;
+                        sync_parent_directory(state_path)?;
+                        continue;
+                    }
+                    (ManagedDestinationState::Regular(hash), Some(state))
+                        if hash == source_hash && state == source_hash => {}
+                    _ => anyhow::bail!(
+                        "Legacy managed update transaction reached an invalid state: {}",
+                        destination.display()
+                    ),
+                }
+            }
             ManagedTransactionKind::Update => {
                 let previous_hash = transaction
                     .previous_hash
@@ -1011,10 +1092,20 @@ fn resume_owner_executable_transaction(
     )
 }
 
+#[cfg(test)]
 fn ensure_managed_hook(
     source: &Path,
     destination: &Path,
     install_mode: ManagedInstallMode,
+) -> Result<()> {
+    ensure_managed_hook_with_legacy_hash(source, destination, install_mode, None)
+}
+
+fn ensure_managed_hook_with_legacy_hash(
+    source: &Path,
+    destination: &Path,
+    install_mode: ManagedInstallMode,
+    legacy_hash: Option<&str>,
 ) -> Result<()> {
     if let Some(parent) = destination.parent() {
         reject_symlink_directory_components(parent)?;
@@ -1045,6 +1136,17 @@ fn ensure_managed_hook(
         );
     }
     if let Some(transaction) = pending_transaction.as_ref() {
+        if transaction.kind == ManagedTransactionKind::LegacyUpdate {
+            let expected_legacy_hash = legacy_hash.context(
+                "Legacy managed transaction is not allowed for an unrecognized destination",
+            )?;
+            if transaction.previous_hash.as_deref() != Some(expected_legacy_hash) {
+                anyhow::bail!(
+                    "Legacy managed transaction does not match the known Python helper: {}",
+                    transaction_path.display()
+                );
+            }
+        }
         resume_owner_executable_transaction(
             source,
             &source_contents,
@@ -1184,6 +1286,66 @@ fn ensure_managed_hook(
     };
     let state_matches = recorded.as_deref().is_some_and(valid_sha256)
         && recorded.as_deref() == Some(existing_hash.as_str());
+
+    // The Python installer did not write managed state for executable helpers.
+    // Migrate only an exact, allowlisted old helper with the original owner and
+    // mode.  The backup is durable before the journal is published; the
+    // journal then makes replacement and state publication resumable.
+    if install_mode == ManagedInstallMode::OwnerExecutable
+        && recorded.is_none()
+        && legacy_hash.is_some_and(|expected| expected == existing_hash)
+    {
+        let metadata = metadata
+            .as_ref()
+            .context("Legacy managed helper destination disappeared")?;
+        verify_legacy_helper_file(destination, metadata)?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("System clock is before UNIX_EPOCH")?
+            .as_nanos();
+        let backup_path = destination.with_file_name(format!(
+            "{}.bak.automation-legacy.{timestamp}",
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("managed-file")
+        ));
+        copy_file_exclusive(destination, &backup_path)?;
+        sync_parent_directory(&backup_path)?;
+        let backup_hash = sha256(
+            fs::read(&backup_path)
+                .with_context(|| format!("Failed to verify backup {}", backup_path.display()))?,
+        );
+        let current_hash = sha256(fs::read(destination).with_context(|| {
+            format!("Failed to re-read legacy helper {}", destination.display())
+        })?);
+        if backup_hash != existing_hash || current_hash != existing_hash {
+            anyhow::bail!(
+                "Legacy managed helper changed while creating backup: {}",
+                destination.display()
+            );
+        }
+
+        let transaction = ManagedTransaction {
+            kind: ManagedTransactionKind::LegacyUpdate,
+            previous_hash: Some(existing_hash),
+            target_hash: source_hash.clone(),
+        };
+        begin_managed_transaction(&transaction_path, &transaction, &source_permissions)?;
+        return resume_owner_executable_transaction(
+            source,
+            &source_contents,
+            &source_hash,
+            destination,
+            &destination_permissions,
+            &state_path,
+            &state_permissions,
+            &transaction_path,
+            &transaction,
+        );
+    }
+
     if install_mode == ManagedInstallMode::OwnerExecutable && !state_matches {
         anyhow::bail!(
             "Managed state does not match {}; refusing to adopt an unmanaged file",
@@ -1660,10 +1822,11 @@ pub fn setup() -> Result<()> {
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
     let managed_binary = build_managed_binary(&dotfiles_path)?;
     for destination in MANAGED_BINARY_DESTINATIONS {
-        ensure_managed_hook(
+        ensure_managed_hook_with_legacy_hash(
             &managed_binary,
             &home.join(destination),
             ManagedInstallMode::OwnerExecutable,
+            legacy_hash_for_destination(destination),
         )?;
     }
     println!("\nLinking shared skill directories...");
@@ -1691,12 +1854,14 @@ mod tests {
     #[cfg(unix)]
     use super::account_home_dir;
     use super::{
-        MANAGED_BINARY_DESTINATIONS, MANAGED_HOOK_COMMAND, ManagedInstallMode, ManagedTransaction,
+        LEGACY_CODEX_DELIVERY_SHA256, LEGACY_CODEX_WORKTREE_SHA256, MANAGED_BINARY_DESTINATIONS,
+        MANAGED_HOOK_COMMAND, MANAGED_HOOK_DESTINATION, ManagedInstallMode, ManagedTransaction,
         ManagedTransactionKind, PYTHON_MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND,
         begin_managed_transaction, contains_legacy_profile_config, copy_file_exclusive,
-        ensure_config_unchanged, ensure_managed_hook, ensure_managed_writable_root,
-        ensure_private_directory, managed_hook_state_path, managed_transaction_path,
-        merge_managed_config, merge_managed_config_with_root, migrate_managed_config_from_template,
+        ensure_config_unchanged, ensure_managed_hook, ensure_managed_hook_with_legacy_hash,
+        ensure_managed_writable_root, ensure_private_directory, legacy_hash_for_destination,
+        managed_hook_state_path, managed_transaction_path, merge_managed_config,
+        merge_managed_config_with_root, migrate_managed_config_from_template,
         publish_regular_file_exclusive, sha256, validate_setup_home, verify_managed_symlink,
     };
     use std::fs;
@@ -2122,6 +2287,156 @@ description = "local"
             0o755
         );
         assert!(!managed_hook_state_path(&destination).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_python_helper_is_migrated_once_with_backup_and_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("legacy-python-helper");
+        let home = directory.path().join("home");
+        let source = directory.path().join("release-cli");
+        let destination = home.join(".local/bin/codex-delivery");
+        let old_contents = b"legacy helper\n";
+        let new_contents = b"rust multicall binary\0";
+        fs::create_dir_all(destination.parent().expect("helper parent")).expect("create home");
+        fs::write(&source, new_contents).expect("write Rust source");
+        fs::write(&destination, old_contents).expect("write legacy helper");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+            .expect("set legacy helper mode");
+        let legacy_hash = sha256(old_contents);
+
+        ensure_managed_hook_with_legacy_hash(
+            &source,
+            &destination,
+            ManagedInstallMode::OwnerExecutable,
+            Some(legacy_hash.as_str()),
+        )
+        .expect("migrate exact legacy helper");
+
+        assert_eq!(
+            fs::read(&destination).expect("read migrated helper"),
+            new_contents
+        );
+        assert_eq!(
+            fs::read_to_string(managed_hook_state_path(&destination)).expect("read state"),
+            sha256(new_contents)
+        );
+        assert!(!managed_transaction_path(&destination).exists());
+        let backups = fs::read_dir(destination.parent().expect("helper parent"))
+            .expect("read helper parent")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("codex-delivery.bak.automation-legacy.")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read(backups[0].path()).expect("read legacy backup"),
+            old_contents
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_python_helper_transaction_resumes_without_managed_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("legacy-python-transaction");
+        let source = directory.path().join("release-cli");
+        let old_contents: &[u8] = b"legacy helper\n";
+        let new_contents: &[u8] = b"rust multicall binary\0";
+        fs::write(&source, new_contents).expect("write Rust source");
+        let old_hash = sha256(old_contents);
+        let new_hash = sha256(new_contents);
+
+        for stage in ["old", "destination", "complete"] {
+            let destination = directory.path().join(format!("codex-delivery-{stage}"));
+            let state_path = managed_hook_state_path(&destination);
+            let destination_contents = if stage == "old" {
+                old_contents
+            } else {
+                new_contents
+            };
+            fs::write(&destination, destination_contents).expect("write interrupted helper");
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+                .expect("set interrupted helper mode");
+            if stage == "complete" {
+                fs::write(&state_path, &new_hash).expect("write completed state");
+            }
+            write_pending_transaction(
+                &source,
+                &destination,
+                ManagedTransactionKind::LegacyUpdate,
+                Some(old_hash.clone()),
+                new_hash.clone(),
+            );
+
+            ensure_managed_hook_with_legacy_hash(
+                &source,
+                &destination,
+                ManagedInstallMode::OwnerExecutable,
+                Some(old_hash.as_str()),
+            )
+            .expect("resume legacy helper transaction");
+            assert_eq!(
+                fs::read(&destination).expect("read migrated helper"),
+                new_contents
+            );
+            assert_eq!(
+                fs::read_to_string(&state_path).expect("read migrated state"),
+                new_hash
+            );
+            assert!(!managed_transaction_path(&destination).exists());
+        }
+
+        let mismatch_destination = directory.path().join("codex-delivery-mismatch");
+        fs::write(&mismatch_destination, old_contents).expect("write mismatched helper");
+        fs::set_permissions(&mismatch_destination, fs::Permissions::from_mode(0o755))
+            .expect("set mismatched helper mode");
+        write_pending_transaction(
+            &source,
+            &mismatch_destination,
+            ManagedTransactionKind::LegacyUpdate,
+            Some(sha256(b"another legacy helper\n")),
+            new_hash,
+        );
+        let pending_path = managed_transaction_path(&mismatch_destination);
+        let pending_before = fs::read(&pending_path).expect("read mismatched journal");
+        assert!(
+            ensure_managed_hook_with_legacy_hash(
+                &source,
+                &mismatch_destination,
+                ManagedInstallMode::OwnerExecutable,
+                Some(old_hash.as_str()),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(&mismatch_destination).expect("read mismatched helper"),
+            old_contents
+        );
+        assert_eq!(
+            fs::read(&pending_path).expect("read retained journal"),
+            pending_before
+        );
+    }
+
+    #[test]
+    fn legacy_hash_allowlist_covers_only_old_helper_destinations() {
+        assert_eq!(
+            legacy_hash_for_destination(".local/bin/codex-worktree"),
+            Some(LEGACY_CODEX_WORKTREE_SHA256)
+        );
+        assert_eq!(
+            legacy_hash_for_destination(".local/bin/codex-delivery"),
+            Some(LEGACY_CODEX_DELIVERY_SHA256)
+        );
+        assert_eq!(legacy_hash_for_destination(MANAGED_HOOK_DESTINATION), None);
     }
 
     #[cfg(unix)]

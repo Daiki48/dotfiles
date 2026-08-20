@@ -1,5 +1,7 @@
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,6 +10,7 @@ use thiserror::Error;
 
 pub(crate) const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+const READER_GRACE: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 const TERMINATE_GRACE: Duration = Duration::from_millis(100);
 
@@ -49,6 +52,8 @@ pub(crate) enum ProcessError {
     },
     #[error("capture worker for {stream} terminated unexpectedly")]
     ReaderStopped { stream: &'static str },
+    #[error("capture worker for {stream} did not stop before its hard deadline")]
+    ReaderDeadline { stream: &'static str },
     #[error("{program} did not expose its configured {stream} pipe")]
     MissingPipe {
         program: String,
@@ -111,9 +116,41 @@ pub(crate) fn run_with_limit(
             });
         }
     };
+    #[cfg(unix)]
+    {
+        if let Err(source) = make_nonblocking(&stdout) {
+            terminate_and_reap(&mut child, false, &program)?;
+            return Err(ProcessError::Capture {
+                program,
+                stream: "stdout",
+                source,
+            });
+        }
+        if let Err(source) = make_nonblocking(&stderr) {
+            terminate_and_reap(&mut child, false, &program)?;
+            return Err(ProcessError::Capture {
+                program,
+                stream: "stderr",
+                source,
+            });
+        }
+    }
     let (sender, receiver) = mpsc::channel();
-    let stdout_reader = spawn_reader(stdout, "stdout", capture_limit, sender.clone());
-    let stderr_reader = spawn_reader(stderr, "stderr", capture_limit, sender);
+    let cancel_readers = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_reader(
+        stdout,
+        "stdout",
+        capture_limit,
+        Arc::clone(&cancel_readers),
+        sender.clone(),
+    );
+    let stderr_reader = spawn_reader(
+        stderr,
+        "stderr",
+        capture_limit,
+        Arc::clone(&cancel_readers),
+        sender,
+    );
 
     let deadline = Instant::now() + timeout;
     let mut status = None;
@@ -159,20 +196,30 @@ pub(crate) fn run_with_limit(
     }
 
     if result_error.is_some() {
-        terminate_and_reap(&mut child, status.is_some(), &program)?;
+        cancel_readers.store(true, Ordering::Release);
+        if let Err(error) = terminate_and_reap(&mut child, status.is_some(), &program) {
+            result_error.get_or_insert(error);
+        }
     } else if status.is_none() {
-        status = Some(child.wait().map_err(|source| ProcessError::Wait {
-            program: program.clone(),
-            source,
-        })?);
+        match child.wait() {
+            Ok(child_status) => status = Some(child_status),
+            Err(source) => {
+                cancel_readers.store(true, Ordering::Release);
+                result_error = Some(ProcessError::Wait {
+                    program: program.clone(),
+                    source,
+                });
+            }
+        }
     }
 
-    stdout_reader
-        .join()
-        .map_err(|_| ProcessError::ReaderStopped { stream: "stdout" })?;
-    stderr_reader
-        .join()
-        .map_err(|_| ProcessError::ReaderStopped { stream: "stderr" })?;
+    let reader_deadline = Instant::now() + READER_GRACE;
+    if let Err(error) = join_reader(stdout_reader, "stdout", reader_deadline) {
+        result_error.get_or_insert(error);
+    }
+    if let Err(error) = join_reader(stderr_reader, "stderr", reader_deadline) {
+        result_error.get_or_insert(error);
+    }
     drain_messages(
         &receiver,
         &program,
@@ -198,18 +245,22 @@ fn spawn_reader<R: Read + Send + 'static>(
     reader: R,
     stream: &'static str,
     limit: usize,
+    cancelled: Arc<AtomicBool>,
     sender: mpsc::Sender<ReadMessage>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let outcome = read_bounded(reader, limit);
+        let outcome = read_bounded(reader, limit, &cancelled);
         let _ = sender.send(ReadMessage { stream, outcome });
     })
 }
 
-fn read_bounded(mut reader: impl Read, limit: usize) -> ReadOutcome {
+fn read_bounded(mut reader: impl Read, limit: usize, cancelled: &AtomicBool) -> ReadOutcome {
     let mut captured = Vec::with_capacity(limit.min(64 * 1024));
     let mut buffer = [0_u8; 8192];
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return ReadOutcome::Data(captured);
+        }
         match reader.read(&mut buffer) {
             Ok(0) => return ReadOutcome::Data(captured),
             Ok(read) if captured.len().saturating_add(read) <= limit => {
@@ -217,9 +268,43 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> ReadOutcome {
             }
             Ok(_) => return ReadOutcome::Limit,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(POLL_INTERVAL);
+            }
             Err(error) => return ReadOutcome::Error(error),
         }
     }
+}
+
+#[cfg(unix)]
+fn make_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+    let descriptor = pipe.as_raw_fd();
+    // SAFETY: fcntl is called for an owned, live pipe descriptor and no pointers.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the same live descriptor is updated only with O_NONBLOCK.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn join_reader(
+    handle: thread::JoinHandle<()>,
+    stream: &'static str,
+    deadline: Instant,
+) -> Result<(), ProcessError> {
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+    if !handle.is_finished() {
+        return Err(ProcessError::ReaderDeadline { stream });
+    }
+    handle
+        .join()
+        .map_err(|_| ProcessError::ReaderStopped { stream })
 }
 
 fn drain_messages(
@@ -363,5 +448,17 @@ mod tests {
             .expect_err("enforce deadline");
         assert!(matches!(error, ProcessError::Timeout { .. }));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escaped_descendant_cannot_hold_capture_workers_past_deadline() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "setsid sh -c 'sleep 2' & exit 0"]);
+        let started = Instant::now();
+        let error = run_with_limit(&mut command, Duration::from_millis(50), 1024)
+            .expect_err("escaped pipe holder must hit the bounded deadline");
+        assert!(matches!(error, ProcessError::Timeout { .. }));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

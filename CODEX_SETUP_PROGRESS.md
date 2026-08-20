@@ -65,9 +65,9 @@ Daiki の要望:
 - **実証済み**: `codex execpolicy check` で 42 ケース全て期待どおり。
 - ⚠️ ただし rules の `forbidden` は approval=never では効かない（下記「重要な制約」参照）。
 
-### 4. Git ガード hook
+### 4. Git ガード hook（当時のPython実装）
 
-- `~/dotfiles/.codex/hooks/block_git_write.py` … git 書き込み系コマンドを `permissionDecision: deny` でブロックする PreToolUse hook。
+- 当時は `~/dotfiles/.codex/hooks/block_git_write.py` で、git 書き込み系コマンドを `permissionDecision: deny` にしていた。現在はRust multi-call binaryへ移行済み。
   - **単体ロジックは全ケース合格**（push/commit/fetch/pull/reset/add/`git -c k=v commit`/`echo hi && git push` → DENY、status/log/diff/show/branch/`git log --grep=push`/一般コマンド → allow）。
   - deny は **stdout JSON（permissionDecision: deny）+ stderr 理由 + exit code 2** の三重で表現（公式仕様: exit 2 = block）。
     旧実装は exit 0 で、JSON が読まれなかった場合に素通り（fail-open）するリスクがあったため、exit 2 で **fail-close** 化済み（code-reviewer 指摘を反映）。
@@ -124,17 +124,17 @@ Daiki の要望:
 
 ---
 
-## 残課題（Daiki が対話で行う ＝ これが完成の最後の 2 ステップ）
+## 当時の残課題（Rust移行により解消・置換済み）
 
 ### A. hook の trust 登録と実動作確認【最優先】
 
 1. 任意の git リポジトリで対話起動: `codex --profile autonomous`
-2. `/hooks` を開き、`block_git_write.py` が **trusted** になっているか確認（未登録なら trust 登録）
+2. `/hooks` を開き、現在の `~/.codex/hooks/block-git-write` が **trusted** になっているか確認（未登録なら trust 登録）
 3. `git push`（または `git commit -m test`）の実行を指示し、**hook で deny される**ことを確認
    - ブロックされれば Git ガード完成
    - されなければ、matcher / command パス / trusted_hash を再確認（hook 定義を変えると hash が変わり再 trust が必要）
    - 補足: trust は hook **定義（command 文字列）**のハッシュに記録される（公式仕様。参照先スクリプト内容は対象外）。
-     今回 block_git_write.py の中身（exit code）のみ変更し hook 定義は不変なので trusted_hash は維持される見込み。
+     Rust移行でcommand定義が変わるため、旧Python hookのtrusted hashは再利用しない。
      `/hooks` で untrusted 表示なら再 trust すれば足りる。
 
 ### B. 対話での rules 動作確認
@@ -156,14 +156,15 @@ Daiki の要望:
 ├── autonomous.config.toml     # profile v2: workspace-write / gpt-5.5         ※ install CLI が ~/.codex/ へ copy
 ├── config.base.toml           # 新端末用 base テンプレート（端末非依存）      ※ install CLI が ~/.codex/config.toml へ copy
 ├── rules/default.rules        # コマンド単位制御（git forbidden / rm prompt） -> symlink
-└── hooks/block_git_write.py    # git 書き込みガード hook（command で参照）
+└── （hook sourceはpackages/cli/src/codex_tools/guard.rsへ移行）
 
 ~/.codex/（実体・ローカル管理）
 ├── config.toml                # base: グローバルデフォルト + projects(端末依存) + hooks定義 + hooks.state(trusted_hash)
 ├── teacher.config.toml        # profile v2 + projects(端末依存)
 ├── autonomous.config.toml     # profile v2 + projects(端末依存)
 ├── AGENTS.md              -> dotfiles（symlink）
-└── rules/default.rules    -> dotfiles（symlink）
+├── rules/default.rules    -> dotfiles（symlink）
+└── hooks/block-git-write  # installer管理のRust multi-call binary
 ```
 
 ※ 旧 `~/dotfiles/.codex/config.toml` は削除（project config として profile を上書きしていたため）。

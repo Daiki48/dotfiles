@@ -4,7 +4,7 @@
 //! starting any process, while Git/GitHub read-backs are bounded and fail
 //! closed.  Process lifecycle is delegated to the shared process runner.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -13,6 +13,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::codex_tools::process;
+use serde::Deserializer;
+use serde::de::{self, MapAccess, Visitor};
 use serde_json::Value as StrictJsonValue;
 
 const MAX_BODY_FILE_BYTES: u64 = 256 * 1024;
@@ -91,6 +93,52 @@ const WRAPPERS: &[&str] = &[
     "command", "env", "exec", "nice", "nohup", "sudo", "timeout", "xargs",
 ];
 const RESTRICTED_COMMANDS: &[&str] = &["git", "gh", "codex-worktree", "codex-delivery"];
+const SHELL_COMPOUND_PREFIXES: &[&str] = &[
+    "!",
+    "-",
+    "{",
+    "case",
+    "coproc",
+    "do",
+    "elif",
+    "else",
+    "end",
+    "for",
+    "foreach",
+    "function",
+    "if",
+    "nocorrect",
+    "noglob",
+    "repeat",
+    "select",
+    "then",
+    "time",
+    "until",
+    "while",
+];
+const SHELL_COMMAND_PREFIXES: &[&str] = &[
+    "!",
+    "-",
+    "{",
+    "do",
+    "elif",
+    "else",
+    "if",
+    "nocorrect",
+    "noglob",
+    "then",
+    "until",
+    "while",
+];
+const SHELL_CONTEXT_MUTATIONS: &[&str] = &[
+    "alias", "autoload", "builtin", "cd", "chdir", "declare", "emulate", "enable", "eval",
+    "export", "float", "function", "hash", "integer", "local", "popd", "pushd", "readonly",
+    "rehash", "set", "setopt", "typeset", "unalias", "unset", "unsetopt",
+];
+const COMMAND_RESOLUTION_MUTATIONS: &[&str] = &[
+    ".", "alias", "autoload", "builtin", "emulate", "enable", "eval", "function", "hash", "rehash",
+    "source", "unalias",
+];
 const SENSITIVE_NAMES: &[&str] = &[
     ".env",
     "auth.json",
@@ -522,6 +570,108 @@ fn command_segments(command: &str) -> Vec<Vec<String>> {
     segments
 }
 
+fn guarded_executable_token(token: &str) -> bool {
+    let name = basename(token);
+    RESTRICTED_COMMANDS.contains(&name)
+        || DESTRUCTIVE_COMMANDS.contains(&name)
+        || SHELLS.contains(&name)
+        || [".", "eval", "find", "source"].contains(&name)
+        || git_subcommand_executable(token)
+}
+
+fn has_command_resolution_mutation(tokens: &[String]) -> bool {
+    let Some(start) = command_start(tokens) else {
+        return false;
+    };
+    COMMAND_RESOLUTION_MUTATIONS.contains(&basename(&tokens[start]))
+}
+
+fn has_shell_context_mutation(tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    if tokens.iter().all(|token| is_assignment(token)) {
+        return true;
+    }
+    command_start(tokens)
+        .and_then(|start| tokens.get(start))
+        .is_some_and(|token| SHELL_CONTEXT_MUTATIONS.contains(&basename(token)))
+}
+
+fn has_unparsed_guarded_command(tokens: &[String]) -> bool {
+    if tokens.is_empty() || !SHELL_COMPOUND_PREFIXES.contains(&tokens[0].as_str()) {
+        return false;
+    }
+    let mut arguments = tokens.to_vec();
+    let mut ambiguous_compound = false;
+    loop {
+        while arguments.first().is_some_and(|token| is_assignment(token)) {
+            arguments.remove(0);
+        }
+        let Some(prefix) = arguments.first().map(String::as_str) else {
+            return false;
+        };
+        if ["coproc", "function"].contains(&prefix) {
+            ambiguous_compound = true;
+            arguments.remove(0);
+            break;
+        }
+        if SHELL_COMMAND_PREFIXES.contains(&prefix) {
+            arguments.remove(0);
+            continue;
+        }
+        if prefix == "time" {
+            arguments.remove(0);
+            while arguments
+                .first()
+                .is_some_and(|token| ["-p", "--"].contains(&token.as_str()))
+            {
+                arguments.remove(0);
+            }
+            continue;
+        }
+        if prefix == "repeat" {
+            if arguments.len() < 2 {
+                return false;
+            }
+            arguments.drain(..2);
+            continue;
+        }
+        break;
+    }
+
+    if ambiguous_compound {
+        return arguments.iter().enumerate().any(|(index, token)| {
+            basename(token) == "env" && env_split_string(&arguments[index..])
+        }) || arguments
+            .iter()
+            .any(|token| guarded_executable_token(token) || command_word_expansion(token));
+    }
+    if has_command_resolution_mutation(&arguments) || wrapper_chain_uses_split(&arguments) {
+        return true;
+    }
+    if arguments
+        .iter()
+        .any(|token| guarded_executable_token(token))
+    {
+        return true;
+    }
+    let Some(start) = command_start(&arguments) else {
+        return false;
+    };
+    if ambiguous_wrapper_options(&arguments)
+        && (arguments
+            .iter()
+            .any(|token| guarded_executable_token(token))
+            || arguments.iter().any(|token| command_word_expansion(token)))
+    {
+        return true;
+    }
+    command_word_expansion(&arguments[start])
+        || guarded_executable_token(&arguments[start])
+        || python_helper_invocation_reason(&arguments).is_some()
+}
+
 fn has_unquoted(command: &str, chars: &[u8]) -> bool {
     let mut quote = 0u8;
     let mut escaped = false;
@@ -704,30 +854,51 @@ fn git_commit_reason(args: &[String]) -> Option<String> {
     if messages.len() != 1 {
         return Some("commit messageは-mで1件だけ明示してください".into());
     }
+    let mut index = 0;
+    while index < args.len() {
+        let token = &args[index];
+        if token == "-m" || token == "--message" {
+            index += 2;
+            continue;
+        }
+        if token.starts_with("--message=") || token.starts_with("-m") && token != "-m" {
+            index += 1;
+            continue;
+        }
+        if token == "-S" || token == "--gpg-sign" || token.starts_with("--gpg-sign=") {
+            index += 1;
+            continue;
+        }
+        return Some("git commit ではmessageとDaikiの署名設定以外の引数を使用できません".into());
+    }
     let message = &messages[0];
-    if message.contains('\n')
-        || !message.starts_with(':')
-        || !message.contains(": ")
-        || message.trim_end().is_empty()
-    {
+    if message.contains('\n') || !valid_commit_subject(message) {
         return Some("commit messageは':gitmoji: 短い要約'の1行形式にしてください".into());
     }
-    if message.to_ascii_lowercase().contains("co-authored-by:")
-        || message.to_ascii_lowercase().contains("generated by")
-        || message.to_ascii_lowercase().contains("signed-off-by:")
-        || message.to_ascii_lowercase().contains("codex")
-        || message.to_ascii_lowercase().contains("openai")
-        || message.to_ascii_lowercase().contains("chatgpt")
-        || message.to_ascii_lowercase().contains("claude")
-        || message.to_ascii_lowercase().contains("gemini")
-        || message.to_ascii_lowercase().contains("copilot")
-    {
+    if ai_attribution(message) {
         return Some("CodexまたはOpenAIのAI帰属は記録できません".into());
     }
     if contains_secret(message) {
         return Some("commit messageに秘密情報らしい値が含まれています".into());
     }
     None
+}
+
+fn valid_commit_subject(message: &str) -> bool {
+    let Some(rest) = message.strip_prefix(':') else {
+        return false;
+    };
+    let Some((tag, subject)) = rest.split_once(':') else {
+        return false;
+    };
+    !tag.is_empty()
+        && tag.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_+-".contains(&byte)
+        })
+        && subject
+            .strip_prefix(' ')
+            .and_then(|value| value.chars().next())
+            .is_some_and(|character| !character.is_whitespace())
 }
 
 fn run_git(cwd: &str, args: &[&str]) -> Option<String> {
@@ -973,6 +1144,67 @@ fn no_symlink_components(path: &Path) -> bool {
     true
 }
 
+struct StrictObjectVisitor;
+
+impl<'de> Visitor<'de> for StrictObjectVisitor {
+    type Value = BTreeMap<String, StrictJsonValue>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON object with unique keys")
+    }
+
+    fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = BTreeMap::new();
+        while let Some(key) = access.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom("duplicate JSON key"));
+            }
+            values.insert(key, access.next_value::<StrictJsonValue>()?);
+        }
+        Ok(values)
+    }
+}
+
+fn parse_strict_object(contents: &str) -> Option<BTreeMap<String, StrictJsonValue>> {
+    let mut deserializer = serde_json::Deserializer::from_str(contents);
+    let values = deserializer.deserialize_map(StrictObjectVisitor).ok()?;
+    deserializer.end().ok()?;
+    Some(values)
+}
+
+fn manifest_schema_matches(
+    manifest: &BTreeMap<String, StrictJsonValue>,
+    expected_strings: &[(&str, &str)],
+) -> bool {
+    let string_fields = [
+        "status",
+        "task_id",
+        "repository",
+        "common_git_dir",
+        "github_name",
+        "branch",
+        "base",
+        "base_oid",
+        "worktree",
+        "created_at",
+        "detail",
+    ];
+    manifest.len() == string_fields.len() + 1
+        && manifest.get("version").and_then(StrictJsonValue::as_i64) == Some(1)
+        && string_fields.iter().all(|key| {
+            manifest
+                .get(*key)
+                .and_then(StrictJsonValue::as_str)
+                .is_some()
+        })
+        && expected_strings.iter().all(|(key, expected)| {
+            manifest.get(*key).and_then(StrictJsonValue::as_str) == Some(*expected)
+        })
+}
+
 fn managed_worktree_reason(
     repository_root: &Path,
     common_git_dir: &Path,
@@ -1046,36 +1278,22 @@ fn managed_worktree_reason(
     let Ok(manifest) = fs::read_to_string(&manifest_path) else {
         return Some("managed worktree manifestを安全に検査できません".into());
     };
+    let Some(manifest) = parse_strict_object(&manifest) else {
+        return Some("managed worktree manifestを安全に検査できません".into());
+    };
     let Some(branch) = run_git(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]) else {
         return Some("managed worktreeのbranchを確認できません".into());
     };
-    let expected_values = [
-        ("version", "1"),
-        ("status", "\"ready\""),
-        ("task_id", &format!("\"{worktree_name}\"")),
+    let expected_strings = [
+        ("status", "ready"),
+        ("task_id", worktree_name),
+        ("repository", repository_path),
+        ("common_git_dir", common_git_dir.to_str().unwrap_or("")),
+        ("github_name", repository.as_str()),
+        ("worktree", worktree_path),
+        ("branch", branch.trim()),
     ];
-    if !expected_values.iter().all(|(key, value)| {
-        manifest.contains(&format!("\"{key}\":{value}"))
-            || manifest.contains(&format!("\"{key}\": {value}"))
-    }) || !manifest.contains(&format!("\"repository\":\"{}\"", repository_root.display()))
-        && !manifest.contains(&format!(
-            "\"repository\": \"{}\"",
-            repository_root.display()
-        ))
-        || !manifest.contains(&format!(
-            "\"common_git_dir\":\"{}\"",
-            common_git_dir.display()
-        )) && !manifest.contains(&format!(
-            "\"common_git_dir\": \"{}\"",
-            common_git_dir.display()
-        ))
-        || !manifest.contains(&format!("\"github_name\":\"{}\"", repository))
-            && !manifest.contains(&format!("\"github_name\": \"{}\"", repository))
-        || !manifest.contains(&format!("\"worktree\":\"{}\"", worktree_root.display()))
-            && !manifest.contains(&format!("\"worktree\": \"{}\"", worktree_root.display()))
-        || !manifest.contains(&format!("\"branch\":\"{}\"", branch.trim()))
-            && !manifest.contains(&format!("\"branch\": \"{}\"", branch.trim()))
-    {
+    if !manifest_schema_matches(&manifest, &expected_strings) {
         return Some("managed worktree manifestがcurrent repository状態と一致しません".into());
     }
     let Some(registered) = run_git(repository_path, &["worktree", "list", "--porcelain", "-z"])
@@ -1084,6 +1302,169 @@ fn managed_worktree_reason(
     };
     if !registered.contains(&format!("worktree {}\0", worktree_root.display())) {
         return Some("requested cwdがGit worktreeとして登録されていません".into());
+    }
+    None
+}
+
+fn branch_worktree(cwd: &str, head: &str) -> Result<PathBuf, String> {
+    let Some(output) = run_git(cwd, &["worktree", "list", "--porcelain", "-z"]) else {
+        return Err("Draft PRの登録済みworktreeを確認できません".into());
+    };
+    let expected_branch = format!("refs/heads/{head}");
+    let mut matches = Vec::new();
+    for raw_record in output.split("\0\0").filter(|record| !record.is_empty()) {
+        let fields = raw_record.split('\0').collect::<Vec<_>>();
+        let paths = fields
+            .iter()
+            .filter_map(|field| field.strip_prefix("worktree "))
+            .collect::<Vec<_>>();
+        let branches = fields
+            .iter()
+            .filter_map(|field| field.strip_prefix("branch "))
+            .collect::<Vec<_>>();
+        if branches != [expected_branch.as_str()] {
+            continue;
+        }
+        if paths.len() != 1
+            || fields
+                .iter()
+                .any(|field| *field == "prunable" || field.starts_with("prunable "))
+        {
+            return Err("Draft PRのhead worktree登録が安全な状態ではありません".into());
+        }
+        matches.push(PathBuf::from(paths[0]));
+    }
+    if matches.len() != 1 {
+        return Err("Draft PRのhead branchを所有するworktreeを一意に確認できません".into());
+    }
+    let candidate = &matches[0];
+    if !candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("Draft PRのhead worktree pathを安全に解決できません".into());
+    }
+    let resolved = fs::canonicalize(candidate)
+        .map_err(|_| "Draft PRのhead worktree pathを安全に解決できません".to_string())?;
+    if candidate != &resolved {
+        return Err("Draft PRのhead worktreeにsymlinkまたは非正規pathは使用できません".into());
+    }
+    let Some(resolved_str) = resolved.to_str() else {
+        return Err("Draft PRのhead worktree rootを確認できません".into());
+    };
+    if resolved_git_path(resolved_str, "--show-toplevel").as_ref() != Some(&resolved) {
+        return Err("Draft PRのhead worktree rootを確認できません".into());
+    }
+    Ok(resolved)
+}
+
+fn remote_refs_snapshot(cwd: &str, head: Option<&str>) -> Option<(String, String, Option<String>)> {
+    let mut owned_args = vec![
+        "ls-remote".to_string(),
+        "--symref".to_string(),
+        "origin".to_string(),
+        "HEAD".to_string(),
+    ];
+    if let Some(head) = head {
+        owned_args.push(format!("refs/heads/{head}"));
+    }
+    let args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_git(cwd, &args)?;
+    let lines = output.lines().collect::<Vec<_>>();
+    if lines.len() != if head.is_some() { 3 } else { 2 } {
+        return None;
+    }
+    let default_line = lines[0].strip_prefix("ref: refs/heads/")?;
+    let (default_branch, marker) = default_line.split_once('\t')?;
+    if marker != "HEAD"
+        || !valid_remote_branch(default_branch)
+        || !valid_oid(lines[1].split_once('\t')?.0)
+    {
+        return None;
+    }
+    let (default_oid, default_marker) = lines[1].split_once('\t')?;
+    if default_marker != "HEAD" || !valid_oid(default_oid) {
+        return None;
+    }
+    let remote_head = if let Some(head) = head {
+        let (oid, reference) = lines[2].split_once('\t')?;
+        if reference != format!("refs/heads/{head}") || !valid_oid(oid) {
+            return None;
+        }
+        Some(oid.to_string())
+    } else {
+        None
+    };
+    Some((
+        format!("origin/{default_branch}"),
+        default_oid.to_string(),
+        remote_head,
+    ))
+}
+
+fn draft_pr_preflight_reason(cwd: &str, base: &str, head: &str) -> Option<String> {
+    let head_cwd = match branch_worktree(cwd, head) {
+        Ok(path) => path,
+        Err(reason) => return Some(reason),
+    };
+    let head_cwd = match head_cwd.to_str() {
+        Some(path) => path,
+        None => return Some("Draft PRのhead worktree pathを確認できません".into()),
+    };
+    let session_common = resolved_git_path(cwd, "--git-common-dir");
+    let head_common = resolved_git_path(head_cwd, "--git-common-dir");
+    if session_common.is_none() || session_common != head_common {
+        return Some("Draft PRのhead worktreeがsession repositoryと一致しません".into());
+    }
+    if origin_repository(cwd) != origin_repository(head_cwd) {
+        return Some("Draft PRのhead worktreeのoriginがsession repositoryと一致しません".into());
+    }
+    let current = run_git(head_cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let local_head = run_git(head_cwd, &["rev-parse", "HEAD"]);
+    if current.as_deref().map(str::trim) != Some(head) || local_head.is_none() {
+        return Some("Draft PRのhead worktreeとbranchを確認できません".into());
+    }
+    let status = run_git(
+        head_cwd,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    if status
+        .as_deref()
+        .is_none_or(|value| !value.trim().is_empty())
+    {
+        return Some("Draft PRのhead worktreeがcleanではありません".into());
+    }
+    let snapshot = match remote_refs_snapshot(head_cwd, Some(head)) {
+        Some(value) => value,
+        None => return Some("Draft PRのremote refを安全に確認できません".into()),
+    };
+    let (remote_default_ref, remote_default_oid, remote_head) = snapshot;
+    if remote_default_ref != format!("origin/{base}") {
+        return Some("Draft PRのbaseはoriginのdefault branchと一致させてください".into());
+    }
+    let local_default_oid = run_git(
+        head_cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/remotes/{remote_default_ref}"),
+        ],
+    );
+    if local_default_oid
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(|value| !value.eq_ignore_ascii_case(&remote_default_oid))
+    {
+        return Some("Draft PRのbase remote-tracking refがremoteと一致しません".into());
+    }
+    if remote_head.is_none_or(|value| {
+        local_head
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|local| !local.eq_ignore_ascii_case(&value))
+    }) {
+        return Some("Draft PRのheadはpush済みのworktree HEADと一致させてください".into());
     }
     None
 }
@@ -1487,6 +1868,33 @@ fn git_pull_reason(args: &[String], cwd: &str) -> Option<String> {
             "local branchがoriginよりaheadまたはdivergedしているためgit pullを拒否しました".into(),
         );
     }
+    let Some(git_dir) = run_git(cwd, &["rev-parse", "--git-dir"]) else {
+        return Some("Gitの進行中操作を確認できないためgit pullを拒否しました".into());
+    };
+    let mut git_dir = PathBuf::from(git_dir.trim());
+    if !git_dir.is_absolute() {
+        git_dir = Path::new(cwd).join(git_dir);
+    }
+    git_operation_in_progress_reason(&git_dir)
+}
+
+fn git_operation_in_progress_reason(git_dir: &Path) -> Option<String> {
+    for name in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-apply",
+        "rebase-merge",
+        "sequencer",
+    ] {
+        match fs::symlink_metadata(git_dir.join(name)) {
+            Ok(_) => return Some("Gitの進行中操作があるためgit pullを拒否しました".into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Some("Gitの進行中操作を確認できないためgit pullを拒否しました".into());
+            }
+        }
+    }
     None
 }
 
@@ -1720,20 +2128,46 @@ fn has_prefixed_token(
 }
 
 fn ai_attribution(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    [
-        "co-authored-by:",
-        "generated by",
-        "generated-by",
-        "signed-off-by:",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-        && [
-            "codex", "openai", "chatgpt", "claude", "gemini", "copilot", " ai", "ai ",
+    value.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        [
+            "co-authored-by",
+            "generated by",
+            "generated-by",
+            "signed-off-by",
         ]
         .iter()
-        .any(|needle| lower.contains(needle))
+        .any(|prefix| {
+            lower.match_indices(prefix).any(|(start, _)| {
+                let remainder = lower[start + prefix.len()..].trim_start();
+                let Some(attribution) = remainder.strip_prefix(':') else {
+                    return false;
+                };
+                contains_ai_identity(attribution.trim_start())
+            })
+        })
+    })
+}
+
+fn contains_ai_identity(value: &str) -> bool {
+    if ["codex", "openai", "chatgpt", "claude", "gemini", "copilot"]
+        .iter()
+        .any(|identity| value.contains(identity))
+    {
+        return true;
+    }
+    value.match_indices("ai").any(|(start, _)| {
+        let prefix_boundary = value[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_alphanumeric() && character != '_');
+        let end = start + 2;
+        let suffix_boundary = value[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_alphanumeric() && character != '_');
+        prefix_boundary && suffix_boundary
+    })
 }
 
 fn sensitive_path(path: &str) -> bool {
@@ -1940,7 +2374,7 @@ fn github_text_reason(values: &[String], label: &str) -> Option<String> {
                 "{label}にCodexまたはOpenAIのAI帰属を含めることはできません"
             ));
         }
-        if value.contains("@copilot") {
+        if contains_copilot_mention(value) {
             return Some(format!("{label}に@copilot mentionを含めることはできません"));
         }
     }
@@ -1991,10 +2425,32 @@ fn file_secret_reason(path: &str, label: &str) -> Option<String> {
             "{label}にCodexまたはOpenAIのAI帰属が含まれています"
         ));
     }
-    if contents.contains("@copilot") {
+    if contains_copilot_mention(&contents) {
         return Some(format!("{label}に@copilot mentionを含めることはできません"));
     }
     None
+}
+
+fn contains_copilot_mention(value: &str) -> bool {
+    const NEEDLE: &[u8] = b"@copilot";
+    value
+        .as_bytes()
+        .windows(NEEDLE.len())
+        .enumerate()
+        .any(|(start, candidate)| {
+            if !candidate.eq_ignore_ascii_case(NEEDLE) {
+                return false;
+            }
+            let valid_prefix = start == 0
+                || !value.as_bytes()[start - 1].is_ascii_alphanumeric()
+                    && !b"_@".contains(&value.as_bytes()[start - 1]);
+            let end = start + NEEDLE.len();
+            let valid_suffix = value
+                .get(end..)
+                .and_then(|suffix| suffix.chars().next())
+                .is_none_or(|character| !character.is_alphanumeric() && character != '_');
+            valid_prefix && valid_suffix
+        })
 }
 
 fn gh_json(cwd: &str, args: &[&str]) -> Option<serde_json::Map<String, StrictJsonValue>> {
@@ -2015,15 +2471,27 @@ fn json_string_value(value: Option<&StrictJsonValue>) -> Option<&str> {
     }
 }
 
+fn json_u64_value(value: Option<&StrictJsonValue>) -> Option<u64> {
+    value.and_then(StrictJsonValue::as_u64)
+}
+
+fn json_bool_value(value: Option<&StrictJsonValue>) -> Option<bool> {
+    value.and_then(StrictJsonValue::as_bool)
+}
+
 fn gh_run_cancel_reason(args: &[String], cwd: &str) -> Option<String> {
     if args.len() != 4
         || args.first().map(String::as_str) != Some("cancel")
+        || args[1].is_empty()
         || !args[1].bytes().all(|c| c.is_ascii_digit())
         || args[1].starts_with('0')
         || args[2] != "--repo"
         || !args[3].contains('/')
     {
         return Some("gh run cancelはrun-idとrepoを指定する正規形だけ許可されます".into());
+    }
+    if std::env::var_os("GH_REPO").is_some() {
+        return Some("gh run cancelではGH_REPO環境変数を使用できません".into());
     }
     if [
         "GH_CONFIG_DIR",
@@ -2043,6 +2511,13 @@ fn gh_run_cancel_reason(args: &[String], cwd: &str) -> Option<String> {
     {
         return Some("gh run cancelではGitHub transportを変更する環境変数を使用できません".into());
     }
+    match run_gh(
+        cwd,
+        &["config", "get", "http_unix_socket", "--host", "github.com"],
+    ) {
+        Some((0, output)) if output.is_empty() => {}
+        _ => return Some("gh run cancelのGitHub transport設定を確認できません".into()),
+    }
     let repository = &args[3];
     if let Some(reason) = repository_reason(repository, cwd) {
         return Some(reason);
@@ -2056,9 +2531,11 @@ fn gh_run_cancel_reason(args: &[String], cwd: &str) -> Option<String> {
         Some(StrictJsonValue::Object(value)) => json_string_value(value.get("full_name")),
         _ => None,
     };
-    if !payload.contains_key("id")
-        || remote_repository.is_none_or(|value| !value.eq_ignore_ascii_case(repository))
-    {
+    let expected_id = args[1].parse::<u64>().ok();
+    if expected_id.is_none() || json_u64_value(payload.get("id")) != expected_id {
+        return Some("gh run cancel対象のidがrun-idと一致しません".into());
+    }
+    if remote_repository.is_none_or(|value| !value.eq_ignore_ascii_case(repository)) {
         return Some("gh run cancel対象のrepository identityが一致しません".into());
     }
     if json_string_value(payload.get("status"))
@@ -2134,7 +2611,16 @@ fn issue_write_reason(command: &str, args: &[String], cwd: &str) -> Option<Strin
                 Some(value) => value,
                 None => return Some("Issue作成にはtitleとbody-fileを明示してください".into()),
             };
-            if let Some(reason) = github_text_reason(&[title], "Issue作成値") {
+            let mut metadata_values = Vec::new();
+            for (short, long) in [("-l", "--label"), ("-a", "--assignee"), ("", "--milestone")] {
+                let Some(values) = option_values(args, short, long) else {
+                    return Some("Issue作成のmetadata引数に値を明示してください".into());
+                };
+                metadata_values.extend(values);
+            }
+            let mut text_values = vec![title];
+            text_values.extend(metadata_values);
+            if let Some(reason) = github_text_reason(&text_values, "Issue作成値") {
                 return Some(reason);
             }
             file_secret_reason(&body, "Issue body")
@@ -2158,7 +2644,54 @@ fn issue_write_reason(command: &str, args: &[String], cwd: &str) -> Option<Strin
                     );
                 }
             };
-            github_target_reason(&positional, "Issue編集")
+            if let Some(reason) = github_target_reason(&positional, "Issue編集") {
+                return Some(reason);
+            }
+            let body_files = option_values(args, "-F", "--body-file");
+            let titles = option_values(args, "-t", "--title");
+            if body_files.as_ref().is_none_or(|values| values.len() > 1)
+                || titles.as_ref().is_none_or(|values| values.len() > 1)
+            {
+                return Some("Issue編集のtitleとbody-fileはそれぞれ1件までです".into());
+            }
+            let body_file = body_files.as_ref().and_then(|values| values.first());
+            let title = titles.as_ref().and_then(|values| values.first());
+            let mut mutation = title.is_some()
+                || body_file.is_some()
+                || args.iter().any(|value| value == "--remove-milestone");
+            let mut metadata_values = Vec::new();
+            for (short, long) in [
+                ("", "--add-label"),
+                ("", "--remove-label"),
+                ("", "--add-assignee"),
+                ("", "--remove-assignee"),
+                ("", "--milestone"),
+            ] {
+                let Some(values) = option_values(args, short, long) else {
+                    return Some("Issue編集のmetadata引数に値を明示してください".into());
+                };
+                mutation |= !values.is_empty();
+                metadata_values.extend(values);
+            }
+            if !mutation {
+                return Some(
+                    "Issue編集にはtitle、body-file、label、assignee、milestoneの変更を明示してください"
+                        .into(),
+                );
+            }
+            let mut text_values = Vec::new();
+            if let Some(title) = title {
+                text_values.push(title.clone());
+            }
+            text_values.extend(metadata_values);
+            if let Some(reason) = github_text_reason(&text_values, "Issue編集値") {
+                return Some(reason);
+            }
+            if let Some(body_file) = body_file {
+                file_secret_reason(body_file, "Issue body")
+            } else {
+                None
+            }
         }
         "comment" => {
             let positional = match strict_gh_args(args, &[common[0], ("-F", "--body-file")], &[]) {
@@ -2179,7 +2712,12 @@ fn issue_write_reason(command: &str, args: &[String], cwd: &str) -> Option<Strin
             file_secret_reason(&body, "Issue body")
         }
         "close" | "reopen" => {
-            let positional = match strict_gh_args(args, &common, &[]) {
+            let values = if command == "close" {
+                [common[0], ("", "--reason")].to_vec()
+            } else {
+                common.to_vec()
+            };
+            let positional = match strict_gh_args(args, &values, &[]) {
                 Some(value) => value,
                 None => {
                     return Some(
@@ -2187,7 +2725,23 @@ fn issue_write_reason(command: &str, args: &[String], cwd: &str) -> Option<Strin
                     );
                 }
             };
-            github_target_reason(&positional, &format!("Issue {command}"))
+            if let Some(reason) = github_target_reason(&positional, &format!("Issue {command}")) {
+                return Some(reason);
+            }
+            if command == "close" {
+                let reasons = option_values(args, "", "--reason");
+                if reasons.as_ref().is_none_or(|values| values.len() > 1) {
+                    return Some("Issue closeのreasonは1件だけ指定してください".into());
+                }
+                if reasons.as_ref().is_some_and(|values| {
+                    values.first().is_some_and(|value| {
+                        !["completed", "not planned"].contains(&value.as_str())
+                    })
+                }) {
+                    return Some("Issue closeのreasonが許可範囲外です".into());
+                }
+            }
+            None
         }
         _ => Some("許可されていないGitHub Issue操作です".into()),
     }
@@ -2258,12 +2812,134 @@ fn pr_write_reason(command: &str, args: &[String], cwd: &str) -> Option<String> 
             if !protected_branch(&base) || !valid_work_branch(&head) {
                 return Some("Draft PRのrepositoryまたはhead branchが許可範囲外です".into());
             }
+            if let Some(reason) = draft_pr_preflight_reason(cwd, &base, &head) {
+                return Some(reason);
+            }
             if let Some(reason) = github_text_reason(&[title], "PR title") {
                 return Some(reason);
             }
             file_secret_reason(&body, "PR body")
         }
-        "edit" | "comment" | "review" | "close" | "reopen" | "update-branch" => {
+        "edit" => {
+            let mut values = common.to_vec();
+            values.extend_from_slice(&[
+                ("-F", "--body-file"),
+                ("-t", "--title"),
+                ("", "--add-label"),
+                ("", "--remove-label"),
+                ("", "--add-assignee"),
+                ("", "--remove-assignee"),
+                ("", "--milestone"),
+                ("", "--add-reviewer"),
+                ("", "--remove-reviewer"),
+            ]);
+            let positional = match strict_gh_args(args, &values, &["--remove-milestone"]) {
+                Some(value) => value,
+                None => {
+                    return Some("PR編集では許可された引数だけを正規形で指定してください".into());
+                }
+            };
+            if let Some(reason) = github_target_reason(&positional, "PR編集") {
+                return Some(reason);
+            }
+            let titles = option_values(args, "-t", "--title");
+            let body_files = option_values(args, "-F", "--body-file");
+            if titles.as_ref().is_none_or(|values| values.len() > 1)
+                || body_files.as_ref().is_none_or(|values| values.len() > 1)
+            {
+                return Some("PR編集のtitleとbody-fileはそれぞれ1件までです".into());
+            }
+            let title = titles.as_ref().and_then(|values| values.first());
+            let body_file = body_files.as_ref().and_then(|values| values.first());
+            let mut mutation = title.is_some()
+                || body_file.is_some()
+                || args.iter().any(|value| value == "--remove-milestone");
+            let metadata_options = [
+                ("", "--add-label"),
+                ("", "--remove-label"),
+                ("", "--add-assignee"),
+                ("", "--remove-assignee"),
+                ("", "--milestone"),
+                ("", "--add-reviewer"),
+                ("", "--remove-reviewer"),
+            ];
+            let mut metadata_values = Vec::new();
+            for (short, long) in metadata_options {
+                let values = option_values(args, short, long);
+                if values.is_none() {
+                    return Some("PR編集のmetadata引数に値を明示してください".into());
+                }
+                let values = values.unwrap_or_default();
+                mutation |= !values.is_empty();
+                metadata_values.extend(values);
+            }
+            if !mutation {
+                return Some("PR編集にはtitle、body-file、label、assignee、milestone、reviewerの変更を明示してください".into());
+            }
+            let mut text_values = Vec::new();
+            if let Some(title) = title {
+                text_values.push(title.clone());
+            }
+            text_values.extend(metadata_values);
+            if let Some(reason) = github_text_reason(&text_values, "PR編集値") {
+                return Some(reason);
+            }
+            if let Some(body_file) = body_file {
+                file_secret_reason(body_file, "PR body")
+            } else {
+                None
+            }
+        }
+        "comment" => {
+            let positional = match strict_gh_args(args, &[common[0], ("-F", "--body-file")], &[]) {
+                Some(value) => value,
+                None => {
+                    return Some(
+                        "PR commentでは許可された引数だけを正規形で指定してください".into(),
+                    );
+                }
+            };
+            if let Some(reason) = github_target_reason(&positional, "PR comment") {
+                return Some(reason);
+            }
+            let body = match required_option(args, "-F", "--body-file") {
+                Some(value) => value,
+                None => return Some("PR commentにはbody-fileを明示してください".into()),
+            };
+            file_secret_reason(&body, "PR body")
+        }
+        "review" => {
+            let switches = ["--approve", "--request-changes", "--comment"];
+            let positional =
+                match strict_gh_args(args, &[common[0], ("-F", "--body-file")], &switches) {
+                    Some(value) => value,
+                    None => {
+                        return Some(
+                            "PR reviewでは許可された引数だけを正規形で指定してください".into(),
+                        );
+                    }
+                };
+            if let Some(reason) = github_target_reason(&positional, "PR review") {
+                return Some(reason);
+            }
+            let actions = switches
+                .iter()
+                .filter(|switch| args.iter().any(|value| value == **switch))
+                .count();
+            if actions != 1 {
+                return Some("PR reviewのactionは1件だけ明示してください".into());
+            }
+            let body_files = option_values(args, "-F", "--body-file");
+            if body_files.as_ref().is_none_or(|values| values.len() > 1) {
+                return Some("PR reviewのbody-fileは1件までです".into());
+            }
+            if let Some(body) = body_files.as_ref().and_then(|values| values.first()) {
+                file_secret_reason(body, "PR body")
+            } else {
+                None
+            }
+        }
+        "close" | "reopen" | "update-branch" => {
             let positional = match strict_gh_args(args, &common, &[]) {
                 Some(value) => value,
                 None => {
@@ -2299,12 +2975,13 @@ fn pr_write_reason(command: &str, args: &[String], cwd: &str) -> Option<String> 
                     _ => None,
                 };
                 if json_string_value(payload.get("state")) != Some("OPEN")
-                    || !payload.contains_key("number")
+                    || json_u64_value(payload.get("number")) != number.parse::<u64>().ok()
+                    || json_bool_value(payload.get("isCrossRepository")) != Some(false)
                     || head_repository.is_none_or(|value| !value.eq_ignore_ascii_case(&repository))
                     || json_string_value(payload.get("headRefName"))
                         .is_none_or(|head| !valid_work_branch(head))
                     || json_string_value(payload.get("headRefOid"))
-                        .is_none_or(|oid| oid.len() != 40 && oid.len() != 64)
+                        .is_none_or(|oid| !valid_oid(oid))
                 {
                     return Some(
                         "PR update-branchはcurrent repository内のopen PRだけ許可されます".into(),
@@ -2332,6 +3009,22 @@ fn pr_write_reason(command: &str, args: &[String], cwd: &str) -> Option<String> 
     }
 }
 
+fn gh_read_only_subcommand(command: &str, subcommand: Option<&str>) -> bool {
+    match command {
+        "pr" => subcommand
+            .is_none_or(|value| ["list", "view", "status", "checks", "diff"].contains(&value)),
+        "run" => subcommand.is_none_or(|value| ["list", "view", "watch"].contains(&value)),
+        "repo" => subcommand.is_none_or(|value| ["list", "view"].contains(&value)),
+        "release" => subcommand
+            .is_none_or(|value| ["list", "view", "verify", "verify-asset"].contains(&value)),
+        "workflow" => subcommand.is_none_or(|value| ["list", "view"].contains(&value)),
+        "label" | "cache" | "secret" => subcommand.is_none_or(|value| value == "list"),
+        "variable" => subcommand.is_none_or(|value| ["list", "get"].contains(&value)),
+        "ruleset" => subcommand.is_none_or(|value| ["list", "view", "check"].contains(&value)),
+        _ => false,
+    }
+}
+
 fn gh_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> {
     let start = command_start(tokens)?;
     if basename(tokens.get(start)?) != "gh" {
@@ -2354,6 +3047,14 @@ fn gh_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> 
             .any(|token| token == "--hostname" || token.starts_with("--hostname="))
     {
         return Some("GitHub接続先hostを変更できません".into());
+    }
+    if tokens.get(1).map(String::as_str) == Some("run")
+        && tokens.get(2).map(String::as_str) == Some("cancel")
+        && tokens[3..]
+            .iter()
+            .any(|token| token == "--help" || token == "-h")
+    {
+        return Some("gh run cancelはrun-idとrepoを指定する正規形だけ許可されます".into());
     }
     if tokens
         .iter()
@@ -2431,8 +3132,15 @@ fn gh_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> 
                 _ => Some("gh runはcancelまたは読み取り専用操作だけ許可されます".into()),
             }
         }
-        "status" | "search" | "repo" | "release" | "workflow" | "label" | "cache" | "variable"
-        | "secret" | "ruleset" => None,
+        "status" | "search" => None,
+        "repo" | "release" | "workflow" | "label" | "cache" | "variable" | "secret" | "ruleset" => {
+            let (subcommand, _) = first_command(&args, GH_GLOBAL_VALUE_OPTIONS);
+            if gh_read_only_subcommand(&command, subcommand.as_deref()) {
+                None
+            } else {
+                Some("許可されていないGitHub書き込み操作です".into())
+            }
+        }
         _ => Some("許可されていないGitHub書き込み操作です".into()),
     }
 }
@@ -2773,18 +3481,162 @@ fn contains_restricted(tokens: &[String], depth: usize) -> bool {
         .any(|nested| contains_restricted(&nested, depth + 1))
 }
 
-fn leading_redirection_hides_guarded(segments: &[Vec<String>]) -> bool {
-    segments.iter().any(|tokens| {
-        tokens.windows(2).any(|window| {
-            let previous = &window[0];
-            let executable = &window[1];
-            (previous.starts_with('/') || previous.chars().all(|c| c.is_ascii_digit()))
-                && (RESTRICTED_COMMANDS.contains(&basename(executable))
-                    || DESTRUCTIVE_COMMANDS.contains(&basename(executable))
-                    || git_subcommand_executable(executable)
-                    || command_word_expansion(executable))
-        })
-    })
+fn shell_tokens_with_punctuation(command: &str) -> Option<Vec<String>> {
+    const PUNCTUATION: &[u8] = b";&|()<>\n";
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            token.push(byte as char);
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if quote == Some(b'\'') {
+            if byte == b'\'' {
+                quote = None;
+            } else {
+                token.push(byte as char);
+            }
+            index += 1;
+            continue;
+        }
+        if quote == Some(b'"') {
+            if byte == b'"' {
+                quote = None;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else {
+                token.push(byte as char);
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'\\' => escaped = true,
+            b' ' | b'\t' | b'\r' => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            byte if PUNCTUATION.contains(&byte) => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+                let start = index;
+                index += 1;
+                while index < bytes.len() && PUNCTUATION.contains(&bytes[index]) {
+                    index += 1;
+                }
+                tokens.push(String::from_utf8_lossy(&bytes[start..index]).into_owned());
+                continue;
+            }
+            _ => token.push(byte as char),
+        }
+        index += 1;
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    Some(tokens)
+}
+
+fn punctuation_is_redirection(token: &str) -> bool {
+    !token.is_empty()
+        && token.chars().all(|c| "<>&|".contains(c))
+        && token.chars().any(|c| "<>".contains(c))
+}
+
+fn leading_redirection_hides_guarded(command: &str) -> bool {
+    if !has_unquoted(command, b"<>") {
+        return false;
+    }
+    let Some(tokens) = shell_tokens_with_punctuation(command) else {
+        return true;
+    };
+    let mut chunk = Vec::new();
+    let mut chunks = Vec::new();
+    for token in tokens {
+        if !token.is_empty() && token.chars().all(|c| ";&|()\n".contains(c)) {
+            if !chunk.is_empty() {
+                chunks.push(std::mem::take(&mut chunk));
+            }
+        } else {
+            chunk.push(token);
+        }
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    for chunk in chunks {
+        let mut arguments = Vec::new();
+        let mut consumed = false;
+        let mut i = 0;
+        while i < chunk.len() {
+            let is_fd = chunk[i].bytes().all(|byte| byte.is_ascii_digit());
+            if (is_fd || punctuation_is_redirection(&chunk[i]))
+                && (is_fd
+                    && chunk
+                        .get(i + 1)
+                        .is_some_and(|token| punctuation_is_redirection(token))
+                    || punctuation_is_redirection(&chunk[i]))
+            {
+                let operator_index = if is_fd { i + 1 } else { i };
+                consumed = true;
+                i = operator_index + 1;
+                if i < chunk.len() && !punctuation_is_redirection(&chunk[i]) {
+                    i += 1;
+                }
+                continue;
+            }
+            arguments.push(chunk[i].clone());
+            i += 1;
+        }
+        if !consumed || arguments.is_empty() {
+            continue;
+        }
+        while arguments.first().is_some_and(|token| {
+            is_assignment(token) || SHELL_COMMAND_PREFIXES.contains(&token.as_str())
+        }) {
+            arguments.remove(0);
+        }
+        if arguments.first().map(String::as_str) == Some("time") {
+            arguments.remove(0);
+            while arguments
+                .first()
+                .is_some_and(|token| ["-p", "--"].contains(&token.as_str()))
+            {
+                arguments.remove(0);
+            }
+        }
+        if arguments.first().map(String::as_str) == Some("repeat") {
+            if arguments.len() >= 2 {
+                arguments.drain(..2);
+            } else {
+                arguments.clear();
+            }
+        }
+        let Some(start) = command_start(&arguments) else {
+            continue;
+        };
+        let executable = &arguments[start];
+        if guarded_executable_token(executable)
+            || command_word_expansion(executable)
+            || contains_restricted(&arguments, 0)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn blocked_reason(command: &str, cwd: Option<&str>, depth: usize) -> Option<String> {
@@ -2797,25 +3649,40 @@ fn blocked_reason(command: &str, cwd: Option<&str>, depth: usize) -> Option<Stri
     if command.contains("$(") || command.contains('`') {
         return Some("command substitutionを含むcommandは安全に検査できません".into());
     }
+    if leading_redirection_hides_guarded(command) {
+        return Some("先頭redirectionを伴うGit/GitHub/helper commandは実行できません".into());
+    }
     let segments = command_segments(command);
     if segments.is_empty() {
         return Some("command is required".into());
     }
-    if has_unquoted(command, b"<>") && leading_redirection_hides_guarded(&segments) {
-        return Some("先頭redirectionを伴うGit/GitHub/helper commandは実行できません".into());
+    if segments.len() > 1
+        && segments
+            .iter()
+            .any(|tokens| has_command_resolution_mutation(tokens))
+    {
+        return Some("command解決を変更するshell builtinを他のsegmentと連結できません".into());
+    }
+    if segments
+        .iter()
+        .any(|tokens| has_unparsed_guarded_command(tokens))
+    {
+        return Some("shell予約語を介したGit/GitHub/helper commandは安全に検査できません".into());
     }
     let restricted = segments.iter().any(|tokens| contains_restricted(tokens, 0));
     let has_compound = segments.iter().any(|tokens| {
-        tokens.first().is_some_and(|v| {
-            [
-                "!", "{", "case", "do", "elif", "else", "for", "function", "if", "then", "time",
-                "until", "while",
-            ]
-            .contains(&v.as_str())
-        })
+        tokens
+            .first()
+            .is_some_and(|value| SHELL_COMPOUND_PREFIXES.contains(&value.as_str()))
     });
     if restricted && has_compound {
         return Some("shell複合構文とGit/GitHub/helper commandを同じ入力で実行できません".into());
+    }
+    if restricted
+        && segments.len() > 1
+        && !segments.iter().all(|tokens| contains_restricted(tokens, 0))
+    {
+        return Some("Git/GitHub/helper commandを他のshell segmentと連結できません".into());
     }
     if restricted && shell_expansion(command) {
         return Some("Git/GitHub/helper commandでは未引用のshell展開を使用できません".into());
@@ -2831,6 +3698,14 @@ fn blocked_reason(command: &str, cwd: Option<&str>, depth: usize) -> Option<Stri
     }
     if has_write && (depth > 0 || segments.len() != 1) {
         return Some("Git/GitHub書き込みは単一の直接commandで実行してください".into());
+    }
+    if restricted
+        && segments.len() > 1
+        && segments
+            .iter()
+            .any(|tokens| has_shell_context_mutation(tokens))
+    {
+        return Some("Git/GitHub/helper commandの前後でshell環境やcwdを変更できません".into());
     }
     for tokens in &segments {
         if ambiguous_wrapper_options(tokens) && (restricted || shell_expansion(command)) {
@@ -3212,6 +4087,207 @@ mod tests {
     }
 
     #[test]
+    fn commit_subject_and_options_match_python_contract() {
+        assert!(git_commit_reason(&["-m".into(), ":bug: summary".into()]).is_none());
+        assert!(git_commit_reason(&["-m".into(), ":bad emoji: summary".into()]).is_some());
+        assert!(
+            git_commit_reason(&["-m".into(), ":bug: summary".into(), "--quiet".into()]).is_some()
+        );
+    }
+
+    #[test]
+    fn pull_preflight_detects_in_progress_git_state() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let git_dir = std::env::temp_dir().join(format!("codex-guard-git-state-{suffix}"));
+        fs::create_dir(&git_dir).expect("create git state fixture");
+        assert!(git_operation_in_progress_reason(&git_dir).is_none());
+        fs::write(git_dir.join("MERGE_HEAD"), b"fixture").expect("write git state fixture");
+        assert!(git_operation_in_progress_reason(&git_dir).is_some());
+        fs::remove_file(git_dir.join("MERGE_HEAD")).expect("remove git state fixture");
+        fs::remove_dir(git_dir).expect("remove git state directory");
+    }
+
+    #[test]
+    fn managed_manifest_schema_is_strict_and_rejects_duplicate_keys() {
+        let fixture = r#"{
+            "version": 1,
+            "status": "ready",
+            "task_id": "issue-31",
+            "repository": "/repo",
+            "common_git_dir": "/repo/.git",
+            "github_name": "owner/repo",
+            "branch": "refactor/example",
+            "base": "origin/main",
+            "base_oid": "0123456789012345678901234567890123456789",
+            "worktree": "/managed/issue-31",
+            "created_at": "2026-08-20T00:00:00Z",
+            "detail": ""
+        }"#;
+        let expected = [
+            ("status", "ready"),
+            ("task_id", "issue-31"),
+            ("repository", "/repo"),
+            ("branch", "refactor/example"),
+        ];
+        let manifest = parse_strict_object(fixture).expect("strict manifest");
+        assert!(manifest_schema_matches(&manifest, &expected));
+
+        let version_spoof = fixture.replacen("\"version\": 1", "\"version\": 10", 1);
+        let version_spoof = parse_strict_object(&version_spoof).expect("version spoof object");
+        assert!(!manifest_schema_matches(&version_spoof, &expected));
+        assert!(parse_strict_object(r#"{"version":1,"version":1}"#).is_none());
+    }
+
+    #[test]
+    fn shell_reserved_words_and_leading_redirections_cannot_hide_guarded_commands() {
+        for command in [
+            "if true; then git reset --hard HEAD; fi",
+            "for value in one; do gh repo delete owner/repo --yes; done",
+            "time git reset --hard HEAD",
+            "! git reset --hard HEAD",
+            "2>status git reset --hard HEAD",
+            "> status git reset --hard HEAD",
+            "2>&1 git reset --hard HEAD",
+        ] {
+            assert!(
+                blocked_reason(command, None, 0).is_some(),
+                "guarded command bypassed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_top_level_read_only_allowlist_is_closed() {
+        for command in [
+            "gh status",
+            "gh search code pattern",
+            "gh repo list",
+            "gh repo view owner/repo",
+            "gh release list",
+            "gh release verify owner/repo",
+            "gh workflow view build.yml",
+            "gh label list",
+            "gh cache list",
+            "gh variable get NAME",
+            "gh secret list",
+            "gh ruleset check",
+        ] {
+            let tokens = command_segments(command)
+                .into_iter()
+                .next()
+                .expect("tokens");
+            assert!(
+                gh_invocation_reason(&tokens, None).is_none(),
+                "read-only command was rejected: {command}"
+            );
+        }
+        for command in [
+            "gh repo delete owner/repo --yes",
+            "gh release delete v1.0.0",
+            "gh workflow disable build.yml",
+            "gh label create unsafe",
+            "gh cache delete 123",
+            "gh variable set NAME",
+            "gh secret set NAME",
+            "gh ruleset delete 1",
+        ] {
+            let tokens = command_segments(command)
+                .into_iter()
+                .next()
+                .expect("tokens");
+            assert!(
+                gh_invocation_reason(&tokens, None).is_some(),
+                "write command was allowed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_lifecycle_option_shapes_match_python_oracle() {
+        let payload: StrictJsonValue =
+            serde_json::from_str(r#"{"number":123,"isCrossRepository":false,"spoofed":true}"#)
+                .expect("remote fixture");
+        let payload = payload.as_object().expect("remote object");
+        assert_eq!(json_u64_value(payload.get("number")), Some(123));
+        assert_eq!(json_u64_value(payload.get("spoofed")), None);
+        assert_eq!(
+            json_bool_value(payload.get("isCrossRepository")),
+            Some(false)
+        );
+
+        let issue_close = vec![
+            "123".into(),
+            "--repo".into(),
+            "owner/repo".into(),
+            "--reason".into(),
+            "completed".into(),
+        ];
+        assert_eq!(
+            strict_gh_args(&issue_close, &[("", "--repo"), ("", "--reason")], &[]),
+            Some(vec!["123".into()])
+        );
+        assert_eq!(
+            option_values(&issue_close, "", "--reason"),
+            Some(vec!["completed".into()])
+        );
+
+        let review = vec![
+            "123".into(),
+            "--repo".into(),
+            "owner/repo".into(),
+            "--approve".into(),
+            "--body-file".into(),
+            "/tmp/review.md".into(),
+        ];
+        assert_eq!(
+            strict_gh_args(
+                &review,
+                &[("", "--repo"), ("-F", "--body-file")],
+                &["--approve", "--request-changes", "--comment"]
+            ),
+            Some(vec!["123".into()])
+        );
+        assert_eq!(
+            option_values(&review, "-F", "--body-file"),
+            Some(vec!["/tmp/review.md".into()])
+        );
+        assert!(
+            strict_gh_args(
+                &["123".into(), "--approve".into(), "--comment".into()],
+                &[],
+                &["--approve", "--comment"]
+            )
+            .is_some()
+        );
+        assert!(ai_attribution(concat!("Co-Authored", "-By : Open", "AI")));
+        assert!(ai_attribution(concat!("generated", "-by: A", "I agent")));
+        assert!(!ai_attribution("ordinary generated result about rust"));
+        assert!(contains_copilot_mention("please ask @Copilot now"));
+        assert!(!contains_copilot_mention("name@copilot"));
+        assert!(!contains_copilot_mention("@copilot_helper"));
+    }
+
+    #[test]
+    fn issue_edit_requires_a_safe_explicit_mutation() {
+        let cwd = std::env::current_dir().expect("current repository");
+        let cwd = cwd.to_str().expect("UTF-8 repository path");
+        let repository = origin_repository(cwd).expect("GitHub origin");
+        let base = vec!["123".into(), "--repo".into(), repository.clone()];
+        assert!(issue_write_reason("edit", &base, cwd).is_some());
+
+        let mut safe = base.clone();
+        safe.extend(["--add-label".into(), "enhancement".into()]);
+        assert!(issue_write_reason("edit", &safe, cwd).is_none());
+
+        let mut unsafe_metadata = base;
+        unsafe_metadata.extend(["--add-label".into(), "@Copilot".into()]);
+        assert!(issue_write_reason("edit", &unsafe_metadata, cwd).is_some());
+    }
+
+    #[test]
     fn helper_syntax_is_restricted() {
         assert!(blocked_reason("codex-worktree list", None, 0).is_none());
         assert!(blocked_reason("codex-worktree create --task-id task-example", None, 0).is_none());
@@ -3278,6 +4354,8 @@ mod tests {
         assert!(git_add_reason(&[".".into()]).is_some());
         assert!(git_commit_reason(&["-m".into(), "Fix config".into()]).is_some());
         assert!(github_text_reason(&["@copilot please".into()], "PR title").is_some());
+        assert!(github_text_reason(&["@Copilot please".into()], "PR title").is_some());
+        assert!(github_text_reason(&["@COPILOT please".into()], "PR title").is_some());
         assert!(
             git_push_reason(
                 &[
