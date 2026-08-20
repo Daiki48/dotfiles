@@ -914,6 +914,10 @@ class GuardTest(unittest.TestCase):
             "if time -p gh pr close 1 --repo owner/repo; then true; fi",
             "coproc gh pr close 1 --repo owner/repo",
             "- git reset --hard HEAD",
+            "if sudo --close-from 3 git add -- README.md; then true; fi",
+            "if sudo --close-from 3 gh pr close 1 --repo owner/repo; then true; fi",
+            "if sudo --close-from 3 codex-worktree create --issue 1; then true; fi",
+            "if sudo --future-option value git add -- README.md; then true; fi",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")

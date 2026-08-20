@@ -91,7 +91,7 @@ PYTHON_SCRIPT_OPTS_WITH_VALUE = {
 }
 SUDO_OPTS_WITH_VALUE = {
     "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
-    "-C", "-D", "--chdir", "-R", "--chroot", "-T", "--command-timeout", "-r",
+    "-C", "--close-from", "-D", "--chdir", "-R", "--chroot", "-T", "--command-timeout", "-r",
     "--role", "-t", "--type", "-U", "--other-user",
 }
 # 改行もshellのcommand separatorとして扱う。shlexの既定では改行が単なる
@@ -2111,6 +2111,11 @@ def _has_unparsed_guarded_command(tokens):
     guarded = RESTRICTED_COMMANDS | DESTRUCTIVE_COMMANDS | SHELLS | {
         ".", "eval", "find", "source",
     }
+    if _has_ambiguous_wrapper_options(arguments) and (
+        any(os.path.basename(token) in guarded for token in arguments)
+        or any(_command_word_has_expansion(token) for token in arguments)
+    ):
+        return True
     if os.path.basename(arguments[start]) in guarded:
         return True
     if _python_helper_invocation_reason(arguments) is not None:
