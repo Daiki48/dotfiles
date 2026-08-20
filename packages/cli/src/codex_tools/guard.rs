@@ -1834,9 +1834,10 @@ fn remote_git_command(
     args: &[&str],
 ) -> Option<(Command, Option<GuardGhSandbox>)> {
     github_repository_from_url(origin)?;
-    if cwd.is_empty() || !local_git_config_is_safe(cwd) {
+    if cwd.is_empty() {
         return None;
     }
+    let sandbox = GuardGhSandbox::create()?;
     let git = trust::trusted_system_binary(SYSTEM_GIT, "Git").ok()?;
     let ssh = trust::trusted_system_binary(SYSTEM_SSH, "SSH").ok()?;
     let mut command = Command::new(git);
@@ -1876,11 +1877,10 @@ fn remote_git_command(
             "-c",
             &format!("remote.origin.pushurl={origin}"),
         ])
-        .current_dir(cwd);
+        .current_dir(&sandbox.path);
     isolate_git_environment(&mut command);
-    let sandbox = if origin.starts_with("https://github.com/") {
+    if origin.starts_with("https://github.com/") {
         trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI").ok()?;
-        let sandbox = GuardGhSandbox::create()?;
         command
             .args([
                 "-c",
@@ -1890,12 +1890,9 @@ fn remote_git_command(
             .env("GH_HOST", "github.com")
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1");
-        Some(sandbox)
-    } else {
-        None
-    };
+    }
     command.args(args);
-    Some((command, sandbox))
+    Some((command, Some(sandbox)))
 }
 
 fn run_remote_git(cwd: &str, origin: &str, args: &[&str]) -> Option<String> {
@@ -3363,6 +3360,16 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
             format!("remote.origin.url={origin}"),
             "-c".to_string(),
             format!("remote.origin.pushurl={origin}"),
+            "-c".to_string(),
+            format!("url.{origin}.insteadOf={origin}"),
+            "-c".to_string(),
+            format!("url.{origin}.pushInsteadOf={origin}"),
+            "-c".to_string(),
+            format!("credential.{origin}.helper="),
+            "-c".to_string(),
+            format!("http.{origin}.proxy="),
+            "-c".to_string(),
+            format!("http.{origin}.sslVerify=true"),
         ]);
         if origin.starts_with("https://") {
             trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI")?;
@@ -3380,6 +3387,8 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
                 "credential.helper=".into(),
                 "-c".into(),
                 "credential.https://github.com.helper=!/usr/bin/gh auth git-credential".into(),
+                "-c".into(),
+                format!("credential.{origin}.helper=!/usr/bin/gh auth git-credential"),
             ]);
             gh_snapshot = Some(snapshot);
         }
@@ -6195,7 +6204,7 @@ mod tests {
         let (command, sandbox) =
             remote_git_command(cwd, origin, &["ls-remote", "--symref", origin, "HEAD"])
                 .expect("construct fixed remote preflight");
-        assert!(sandbox.is_none());
+        assert!(sandbox.is_some());
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())

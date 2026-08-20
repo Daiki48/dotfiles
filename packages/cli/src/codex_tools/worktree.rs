@@ -600,6 +600,8 @@ fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Result<Command, Workt
         .arg("-c")
         .arg("core.fsmonitor=")
         .arg("-c")
+        .arg("core.askPass=")
+        .arg("-c")
         .arg("credential.helper=")
         .arg("-c")
         .arg("submodule.recurse=false")
@@ -624,13 +626,33 @@ fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Result<Command, Workt
         .arg("-c")
         .arg("http.sslVerify=true")
         .arg("-c")
+        .arg("http.followRedirects=initial")
+        .arg("-c")
         .arg("remote.origin.uploadpack=git-upload-pack")
         .arg("-c")
         .arg("remote.origin.receivepack=git-receive-pack")
         .arg("-c")
         .arg("core.bare=false")
         .arg("--work-tree")
-        .arg(cwd)
+        .arg(cwd);
+    if let Some(origin) = arguments.iter().copied().find(|argument| {
+        github_repository(argument).is_some() || cfg!(test) && safe_local_origin(argument)
+    }) {
+        command
+            .arg("-c")
+            .arg(format!("url.{origin}.insteadOf={origin}"))
+            .arg("-c")
+            .arg(format!("url.{origin}.pushInsteadOf={origin}"))
+            .arg("-c")
+            .arg(format!("credential.{origin}.helper="))
+            .arg("-c")
+            .arg(format!("http.{origin}.proxy="))
+            .arg("-c")
+            .arg(format!("http.{origin}.extraHeader="))
+            .arg("-c")
+            .arg(format!("http.{origin}.sslVerify=true"));
+    }
+    command
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -671,6 +693,7 @@ fn unsafe_local_config_key(key: &str) -> bool {
         || key == "core.sshcommand"
         || key == "core.gitproxy"
         || key == "core.fsmonitor"
+        || key == "core.askpass"
         || key.starts_with("credential.") && key.ends_with(".helper")
         || key == "submodule.recurse"
         || key == "fetch.recursesubmodules"
@@ -2243,6 +2266,7 @@ mod tests {
         for key in [
             "include.path",
             "core.sshCommand",
+            "core.askPass",
             "credential.https://github.com/owner/repo.helper",
             "submodule.recurse",
             "fetch.recurseSubmodules",
@@ -2268,6 +2292,7 @@ mod tests {
             .collect::<Vec<_>>();
         for expected in [
             "credential.helper=",
+            "core.askPass=",
             "submodule.recurse=false",
             "fetch.recurseSubmodules=false",
             "push.recurseSubmodules=no",
@@ -2317,6 +2342,23 @@ mod tests {
                 true
             )
             .is_err()
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_askpass_is_rejected_without_execution() {
+        let fixture = TemporaryRepository::new();
+        let marker = fixture.directory.join("askpass-ran");
+        let askpass = format!("sh -c 'touch {}'", marker.display());
+        run_git(
+            &fixture.repository,
+            &["config", "core.askPass", askpass.as_str()],
+        );
+
+        assert!(
+            create_worktree(&fixture.repository, "feat/askpass", "task-askpass", true).is_err()
         );
         assert!(!marker.exists());
     }
