@@ -2229,7 +2229,17 @@ def _leading_redirection_wraps_guarded_command(command, cwd=None, depth=0):
                 and any(char in "<>" for char in operator)
             ):
                 consumed = True
-                index += 2
+                index += 1
+                if (
+                    index < len(chunk)
+                    and (
+                        (">" in operator and chunk[index] == "!")
+                        or (operator == "<<" and chunk[index] == "-")
+                    )
+                ):
+                    index += 1
+                if index < len(chunk):
+                    index += 1
                 continue
             arguments.append(chunk[index])
             index += 1
