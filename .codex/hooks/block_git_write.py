@@ -2172,6 +2172,17 @@ def _has_shell_context_mutation(tokens):
     }
 
 
+def _has_command_resolution_mutation(tokens):
+    """後続command名の解決または実行を変更し得るshell builtinならTrue。"""
+    start = _command_start(tokens)
+    if start is None:
+        return False
+    return os.path.basename(tokens[start]) in {
+        ".", "alias", "autoload", "emulate", "enable", "eval", "function",
+        "hash", "rehash", "source", "unalias",
+    }
+
+
 def _has_unparsed_guarded_command(tokens):
     """shell予約語の後ろにguard対象commandがある未解析構文を検出する。"""
     if not tokens or tokens[0] not in SHELL_COMPOUND_PREFIXES:
@@ -2255,6 +2266,10 @@ def blocked_reason(command, cwd=None, depth=0):
     if "$(" in command or "`" in command:
         return "command substitutionを含むcommandは安全に検査できません"
     segments = list(_command_segments(command))
+    if len(segments) > 1 and any(
+        _has_command_resolution_mutation(tokens) for tokens in segments
+    ):
+        return "command解決を変更するshell builtinを他のsegmentと連結できません"
     if any(_has_unparsed_guarded_command(tokens) for tokens in segments):
         return "shell予約語を介したGit/GitHub/helper commandは安全に検査できません"
     has_restricted = any(_contains_restricted_command(tokens) for tokens in segments)
