@@ -24,6 +24,9 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace --locked
 
+      - name: Build optimized Rust guardrails
+        run: cargo build --workspace --release --locked
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 

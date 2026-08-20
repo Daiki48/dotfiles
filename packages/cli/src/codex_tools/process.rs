@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
+use std::ffi::OsString;
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
@@ -23,6 +25,10 @@ const READER_GRACE: Duration = Duration::from_millis(250);
 const TERMINATE_GRACE: Duration = Duration::from_millis(100);
 #[cfg(target_os = "linux")]
 const DESCENDANT_REAP_GRACE: Duration = Duration::from_millis(500);
+#[cfg(target_os = "linux")]
+const UNSHARE_BINARY: &str = "/usr/bin/unshare";
+#[cfg(target_os = "linux")]
+const ENVIRONMENT_CLEARED_MARKER: &str = "CODEX_PROCESS_ENVIRONMENT_CLEARED";
 
 #[derive(Debug)]
 pub(crate) struct Output {
@@ -88,6 +94,56 @@ enum ReadOutcome {
 struct ReadMessage {
     stream: &'static str,
     outcome: ReadOutcome,
+}
+
+pub(crate) fn clear_environment(command: &mut Command) {
+    command.env_clear().env(ENVIRONMENT_CLEARED_MARKER, "1");
+}
+
+#[cfg(not(target_os = "linux"))]
+const ENVIRONMENT_CLEARED_MARKER: &str = "CODEX_PROCESS_ENVIRONMENT_CLEARED";
+
+#[cfg(target_os = "linux")]
+fn linux_pid_namespace_command(command: &Command) -> io::Result<Command> {
+    let unshare =
+        super::trust::trusted_system_binary(UNSHARE_BINARY, "Unshare").map_err(io::Error::other)?;
+    let program = command.get_program().to_os_string();
+    let arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
+    let environment = command
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(OsString::from)))
+        .collect::<Vec<_>>();
+    let environment_was_cleared = environment.iter().any(|(key, value)| {
+        key == ENVIRONMENT_CLEARED_MARKER && value.as_deref() == Some(std::ffi::OsStr::new("1"))
+    });
+
+    let mut isolated = Command::new(unshare);
+    if environment_was_cleared {
+        isolated.env_clear();
+    }
+    for (key, value) in environment {
+        if key == ENVIRONMENT_CLEARED_MARKER {
+            continue;
+        }
+        if let Some(value) = value {
+            isolated.env(key, value);
+        } else {
+            isolated.env_remove(key);
+        }
+    }
+    if let Some(directory) = command.get_current_dir() {
+        isolated.current_dir(directory);
+    }
+    isolated.args([
+        "--user",
+        "--map-current-user",
+        "--pid",
+        "--fork",
+        "--kill-child=KILL",
+        "--",
+    ]);
+    isolated.arg(program).args(arguments).stdin(Stdio::null());
+    Ok(isolated)
 }
 
 #[cfg(target_os = "linux")]
@@ -269,22 +325,51 @@ impl DescendantTracker {
     #[cfg(target_os = "linux")]
     fn signal_known(&mut self, signal: libc::c_int) -> Option<io::Error> {
         self.refresh();
-        let snapshot = proc_snapshot().ok();
         let mut first_error = None;
         for (pid, start_time) in &self.tracked {
             if Some(*pid) == self.root_pid {
                 continue;
             }
-            if snapshot
-                .as_ref()
-                .and_then(|value| value.get(pid))
+            if proc_snapshot()
+                .ok()
+                .and_then(|value| value.get(pid).copied())
                 .is_none_or(|stat| *start_time != 0 && stat.start_time != *start_time)
             {
                 continue;
             }
-            // SAFETY: pid was read from /proc and its starttime is checked
-            // immediately before signaling, preventing PID-reuse kills.
-            if unsafe { libc::kill(*pid, signal) } == -1 {
+            // SAFETY: pidfd_open returns a stable kernel reference to the
+            // observed process.  A second starttime check after opening closes
+            // the PID-reuse race before pidfd_send_signal.
+            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, *pid, 0) } as i32;
+            if descriptor == -1 {
+                let error = io::Error::last_os_error();
+                if !matches!(error.raw_os_error(), Some(libc::ESRCH)) {
+                    first_error.get_or_insert(error);
+                }
+                continue;
+            }
+            let same_process = proc_snapshot()
+                .ok()
+                .and_then(|value| value.get(pid).copied())
+                .is_some_and(|stat| *start_time == 0 || stat.start_time == *start_time);
+            let signal_result = if same_process {
+                // SAFETY: descriptor is a live pidfd and the remaining
+                // arguments contain no pointers except a null siginfo.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        descriptor,
+                        signal,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                }
+            } else {
+                0
+            };
+            // SAFETY: descriptor was returned by pidfd_open in this loop.
+            unsafe { libc::close(descriptor) };
+            if signal_result == -1 {
                 let error = io::Error::last_os_error();
                 if !matches!(error.raw_os_error(), Some(libc::ESRCH)) {
                     first_error.get_or_insert(error);
@@ -398,6 +483,14 @@ pub(crate) fn run_with_limit(
         source,
     })?;
     descendants.mark_command(command);
+    #[cfg(target_os = "linux")]
+    let mut isolated_command =
+        linux_pid_namespace_command(command).map_err(|source| ProcessError::Isolation {
+            program: program.clone(),
+            source,
+        })?;
+    #[cfg(target_os = "linux")]
+    let command = &mut isolated_command;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -790,9 +883,9 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "setsid sh -c 'sleep 2' & exit 0"]);
         let started = Instant::now();
-        let error = run_with_limit(&mut command, Duration::from_millis(50), 1024)
-            .expect_err("escaped pipe holder must hit the bounded deadline");
-        assert!(matches!(error, ProcessError::Timeout { .. }));
+        let output = run_with_limit(&mut command, Duration::from_millis(500), 1024)
+            .expect("PID namespace teardown must stop the escaped pipe holder");
+        assert!(output.status.success());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -809,13 +902,15 @@ mod tests {
         ));
         let pid_file = pid_file.to_str().expect("pid file path");
         let script = format!(
-            "setsid sh -c 'sleep 30 & echo $! > {pid_file}; wait' & while [ ! -s {pid_file} ]; do sleep 0.01; done; exit 0"
+            "setsid sh -c 'grep \"^NSpid:\" /proc/self/status | cut -f2 > {pid_file}; exec env -u CODEX_PROCESS_RUN_ID sleep 30' & while [ ! -s {pid_file} ]; do sleep 0.01; done; exit 0"
         );
         let mut command = Command::new("sh");
         command.args(["-c", &script]);
-        let error = run_with_limit(&mut command, Duration::from_millis(100), 1024)
-            .expect_err("escaped descendant must hit the bounded deadline");
-        assert!(matches!(error, ProcessError::Timeout { .. }));
+        match run_with_limit(&mut command, Duration::from_millis(500), 1024) {
+            Ok(output) => assert!(output.status.success()),
+            Err(ProcessError::Timeout { .. }) => {}
+            Err(error) => panic!("unexpected namespace cleanup error: {error}"),
+        }
 
         let pid = fs::read_to_string(pid_file)
             .expect("escaped descendant pid file")

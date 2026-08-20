@@ -607,6 +607,16 @@ fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Result<Command, Workt
         .arg("-c")
         .arg("protocol.ext.allow=never")
         .arg("-c")
+        .arg(if cfg!(test) {
+            "protocol.file.allow=always"
+        } else {
+            "protocol.file.allow=never"
+        })
+        .arg("-c")
+        .arg("protocol.git.allow=never")
+        .arg("-c")
+        .arg("http.sslVerify=true")
+        .arg("-c")
         .arg("remote.origin.uploadpack=git-upload-pack")
         .arg("-c")
         .arg("remote.origin.receivepack=git-receive-pack")
@@ -658,6 +668,17 @@ fn unsafe_local_config_key(key: &str) -> bool {
         || key == "http.proxy"
         || key == "https.proxy"
         || key == "protocol.ext.allow"
+        || key.starts_with("protocol.") && key.ends_with(".allow")
+        || key == "http.sslverify"
+        || key == "http.sslcainfo"
+        || key.starts_with("http.")
+            && (key.ends_with(".proxy")
+                || key.ends_with(".extraheader")
+                || key.ends_with(".proxycommand")
+                || key.ends_with(".sslcainfo")
+                || key.ends_with(".sslverify")
+                || key.ends_with(".sslcert")
+                || key.ends_with(".sslkey"))
         || key.starts_with("url.")
             && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof"))
         || key.starts_with("http.")
@@ -821,7 +842,6 @@ fn github_repository(remote: &str) -> Option<String> {
     let value = remote.trim().trim_end_matches('/');
     let value = [
         "https://github.com/",
-        "http://github.com/",
         "ssh://git@github.com/",
         "git@github.com:",
     ]
@@ -2102,6 +2122,7 @@ mod tests {
             Some("owner/repo".to_string())
         );
         assert!(github_repository("https://example.com/owner/repo.git").is_none());
+        assert!(github_repository("http://github.com/owner/repo.git").is_none());
         assert_ne!(
             repository_key("a--b/c").unwrap(),
             repository_key("a/b--c").unwrap()
@@ -2210,7 +2231,10 @@ mod tests {
             "include.path",
             "core.sshCommand",
             "http.example.proxy",
+            "http.https://github.com/.sslVerify",
+            "http.https://github.com/.extraHeader",
             "url.safe.insteadOf",
+            "protocol.file.allow",
             "filter.lfs.process",
             "diff.external",
             "merge.custom.driver",

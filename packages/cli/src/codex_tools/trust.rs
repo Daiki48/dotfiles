@@ -90,6 +90,8 @@ mod tests {
         ] {
             assert!(trusted_system_binary(path, name).is_ok(), "{path}");
         }
+        #[cfg(target_os = "linux")]
+        assert!(trusted_system_binary("/usr/bin/unshare", "Unshare").is_ok());
     }
 
     #[cfg(unix)]

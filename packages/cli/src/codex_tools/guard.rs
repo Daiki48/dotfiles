@@ -957,19 +957,18 @@ fn dangerous_local_git_key(key: &str) -> bool {
 }
 
 fn isolate_git_environment(command: &mut Command) {
-    command
-        .env_clear()
-        .envs(std::env::vars_os().filter(|(key, _)| {
-            let key = key.to_string_lossy();
-            !key.starts_with("GIT_")
-                && key != "SSH_ASKPASS"
-                && !key.eq_ignore_ascii_case("HTTP_PROXY")
-                && !key.eq_ignore_ascii_case("HTTPS_PROXY")
-                && !key.eq_ignore_ascii_case("ALL_PROXY")
-                && !key.eq_ignore_ascii_case("NO_PROXY")
-                && !key.eq_ignore_ascii_case("SSL_CERT_FILE")
-                && !key.eq_ignore_ascii_case("SSL_CERT_DIR")
-        }));
+    process::clear_environment(command);
+    command.envs(std::env::vars_os().filter(|(key, _)| {
+        let key = key.to_string_lossy();
+        !key.starts_with("GIT_")
+            && key != "SSH_ASKPASS"
+            && !key.eq_ignore_ascii_case("HTTP_PROXY")
+            && !key.eq_ignore_ascii_case("HTTPS_PROXY")
+            && !key.eq_ignore_ascii_case("ALL_PROXY")
+            && !key.eq_ignore_ascii_case("NO_PROXY")
+            && !key.eq_ignore_ascii_case("SSL_CERT_FILE")
+            && !key.eq_ignore_ascii_case("SSL_CERT_DIR")
+    }));
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1145,8 +1144,8 @@ fn run_gh(cwd: &str, args: &[&str]) -> Option<(i32, Vec<u8>)> {
     let gh = trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI").ok()?;
     let mut command = Command::new(gh);
     command.args(args).current_dir(cwd);
+    process::clear_environment(&mut command);
     command
-        .env_clear()
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_HOST", "github.com")
         .env("GH_CONFIG_DIR", &sandbox.path)
@@ -1169,7 +1168,6 @@ fn github_repository_from_url(remote: &str) -> Option<String> {
     let mut url = remote.trim().trim_end_matches('/');
     let prefixes = [
         "https://github.com/",
-        "http://github.com/",
         "ssh://git@github.com/",
         "git@github.com:",
     ];
@@ -4760,6 +4758,8 @@ mod tests {
             "core.fsmonitor",
             "credential.helper",
             "http.example.proxy",
+            "http.https://github.com/.sslVerify",
+            "http.https://github.com/.extraHeader",
             "url.safe.insteadOf",
             "remote.origin.pushurl",
             "protocol.ext.allow",
@@ -4771,6 +4771,11 @@ mod tests {
         }
         assert!(!dangerous_local_git_key("remote.origin.url"));
         assert!(!dangerous_local_git_key("user.name"));
+        assert!(github_repository_from_url("http://github.com/owner/repo").is_none());
+        assert_eq!(
+            github_repository_from_url("https://github.com/owner/repo.git"),
+            Some("owner/repo".into())
+        );
     }
 
     #[test]

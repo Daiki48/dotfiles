@@ -369,6 +369,8 @@ fn git_command(args: &[String]) -> Result<Vec<String>> {
         "-c".into(),
         "protocol.git.allow=never".into(),
         "-c".into(),
+        "http.sslVerify=true".into(),
+        "-c".into(),
         "remote.origin.uploadpack=git-upload-pack".into(),
         "-c".into(),
         "remote.origin.receivepack=git-receive-pack".into(),
@@ -469,6 +471,14 @@ fn dangerous_local_git_key(key: &str) -> bool {
         || key == "http.proxy"
         || key == "http.sslcainfo"
         || key == "http.sslverify"
+        || key.starts_with("http.")
+            && (key.ends_with(".proxy")
+                || key.ends_with(".extraheader")
+                || key.ends_with(".proxycommand")
+                || key.ends_with(".sslcainfo")
+                || key.ends_with(".sslverify")
+                || key.ends_with(".sslcert")
+                || key.ends_with(".sslkey"))
         || key.starts_with("pager.")
         || key.starts_with("filter.")
             && (key.ends_with(".process")
@@ -3420,6 +3430,8 @@ mod tests {
             "core.sshCommand",
             "credential.helper",
             "core.fsmonitor",
+            "http.https://github.com/.sslVerify",
+            "http.https://github.com/.extraHeader",
             "diff.external",
             "filter.lfs.process",
             "remote.origin.uploadpack",

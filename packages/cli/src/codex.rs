@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::{
     ffi::{CStr, OsStr},
@@ -13,7 +13,8 @@ use std::{
 };
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
-use crate::utils::{create_symlink, run_command};
+use crate::codex_tools::process;
+use crate::utils::create_symlink;
 
 const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
@@ -48,6 +49,8 @@ const MANAGED_BINARY_DESTINATIONS: &[&str] = &[
 ];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 const MANAGED_TRANSACTION_SUFFIX: &str = ".managed.pending";
+const SETUP_TRANSACTION_NAME: &str = ".rust-guardrails-setup.pending";
+const SETUP_TRANSACTION_CONTENTS: &str = "v1\nrust-guardrails\n";
 
 // These are the exact SHA-256 values of
 // `origin/main:.codex/helpers/codex-{worktree,delivery}` from the last Python
@@ -110,6 +113,8 @@ const CARGO_RELATIVE_PATH: &str = ".cargo/bin/cargo";
 const CODEX_RELATIVE_PATH: &str = ".local/bin/codex";
 const RUSTUP_RELATIVE_PATH: &str = ".cargo/bin/rustup";
 const SYSTEM_BUILD_PATH: &str = "/usr/bin";
+const TOOL_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const RELEASE_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[cfg(unix)]
 fn current_uid() -> u32 {
@@ -208,11 +213,10 @@ fn codex_binary_path(home: &Path) -> Result<PathBuf> {
 
 fn codex_check(path: &Path) -> Result<()> {
     println!("\nCodex CLI version:");
-    let output = Command::new(path)
-        .env_clear()
-        .env("PATH", SYSTEM_BUILD_PATH)
-        .arg("--version")
-        .output()
+    let mut command = Command::new(path);
+    process::clear_environment(&mut command);
+    command.env("PATH", SYSTEM_BUILD_PATH).arg("--version");
+    let output = process::run(&mut command, TOOL_CHECK_TIMEOUT)
         .with_context(|| format!("Failed to execute trusted Codex CLI {}", path.display()))?;
     if !output.status.success() {
         anyhow::bail!(
@@ -227,12 +231,13 @@ fn codex_check(path: &Path) -> Result<()> {
 
 fn trusted_rustc_path(home: &Path) -> Result<PathBuf> {
     let rustup = trusted_user_executable(home, RUSTUP_RELATIVE_PATH, "Rustup")?;
-    let output = Command::new(rustup)
-        .env_clear()
+    let mut command = Command::new(rustup);
+    process::clear_environment(&mut command);
+    command
         .env("HOME", home)
         .env("PATH", SYSTEM_BUILD_PATH)
-        .args(["which", "rustc"])
-        .output()
+        .args(["which", "rustc"]);
+    let output = process::run(&mut command, TOOL_CHECK_TIMEOUT)
         .context("Failed to resolve the trusted Rust compiler")?;
     if !output.status.success() {
         anyhow::bail!(
@@ -416,6 +421,11 @@ fn preflight_shared_symlink(
 
     let destination_path = home.join(destination);
     validate_absolute_path(&destination_path)?;
+    reject_symlink_directory_components(
+        destination_path
+            .parent()
+            .context("Shared destination has no parent directory")?,
+    )?;
     match fs::symlink_metadata(&destination_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             verify_managed_symlink(&source_path, &destination_path)?;
@@ -1181,6 +1191,11 @@ fn preflight_managed_binary_paths(home: &Path) -> Result<()> {
     for relative in MANAGED_BINARY_DESTINATIONS {
         let destination = home.join(relative);
         validate_absolute_path(&destination)?;
+        reject_symlink_directory_components(
+            destination
+                .parent()
+                .context("Managed binary destination has no parent directory")?,
+        )?;
         match fs::symlink_metadata(&destination) {
             Ok(metadata) if metadata.file_type().is_symlink() =>
             {
@@ -2345,12 +2360,109 @@ fn preflight_retired_state(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn preflight_setup_transaction(codex_dir: &Path) -> Result<bool> {
+    let path = codex_dir.join(SETUP_TRANSACTION_NAME);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to inspect setup transaction {}", path.display())
+            });
+        }
+    };
+    verify_current_user_regular_file(&path, &metadata)?;
+    #[cfg(unix)]
+    if metadata.mode() & 0o077 != 0 {
+        anyhow::bail!("Setup transaction is not private: {}", path.display());
+    }
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read setup transaction {}", path.display()))?;
+    if contents != SETUP_TRANSACTION_CONTENTS {
+        anyhow::bail!("Setup transaction is invalid: {}", path.display());
+    }
+    Ok(true)
+}
+
+fn begin_setup_transaction(codex_dir: &Path) -> Result<()> {
+    if preflight_setup_transaction(codex_dir)? {
+        println!("- Resuming the interrupted Rust guardrail setup transaction.");
+        return Ok(());
+    }
+    let path = codex_dir.join(SETUP_TRANSACTION_NAME);
+    publish_regular_file_exclusive(
+        &path,
+        SETUP_TRANSACTION_CONTENTS,
+        private_file_permissions(&fs::metadata(codex_dir)?.permissions()),
+    )
+}
+
+fn complete_setup_transaction(codex_dir: &Path) -> Result<()> {
+    let path = codex_dir.join(SETUP_TRANSACTION_NAME);
+    if !preflight_setup_transaction(codex_dir)? {
+        anyhow::bail!("Setup transaction disappeared before completion");
+    }
+    fs::remove_file(&path)
+        .with_context(|| format!("Failed to complete setup transaction {}", path.display()))?;
+    sync_parent_directory(&path)
+}
+
 fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         fs::canonicalize(path)
             .with_context(|| format!("Failed to resolve managed path {}", path.display()))
     } else {
         Ok(path.to_path_buf())
+    }
+}
+
+fn reject_cargo_configuration(dotfiles_path: &Path, home: &Path) -> Result<()> {
+    let mut directories = dotfiles_path
+        .ancestors()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    if !directories.iter().any(|directory| directory == home) {
+        directories.push(home.to_path_buf());
+    }
+    for directory in directories {
+        for name in ["config", "config.toml"] {
+            let path = directory.join(".cargo").join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => anyhow::bail!(
+                    "Cargo configuration is not allowed during guardrail build: {}",
+                    path.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to inspect Cargo configuration {}", path.display())
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_release_binary_magic(magic: [u8; 4]) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        magic == *b"\x7fELF"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        matches!(
+            magic,
+            [0xfe, 0xed, 0xfa, 0xce]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = magic;
+        true
     }
 }
 
@@ -2389,23 +2501,9 @@ fn verify_release_binary(dotfiles_path: &Path, binary: &Path) -> Result<()> {
     let mut magic = [0_u8; 4];
     file.read_exact(&mut magic)
         .with_context(|| format!("Failed to read release artifact {}", binary.display()))?;
-    #[cfg(target_os = "linux")]
-    if magic != *b"\x7fELF" {
+    if !valid_release_binary_magic(magic) {
         anyhow::bail!(
-            "Release artifact is not an ELF binary: {}",
-            binary.display()
-        );
-    }
-    #[cfg(target_os = "macos")]
-    if !matches!(
-        magic,
-        [0xfe, 0xed, 0xfa, 0xce]
-            | [0xce, 0xfa, 0xed, 0xfe]
-            | [0xfe, 0xed, 0xfa, 0xcf]
-            | [0xcf, 0xfa, 0xed, 0xfe]
-    ) {
-        anyhow::bail!(
-            "Release artifact is not a Mach-O binary: {}",
+            "Release artifact has an invalid executable format: {}",
             binary.display()
         );
     }
@@ -2424,6 +2522,7 @@ fn preflight_setup_state(home: &Path, codex_dir: &Path, dotfiles_path: &Path) ->
     }
     preflight_config_state(codex_dir, &dotfiles_path.join(CODEX_CONFIG_TEMPLATE))?;
     preflight_retired_state(codex_dir)?;
+    preflight_setup_transaction(codex_dir)?;
     preflight_managed_binary_paths(home)?;
     validate_absolute_path(&dotfiles_path.join("target/release"))?;
     Ok(())
@@ -2431,17 +2530,26 @@ fn preflight_setup_state(home: &Path, codex_dir: &Path, dotfiles_path: &Path) ->
 
 fn build_managed_binary(dotfiles_path: &Path, home: &Path) -> Result<PathBuf> {
     println!("\nBuilding optimized Codex guardrail binary...");
+    reject_cargo_configuration(dotfiles_path, home)?;
     let cargo = trusted_user_executable(home, CARGO_RELATIVE_PATH, "Cargo")?;
     let rustc = trusted_rustc_path(home)?;
     let mut command = Command::new(cargo);
+    process::clear_environment(&mut command);
     command
         .current_dir(dotfiles_path)
-        .env_clear()
         .env("HOME", home)
         .env("PATH", SYSTEM_BUILD_PATH)
         .env("RUSTC", rustc)
         .args(["build", "--release", "--locked", "-p", "cli"]);
-    run_command(command, "Failed to build the Codex guardrail binary")?;
+    let output = process::run(&mut command, RELEASE_BUILD_TIMEOUT)
+        .context("Failed to build the Codex guardrail binary")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to build the Codex guardrail binary (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
 
     let binary = dotfiles_path
         .join("target/release")
@@ -2487,6 +2595,7 @@ pub fn setup() -> Result<()> {
     ensure_private_directory(&codex_dir)?;
     let managed_worktree_root = codex_dir.join("worktrees");
     ensure_private_directory(&managed_worktree_root)?;
+    begin_setup_transaction(&codex_dir)?;
 
     println!("\nLinking shared configuration files...");
     for (source, dest) in CODEX_FILES {
@@ -2511,6 +2620,7 @@ pub fn setup() -> Result<()> {
     println!("\nMigrating shared Codex settings...");
     migrate_managed_config(&codex_dir)?;
     archive_legacy_python_hooks(&codex_dir)?;
+    complete_setup_transaction(&codex_dir)?;
 
     println!("\n✅ Codex CLI setup completed!");
     println!("\n💡 Next steps:");
@@ -2529,14 +2639,15 @@ mod tests {
         LEGACY_CODEX_DELIVERY_SHA256, LEGACY_CODEX_WORKTREE_SHA256, MANAGED_BINARY_DESTINATIONS,
         MANAGED_HOOK_COMMAND, MANAGED_HOOK_DESTINATION, ManagedInstallMode, ManagedTransaction,
         ManagedTransactionKind, PYTHON_MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND,
-        archive_legacy_python_hook, begin_managed_transaction, contains_legacy_profile_config,
-        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook,
-        ensure_managed_hook_with_legacy_hash, ensure_managed_writable_root,
-        ensure_private_directory, legacy_hash_for_destination, managed_hook_state_path,
-        managed_transaction_path, merge_managed_config, merge_managed_config_with_root,
-        migrate_managed_config_from_template, preflight_config_state,
-        preflight_managed_binary_destination, preflight_shared_symlink,
-        publish_regular_file_exclusive, sha256, trusted_user_executable, validate_setup_home,
+        archive_legacy_python_hook, begin_managed_transaction, begin_setup_transaction,
+        complete_setup_transaction, contains_legacy_profile_config, copy_file_exclusive,
+        ensure_config_unchanged, ensure_managed_hook, ensure_managed_hook_with_legacy_hash,
+        ensure_managed_writable_root, ensure_private_directory, legacy_hash_for_destination,
+        managed_hook_state_path, managed_transaction_path, merge_managed_config,
+        merge_managed_config_with_root, migrate_managed_config_from_template,
+        preflight_config_state, preflight_managed_binary_destination, preflight_setup_transaction,
+        preflight_shared_symlink, publish_regular_file_exclusive, reject_cargo_configuration,
+        sha256, trusted_user_executable, valid_release_binary_magic, validate_setup_home,
         verify_managed_symlink,
     };
     use std::fs;
@@ -2622,6 +2733,69 @@ mod tests {
             fs::read(&destination).expect("read conflicting destination"),
             b"local"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_a_symlinked_shared_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("preflight-parent-symlink");
+        let dotfiles = directory.path().join("dotfiles");
+        let home = directory.path().join("home");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(dotfiles.join(".agents")).expect("create shared source");
+        fs::create_dir_all(&home).expect("create home");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        fs::write(dotfiles.join(".agents/skills"), b"source").expect("write shared source");
+        symlink(&outside, home.join(".agents")).expect("link destination parent");
+
+        assert!(
+            preflight_shared_symlink(&dotfiles, &home, ".agents/skills", ".agents/skills").is_err()
+        );
+        assert!(!outside.join("skills").exists());
+    }
+
+    #[test]
+    fn cargo_configuration_is_rejected_before_release_build() {
+        let directory = TestDirectory::new("cargo-config-preflight");
+        let home = directory.path().join("home");
+        let dotfiles = home.join("worktrees/task");
+        fs::create_dir_all(dotfiles.join(".cargo")).expect("create project Cargo directory");
+        fs::write(
+            dotfiles.join(".cargo/config.toml"),
+            "[build]\nrustc-wrapper='evil'\n",
+        )
+        .expect("write project Cargo config");
+
+        assert!(reject_cargo_configuration(&dotfiles, &home).is_err());
+    }
+
+    #[test]
+    fn setup_transaction_is_durable_and_resumable() {
+        let directory = TestDirectory::new("setup-transaction");
+        fs::create_dir_all(directory.path()).expect("create setup directory");
+
+        assert!(!preflight_setup_transaction(directory.path()).expect("empty preflight"));
+        begin_setup_transaction(directory.path()).expect("begin setup transaction");
+        assert!(preflight_setup_transaction(directory.path()).expect("pending preflight"));
+        begin_setup_transaction(directory.path()).expect("resume setup transaction");
+        complete_setup_transaction(directory.path()).expect("complete setup transaction");
+        assert!(!preflight_setup_transaction(directory.path()).expect("completed preflight"));
+    }
+
+    #[test]
+    fn release_binary_magic_is_platform_specific() {
+        #[cfg(target_os = "linux")]
+        {
+            assert!(valid_release_binary_magic(*b"\x7fELF"));
+            assert!(!valid_release_binary_magic(*b"MZ!!"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(valid_release_binary_magic([0xcf, 0xfa, 0xed, 0xfe]));
+            assert!(!valid_release_binary_magic(*b"MZ!!"));
+        }
     }
 
     #[test]
