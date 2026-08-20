@@ -223,10 +223,7 @@ struct ProcStat {
 fn proc_snapshot() -> io::Result<HashMap<i32, ProcStat>> {
     let mut result = HashMap::new();
     for entry in fs::read_dir("/proc")? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
+        let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -234,21 +231,32 @@ fn proc_snapshot() -> io::Result<HashMap<i32, ProcStat>> {
         let Ok(pid) = name.parse::<i32>() else {
             continue;
         };
-        let Ok(contents) = fs::read_to_string(entry.path().join("stat")) else {
-            continue;
+        let contents = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         };
         let Some(comm_end) = contents.rfind(") ") else {
-            continue;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("/proc/{pid}/stat has no command terminator"),
+            ));
         };
         let fields = contents[comm_end + 2..]
             .split_whitespace()
             .collect::<Vec<_>>();
         // After the comm field, field 3 is state and field 22 is starttime.
         let (Some(parent), Some(start_time)) = (fields.get(1), fields.get(19)) else {
-            continue;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("/proc/{pid}/stat is truncated"),
+            ));
         };
         let (Ok(parent), Ok(start_time)) = (parent.parse(), start_time.parse()) else {
-            continue;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("/proc/{pid}/stat contains invalid numeric fields"),
+            ));
         };
         result.insert(pid, ProcStat { parent, start_time });
     }
@@ -364,18 +372,22 @@ impl DescendantTracker {
     }
 
     #[cfg(target_os = "linux")]
-    fn set_root(&mut self, root_pid: u32) {
+    fn set_root(&mut self, root_pid: u32) -> io::Result<()> {
         let root_pid = root_pid as i32;
         self.root_pid = Some(root_pid);
-        let start_time = proc_snapshot()
-            .ok()
-            .and_then(|snapshot| snapshot.get(&root_pid).map(|stat| stat.start_time))
-            .unwrap_or(0);
+        let snapshot = proc_snapshot()?;
+        let start_time = snapshot
+            .get(&root_pid)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "root PID disappeared"))?
+            .start_time;
         self.tracked.insert(root_pid, start_time);
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn set_root(&mut self, _root_pid: u32) {}
+    fn set_root(&mut self, _root_pid: u32) -> io::Result<()> {
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     fn mark_command(&self, command: &mut Command) {
@@ -386,15 +398,16 @@ impl DescendantTracker {
     fn mark_command(&self, _command: &mut Command) {}
 
     #[cfg(target_os = "linux")]
-    fn carries_marker(&self, pid: i32) -> bool {
+    fn carries_marker(&self, pid: i32) -> io::Result<bool> {
         let expected = format!("CODEX_PROCESS_RUN_ID={}", self.marker);
-        fs::read(format!("/proc/{pid}/environ"))
-            .ok()
-            .is_some_and(|environment| {
-                environment
-                    .split(|byte| *byte == 0)
-                    .any(|entry| entry == expected.as_bytes())
-            })
+        let environment = match fs::read(format!("/proc/{pid}/environ")) {
+            Ok(environment) => environment,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == expected.as_bytes()))
     }
 
     #[cfg(target_os = "linux")]
@@ -427,7 +440,7 @@ impl DescendantTracker {
                 }
                 // A per-run marker is required for newly adopted children so
                 // another thread's unrelated child can never be claimed.
-                let adopted = stat.parent == self.runner_pid && self.carries_marker(*pid);
+                let adopted = stat.parent == self.runner_pid && self.carries_marker(*pid)?;
                 let descendant = self.tracked.contains_key(&stat.parent);
                 if adopted || descendant {
                     self.tracked.insert(*pid, stat.start_time);
@@ -568,6 +581,24 @@ pub(crate) fn run_with_limit(
     let namespace_available = linux_pid_namespace_available();
     #[cfg(not(target_os = "linux"))]
     let namespace_available = false;
+    #[cfg(all(target_os = "linux", not(test)))]
+    if !namespace_available {
+        return Err(ProcessError::Isolation {
+            program: command.get_program().to_string_lossy().into_owned(),
+            source: io::Error::new(
+                io::ErrorKind::Unsupported,
+                "trusted user/PID namespace isolation is unavailable",
+            ),
+        });
+    }
+    #[cfg(all(not(target_os = "linux"), not(test)))]
+    return Err(ProcessError::Isolation {
+        program: command.get_program().to_string_lossy().into_owned(),
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process-tree isolation is supported only on Linux",
+        ),
+    });
     run_with_limit_config(command, timeout, capture_limit, namespace_available)
 }
 
@@ -629,7 +660,10 @@ fn run_with_limit_config(
         program: program.clone(),
         source,
     })?;
-    descendants.set_root(child.id());
+    if let Err(source) = descendants.set_root(child.id()) {
+        terminate_and_reap(&mut child, false, &mut descendants, &program)?;
+        return Err(ProcessError::Isolation { program, source });
+    }
     let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
         (Some(stdout), Some(stderr)) => (stdout, stderr),
         (stdout, stderr) => {
@@ -1165,6 +1199,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn escaped_descendant_is_killed_and_reaped_after_deadline() {
+        if !super::linux_pid_namespace_available() {
+            // A target can erase the test fallback's ownership marker. The
+            // release binary rejects this host instead of claiming isolation.
+            return;
+        }
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock")

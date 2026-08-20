@@ -29,7 +29,9 @@ hookのallow/deny、helperのCLI、worktree manifest、delivery receipt v1/v2/v3
 検証済みsystem `unshare`で外部commandごとにuser/PID namespaceを作り、namespaceのPID 1終了時に
 `setsid`や環境変数解除で離脱した子孫もkernelが停止します。補助追跡のsignalはpidfdを使い、PID再利用競合を
 避けます。capture readerにもnon-blocking cancelとhard deadlineを設けています。unprivileged user namespaceを
-利用できないLinuxでは、安全な子孫停止を保証できないため外部commandを実行せず停止します。
+利用できないLinux、および同等のprocess tree隔離を実装していない非Linuxでは、安全な子孫停止を保証できないため
+release binaryは外部commandを実行せず停止します。CIのunit test binaryだけは、namespace非対応hostでもfixtureを検証できるよう、
+process group・subreaper・run markerによるtest専用fallbackを使用します。
 managed file、manifest、receipt、stateは一時fileの同期とrenameを使い、途中状態を明示的に再開または拒否します。
 Git実行時はsystem/global設定と環境変数を隔離し、repository-localの外部実行・transport変更設定を検出した場合も
 停止します。平文HTTPのGitHub remoteと`file`/`git`/`ext` transportを拒否し、TLS検証を固定します。SSHは
