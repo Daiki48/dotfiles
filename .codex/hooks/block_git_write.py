@@ -319,6 +319,63 @@ def _contains_env_split_string(tokens):
     )
 
 
+def _wrapper_chain_uses_env_split_string(tokens):
+    """実行位置までのwrapper chainにenv split-stringがあればTrue。"""
+    index = 0
+    while index < len(tokens):
+        while index < len(tokens) and re.match(
+            r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[index]
+        ):
+            index += 1
+        if index >= len(tokens):
+            return False
+        basename = os.path.basename(tokens[index])
+        if basename not in COMMAND_WRAPPERS:
+            return False
+        if basename == "env" and _env_uses_split_string(tokens[index:]):
+            return True
+        if (
+            basename == "command"
+            and index + 1 < len(tokens)
+            and tokens[index + 1] in {"-v", "-V"}
+        ):
+            return False
+        index += 1
+        options_with_value = {
+            "env": ENV_OPTS_WITH_VALUE,
+            "exec": EXEC_OPTS_WITH_VALUE,
+            "nice": NICE_OPTS_WITH_VALUE,
+            "sudo": SUDO_OPTS_WITH_VALUE,
+            "timeout": TIMEOUT_OPTS_WITH_VALUE,
+            "xargs": XARGS_OPTS_WITH_VALUE,
+        }.get(basename, frozenset())
+        while index < len(tokens):
+            option = tokens[index]
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", option):
+                index += 1
+                continue
+            if option == "--":
+                index += 1
+                break
+            if option in options_with_value:
+                index += 2
+                continue
+            if any(
+                option.startswith(f"{item}=")
+                for item in options_with_value
+                if item.startswith("--")
+            ):
+                index += 1
+                continue
+            if option.startswith("-"):
+                index += 1
+                continue
+            break
+        if basename == "timeout" and index < len(tokens):
+            index += 1
+    return False
+
+
 def _is_protected_branch(branch):
     branch = branch.removeprefix("refs/heads/")
     return branch in PROTECTED_BRANCHES or any(
@@ -2234,7 +2291,7 @@ def _has_unparsed_guarded_command(tokens):
         )
     if _has_command_resolution_mutation(arguments):
         return True
-    if _env_uses_split_string(arguments):
+    if _wrapper_chain_uses_env_split_string(arguments):
         return True
     start = _command_start(arguments)
     if start is None:
@@ -2348,8 +2405,10 @@ def blocked_reason(command, cwd=None, depth=0):
             and not any(_nested_shell_commands(tokens))
         ):
             return "shellは検査可能な-c inline commandだけを実行できます"
-        if _env_uses_split_string(tokens):
+        if _wrapper_chain_uses_env_split_string(tokens):
             return "envのsplit-stringは安全に解析できません"
+        if start is not None and os.path.basename(tokens[start]) == "builtin":
+            return "builtin経由のshell builtin実行は安全に検査できません"
         if _shell_wraps_restricted_command(tokens):
             return "shell経由のGit/GitHub/削除commandは実行できません"
         if start is not None and os.path.basename(tokens[start]) in DESTRUCTIVE_COMMANDS:
