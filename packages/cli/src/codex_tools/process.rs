@@ -97,11 +97,10 @@ struct ReadMessage {
 }
 
 pub(crate) fn clear_environment(command: &mut Command) {
-    command.env_clear().env(ENVIRONMENT_CLEARED_MARKER, "1");
+    command.env_clear();
+    #[cfg(target_os = "linux")]
+    command.env(ENVIRONMENT_CLEARED_MARKER, "1");
 }
-
-#[cfg(not(target_os = "linux"))]
-const ENVIRONMENT_CLEARED_MARKER: &str = "CODEX_PROCESS_ENVIRONMENT_CLEARED";
 
 #[cfg(target_os = "linux")]
 fn linux_pid_namespace_command(command: &Command) -> io::Result<Command> {
