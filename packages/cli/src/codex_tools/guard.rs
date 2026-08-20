@@ -3362,6 +3362,10 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
                 "http.followRedirects=initial",
                 "-c",
                 "remote.origin.proxy=",
+                "-c",
+                "remote.origin.uploadpack=git-upload-pack",
+                "-c",
+                "remote.origin.receivepack=git-receive-pack",
             ]
             .map(str::to_string),
         );
@@ -6099,6 +6103,8 @@ mod tests {
             assert!(rewritten.contains("http.extraHeader="));
             assert!(rewritten.contains("http.followRedirects=initial"));
             assert!(rewritten.contains("remote.origin.proxy="));
+            assert!(rewritten.contains("remote.origin.uploadpack=git-upload-pack"));
+            assert!(rewritten.contains("remote.origin.receivepack=git-receive-pack"));
             assert!(rewritten.contains(".extraHeader="));
             assert!(rewritten.contains("GIT_CONFIG_GLOBAL=/dev/null"));
             assert!(rewritten.contains("GIT_CONFIG_SYSTEM=/dev/null"));
