@@ -1216,6 +1216,7 @@ mod tests {
     fn stops_a_process_group_at_the_capture_limit() {
         let mut command = Command::new("sh");
         command.args(["-c", "yes x"]);
+        // process_run_lockの待機時間は責務外なので、壁時計の上限は検証しない。
         let error = run_with_limit(&mut command, Duration::from_secs(5), 1024)
             .expect_err("reject unbounded output");
         assert!(matches!(error, ProcessError::CaptureLimit { .. }));
