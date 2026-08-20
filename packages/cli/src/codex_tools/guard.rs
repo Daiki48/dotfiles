@@ -3345,6 +3345,10 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
                 "-c",
                 "core.sshCommand=/usr/bin/ssh -F /dev/null -o BatchMode=yes",
                 "-c",
+                "core.askPass=",
+                "-c",
+                "core.gitProxy=none",
+                "-c",
                 "protocol.ext.allow=never",
                 "-c",
                 "protocol.file.allow=never",
@@ -6083,6 +6087,8 @@ mod tests {
             assert!(
                 rewritten.contains("core.sshCommand=/usr/bin/ssh -F /dev/null -o BatchMode=yes")
             );
+            assert!(rewritten.contains("core.askPass="));
+            assert!(rewritten.contains("core.gitProxy=none"));
             assert!(rewritten.contains("protocol.ext.allow=never"));
             assert!(rewritten.contains("protocol.file.allow=never"));
             assert!(rewritten.contains("protocol.git.allow=never"));
