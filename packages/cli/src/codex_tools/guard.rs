@@ -1300,7 +1300,16 @@ fn valid_repo_char(c: u8) -> bool {
 }
 
 fn origin_repository(cwd: &str) -> Option<String> {
-    github_repository_from_url(run_git(cwd, &["remote", "get-url", "origin"])?.trim())
+    verified_origin(cwd).map(|(repository, _)| repository)
+}
+
+fn verified_origin(cwd: &str) -> Option<(String, String)> {
+    let output = run_git(cwd, &["remote", "get-url", "origin"])?;
+    let value = output.trim();
+    if value.is_empty() || value.lines().count() != 1 {
+        return None;
+    }
+    Some((github_repository_from_url(value)?, value.to_string()))
 }
 
 fn current_work_branch_reason(cwd: &str) -> Option<String> {
@@ -3026,29 +3035,45 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
         return Ok(None);
     }
     let mut tokens = segments.into_iter().next().unwrap_or_default();
-    let Some((git_index, subcommand_index, subcommand)) = git_subcommand_index(&tokens) else {
+    let Some(git_index) = command_start(&tokens) else {
         return Ok(None);
     };
-    let write = GIT_SAFE_WRITE.contains(&subcommand);
-    let network = ["fetch", "pull", "push", "ls-remote"].contains(&subcommand);
-    if !write && !network {
+    if tokens.get(git_index).map(|token| basename(token)) != Some("git") {
         return Ok(None);
     }
+    let subcommand = git_subcommand_index(&tokens);
+    let subcommand_index = subcommand
+        .as_ref()
+        .map(|(_, index, _)| *index)
+        .unwrap_or(git_index + 1);
+    let subcommand = subcommand.as_ref().map(|(_, _, value)| *value);
+    let write = subcommand.is_some_and(|value| GIT_SAFE_WRITE.contains(&value));
+    let network =
+        subcommand.is_some_and(|value| ["fetch", "pull", "push", "ls-remote"].contains(&value));
+    let isolate_environment = network || !write;
 
     let git = trust::trusted_system_binary(SYSTEM_GIT, "Git")?;
     tokens[git_index] = git;
-    let mut configs: Vec<String> = Vec::with_capacity(if network { 18 } else { 2 });
-    if write {
-        configs.extend(["-c", "core.hooksPath=/dev/null"].map(str::to_string));
-    }
+    let mut configs: Vec<String> = [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "diff.external=",
+    ]
+    .map(str::to_string)
+    .into();
+    let mut gh_snapshot = None;
     if network {
         trust::trusted_system_binary(SYSTEM_SSH, "SSH")?;
         let cwd = cwd
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "network Gitのrepository cwdを確認できません".to_string())?;
-        let repository = origin_repository(cwd)
+        let (_, origin) = verified_origin(cwd)
             .ok_or_else(|| "network GitのGitHub originを確認できません".to_string())?;
-        let origin = format!("https://github.com/{repository}.git");
         configs.extend(
             [
                 "-c",
@@ -3070,51 +3095,88 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
             "-c".to_string(),
             format!("remote.origin.pushurl={origin}"),
         ]);
+        if origin.starts_with("https://") {
+            trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI")?;
+            let snapshot = GuardGhSandbox::create()
+                .ok_or_else(|| {
+                    "Git credential configをprivate snapshotへ固定できません".to_string()
+                })?
+                .into_persistent();
+            let snapshot = snapshot
+                .to_str()
+                .ok_or_else(|| "Git credential snapshot pathを確認できません".to_string())?
+                .to_string();
+            configs.extend([
+                "-c".into(),
+                "credential.helper=".into(),
+                "-c".into(),
+                "credential.https://github.com.helper=!/usr/bin/gh auth git-credential".into(),
+            ]);
+            gh_snapshot = Some(snapshot);
+        }
     }
     tokens.splice(subcommand_index..subcommand_index, configs);
-    if network {
+    if isolate_environment {
         trust::trusted_system_binary(SYSTEM_ENV, "Env")?;
         if git_index != 0 && tokens[..git_index] != ["env", "-u", "SSH_ASKPASS"] {
-            return Err("network Git wrapperを安全に再構成できません".into());
+            return Err("Git wrapperを安全に再構成できません".into());
         }
-        tokens.splice(
-            0..git_index,
-            [
-                SYSTEM_ENV,
-                "-u",
-                "SSH_ASKPASS",
-                "-u",
-                "SSH_ASKPASS_REQUIRE",
-                "-u",
-                "HTTP_PROXY",
-                "-u",
-                "HTTPS_PROXY",
-                "-u",
-                "ALL_PROXY",
-                "-u",
-                "NO_PROXY",
-                "-u",
-                "http_proxy",
-                "-u",
-                "https_proxy",
-                "-u",
-                "all_proxy",
-                "-u",
-                "no_proxy",
-                "-u",
-                "SSL_CERT_FILE",
-                "-u",
-                "SSL_CERT_DIR",
-                "GIT_CONFIG_NOSYSTEM=1",
-                "GIT_CONFIG_GLOBAL=/dev/null",
-                "GIT_CONFIG_SYSTEM=/dev/null",
-                "GIT_TERMINAL_PROMPT=0",
-                "GIT_PAGER=cat",
-                "PATH=/usr/bin:/bin",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        );
+        let mut environment = [
+            SYSTEM_ENV,
+            "-u",
+            "SSH_ASKPASS",
+            "-u",
+            "SSH_ASKPASS_REQUIRE",
+            "-u",
+            "HTTP_PROXY",
+            "-u",
+            "HTTPS_PROXY",
+            "-u",
+            "ALL_PROXY",
+            "-u",
+            "NO_PROXY",
+            "-u",
+            "http_proxy",
+            "-u",
+            "https_proxy",
+            "-u",
+            "all_proxy",
+            "-u",
+            "no_proxy",
+            "-u",
+            "SSL_CERT_FILE",
+            "-u",
+            "SSL_CERT_DIR",
+            "-u",
+            "GH_CONFIG_DIR",
+            "-u",
+            "GH_HOST",
+            "-u",
+            "GH_REPO",
+            "-u",
+            "GH_TOKEN",
+            "-u",
+            "GITHUB_TOKEN",
+            "-u",
+            "GH_ENTERPRISE_TOKEN",
+            "-u",
+            "GH_DEBUG",
+            "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+            "GIT_TERMINAL_PROMPT=0",
+            "GIT_PAGER=cat",
+            "GH_HOST=github.com",
+            "GH_PROMPT_DISABLED=1",
+            "GH_NO_UPDATE_NOTIFIER=1",
+            "PATH=/usr/bin:/bin",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        if let Some(snapshot) = gh_snapshot {
+            environment.push(format!("GH_CONFIG_DIR={snapshot}"));
+        }
+        tokens.splice(0..git_index, environment);
     }
     Ok(Some(
         tokens
@@ -3154,6 +3216,16 @@ fn rewrite_gh_safety_command(command: &str) -> Result<Option<String>, String> {
             "-u".into(),
             "GH_ENTERPRISE_TOKEN".into(),
             "-u".into(),
+            "GH_REPO".into(),
+            "-u".into(),
+            "GH_TOKEN".into(),
+            "-u".into(),
+            "GITHUB_TOKEN".into(),
+            "-u".into(),
+            "GH_DEBUG".into(),
+            "-u".into(),
+            "GH_FORCE_TTY".into(),
+            "-u".into(),
             "HTTPS_PROXY".into(),
             "-u".into(),
             "HTTP_PROXY".into(),
@@ -3185,6 +3257,7 @@ fn rewrite_gh_safety_command(command: &str) -> Result<Option<String>, String> {
             "VISUAL".into(),
             "GH_PROMPT_DISABLED=1".into(),
             "GH_HOST=github.com".into(),
+            "GH_NO_UPDATE_NOTIFIER=1".into(),
             format!("GH_CONFIG_DIR={snapshot}"),
             "GH_PAGER=cat".into(),
             "PATH=/usr/bin:/bin".into(),
@@ -5701,9 +5774,9 @@ mod tests {
         )
         .expect("rewrite commit")
         .expect("commit requires a rewrite");
-        assert!(commit.contains(
-            "'/usr/bin/git' '-C' '/managed/worktree' '-c' 'core.hooksPath=/dev/null' 'commit'"
-        ));
+        assert!(commit.contains("'/usr/bin/git' '-C' '/managed/worktree'"));
+        assert!(commit.contains("'core.hooksPath=/dev/null'"));
+        assert!(commit.ends_with("'commit' '-m' ':bug: fix'"));
         assert!(!commit.contains("core.sshCommand"));
 
         let cwd = std::env::current_dir().expect("current test repository");
@@ -5730,12 +5803,34 @@ mod tests {
                 rewritten.contains("remote.origin.url=https://github.com/Daiki48/dotfiles.git")
             );
             assert!(rewritten.starts_with("'/usr/bin/env'"));
+            assert!(
+                rewritten.contains(
+                    "credential.https://github.com.helper=!/usr/bin/gh auth git-credential"
+                )
+            );
+            assert!(rewritten.contains("GH_CONFIG_DIR=/tmp/.codex-hook-gh-"));
+            #[cfg(unix)]
+            {
+                let snapshot = command_segments(&rewritten)
+                    .into_iter()
+                    .next()
+                    .and_then(|tokens| {
+                        tokens.into_iter().find_map(|token| {
+                            token.strip_prefix("GH_CONFIG_DIR=").map(PathBuf::from)
+                        })
+                    })
+                    .expect("Git credential snapshot path");
+                remove_expired_gh_snapshot(&snapshot).expect("remove Git credential snapshot");
+            }
         }
-        assert!(
-            rewrite_git_safety_command("git status", None)
-                .expect("inspect status")
-                .is_none()
-        );
+        let status = rewrite_git_safety_command("git status", None)
+            .expect("rewrite status")
+            .expect("read-only Git requires a rewrite");
+        assert!(status.starts_with("'/usr/bin/env'"));
+        assert!(status.contains("'/usr/bin/git' '-c' 'core.hooksPath=/dev/null'"));
+        assert!(status.contains("core.fsmonitor=false"));
+        assert!(status.contains("diff.external="));
+        assert!(status.contains("GIT_CONFIG_GLOBAL=/dev/null"));
     }
 
     #[cfg(unix)]
@@ -5749,6 +5844,10 @@ mod tests {
         assert!(rewritten.starts_with("'/usr/bin/env'"));
         assert!(rewritten.contains("'-u' 'HTTPS_PROXY'"));
         assert!(rewritten.contains("'-u' 'GH_CONFIG_DIR'"));
+        assert!(rewritten.contains("'-u' 'GH_REPO'"));
+        assert!(rewritten.contains("'-u' 'GH_TOKEN'"));
+        assert!(rewritten.contains("'-u' 'GITHUB_TOKEN'"));
+        assert!(rewritten.contains("'-u' 'GH_DEBUG'"));
         assert!(rewritten.contains("'GH_HOST=github.com'"));
         assert!(rewritten.contains("'/usr/bin/gh' 'issue' 'view'"));
 
@@ -5774,6 +5873,41 @@ mod tests {
 
         let root = fs::symlink_metadata("/").expect("inspect runtime root");
         assert!(trusted_helper_ancestor_owner(root.uid()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn network_git_preserves_a_verified_ssh_origin_scheme() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-guard-ssh-origin-{suffix}"));
+        fs::create_dir(&root).expect("create SSH origin fixture");
+        for arguments in [
+            vec!["init", "-q"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:owner/repository.git",
+            ],
+        ] {
+            let status = Command::new(SYSTEM_GIT)
+                .current_dir(&root)
+                .args(arguments)
+                .status()
+                .expect("configure SSH origin fixture");
+            assert!(status.success());
+        }
+        let rewritten =
+            rewrite_git_safety_command("git fetch origin refs/heads/main", root.to_str())
+                .expect("rewrite SSH fetch")
+                .expect("SSH fetch requires a rewrite");
+        assert!(rewritten.contains("remote.origin.url=git@github.com:owner/repository.git"));
+        assert!(!rewritten.contains("credential.https://github.com.helper"));
+        assert!(!rewritten.contains("GH_CONFIG_DIR=/tmp/"));
+        fs::remove_dir_all(root).expect("remove SSH origin fixture");
     }
 
     #[cfg(unix)]

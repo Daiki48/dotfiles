@@ -1069,8 +1069,12 @@ fn repository(root: &Path) -> Result<String> {
     Ok(fetched)
 }
 
-fn canonical_remote_url(root: &Path) -> Result<String> {
-    Ok(format!("https://github.com/{}.git", repository(root)?))
+fn canonical_remote_url(root: &Path, expected_repository: &str) -> Result<String> {
+    let current = repository(root)?;
+    if !current.eq_ignore_ascii_case(expected_repository) {
+        return Err(error("origin repository identityが検査後に変化しました"));
+    }
+    Ok(format!("https://github.com/{expected_repository}.git"))
 }
 
 fn manifest(root: &Path, task: &str, repository_name_value: &str) -> Result<(Value, PathBuf)> {
@@ -1975,10 +1979,10 @@ fn ruleset(root: &Path, repository: &str) -> Result<()> {
     Ok(())
 }
 
-fn fetch_main(root: &Path) -> Result<String> {
+fn fetch_main(root: &Path, repository: &str) -> Result<String> {
     let args_vec = vec![
         "fetch".into(),
-        canonical_remote_url(root)?,
+        canonical_remote_url(root, repository)?,
         "refs/heads/main:refs/remotes/origin/main".into(),
     ];
     if !run(
@@ -2038,7 +2042,7 @@ fn validate_delivery(
         ));
     }
     default_branch(root, &repository)?;
-    let live = fetch_main(root)?;
+    let live = fetch_main(root, &repository)?;
     if let Some(base) = inspected_base {
         base.push(live.clone());
     }
@@ -2212,8 +2216,8 @@ fn worktree_records(root: &Path) -> Result<Vec<HashMap<String, String>>> {
     }
     Ok(records)
 }
-fn remote_branch(root: &Path, branch: &str) -> Result<Option<String>> {
-    let remote = canonical_remote_url(root)?;
+fn remote_branch(root: &Path, repository: &str, branch: &str) -> Result<Option<String>> {
+    let remote = canonical_remote_url(root, repository)?;
     let output = git(
         root,
         &[
@@ -2254,9 +2258,9 @@ fn assert_main_clean(root: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn assert_main_synced(root: &Path) -> Result<()> {
+fn assert_main_synced(root: &Path, repository: &str) -> Result<()> {
     assert_main_clean(root)?;
-    let remote = fetch_main(root)?;
+    let remote = fetch_main(root, repository)?;
     if oid(
         git(root, &["rev-parse", "HEAD"], true)?.trim(),
         "人間用main head",
@@ -2266,11 +2270,11 @@ fn assert_main_synced(root: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn assert_merge_base_unchanged(root: &Path, inspected: &[String]) -> Result<()> {
+fn assert_merge_base_unchanged(root: &Path, repository: &str, inspected: &[String]) -> Result<()> {
     let last = inspected
         .last()
         .ok_or_else(|| error("merge直前の検査済みbaseがありません"))?;
-    if fetch_main(root)? != *last {
+    if fetch_main(root, repository)? != *last {
         return Err(error(
             "merge直前にorigin/mainが検査済みbaseから変化しました",
         ));
@@ -2385,7 +2389,7 @@ fn deliver_locked(
         atomic_json(&path, &state)?;
         state
     };
-    assert_merge_base_unchanged(root, &inspected)?;
+    assert_merge_base_unchanged(root, &repository, &inspected)?;
     gh(
         root,
         &[
@@ -2468,7 +2472,7 @@ fn finish_locked(
     assert_main_clean(root)?;
     let stage = str_value(&state, "stage")?;
     if stage == "completed" {
-        if remote_branch(root, &str_value(&manifest_value, "branch")?)?.is_some()
+        if remote_branch(root, &repository, &str_value(&manifest_value, "branch")?)?.is_some()
             || worktree_path.exists()
             || worktree_path.is_symlink()
         {
@@ -2477,7 +2481,7 @@ fn finish_locked(
         return Ok(state);
     }
     if stage == "merged" {
-        let remote_main = fetch_main(root)?;
+        let remote_main = fetch_main(root, &repository)?;
         let args = [
             "merge-base",
             "--is-ancestor",
@@ -2524,16 +2528,16 @@ fn finish_locked(
         {
             return Err(error("人間用mainをff-only syncできません"));
         }
-        assert_main_synced(root)?;
+        assert_main_synced(root, &repository)?;
         state = save_stage(&repository, task, &state, "main_synced", "")?;
     } else {
-        assert_main_synced(root)?;
+        assert_main_synced(root, &repository)?;
     }
     let stage = str_value(&state, "stage")?;
     if ["main_synced", "remote_delete_started"].contains(&stage.as_str()) {
-        assert_main_synced(root)?;
+        assert_main_synced(root, &repository)?;
         let branch = str_value(&manifest_value, "branch")?;
-        let remote = remote_branch(root, &branch)?;
+        let remote = remote_branch(root, &repository, &branch)?;
         if remote.as_deref().is_some_and(|v| v != head) {
             return Err(error("remote task branchがreceipt headから変化しています"));
         }
@@ -2558,7 +2562,7 @@ fn finish_locked(
         worktree_clean_head(&worktree_path, &head)?;
         if remote.is_some() {
             state = save_stage(&repository, task, &state, "remote_delete_started", "")?;
-            let remote_url = canonical_remote_url(root)?;
+            let remote_url = canonical_remote_url(root, &repository)?;
             let args = [
                 "push".into(),
                 format!("--force-with-lease=refs/heads/{branch}:{head}"),
@@ -2575,7 +2579,7 @@ fn finish_locked(
             {
                 return Err(error("remote task branchを削除できません"));
             }
-            if remote_branch(root, &branch)?.is_some() {
+            if remote_branch(root, &repository, &branch)?.is_some() {
                 return Err(error("remote task branchを削除後も確認できました"));
             }
         }
@@ -2583,9 +2587,9 @@ fn finish_locked(
     }
     let stage = str_value(&state, "stage")?;
     if ["remote_deleted", "worktree_unlock_started"].contains(&stage.as_str()) {
-        assert_main_synced(root)?;
+        assert_main_synced(root, &repository)?;
         let branch = str_value(&manifest_value, "branch")?;
-        if remote_branch(root, &branch)?.is_some() {
+        if remote_branch(root, &repository, &branch)?.is_some() {
             return Err(error("remote task branchがcleanup中に再出現しました"));
         }
         let records = worktree_records(root)?;
@@ -2632,7 +2636,7 @@ fn finish_locked(
                 if unlocked.get("locked").is_some() {
                     return Err(error("worktree unlock後のlock状態を確認できません"));
                 }
-                assert_main_synced(root)?;
+                assert_main_synced(root, &repository)?;
                 worktree(root, &manifest_value, &worktree_path)?;
                 worktree_clean_head(&worktree_path, &head)?;
             }
@@ -2655,7 +2659,7 @@ fn finish_locked(
     }
     if str_value(&state, "stage")? == "worktree_removed" {
         let branch = str_value(&manifest_value, "branch")?;
-        if remote_branch(root, &branch)?.is_some() {
+        if remote_branch(root, &repository, &branch)?.is_some() {
             return Err(error("remote task branchがcleanup中に再出現しました"));
         }
         let args = [
@@ -3081,6 +3085,19 @@ mod tests {
         assert!(!branch_name("main"));
         assert!(plan_id("CODEX-DELIVERY-TEST-v1"));
         assert!(!plan_id("bad-v0"));
+    }
+
+    #[test]
+    fn remote_url_is_bound_to_the_initial_repository_identity() {
+        let mut root = std::env::current_dir().expect("current repository");
+        while !root.join(".git").exists() {
+            assert!(root.pop(), "repository root is present");
+        }
+        assert_eq!(
+            canonical_remote_url(&root, "Daiki48/dotfiles").expect("stable repository identity"),
+            "https://github.com/Daiki48/dotfiles.git"
+        );
+        assert!(canonical_remote_url(&root, "other/repository").is_err());
     }
     #[test]
     fn receipt_v3_requires_separate_decision_and_gate() {
