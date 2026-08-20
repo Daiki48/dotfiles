@@ -969,6 +969,9 @@ fn isolate_git_environment(command: &mut Command) {
     command.envs(std::env::vars_os().filter(|(key, _)| {
         let key = key.to_string_lossy();
         !key.starts_with("GIT_")
+            && !key.starts_with("GH_")
+            && key != "GITHUB_TOKEN"
+            && key != "GITHUB_ENTERPRISE_TOKEN"
             && key != "SSH_ASKPASS"
             && !key.eq_ignore_ascii_case("HTTP_PROXY")
             && !key.eq_ignore_ascii_case("HTTPS_PROXY")
@@ -1825,18 +1828,104 @@ fn branch_worktree(cwd: &str, head: &str) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
-fn remote_refs_snapshot(cwd: &str, head: Option<&str>) -> Option<(String, String, Option<String>)> {
+fn remote_git_command(
+    cwd: &str,
+    origin: &str,
+    args: &[&str],
+) -> Option<(Command, Option<GuardGhSandbox>)> {
+    github_repository_from_url(origin)?;
+    if cwd.is_empty() || !local_git_config_is_safe(cwd) {
+        return None;
+    }
+    let git = trust::trusted_system_binary(SYSTEM_GIT, "Git").ok()?;
+    let ssh = trust::trusted_system_binary(SYSTEM_SSH, "SSH").ok()?;
+    let mut command = Command::new(git);
+    command
+        .args([
+            "--no-pager",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "diff.external=",
+            "-c",
+            &format!("core.sshCommand={ssh} -F /dev/null -o BatchMode=yes"),
+            "-c",
+            "core.gitProxy=none",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "protocol.file.allow=never",
+            "-c",
+            "protocol.git.allow=never",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "fetch.recurseSubmodules=false",
+            "-c",
+            "push.recurseSubmodules=no",
+            "-c",
+            "http.sslVerify=true",
+            "-c",
+            &format!("remote.origin.url={origin}"),
+            "-c",
+            &format!("remote.origin.pushurl={origin}"),
+        ])
+        .current_dir(cwd);
+    isolate_git_environment(&mut command);
+    let sandbox = if origin.starts_with("https://github.com/") {
+        trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI").ok()?;
+        let sandbox = GuardGhSandbox::create()?;
+        command
+            .args([
+                "-c",
+                "credential.https://github.com.helper=!/usr/bin/gh auth git-credential",
+            ])
+            .env("GH_CONFIG_DIR", &sandbox.path)
+            .env("GH_HOST", "github.com")
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1");
+        Some(sandbox)
+    } else {
+        None
+    };
+    command.args(args);
+    Some((command, sandbox))
+}
+
+fn run_remote_git(cwd: &str, origin: &str, args: &[&str]) -> Option<String> {
+    let (mut command, sandbox) = remote_git_command(cwd, origin, args)?;
+    let output =
+        process::run_with_limit(&mut command, GIT_COMMAND_TIMEOUT, MAX_GIT_OUTPUT_BYTES).ok()?;
+    drop(sandbox);
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+fn remote_refs_snapshot(
+    cwd: &str,
+    origin: &str,
+    head: Option<&str>,
+) -> Option<(String, String, Option<String>)> {
     let mut owned_args = vec![
         "ls-remote".to_string(),
+        "--upload-pack=git-upload-pack".to_string(),
         "--symref".to_string(),
-        "origin".to_string(),
+        origin.to_string(),
         "HEAD".to_string(),
     ];
     if let Some(head) = head {
         owned_args.push(format!("refs/heads/{head}"));
     }
     let args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let output = run_git(cwd, &args)?;
+    let output = run_remote_git(cwd, origin, &args)?;
     let lines = output.lines().collect::<Vec<_>>();
     if lines.len() != if head.is_some() { 3 } else { 2 } {
         return None;
@@ -1883,9 +1972,14 @@ fn draft_pr_preflight_reason(cwd: &str, base: &str, head: &str) -> Option<String
     if session_common.is_none() || session_common != head_common {
         return Some("Draft PRのhead worktreeがsession repositoryと一致しません".into());
     }
-    if origin_repository(cwd) != origin_repository(head_cwd) {
+    let session_origin = verified_origin(cwd);
+    let head_origin = verified_origin(head_cwd);
+    if session_origin.as_ref().map(|value| &value.0) != head_origin.as_ref().map(|value| &value.0) {
         return Some("Draft PRのhead worktreeのoriginがsession repositoryと一致しません".into());
     }
+    let Some((_, origin)) = head_origin else {
+        return Some("Draft PRのhead worktreeのoriginを確認できません".into());
+    };
     let current = run_git(head_cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
     let local_head = run_git(head_cwd, &["rev-parse", "HEAD"]);
     if current.as_deref().map(str::trim) != Some(head) || local_head.is_none() {
@@ -1901,7 +1995,7 @@ fn draft_pr_preflight_reason(cwd: &str, base: &str, head: &str) -> Option<String
     {
         return Some("Draft PRのhead worktreeがcleanではありません".into());
     }
-    let snapshot = match remote_refs_snapshot(head_cwd, Some(head)) {
+    let snapshot = match remote_refs_snapshot(head_cwd, &origin, Some(head)) {
         Some(value) => value,
         None => return Some("Draft PRのremote refを安全に確認できません".into()),
     };
@@ -6091,6 +6185,38 @@ mod tests {
         assert!(!rewritten.contains("credential.https://github.com.helper"));
         assert!(!rewritten.contains("GH_CONFIG_DIR=/tmp/"));
         fs::remove_dir_all(root).expect("remove SSH origin fixture");
+    }
+
+    #[test]
+    fn remote_preflight_uses_a_fixed_ssh_transport_and_literal_origin() {
+        let cwd = std::env::current_dir().expect("current test repository");
+        let cwd = cwd.to_str().expect("UTF-8 test repository");
+        let origin = "git@github.com:owner/repository.git";
+        let (command, sandbox) =
+            remote_git_command(cwd, origin, &["ls-remote", "--symref", origin, "HEAD"])
+                .expect("construct fixed remote preflight");
+        assert!(sandbox.is_none());
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for expected in [
+            "core.sshCommand=/usr/bin/ssh -F /dev/null -o BatchMode=yes",
+            "credential.helper=",
+            "protocol.ext.allow=never",
+            "protocol.file.allow=never",
+            "protocol.git.allow=never",
+            "submodule.recurse=false",
+            "fetch.recurseSubmodules=false",
+            "push.recurseSubmodules=no",
+            "http.sslVerify=true",
+            origin,
+        ] {
+            assert!(
+                arguments.iter().any(|argument| argument == expected),
+                "{expected}"
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -73,6 +73,7 @@ struct Repository {
     root: PathBuf,
     common_git_dir: PathBuf,
     github_name: String,
+    origin_url: String,
     default_branch: String,
     default_oid: String,
 }
@@ -870,19 +871,24 @@ fn valid_github_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'/')
 }
 
-fn origin_identity(root: &Path, allow_local_origin: bool) -> Result<String, WorktreeError> {
+fn origin_identity(
+    root: &Path,
+    allow_local_origin: bool,
+) -> Result<(String, String), WorktreeError> {
     let (fetch, push) = origin_urls(root)?;
     let fetch_repository = github_repository(&fetch);
     let push_repository = github_repository(&push);
     if fetch_repository.is_none() || push_repository != fetch_repository {
         if allow_local_origin && fetch == push && safe_local_origin(&fetch) {
-            return Ok("test/local".to_string());
+            return Ok(("test/local".to_string(), fetch));
         }
         return Err(error(
             "originのfetch/push先は同一GitHub repositoryにしてください",
         ));
     }
-    fetch_repository.ok_or_else(|| error("origin repositoryを確認できません"))
+    fetch_repository
+        .map(|repository| (repository, fetch))
+        .ok_or_else(|| error("origin repositoryを確認できません"))
 }
 
 fn is_protected(branch: &str) -> bool {
@@ -899,13 +905,12 @@ fn valid_oid(value: &str) -> bool {
     (value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn remote_default(root: &Path) -> Result<(String, String), WorktreeError> {
-    let (origin, _) = origin_urls(root)?;
+fn remote_default(root: &Path, origin: &str) -> Result<(String, String), WorktreeError> {
     let arguments = [
         "ls-remote",
         "--upload-pack=git-upload-pack",
         "--symref",
-        origin.as_str(),
+        origin,
         "HEAD",
     ];
     let output = git_stdout(root, &arguments)?;
@@ -944,9 +949,9 @@ fn inspect_repository(
     {
         return Err(error("worktree作成はmain checkoutから実行してください"));
     }
-    let github_name = origin_identity(&root, allow_local_origin)?;
+    let (github_name, origin_url) = origin_identity(&root, allow_local_origin)?;
     let (default_branch, default_oid) = if require_remote {
-        remote_default(&root)?
+        remote_default(&root, &origin_url)?
     } else {
         (String::new(), String::new())
     };
@@ -954,6 +959,7 @@ fn inspect_repository(
         root,
         common_git_dir,
         github_name,
+        origin_url,
         default_branch,
         default_oid,
     })
@@ -1383,14 +1389,13 @@ fn branch_exists(repository: &Repository, branch: &str) -> Result<bool, Worktree
     if local_code == 0 {
         return Ok(true);
     }
-    let (origin, _) = origin_urls(&repository.root)?;
     let remote_ref = format!("refs/heads/{branch}");
     let arguments = [
         "ls-remote",
         "--exit-code",
         "--upload-pack=git-upload-pack",
         "--heads",
-        origin.as_str(),
+        repository.origin_url.as_str(),
         remote_ref.as_str(),
     ];
     let (remote_code, output) = git_allow_failure(&repository.root, &arguments)?;
@@ -1435,7 +1440,6 @@ fn create_worktree(
     if branch_exists(&repository, branch)? {
         return Err(error("localまたはremote branchが既に存在します"));
     }
-    let (origin, _) = origin_urls(&repository.root)?;
     let refspec = format!(
         "+refs/heads/{}:refs/remotes/origin/{}",
         repository.default_branch, repository.default_branch
@@ -1444,7 +1448,7 @@ fn create_worktree(
         "fetch",
         "--no-tags",
         "--upload-pack=git-upload-pack",
-        origin.as_str(),
+        repository.origin_url.as_str(),
         refspec.as_str(),
     ];
     git_stdout(&repository.root, &fetch_arguments)?;
@@ -1454,7 +1458,7 @@ fn create_worktree(
     )?
     .trim()
     .to_ascii_lowercase();
-    let (remote_branch, remote_oid) = remote_default(&repository.root)?;
+    let (remote_branch, remote_oid) = remote_default(&repository.root, &repository.origin_url)?;
     if remote_branch != repository.default_branch || fetched_oid != remote_oid {
         return Err(error(
             "fetch後のorigin default branchがremote HEADと一致しません",
@@ -2315,6 +2319,27 @@ mod tests {
             .is_err()
         );
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn network_operations_keep_the_initial_verified_origin_literal() {
+        let fixture = TemporaryRepository::new();
+        let repository = inspect_repository(&fixture.repository, true, true)
+            .expect("inspect initial verified origin");
+        let missing = fixture.directory.join("unverified-replacement.git");
+        run_git(
+            &fixture.repository,
+            &["remote", "set-url", "origin", missing.to_str().unwrap()],
+        );
+
+        assert!(!branch_exists(&repository, "feat/not-present").unwrap());
+        assert_eq!(
+            remote_default(&repository.root, &repository.origin_url).unwrap(),
+            (
+                repository.default_branch.clone(),
+                repository.default_oid.clone()
+            )
+        );
     }
 
     #[test]
