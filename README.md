@@ -65,7 +65,7 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `tmux` | Install tmux via apt/dnf, clone [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager) into `~/.config/tmux/plugins/tpm`, and symlink `~/.config/tmux/tmux.conf`. After setup, press `Ctrl+g` then `I` (capital i) inside tmux to install plugins. | yes |
 | `mise [TOOL@VERSION]...` | Install mise from its recommended apt/dnf repository. Optional tool arguments are installed and recorded in the global mise config; with no arguments, only mise itself is installed. Shell activation is provided by the managed `.zshrc`. | yes |
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
-| `codex` | Install Codex CLI via `npm install -g @openai/codex`. Symlinks shared instructions, safety rules, and Skills; distributes the `codex-worktree` and `codex-delivery` helpers and configures their managed writable root; then idempotently installs or migrates `~/.codex/config.toml` to the workspace-write + auto-review defaults. Machine-local trust and TUI settings are preserved. | no |
+| `codex` | Require a trusted Codex CLI at `~/.local/bin/codex`, symlink shared instructions, safety rules, and Skills, then release-build and atomically install the Rust Git/GitHub hook plus `codex-worktree` and `codex-delivery` multi-call helpers. The setup preflights every managed destination before mutation and idempotently migrates `~/.codex/config.toml`; it never executes `codex`, `cargo`, or `npm` from `PATH`. Machine-local trust and TUI settings are preserved. | no |
 | `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`, `~/.gemini/GEMINI.md`, and `~/.gemini/policies/`. Requires `GEMINI_API_KEY` exported in your shell. | no |
 
 #### AI CLI configuration policy
@@ -210,3 +210,4 @@ Config for CorvusSKK.
 - [docker](https://github.com/Daiki48/dotfiles/blob/main/docs/setup-docker.md)
 - [Codex worktree運用](docs/codex-worktrees.ja.md)
 - [Codex delivery運用](docs/codex-delivery.ja.md)
+- [Codex guardrailのRust実装](docs/codex-rust-guardrails.ja.md)

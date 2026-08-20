@@ -11,11 +11,9 @@ pull requestと`main`へのpushで、次を同じjob内で実行します。
 
 | 検証 | ローカルとCIのcommand |
 |---|---|
-| Git/GitHub hook | `python3 -m unittest discover -s .codex/hooks -p 'test_*.py'` |
-| worktree helper | `python3 -m unittest discover -s .codex/helpers -p 'test_*.py'` |
-| Ruleset宣言 | `python3 -m unittest discover -s .github/rulesets -p 'test_*.py'` |
-| Rust workspace | `cargo test --workspace --locked` |
+| hook・helper・Ruleset | `cargo test --workspace --locked` |
 | Rust format | `cargo fmt --all -- --check` |
+| Rust lint | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 
 workflowは`contents: read`だけを要求し、credentialをcheckout後に保持しません。
 `pull_request_target`は使用せず、forkや未信頼branchのコードへsecretを渡しません。
