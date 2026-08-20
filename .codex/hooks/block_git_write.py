@@ -2116,6 +2116,8 @@ def _has_unparsed_guarded_command(tokens):
         or any(_command_word_has_expansion(token) for token in arguments)
     ):
         return True
+    if _command_word_has_expansion(arguments[start]):
+        return True
     if os.path.basename(arguments[start]) in guarded:
         return True
     if _python_helper_invocation_reason(arguments) is not None:
