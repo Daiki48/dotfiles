@@ -19,8 +19,7 @@ const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
     (".codex/rules/default.rules", ".codex/rules/default.rules"),
 ];
-const MANAGED_HOOK_SOURCE: &str = ".codex/hooks/block_git_write.py";
-const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/block_git_write.py";
+const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/block-git-write";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedInstallMode {
     PreserveSource,
@@ -41,17 +40,10 @@ struct ManagedTransaction {
     target_hash: String,
 }
 
-const MANAGED_HELPERS: &[(&str, &str, ManagedInstallMode)] = &[
-    (
-        ".codex/helpers/codex-worktree",
-        ".local/bin/codex-worktree",
-        ManagedInstallMode::PreserveSource,
-    ),
-    (
-        ".codex/helpers/codex-delivery",
-        ".local/bin/codex-delivery",
-        ManagedInstallMode::OwnerExecutable,
-    ),
+const MANAGED_BINARY_DESTINATIONS: &[&str] = &[
+    MANAGED_HOOK_DESTINATION,
+    ".local/bin/codex-worktree",
+    ".local/bin/codex-delivery",
 ];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 const MANAGED_TRANSACTION_SUFFIX: &str = ".managed.pending";
@@ -78,7 +70,9 @@ const MANAGED_AGENT_KEYS: &[&str] = &[
     "default_subagent_model",
     "default_subagent_reasoning_effort",
 ];
-const MANAGED_HOOK_COMMAND: &str = "command = 'python3 \"$HOME/.codex/hooks/block_git_write.py\"'";
+const MANAGED_HOOK_COMMAND: &str = "command = '\"$HOME/.codex/hooks/block-git-write\"'";
+const PYTHON_MANAGED_HOOK_COMMAND: &str =
+    "command = 'python3 \"$HOME/.codex/hooks/block_git_write.py\"'";
 const RETIRED_HOOK_COMMAND: &str =
     "command = 'python3 \"$HOME/.codex/hooks/prevent_irreversible_git.py\"'";
 const MANAGED_HOOK_CONFIG: &str = r#"[[hooks.PreToolUse]]
@@ -86,7 +80,7 @@ matcher = "^Bash$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
+command = '"$HOME/.codex/hooks/block-git-write"'
 timeout = 10
 statusMessage = "Git/GitHub操作を確認中""#;
 const PRE_TOOL_USE_HEADER: &str = "[[hooks.PreToolUse]]";
@@ -327,7 +321,7 @@ fn remove_retired_managed_hook(existing: &str) -> String {
             .unwrap_or(existing_lines.len());
         let has_managed_hook = existing_lines[section_start..section_end]
             .iter()
-            .any(|line| line.trim() == RETIRED_HOOK_COMMAND);
+            .any(|line| is_retired_managed_hook_command(line.trim()));
         if !has_managed_hook {
             merged.extend_from_slice(&existing_lines[section_start..section_end]);
             index = section_end;
@@ -351,7 +345,7 @@ fn remove_retired_managed_hook(existing: &str) -> String {
                 .unwrap_or(section_end);
             if !existing_lines[hook_start..hook_end]
                 .iter()
-                .any(|line| line.trim() == RETIRED_HOOK_COMMAND)
+                .any(|line| is_retired_managed_hook_command(line.trim()))
             {
                 retained_hooks.extend_from_slice(&existing_lines[hook_start..hook_end]);
             }
@@ -364,6 +358,10 @@ fn remove_retired_managed_hook(existing: &str) -> String {
         index = section_end;
     }
     format!("{}\n", merged.join("\n").trim_start_matches('\n'))
+}
+
+fn is_retired_managed_hook_command(line: &str) -> bool {
+    line == RETIRED_HOOK_COMMAND || line == PYTHON_MANAGED_HOOK_COMMAND
 }
 
 fn merge_managed_config(template: &str, existing: &str) -> String {
@@ -525,7 +523,11 @@ fn backup_legacy_config(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_file_temp(path: &Path, contents: &str, permissions: fs::Permissions) -> Result<PathBuf> {
+fn write_file_temp(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+    permissions: fs::Permissions,
+) -> Result<PathBuf> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("System clock is before UNIX_EPOCH")?
@@ -548,7 +550,7 @@ fn write_file_temp(path: &Path, contents: &str, permissions: fs::Permissions) ->
             .open(&temp_path)
             .with_context(|| format!("Failed to create temporary {}", temp_path.display()))?;
         temp_created = true;
-        temp.write_all(contents.as_bytes())
+        temp.write_all(contents.as_ref())
             .with_context(|| format!("Failed to write temporary {}", temp_path.display()))?;
         fs::set_permissions(&temp_path, permissions)
             .with_context(|| format!("Failed to set permissions on {}", temp_path.display()))?;
@@ -565,7 +567,11 @@ fn write_file_temp(path: &Path, contents: &str, permissions: fs::Permissions) ->
     Ok(temp_path)
 }
 
-fn replace_regular_file(path: &Path, contents: &str, permissions: fs::Permissions) -> Result<()> {
+fn replace_regular_file(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+    permissions: fs::Permissions,
+) -> Result<()> {
     let temp_path = write_file_temp(path, contents, permissions)?;
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
@@ -590,7 +596,7 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 
 fn publish_regular_file_exclusive(
     path: &Path,
-    contents: &str,
+    contents: impl AsRef<[u8]>,
     permissions: fs::Permissions,
 ) -> Result<()> {
     let temp_path = write_file_temp(path, contents, permissions)?;
@@ -607,7 +613,7 @@ fn managed_hook_state_path(hook_path: &Path) -> PathBuf {
     let file_name = hook_path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("block_git_write.py");
+        .unwrap_or("block-git-write");
     hook_path.with_file_name(format!("{file_name}{MANAGED_HOOK_STATE_SUFFIX}"))
 }
 
@@ -619,8 +625,8 @@ fn managed_transaction_path(destination: &Path) -> PathBuf {
     destination.with_file_name(format!("{file_name}{MANAGED_TRANSACTION_SUFFIX}"))
 }
 
-fn sha256(contents: &str) -> String {
-    format!("{:x}", Sha256::digest(contents.as_bytes()))
+fn sha256(contents: impl AsRef<[u8]>) -> String {
+    format!("{:x}", Sha256::digest(contents.as_ref()))
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -772,7 +778,7 @@ fn inspect_managed_destination(path: &Path) -> Result<ManagedDestinationState> {
         return Ok(ManagedDestinationState::Symlink);
     }
     verify_current_user_regular_file(path, &metadata)?;
-    let contents = fs::read_to_string(path)
+    let contents = fs::read(path)
         .with_context(|| format!("Failed to read managed file {}", path.display()))?;
     Ok(ManagedDestinationState::Regular(sha256(&contents)))
 }
@@ -883,7 +889,7 @@ fn finish_managed_transaction(
 #[allow(clippy::too_many_arguments)]
 fn resume_owner_executable_transaction(
     source: &Path,
-    source_contents: &str,
+    source_contents: &[u8],
     source_hash: &str,
     destination: &Path,
     destination_permissions: &fs::Permissions,
@@ -1021,7 +1027,7 @@ fn ensure_managed_hook(
             })?;
         }
     }
-    let source_contents = fs::read_to_string(source)
+    let source_contents = fs::read(source)
         .with_context(|| format!("Failed to read managed hook source {}", source.display()))?;
     let source_permissions = fs::metadata(source)
         .with_context(|| format!("Failed to inspect managed hook source {}", source.display()))?
@@ -1117,7 +1123,7 @@ fn ensure_managed_hook(
             destination
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("block_git_write.py")
+                .unwrap_or("block-git-write")
         ));
         copy_symlink_exclusive(destination, &backup_path)?;
         sync_parent_directory(&backup_path)?;
@@ -1159,7 +1165,7 @@ fn ensure_managed_hook(
         verify_current_user_regular_file(destination, metadata)?;
     }
 
-    let existing = fs::read_to_string(destination)
+    let existing = fs::read(destination)
         .with_context(|| format!("Failed to read managed hook {}", destination.display()))?;
     let existing_hash = sha256(&existing);
     let recorded = if install_mode == ManagedInstallMode::OwnerExecutable {
@@ -1210,7 +1216,7 @@ fn ensure_managed_hook(
         destination
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("block_git_write.py")
+            .unwrap_or("block-git-write")
     ));
     copy_file_exclusive(destination, &backup_path)?;
     sync_parent_directory(&backup_path)?;
@@ -1595,6 +1601,28 @@ fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
     }
 }
 
+fn build_managed_binary(dotfiles_path: &Path) -> Result<PathBuf> {
+    println!("\nBuilding optimized Codex guardrail binary...");
+    let mut command = Command::new("cargo");
+    command
+        .current_dir(dotfiles_path)
+        .args(["build", "--release", "--locked", "-p", "cli"]);
+    run_command(command, "Failed to build the Codex guardrail binary")?;
+
+    let binary = dotfiles_path
+        .join("target/release")
+        .join(format!("cli{}", std::env::consts::EXE_SUFFIX));
+    let metadata = fs::symlink_metadata(&binary)
+        .with_context(|| format!("Failed to inspect built binary {}", binary.display()))?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!(
+            "Built guardrail is not a regular file: {}",
+            binary.display()
+        );
+    }
+    Ok(binary)
+}
+
 pub fn setup() -> Result<()> {
     println!("🧠 Setting up Codex CLI...\n");
     let home = setup_home_dir()?;
@@ -1630,16 +1658,12 @@ pub fn setup() -> Result<()> {
         ensure_shared_symlink(source, dest)?;
     }
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
-    ensure_managed_hook(
-        &dotfiles_path.join(MANAGED_HOOK_SOURCE),
-        &home.join(MANAGED_HOOK_DESTINATION),
-        ManagedInstallMode::PreserveSource,
-    )?;
-    for (source, destination, install_mode) in MANAGED_HELPERS {
+    let managed_binary = build_managed_binary(&dotfiles_path)?;
+    for destination in MANAGED_BINARY_DESTINATIONS {
         ensure_managed_hook(
-            &dotfiles_path.join(source),
+            &managed_binary,
             &home.join(destination),
-            *install_mode,
+            ManagedInstallMode::OwnerExecutable,
         )?;
     }
     println!("\nLinking shared skill directories...");
@@ -1667,12 +1691,12 @@ mod tests {
     #[cfg(unix)]
     use super::account_home_dir;
     use super::{
-        MANAGED_HELPERS, MANAGED_HOOK_COMMAND, ManagedInstallMode, ManagedTransaction,
-        ManagedTransactionKind, RETIRED_HOOK_COMMAND, begin_managed_transaction,
-        contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
-        ensure_managed_hook, ensure_managed_writable_root, ensure_private_directory,
-        managed_hook_state_path, managed_transaction_path, merge_managed_config,
-        merge_managed_config_with_root, migrate_managed_config_from_template,
+        MANAGED_BINARY_DESTINATIONS, MANAGED_HOOK_COMMAND, ManagedInstallMode, ManagedTransaction,
+        ManagedTransactionKind, PYTHON_MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND,
+        begin_managed_transaction, contains_legacy_profile_config, copy_file_exclusive,
+        ensure_config_unchanged, ensure_managed_hook, ensure_managed_writable_root,
+        ensure_private_directory, managed_hook_state_path, managed_transaction_path,
+        merge_managed_config, merge_managed_config_with_root, migrate_managed_config_from_template,
         publish_regular_file_exclusive, sha256, validate_setup_home, verify_managed_symlink,
     };
     use std::fs;
@@ -1704,22 +1728,75 @@ mod tests {
     }
 
     #[test]
-    fn managed_helpers_include_worktree_and_delivery() {
+    fn managed_binary_destinations_include_hook_and_helpers() {
         assert_eq!(
-            MANAGED_HELPERS,
+            MANAGED_BINARY_DESTINATIONS,
             &[
-                (
-                    ".codex/helpers/codex-worktree",
-                    ".local/bin/codex-worktree",
-                    ManagedInstallMode::PreserveSource,
-                ),
-                (
-                    ".codex/helpers/codex-delivery",
-                    ".local/bin/codex-delivery",
-                    ManagedInstallMode::OwnerExecutable,
-                ),
+                ".codex/hooks/block-git-write",
+                ".local/bin/codex-worktree",
+                ".local/bin/codex-delivery",
             ]
         );
+    }
+
+    #[test]
+    fn owner_executable_install_accepts_non_utf8_binary_contents() {
+        let directory = TestDirectory::new("managed-binary");
+        let source = directory.path().join("cli");
+        let destination = directory.path().join("block-git-write");
+        let original = [0x7f, b'E', b'L', b'F', 0xff, 0x00];
+        let updated = [0x7f, b'E', b'L', b'F', 0xfe, 0x00];
+        fs::write(&source, original).expect("write binary source");
+
+        ensure_managed_hook(&source, &destination, ManagedInstallMode::OwnerExecutable)
+            .expect("install binary");
+        assert_eq!(fs::read(&destination).expect("read binary"), original);
+
+        fs::write(&source, updated).expect("update binary source");
+        ensure_managed_hook(&source, &destination, ManagedInstallMode::OwnerExecutable)
+            .expect("update binary");
+        assert_eq!(
+            fs::read(&destination).expect("read updated binary"),
+            updated
+        );
+    }
+
+    #[test]
+    fn temporary_home_receives_the_same_private_multicall_binary() {
+        let directory = TestDirectory::new("managed-multicall-home");
+        let home = directory.path().join("home");
+        let source = directory.path().join("release-cli");
+        let binary = [0x7f, b'E', b'L', b'F', 0xff, 0x00, 0x01];
+        fs::create_dir(&home).expect("create temporary home");
+        fs::write(&source, binary).expect("write release binary fixture");
+
+        for relative in MANAGED_BINARY_DESTINATIONS {
+            let destination = home.join(relative);
+            ensure_managed_hook(&source, &destination, ManagedInstallMode::OwnerExecutable)
+                .expect("install multicall entrypoint");
+            assert_eq!(
+                fs::read(&destination).expect("read installed binary"),
+                binary
+            );
+            assert_eq!(
+                fs::read_to_string(managed_hook_state_path(&destination))
+                    .expect("read managed hash")
+                    .trim(),
+                sha256(binary)
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&destination)
+                        .expect("inspect installed binary")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+            }
+        }
     }
 
     #[test]
@@ -2529,7 +2606,7 @@ matcher = "^Bash$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
+command = '"$HOME/.codex/hooks/block-git-write"'
 timeout = 10
 statusMessage = "Git/GitHub操作を確認中""#;
         let old = r#"model = "old"
@@ -2549,6 +2626,11 @@ timeout = 30
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
+command = 'python3 "$HOME/.codex/hooks/block_git_write.py"'
+timeout = 10
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
 command = "echo prevent_irreversible_git.py"
 timeout = 30
 
@@ -2557,6 +2639,7 @@ timeout = 30
         let updated = merge_managed_config(template, old);
         assert!(updated.contains(MANAGED_HOOK_COMMAND));
         assert!(!updated.contains(RETIRED_HOOK_COMMAND));
+        assert!(!updated.contains(PYTHON_MANAGED_HOOK_COMMAND));
         assert!(updated.contains("matcher = \".*\""));
         assert!(!updated.lines().any(|line| line == "timeout = 1"));
         assert!(updated.contains("command = \"local-check\"\ntimeout = 30"));

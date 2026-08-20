@@ -1,6 +1,7 @@
 mod alacritty;
 mod claude;
 mod codex;
+mod codex_tools;
 mod common;
 mod gemini;
 mod ghostty;
@@ -12,7 +13,8 @@ mod wezterm;
 mod zellij;
 mod zsh;
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use crate::common::Distro;
 use clap::{Parser, Subcommand};
@@ -75,7 +77,23 @@ enum Commands {
     Gemini,
 }
 
-fn main() -> anyhow::Result<()> {
+fn multicall_exit_code<I>(executable: &Path, args: I) -> Option<i32>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    match executable.file_name().and_then(|name| name.to_str()) {
+        Some("block-git-write") => Some(codex_tools::guard::entrypoint()),
+        Some("codex-worktree") => Some(codex_tools::worktree::entrypoint(args)),
+        Some("codex-delivery") => Some(codex_tools::delivery::entrypoint(args)),
+        _ => None,
+    }
+}
+
+fn run() -> anyhow::Result<()> {
+    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cli"));
+    if let Some(code) = multicall_exit_code(&executable, std::env::args_os().skip(1)) {
+        std::process::exit(code);
+    }
     let cli = Cli::parse();
 
     match cli.command {
@@ -176,4 +194,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("error: {error:#}");
+        std::process::exit(1);
+    }
 }
