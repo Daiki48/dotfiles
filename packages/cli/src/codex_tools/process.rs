@@ -262,6 +262,56 @@ fn process_run_lock() -> &'static Mutex<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn signal_observed_process(pid: i32, start_time: u64, signal: libc::c_int) -> Option<io::Error> {
+    let snapshot = match proc_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Some(error),
+    };
+    let observed = snapshot.get(&pid)?;
+    if start_time != 0 && observed.start_time != start_time {
+        return None;
+    }
+    // SAFETY: pidfd_open returns a stable kernel reference to the observed PID.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if descriptor == -1 {
+        let error = io::Error::last_os_error();
+        return (!matches!(error.raw_os_error(), Some(libc::ESRCH))).then_some(error);
+    }
+    let same_process = match proc_snapshot() {
+        Ok(snapshot) => snapshot
+            .get(&pid)
+            .is_some_and(|stat| start_time == 0 || stat.start_time == start_time),
+        Err(error) => {
+            // SAFETY: descriptor was returned by pidfd_open above.
+            unsafe { libc::close(descriptor) };
+            return Some(error);
+        }
+    };
+    let result = if same_process {
+        // SAFETY: descriptor is a live pidfd; siginfo is intentionally null.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                descriptor,
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        }
+    } else {
+        0
+    };
+    // SAFETY: descriptor was returned by pidfd_open above.
+    unsafe { libc::close(descriptor) };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        (!matches!(error.raw_os_error(), Some(libc::ESRCH))).then_some(error)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn enable_subreaper() -> io::Result<()> {
     // SAFETY: prctl changes only this process's child-reaping policy and takes
     // no pointers for PR_SET_CHILD_SUBREAPER.
@@ -348,10 +398,13 @@ impl DescendantTracker {
     }
 
     #[cfg(target_os = "linux")]
-    fn refresh(&mut self) {
-        let Ok(snapshot) = proc_snapshot() else {
-            return;
-        };
+    fn refresh(&mut self) -> io::Result<()> {
+        self.refresh_from(proc_snapshot())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn refresh_from(&mut self, snapshot: io::Result<HashMap<i32, ProcStat>>) -> io::Result<()> {
+        let snapshot = snapshot?;
         let root_pid = self.root_pid;
         self.tracked.retain(|pid, start_time| {
             if Some(*pid) == root_pid && !snapshot.contains_key(pid) {
@@ -372,11 +425,9 @@ impl DescendantTracker {
                 {
                     continue;
                 }
-                // Existing unrelated children are captured in baseline. The
-                // marker also identifies this run after a descendant escapes
-                // its original process group and is adopted by the subreaper.
-                let adopted = stat.parent == self.runner_pid
-                    && (self.carries_marker(*pid) || !self.baseline.contains_key(pid));
+                // A per-run marker is required for newly adopted children so
+                // another thread's unrelated child can never be claimed.
+                let adopted = stat.parent == self.runner_pid && self.carries_marker(*pid);
                 let descendant = self.tracked.contains_key(&stat.parent);
                 if adopted || descendant {
                     self.tracked.insert(*pid, stat.start_time);
@@ -384,70 +435,45 @@ impl DescendantTracker {
                 }
             }
         }
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn refresh(&mut self) {}
+    fn refresh(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     fn signal_known(&mut self, signal: libc::c_int) -> Option<io::Error> {
-        self.refresh();
+        if let Err(error) = self.refresh() {
+            return Some(error);
+        }
         let mut first_error = None;
         for (pid, start_time) in &self.tracked {
             if Some(*pid) == self.root_pid {
                 continue;
             }
-            if proc_snapshot()
-                .ok()
-                .and_then(|value| value.get(pid).copied())
-                .is_none_or(|stat| *start_time != 0 && stat.start_time != *start_time)
-            {
-                continue;
-            }
-            // SAFETY: pidfd_open returns a stable kernel reference to the
-            // observed process.  A second starttime check after opening closes
-            // the PID-reuse race before pidfd_send_signal.
-            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, *pid, 0) } as i32;
-            if descriptor == -1 {
-                let error = io::Error::last_os_error();
-                if !matches!(error.raw_os_error(), Some(libc::ESRCH)) {
-                    first_error.get_or_insert(error);
-                }
-                continue;
-            }
-            let same_process = proc_snapshot()
-                .ok()
-                .and_then(|value| value.get(pid).copied())
-                .is_some_and(|stat| *start_time == 0 || stat.start_time == *start_time);
-            let signal_result = if same_process {
-                // SAFETY: descriptor is a live pidfd and the remaining
-                // arguments contain no pointers except a null siginfo.
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        descriptor,
-                        signal,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0,
-                    )
-                }
-            } else {
-                0
-            };
-            // SAFETY: descriptor was returned by pidfd_open in this loop.
-            unsafe { libc::close(descriptor) };
-            if signal_result == -1 {
-                let error = io::Error::last_os_error();
-                if !matches!(error.raw_os_error(), Some(libc::ESRCH)) {
-                    first_error.get_or_insert(error);
-                }
+            if let Some(error) = signal_observed_process(*pid, *start_time, signal) {
+                first_error.get_or_insert(error);
             }
         }
         first_error
     }
 
+    #[cfg(target_os = "linux")]
+    fn signal_root(&self, signal: libc::c_int) -> Option<io::Error> {
+        let pid = self.root_pid?;
+        let start_time = self.tracked.get(&pid).copied().unwrap_or(0);
+        signal_observed_process(pid, start_time, signal)
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn signal_known(&mut self, _signal: i32) -> Option<io::Error> {
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn signal_root(&self, _signal: i32) -> Option<io::Error> {
         None
     }
 
@@ -491,11 +517,17 @@ impl DescendantTracker {
         let deadline = Instant::now() + DESCENDANT_REAP_GRACE;
         let mut first_error = None;
         loop {
-            self.refresh();
+            if let Err(error) = self.refresh() {
+                first_error.get_or_insert(error);
+                break;
+            }
             if let Some(error) = self.reap_known() {
                 first_error.get_or_insert(error);
             }
-            self.refresh();
+            if let Err(error) = self.refresh() {
+                first_error.get_or_insert(error);
+                break;
+            }
             let has_live = self.tracked.keys().any(|pid| Some(*pid) != self.root_pid);
             if !has_live {
                 break;
@@ -655,7 +687,13 @@ fn run_with_limit_config(
     let mut completed_cleanup = false;
 
     while result_error.is_none() && (status.is_none() || stdout.is_none() || stderr.is_none()) {
-        descendants.refresh();
+        if let Err(source) = descendants.refresh() {
+            result_error = Some(ProcessError::Isolation {
+                program: program.clone(),
+                source,
+            });
+            break;
+        }
         drain_messages(
             &receiver,
             &program,
@@ -679,7 +717,7 @@ fn run_with_limit_config(
                 }
             }
         }
-        if status.is_some() && !completed_cleanup && (stdout.is_none() || stderr.is_none()) {
+        if status.is_some() && !completed_cleanup {
             completed_cleanup = true;
             if let Err(error) = terminate_and_reap(&mut child, true, &mut descendants, &program) {
                 result_error = Some(error);
@@ -705,17 +743,6 @@ fn run_with_limit_config(
             terminate_and_reap(&mut child, status.is_some(), &mut descendants, &program)
         {
             result_error.get_or_insert(error);
-        }
-    } else if status.is_none() {
-        match child.wait() {
-            Ok(child_status) => status = Some(child_status),
-            Err(source) => {
-                cancel_readers.store(true, Ordering::Release);
-                result_error = Some(ProcessError::Wait {
-                    program: program.clone(),
-                    source,
-                });
-            }
         }
     }
 
@@ -857,48 +884,82 @@ fn terminate_and_reap(
     {
         let process_group = child.id() as i32;
         let mut cleanup_error = None;
-        descendants.refresh();
-        // SAFETY: kill is called with a validated child process-group id and no pointers.
-        unsafe {
-            if libc::kill(-process_group, libc::SIGTERM) == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    cleanup_error = Some(error);
+        let mut root_reaped = already_reaped;
+        if let Err(error) = descendants.refresh() {
+            cleanup_error.get_or_insert(error);
+        }
+        if !root_reaped {
+            // The group id cannot be reused while its observed leader remains
+            // unreaped. Root signaling via pidfd also covers a root that called
+            // setsid and left its configured process group.
+            unsafe {
+                if libc::kill(-process_group, libc::SIGTERM) == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        cleanup_error.get_or_insert(error);
+                    }
                 }
+            }
+            if let Some(error) = descendants.signal_root(libc::SIGTERM) {
+                cleanup_error.get_or_insert(error);
             }
         }
         if let Some(error) = descendants.signal_known(libc::SIGTERM) {
             cleanup_error.get_or_insert(error);
         }
         let grace_deadline = Instant::now() + TERMINATE_GRACE;
-        while !already_reaped && Instant::now() < grace_deadline {
+        while !root_reaped && Instant::now() < grace_deadline {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(_)) => root_reaped = true,
                 Ok(None) => thread::sleep(POLL_INTERVAL),
                 Err(error) => {
                     cleanup_error.get_or_insert(error);
                     break;
                 }
             }
-            descendants.refresh();
+            if let Err(error) = descendants.refresh() {
+                cleanup_error.get_or_insert(error);
+                break;
+            }
             if let Some(error) = descendants.reap_known() {
                 cleanup_error.get_or_insert(error);
             }
         }
-        // Killing the group also closes pipes inherited by descendants after the leader exits.
-        unsafe {
-            if libc::kill(-process_group, libc::SIGKILL) == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    cleanup_error.get_or_insert(error);
+        if !root_reaped {
+            unsafe {
+                if libc::kill(-process_group, libc::SIGKILL) == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        cleanup_error.get_or_insert(error);
+                    }
                 }
+            }
+            if let Some(error) = descendants.signal_root(libc::SIGKILL) {
+                cleanup_error.get_or_insert(error);
             }
         }
         if let Some(error) = descendants.signal_known(libc::SIGKILL) {
             cleanup_error.get_or_insert(error);
         }
-        if !already_reaped && let Err(error) = child.wait() {
-            cleanup_error.get_or_insert(error);
+        let hard_deadline = Instant::now() + DESCENDANT_REAP_GRACE;
+        while !root_reaped {
+            match child.try_wait() {
+                Ok(Some(_)) => root_reaped = true,
+                Ok(None) if Instant::now() < hard_deadline => thread::sleep(POLL_INTERVAL),
+                Ok(None) => {
+                    cleanup_error.get_or_insert_with(|| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "root process did not terminate before cleanup deadline",
+                        )
+                    });
+                    break;
+                }
+                Err(error) => {
+                    cleanup_error.get_or_insert(error);
+                    break;
+                }
+            }
         }
         if let Some(error) = descendants.reap_until_gone() {
             cleanup_error.get_or_insert(error);
@@ -935,7 +996,9 @@ fn terminate_and_reap(
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
-    use super::{ENVIRONMENT_CLEARED_MARKER, prepare_linux_command, run_with_limit_config};
+    use super::{
+        DescendantTracker, ENVIRONMENT_CLEARED_MARKER, prepare_linux_command, run_with_limit_config,
+    };
     use super::{ProcessError, run_with_limit};
     use std::fs;
     use std::io;
@@ -966,6 +1029,92 @@ mod tests {
             .expect("fallback must stop and reap the escaped pipe holder");
         assert!(output.status.success());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_stops_a_target_that_attempts_to_leave_its_process_group() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec setsid sleep 30"]);
+        let started = Instant::now();
+        let output = run_with_limit_config(&mut command, Duration::from_millis(50), 1024, false)
+            .expect("setsid helper and its detached child must be reaped");
+        assert!(output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_cleans_an_escaped_descendant_that_closed_its_pipes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let pid_file = std::env::temp_dir().join(format!(
+            "codex-process-closed-pipe-{}-{nonce}.pid",
+            std::process::id()
+        ));
+        let pid_file_text = pid_file.to_str().expect("pid file path");
+        let script = format!(
+            "setsid sh -c 'echo $$ > {pid_file_text}; exec >/dev/null 2>&1; sleep 30' & while [ ! -s {pid_file_text} ]; do sleep 0.01; done; exit 0"
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+        let output = run_with_limit_config(&mut command, Duration::from_millis(500), 1024, false)
+            .expect("normal completion must clean detached descendants");
+        assert!(output.status.success());
+
+        let pid = fs::read_to_string(&pid_file)
+            .expect("escaped descendant pid file")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("escaped descendant pid");
+        // SAFETY: kill(pid, 0) only probes process existence.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        fs::remove_file(pid_file).expect("remove pid file");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_does_not_claim_an_unrelated_child_spawned_during_the_run() {
+        let unrelated = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn concurrent unrelated child")
+        });
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let error = run_with_limit_config(&mut command, Duration::from_millis(75), 1024, false)
+            .expect_err("enforce deadline");
+        assert!(matches!(error, ProcessError::Timeout { .. }));
+
+        let mut unrelated = unrelated.join().expect("join unrelated spawner");
+        assert!(
+            unrelated
+                .try_wait()
+                .expect("inspect unrelated child")
+                .is_none(),
+            "cleanup signaled a concurrently-created unrelated child"
+        );
+        unrelated.kill().expect("stop unrelated child");
+        unrelated.wait().expect("reap unrelated child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_snapshot_failure_is_not_treated_as_success() {
+        let mut tracker = DescendantTracker::new().expect("create tracker");
+        let failure = tracker.refresh_from(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fixture",
+        )));
+        assert_eq!(
+            failure.expect_err("snapshot failure must propagate").kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
