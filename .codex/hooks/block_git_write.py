@@ -2049,6 +2049,15 @@ def _has_shell_argument_expansion(command):
     return False
 
 
+def _command_word_has_expansion(token):
+    """実行command名そのものを変更し得るshell expansionならTrue。"""
+    return (
+        any(char in token for char in {"$", "`", "*", "?"})
+        or (any(char in token for char in {"{", "}"}) and token not in {"{", "}"})
+        or ("[" in token and token != "[")
+    )
+
+
 def _has_shell_context_mutation(tokens):
     """後続commandの環境またはcwdを変え得るshell segmentならTrue。"""
     if not tokens:
@@ -2175,7 +2184,7 @@ def blocked_reason(command, cwd=None, depth=0):
         ):
             return "wrapperの未知optionを含むguard対象commandは安全に検査できません"
         start = _command_start(tokens)
-        if start is not None and any(char in tokens[start] for char in "$`"):
+        if start is not None and _command_word_has_expansion(tokens[start]):
             return "shell展開で実行commandを決定する操作は許可されていません"
         if start is not None and os.path.basename(tokens[start]) in {"source", "."}:
             return "sourceによる未検査scriptの実行は許可されていません"
