@@ -601,6 +601,12 @@ fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Result<Command, Workt
         .arg("-c")
         .arg("credential.helper=")
         .arg("-c")
+        .arg("submodule.recurse=false")
+        .arg("-c")
+        .arg("fetch.recurseSubmodules=false")
+        .arg("-c")
+        .arg("push.recurseSubmodules=no")
+        .arg("-c")
         .arg("http.proxy=")
         .arg("-c")
         .arg("https.proxy=")
@@ -664,7 +670,10 @@ fn unsafe_local_config_key(key: &str) -> bool {
         || key == "core.sshcommand"
         || key == "core.gitproxy"
         || key == "core.fsmonitor"
-        || key == "credential.helper"
+        || key.starts_with("credential.") && key.ends_with(".helper")
+        || key == "submodule.recurse"
+        || key == "fetch.recursesubmodules"
+        || key == "push.recursesubmodules"
         || key == "http.proxy"
         || key == "https.proxy"
         || key == "protocol.ext.allow"
@@ -2230,6 +2239,10 @@ mod tests {
         for key in [
             "include.path",
             "core.sshCommand",
+            "credential.https://github.com/owner/repo.helper",
+            "submodule.recurse",
+            "fetch.recurseSubmodules",
+            "push.recurseSubmodules",
             "http.example.proxy",
             "http.https://github.com/.sslVerify",
             "http.https://github.com/.extraHeader",
@@ -2243,6 +2256,23 @@ mod tests {
         }
         assert!(!unsafe_local_config_key("remote.origin.url"));
         assert!(!unsafe_local_config_key("user.name"));
+
+        let command = isolated_git_command(Path::new("/tmp"), &["fetch", "origin"]).unwrap();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for expected in [
+            "credential.helper=",
+            "submodule.recurse=false",
+            "fetch.recurseSubmodules=false",
+            "push.recurseSubmodules=no",
+        ] {
+            assert!(
+                arguments.iter().any(|argument| argument == expected),
+                "{expected}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2257,6 +2287,33 @@ mod tests {
         );
 
         assert!(create_worktree(&fixture.repository, "feat/ssh", "task-ssh", true).is_err());
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn url_specific_credential_helper_is_rejected_without_execution() {
+        let fixture = TemporaryRepository::new();
+        let marker = fixture.directory.join("credential-helper-ran");
+        let helper = format!("!sh -c 'touch {}'", marker.display());
+        run_git(
+            &fixture.repository,
+            &[
+                "config",
+                "credential.https://github.com/owner/repo.helper",
+                helper.as_str(),
+            ],
+        );
+
+        assert!(
+            create_worktree(
+                &fixture.repository,
+                "feat/credential",
+                "task-credential",
+                true
+            )
+            .is_err()
+        );
         assert!(!marker.exists());
     }
 
