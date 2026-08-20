@@ -28,6 +28,10 @@ const DESCENDANT_REAP_GRACE: Duration = Duration::from_millis(500);
 #[cfg(target_os = "linux")]
 const UNSHARE_BINARY: &str = "/usr/bin/unshare";
 #[cfg(target_os = "linux")]
+const TRUE_BINARY: &str = "/usr/bin/true";
+#[cfg(target_os = "linux")]
+const NAMESPACE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(target_os = "linux")]
 const ENVIRONMENT_CLEARED_MARKER: &str = "CODEX_PROCESS_ENVIRONMENT_CLEARED";
 
 #[derive(Debug)]
@@ -143,6 +147,69 @@ fn linux_pid_namespace_command(command: &Command) -> io::Result<Command> {
     ]);
     isolated.arg(program).args(arguments).stdin(Stdio::null());
     Ok(isolated)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_namespace_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let Ok(unshare) = super::trust::trusted_system_binary(UNSHARE_BINARY, "Unshare") else {
+            return false;
+        };
+        let Ok(true_binary) = super::trust::trusted_system_binary(TRUE_BINARY, "True") else {
+            return false;
+        };
+        let mut probe = Command::new(unshare);
+        probe
+            .env_clear()
+            .args([
+                "--user",
+                "--map-current-user",
+                "--pid",
+                "--fork",
+                "--kill-child=KILL",
+                "--",
+            ])
+            .arg(true_binary)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let Ok(mut child) = probe.spawn() else {
+            return false;
+        };
+        let deadline = Instant::now() + NAMESPACE_PROBE_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_command(
+    command: &mut Command,
+    namespace_available: bool,
+) -> io::Result<Option<Command>> {
+    if namespace_available {
+        linux_pid_namespace_command(command).map(Some)
+    } else {
+        // This marker exists only to preserve env_clear while constructing the
+        // unshare wrapper. Do not expose it to a directly executed target.
+        command.env_remove(ENVIRONMENT_CLEARED_MARKER);
+        Ok(None)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -305,10 +372,11 @@ impl DescendantTracker {
                 {
                     continue;
                 }
-                // PR_SET_CHILD_SUBREAPER also adopts unrelated children created
-                // by other threads.  The per-run environment marker prevents
-                // cleanup from signaling those processes.
-                let adopted = stat.parent == self.runner_pid && self.carries_marker(*pid);
+                // Existing unrelated children are captured in baseline. The
+                // marker also identifies this run after a descendant escapes
+                // its original process group and is adopted by the subreaper.
+                let adopted = stat.parent == self.runner_pid
+                    && (self.carries_marker(*pid) || !self.baseline.contains_key(pid));
                 let descendant = self.tracked.contains_key(&stat.parent);
                 if adopted || descendant {
                     self.tracked.insert(*pid, stat.start_time);
@@ -464,6 +532,21 @@ pub(crate) fn run_with_limit(
     timeout: Duration,
     capture_limit: usize,
 ) -> Result<Output, ProcessError> {
+    #[cfg(target_os = "linux")]
+    let namespace_available = linux_pid_namespace_available();
+    #[cfg(not(target_os = "linux"))]
+    let namespace_available = false;
+    run_with_limit_config(command, timeout, capture_limit, namespace_available)
+}
+
+fn run_with_limit_config(
+    command: &mut Command,
+    timeout: Duration,
+    capture_limit: usize,
+    namespace_available: bool,
+) -> Result<Output, ProcessError> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = namespace_available;
     let program = command.get_program().to_string_lossy().into_owned();
     #[cfg(target_os = "linux")]
     let _run_guard = process_run_lock()
@@ -484,12 +567,17 @@ pub(crate) fn run_with_limit(
     descendants.mark_command(command);
     #[cfg(target_os = "linux")]
     let mut isolated_command =
-        linux_pid_namespace_command(command).map_err(|source| ProcessError::Isolation {
-            program: program.clone(),
-            source,
+        prepare_linux_command(command, namespace_available).map_err(|source| {
+            ProcessError::Isolation {
+                program: program.clone(),
+                source,
+            }
         })?;
     #[cfg(target_os = "linux")]
-    let command = &mut isolated_command;
+    let command = match isolated_command.as_mut() {
+        Some(isolated) => isolated,
+        None => command,
+    };
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -564,8 +652,10 @@ pub(crate) fn run_with_limit(
     let mut stdout = None;
     let mut stderr = None;
     let mut result_error = None;
+    let mut completed_cleanup = false;
 
     while result_error.is_none() && (status.is_none() || stdout.is_none() || stderr.is_none()) {
+        descendants.refresh();
         drain_messages(
             &receiver,
             &program,
@@ -587,6 +677,13 @@ pub(crate) fn run_with_limit(
                     });
                     break;
                 }
+            }
+        }
+        if status.is_some() && !completed_cleanup && (stdout.is_none() || stderr.is_none()) {
+            completed_cleanup = true;
+            if let Err(error) = terminate_and_reap(&mut child, true, &mut descendants, &program) {
+                result_error = Some(error);
+                break;
             }
         }
         if status.is_some() && stdout.is_some() && stderr.is_some() {
@@ -837,11 +934,39 @@ fn terminate_and_reap(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::{ENVIRONMENT_CLEARED_MARKER, prepare_linux_command, run_with_limit_config};
     use super::{ProcessError, run_with_limit};
     use std::fs;
     use std::io;
     use std::process::Command;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_unavailable_uses_the_subreaper_fallback() {
+        let mut command = Command::new("sh");
+        super::clear_environment(&mut command);
+        command.arg("-c").arg("exit 0");
+        assert!(
+            prepare_linux_command(&mut command, false)
+                .expect("prepare fallback command")
+                .is_none()
+        );
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != ENVIRONMENT_CLEARED_MARKER)
+        );
+
+        let mut escaped = Command::new("sh");
+        escaped.args(["-c", "setsid sh -c 'sleep 2' & exit 0"]);
+        let started = Instant::now();
+        let output = run_with_limit_config(&mut escaped, Duration::from_millis(500), 1024, false)
+            .expect("fallback must stop and reap the escaped pipe holder");
+        assert!(output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn captures_stdout_and_stderr_without_deadlock() {

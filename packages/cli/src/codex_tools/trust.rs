@@ -87,6 +87,7 @@ mod tests {
             ("/usr/bin/git", "Git"),
             ("/usr/bin/gh", "GitHub CLI"),
             ("/usr/bin/ssh", "SSH"),
+            ("/usr/bin/true", "True"),
         ] {
             assert!(trusted_system_binary(path, name).is_ok(), "{path}");
         }
