@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -10,7 +12,7 @@ use std::{
     ffi::{CStr, CString, OsStr},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::ffi::OsStrExt,
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, PermissionsExt},
 };
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
@@ -282,39 +284,13 @@ fn copy_file_exclusive_with_permissions(
     destination: &Path,
     permissions: fs::Permissions,
 ) -> Result<()> {
-    let mut destination_created = false;
-    let copy_result = (|| {
-        let mut input = fs::File::open(source)
-            .with_context(|| format!("Failed to open {}", source.display()))?;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut output = options
-            .open(destination)
-            .with_context(|| format!("Failed to create {}", destination.display()))?;
-        destination_created = true;
-        std::io::copy(&mut input, &mut output).with_context(|| {
-            format!(
-                "Failed to copy from {} to {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-        fs::set_permissions(destination, permissions)
-            .with_context(|| format!("Failed to set permissions on {}", destination.display()))?;
-        output
-            .sync_all()
-            .with_context(|| format!("Failed to sync {}", destination.display()))?;
-        Ok(())
-    })();
-    if let Err(error) = copy_result {
-        if destination_created {
-            let _ = fs::remove_file(destination);
-        }
-        return Err(error);
-    }
-    Ok(())
+    let mut input =
+        fs::File::open(source).with_context(|| format!("Failed to open {}", source.display()))?;
+    let mut contents = Vec::new();
+    input
+        .read_to_end(&mut contents)
+        .with_context(|| format!("Failed to read {}", source.display()))?;
+    write_file_exclusive_bytes(destination, &contents, permissions)
 }
 
 fn write_file_exclusive(
@@ -322,22 +298,34 @@ fn write_file_exclusive(
     contents: &str,
     permissions: fs::Permissions,
 ) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    write_file_exclusive_bytes(destination, contents.as_bytes(), permissions)
+}
+
+fn write_file_exclusive_bytes(
+    destination: &Path,
+    contents: &[u8],
+    permissions: fs::Permissions,
+) -> Result<()> {
     #[cfg(unix)]
-    options.mode(0o600);
-    let mut output = options
-        .open(destination)
-        .with_context(|| format!("Failed to create {}", destination.display()))?;
-    output
-        .write_all(contents.as_bytes())
-        .with_context(|| format!("Failed to write {}", destination.display()))?;
-    fs::set_permissions(destination, permissions)
-        .with_context(|| format!("Failed to set permissions on {}", destination.display()))?;
-    output
-        .sync_all()
-        .with_context(|| format!("Failed to sync {}", destination.display()))?;
-    Ok(())
+    return write_file_exclusive_at(destination, contents, &permissions);
+
+    #[cfg(not(unix))]
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut output = options
+            .open(destination)
+            .with_context(|| format!("Failed to create {}", destination.display()))?;
+        output
+            .write_all(contents.as_bytes())
+            .with_context(|| format!("Failed to write {}", destination.display()))?;
+        fs::set_permissions(destination, permissions)
+            .with_context(|| format!("Failed to set permissions on {}", destination.display()))?;
+        output
+            .sync_all()
+            .with_context(|| format!("Failed to sync {}", destination.display()))?;
+        Ok(())
+    }
 }
 
 fn verify_managed_symlink(expected: &Path, destination: &Path) -> Result<()> {
@@ -371,17 +359,21 @@ fn verify_managed_symlink(expected: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn copy_symlink_exclusive(source: &Path, destination: &Path) -> Result<()> {
-    use std::os::unix::fs::symlink;
-
     let target = fs::read_link(source)
         .with_context(|| format!("Failed to read symlink {}", source.display()))?;
-    symlink(&target, destination).with_context(|| {
-        format!(
-            "Failed to archive symlink {} to {}",
-            source.display(),
-            destination.display()
-        )
-    })
+    let (parent, name) = open_anchored_parent(destination, true)?;
+    let target = c_string(target.as_os_str(), "Archived symlink target")?;
+    // SAFETY: target, parent, and name remain valid for this call.
+    if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "Failed to archive symlink {} to {}",
+                source.display(),
+                destination.display()
+            )
+        });
+    }
+    sync_open_directory(&parent, destination)
 }
 
 #[cfg(not(unix))]
@@ -459,6 +451,304 @@ fn open_or_create_directory_at(parent: &OwnedFd, name: &OsStr, label: &str) -> R
     let directory = unsafe { OwnedFd::from_raw_fd(descriptor) };
     validate_open_directory(&directory, label)?;
     Ok(directory)
+}
+
+#[cfg(unix)]
+fn anchored_directory_stat(directory: &OwnedFd, label: &str) -> Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: directory is open and stat points to writable storage.
+    if unsafe { libc::fstat(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to inspect {label}"));
+    }
+    // SAFETY: fstat succeeded.
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(unix)]
+fn validate_anchored_directory(directory: &OwnedFd, label: &str) -> Result<()> {
+    let stat = anchored_directory_stat(directory, label)?;
+    let trusted_system_owner = stat.st_uid == 0
+        || cfg!(target_os = "linux")
+            && fs::read_to_string("/proc/sys/kernel/overflowuid")
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                == Some(stat.st_uid);
+    let trusted_owner = trusted_system_owner || stat.st_uid == current_uid();
+    let sticky_root = trusted_system_owner && stat.st_mode & libc::S_ISVTX != 0;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || !trusted_owner
+        || stat.st_mode & 0o022 != 0 && !sticky_root
+    {
+        anyhow::bail!("{label} has an unsafe owner, mode, or file type");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_anchored_root() -> Result<OwnedFd> {
+    let root = c_string(OsStr::new("/"), "Filesystem root")?;
+    // SAFETY: root is NUL terminated and the returned descriptor is owned here.
+    let descriptor = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to open filesystem root");
+    }
+    // SAFETY: open returned a new descriptor.
+    let root = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    validate_anchored_directory(&root, "filesystem root")?;
+    Ok(root)
+}
+
+#[cfg(unix)]
+fn open_anchored_child(
+    parent: &OwnedFd,
+    name: &OsStr,
+    create: bool,
+    label: &str,
+) -> Result<OwnedFd> {
+    let name = c_string(name, label)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: parent and name remain valid.
+    let mut descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if descriptor < 0
+        && create
+        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+    {
+        let parent_stat = anchored_directory_stat(parent, "managed path parent")?;
+        if parent_stat.st_uid != current_uid() {
+            anyhow::bail!("Cannot create a managed directory below a non-user-owned parent");
+        }
+        // SAFETY: parent and name remain valid.
+        let status = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+        if status != 0
+            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Failed to create {label}"));
+        }
+        // SAFETY: parent and name remain valid.
+        descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    }
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to open {label} without following symlinks"));
+    }
+    // SAFETY: openat returned a new descriptor.
+    let directory = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    validate_anchored_directory(&directory, label)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_anchored_parent(path: &Path, create: bool) -> Result<(OwnedFd, CString)> {
+    if !path.is_absolute() {
+        anyhow::bail!("Managed mutation path must be absolute: {}", path.display());
+    }
+    let name = path
+        .file_name()
+        .context("Managed mutation path has no file name")?;
+    let mut directory = open_anchored_root()?;
+    let parent = path
+        .parent()
+        .context("Managed mutation path has no parent")?;
+    for component in parent.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => {
+                directory =
+                    open_anchored_child(&directory, value, create, "managed mutation parent")?;
+            }
+            _ => anyhow::bail!(
+                "Managed mutation path is not normalized: {}",
+                path.display()
+            ),
+        }
+    }
+    Ok((directory, c_string(name, "Managed mutation file name")?))
+}
+
+#[cfg(unix)]
+fn sync_open_directory(directory: &OwnedFd, path: &Path) -> Result<()> {
+    // SAFETY: directory is an open directory descriptor.
+    if unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to sync parent of {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_file_exclusive_at(
+    path: &Path,
+    contents: &[u8],
+    permissions: &fs::Permissions,
+) -> Result<()> {
+    let (parent, name) = open_anchored_parent(path, true)?;
+    // SAFETY: parent and name remain valid; a new descriptor is returned.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to create {}", path.display()));
+    }
+    // SAFETY: openat returned a new descriptor.
+    let owned = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    let result = (|| {
+        // SAFETY: owned is an open regular-file descriptor.
+        if unsafe { libc::fchmod(owned.as_raw_fd(), permissions.mode()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Failed to set permissions on {}", path.display()));
+        }
+        let mut output = fs::File::from(owned);
+        output
+            .write_all(contents)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        output
+            .sync_all()
+            .with_context(|| format!("Failed to sync {}", path.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // SAFETY: parent and name remain valid; failure cleanup is best effort.
+        let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+        return Err(error);
+    }
+    sync_open_directory(&parent, path)
+}
+
+#[cfg(unix)]
+fn remove_file_anchored(path: &Path) -> Result<()> {
+    let (parent, name) = open_anchored_parent(path, false)?;
+    // SAFETY: parent and name remain valid.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to remove {}", path.display()));
+    }
+    sync_open_directory(&parent, path)
+}
+
+#[cfg(unix)]
+fn rename_anchored(source: &Path, destination: &Path) -> Result<()> {
+    let (source_parent, source_name) = open_anchored_parent(source, false)?;
+    let (destination_parent, destination_name) = open_anchored_parent(destination, true)?;
+    // SAFETY: both directory/name pairs remain valid.
+    if unsafe {
+        libc::renameat(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "Failed to rename {} to {}",
+                source.display(),
+                destination.display()
+            )
+        });
+    }
+    sync_open_directory(&source_parent, source)?;
+    if source_parent.as_raw_fd() != destination_parent.as_raw_fd() {
+        sync_open_directory(&destination_parent, destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hard_link_anchored(source: &Path, destination: &Path) -> Result<()> {
+    let (source_parent, source_name) = open_anchored_parent(source, false)?;
+    let (destination_parent, destination_name) = open_anchored_parent(destination, true)?;
+    // SAFETY: both directory/name pairs remain valid; flags=0 does not follow source symlinks.
+    if unsafe {
+        libc::linkat(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "Failed to link {} to {}",
+                source.display(),
+                destination.display()
+            )
+        });
+    }
+    sync_open_directory(&destination_parent, destination)
+}
+
+#[cfg(unix)]
+fn set_file_permissions_anchored(path: &Path, permissions: &fs::Permissions) -> Result<()> {
+    let (parent, name) = open_anchored_parent(path, false)?;
+    // SAFETY: parent and name remain valid and a new descriptor is returned.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to open {}", path.display()));
+    }
+    // SAFETY: openat returned a new descriptor.
+    let file = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    // SAFETY: file remains open for this call.
+    if unsafe { libc::fchmod(file.as_raw_fd(), permissions.mode()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to set permissions on {}", path.display()));
+    }
+    Ok(())
+}
+
+fn remove_managed_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    return remove_file_anchored(path);
+    #[cfg(not(unix))]
+    return fs::remove_file(path).with_context(|| format!("Failed to remove {}", path.display()));
+}
+
+fn rename_managed_file(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(unix)]
+    return rename_anchored(source, destination);
+    #[cfg(not(unix))]
+    return fs::rename(source, destination).with_context(|| {
+        format!(
+            "Failed to rename {} to {}",
+            source.display(),
+            destination.display()
+        )
+    });
+}
+
+fn hard_link_managed(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(unix)]
+    return hard_link_anchored(source, destination);
+    #[cfg(not(unix))]
+    return fs::hard_link(source, destination).with_context(|| {
+        format!(
+            "Failed to link {} to {}",
+            source.display(),
+            destination.display()
+        )
+    });
 }
 
 #[cfg(unix)]
@@ -903,30 +1193,8 @@ fn write_file_temp(
         ".{file_name}.tmp.automation.{}.{timestamp}",
         std::process::id()
     ));
-    let mut temp_created = false;
-    let write_result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut temp = options
-            .open(&temp_path)
-            .with_context(|| format!("Failed to create temporary {}", temp_path.display()))?;
-        temp_created = true;
-        temp.write_all(contents.as_ref())
-            .with_context(|| format!("Failed to write temporary {}", temp_path.display()))?;
-        fs::set_permissions(&temp_path, permissions)
-            .with_context(|| format!("Failed to set permissions on {}", temp_path.display()))?;
-        temp.sync_all()
-            .with_context(|| format!("Failed to sync temporary {}", temp_path.display()))?;
-        Ok(())
-    })();
-    if let Err(error) = write_result {
-        if temp_created {
-            let _ = fs::remove_file(&temp_path);
-        }
-        return Err(error);
-    }
+    write_file_exclusive_bytes(&temp_path, contents.as_ref(), permissions)
+        .with_context(|| format!("Failed to create temporary {}", temp_path.display()))?;
     Ok(temp_path)
 }
 
@@ -936,8 +1204,8 @@ fn replace_regular_file(
     permissions: fs::Permissions,
 ) -> Result<()> {
     let temp_path = write_file_temp(path, contents, permissions)?;
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
+    if let Err(error) = rename_managed_file(&temp_path, path) {
+        let _ = remove_managed_file(&temp_path);
         return Err(error).with_context(|| format!("Failed to update {}", path.display()));
     }
     Ok(())
@@ -946,13 +1214,8 @@ fn replace_regular_file(
 fn sync_parent_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        let parent = path
-            .parent()
-            .with_context(|| format!("Managed path has no parent: {}", path.display()))?;
-        fs::File::open(parent)
-            .with_context(|| format!("Failed to open directory {}", parent.display()))?
-            .sync_all()
-            .with_context(|| format!("Failed to sync directory {}", parent.display()))?;
+        let (parent, _) = open_anchored_parent(path, false)?;
+        sync_open_directory(&parent, path)?;
     }
     Ok(())
 }
@@ -963,11 +1226,11 @@ fn publish_regular_file_exclusive(
     permissions: fs::Permissions,
 ) -> Result<()> {
     let temp_path = write_file_temp(path, contents, permissions)?;
-    if let Err(error) = fs::hard_link(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
+    if let Err(error) = hard_link_managed(&temp_path, path) {
+        let _ = remove_managed_file(&temp_path);
         return Err(error).with_context(|| format!("Failed to publish {}", path.display()));
     }
-    fs::remove_file(&temp_path)
+    remove_managed_file(&temp_path)
         .with_context(|| format!("Failed to remove temporary {}", temp_path.display()))?;
     sync_parent_directory(path)
 }
@@ -1449,7 +1712,7 @@ fn repair_managed_permissions(
             })?
             .permissions();
         if current.mode() & 0o7777 != expected.mode() & 0o7777 {
-            fs::set_permissions(destination, expected.clone()).with_context(|| {
+            set_file_permissions_anchored(destination, expected).with_context(|| {
                 format!("Failed to repair permissions on {}", destination.display())
             })?;
             return Ok(true);
@@ -1468,7 +1731,7 @@ fn finish_managed_transaction(
             transaction_path.display()
         );
     }
-    fs::remove_file(transaction_path).with_context(|| {
+    remove_managed_file(transaction_path).with_context(|| {
         format!(
             "Failed to complete managed transaction {}",
             transaction_path.display()
@@ -1661,6 +1924,9 @@ fn ensure_managed_hook_with_legacy_hash(
 ) -> Result<()> {
     if let Some(parent) = destination.parent() {
         reject_symlink_directory_components(parent)?;
+        #[cfg(unix)]
+        let _ = open_anchored_parent(destination, true)?;
+        #[cfg(not(unix))]
         if !parent.exists() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -1750,7 +2016,7 @@ fn ensure_managed_hook_with_legacy_hash(
         }
         copy_file_exclusive_with_permissions(source, destination, destination_permissions.clone())?;
         if let Err(error) = write_file_exclusive(&state_path, &source_hash, source_permissions) {
-            let _ = fs::remove_file(destination);
+            let _ = remove_managed_file(destination);
             return Err(error);
         }
         println!("- Installed local managed hook: {}", destination.display());
@@ -2065,18 +2331,18 @@ fn migrate_managed_config_from_template_with_root(
         .permissions();
     let temp_path = write_file_temp(&config_path, &migrated, permissions)?;
     if let Err(error) = ensure_config_unchanged(&config_path, &existing, is_symlink) {
-        let _ = fs::remove_file(&temp_path);
+        let _ = remove_managed_file(&temp_path);
         return Err(error);
     }
     if is_symlink {
         let symlink_backup_path =
             codex_dir.join(format!("config.toml.bak.automation-link.{timestamp}"));
         if let Err(error) = copy_symlink_exclusive(&config_path, &symlink_backup_path) {
-            let _ = fs::remove_file(&temp_path);
+            let _ = remove_managed_file(&temp_path);
             return Err(error);
         }
-        if let Err(write_error) = fs::rename(&temp_path, &config_path) {
-            let _ = fs::remove_file(&temp_path);
+        if let Err(write_error) = rename_managed_file(&temp_path, &config_path) {
+            let _ = remove_managed_file(&temp_path);
             return Err(write_error).context(format!(
                 "Failed to atomically replace symlink {}; the original remains in place",
                 config_path.display()
@@ -2089,8 +2355,8 @@ fn migrate_managed_config_from_template_with_root(
         );
         return Ok(());
     }
-    if let Err(error) = fs::rename(&temp_path, &config_path) {
-        let _ = fs::remove_file(&temp_path);
+    if let Err(error) = rename_managed_file(&temp_path, &config_path) {
+        let _ = remove_managed_file(&temp_path);
         return Err(error).with_context(|| format!("Failed to update {}", config_path.display()));
     }
     println!(
@@ -2132,7 +2398,7 @@ fn archive_retired_profiles(codex_dir: &Path) -> Result<()> {
                 });
             }
         }
-        fs::rename(&profile_path, &backup_path).with_context(|| {
+        rename_managed_file(&profile_path, &backup_path).with_context(|| {
             format!(
                 "Failed to archive retired profile {} to {}",
                 profile_path.display(),
@@ -2196,7 +2462,7 @@ fn archive_legacy_python_hook(path: &Path, expected_hash: &str) -> Result<bool> 
     if backup.exists() {
         anyhow::bail!("Legacy hook backup already exists: {}", backup.display());
     }
-    fs::rename(path, &backup).with_context(|| {
+    rename_managed_file(path, &backup).with_context(|| {
         format!(
             "Failed to archive legacy hook {} to {}",
             path.display(),
@@ -2212,7 +2478,7 @@ fn archive_legacy_python_hook(path: &Path, expected_hash: &str) -> Result<bool> 
             .context("Legacy hook state file name is not UTF-8")?;
         let state_backup =
             state.with_file_name(format!("{state_name}.bak.rust-migration.{timestamp}"));
-        fs::rename(&state, &state_backup).with_context(|| {
+        rename_managed_file(&state, &state_backup).with_context(|| {
             format!(
                 "Failed to archive legacy hook state {} to {}",
                 state.display(),
@@ -2388,6 +2654,12 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                let anchor = path.join(".managed-directory-anchor");
+                let _ = open_anchored_parent(&anchor, true)?;
+            }
+            #[cfg(not(unix))]
             fs::create_dir_all(path)
                 .with_context(|| format!("Failed to create directory {}", path.display()))?;
         }
@@ -2405,8 +2677,15 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
         );
     }
     #[cfg(unix)]
-    fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-        .with_context(|| format!("Failed to set private permissions on {}", path.display()))?;
+    {
+        let directory = open_directory(path, "managed private directory")?;
+        // SAFETY: directory remains open for this call.
+        if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("Failed to set private permissions on {}", path.display())
+            });
+        }
+    }
     Ok(())
 }
 
@@ -2575,7 +2854,7 @@ fn complete_setup_transaction(codex_dir: &Path) -> Result<()> {
     if !preflight_setup_transaction(codex_dir)? {
         anyhow::bail!("Setup transaction disappeared before completion");
     }
-    fs::remove_file(&path)
+    remove_managed_file(&path)
         .with_context(|| format!("Failed to complete setup transaction {}", path.display()))?;
     sync_parent_directory(&path)
 }
@@ -2823,7 +3102,7 @@ mod tests {
         preflight_config_state, preflight_managed_binary_destination, preflight_setup_transaction,
         preflight_shared_symlink, publish_regular_file_exclusive, reject_cargo_configuration,
         sha256, trusted_user_executable, valid_release_binary_magic, validate_setup_home,
-        verify_managed_symlink,
+        verify_managed_symlink, write_file_exclusive,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2959,6 +3238,26 @@ mod tests {
             fs::read_link(home.join(".codex/AGENTS.md")).expect("read managed symlink"),
             fs::canonicalize(dotfiles.join(".codex/AGENTS.md")).expect("resolve shared source")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_file_mutation_does_not_follow_a_swapped_parent() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = TestDirectory::new("anchored-managed-file");
+        let home = directory.path().join("home");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&home).expect("create managed home");
+        fs::create_dir(&outside).expect("create outside directory");
+        symlink(&outside, home.join("hooks")).expect("swap managed file parent");
+
+        let destination = home.join("hooks/block-git-write");
+        assert!(
+            write_file_exclusive(&destination, "managed", fs::Permissions::from_mode(0o700),)
+                .is_err()
+        );
+        assert!(!outside.join("block-git-write").exists());
     }
 
     #[test]

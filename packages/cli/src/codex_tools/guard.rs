@@ -32,9 +32,11 @@ const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const BODY_SNAPSHOT_DIR_PREFIX: &str = ".codex-hook-body-";
 const BODY_SNAPSHOT_MAX_RETAINED: usize = 128;
 const BODY_SNAPSHOT_TTL: Duration = Duration::from_secs(60 * 60);
+const GH_SNAPSHOT_DIR_PREFIX: &str = ".codex-hook-gh-";
 const SYSTEM_GIT: &str = "/usr/bin/git";
 const SYSTEM_GH: &str = "/usr/bin/gh";
 const SYSTEM_SSH: &str = "/usr/bin/ssh";
+const SYSTEM_ENV: &str = "/usr/bin/env";
 const SYSTEM_PATH: &str = "/usr/bin:/bin";
 
 static BODY_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1054,11 +1056,12 @@ impl GuardGhSandbox {
             .duration_since(UNIX_EPOCH)
             .ok()?
             .as_nanos();
+        cleanup_gh_snapshots(&root, timestamp).ok()?;
         let mut path = None;
         for _ in 0..32 {
             let counter = BODY_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
             let candidate = root.join(format!(
-                ".codex-hook-gh-{}-{timestamp}-{counter}",
+                "{GH_SNAPSHOT_DIR_PREFIX}{}-{timestamp}-{counter}",
                 std::process::id()
             ));
             let mut builder = fs::DirBuilder::new();
@@ -1125,6 +1128,12 @@ impl GuardGhSandbox {
     fn create() -> Option<Self> {
         None
     }
+
+    fn into_persistent(self) -> PathBuf {
+        let path = self.path.clone();
+        std::mem::forget(self);
+        path
+    }
 }
 
 impl Drop for GuardGhSandbox {
@@ -1135,6 +1144,100 @@ impl Drop for GuardGhSandbox {
         }
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[cfg(unix)]
+fn gh_snapshot_timestamp(name: &str) -> Option<u128> {
+    let suffix = name.strip_prefix(GH_SNAPSHOT_DIR_PREFIX)?;
+    let mut parts = suffix.split('-');
+    let pid = parts.next()?;
+    let timestamp = parts.next()?;
+    let counter = parts.next()?;
+    if parts.next().is_some()
+        || pid.is_empty()
+        || counter.is_empty()
+        || !pid.bytes().all(|byte| byte.is_ascii_digit())
+        || !counter.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    timestamp.parse().ok()
+}
+
+#[cfg(unix)]
+fn remove_expired_gh_snapshot(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "expired GH snapshotを検査できません".to_string())?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::getuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err("expired GH snapshotを安全に検査できません".into());
+    }
+    let entries = fs::read_dir(path)
+        .map_err(|_| "expired GH snapshotを検査できません".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "expired GH snapshotを検査できません".to_string())?;
+    if entries.len() > 1
+        || entries
+            .first()
+            .is_some_and(|entry| entry.file_name() != "hosts.yml")
+    {
+        return Err("expired GH snapshotの構造が不正です".into());
+    }
+    if let Some(entry) = entries.first() {
+        let file = fs::symlink_metadata(entry.path())
+            .map_err(|_| "expired GH snapshotを検査できません".to_string())?;
+        if !file.is_file()
+            || file.file_type().is_symlink()
+            || file.uid() != unsafe { libc::getuid() }
+            || file.nlink() != 1
+            || file.mode() & 0o777 != 0o400
+            || file.len() > MAX_MANIFEST_BYTES
+        {
+            return Err("expired GH snapshotを安全に検査できません".into());
+        }
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "expired GH snapshotを削除可能にできません".to_string())?;
+    if let Some(entry) = entries.first() {
+        fs::remove_file(entry.path())
+            .map_err(|_| "expired GH snapshotを削除できません".to_string())?;
+    }
+    fs::remove_dir(path).map_err(|_| "expired GH snapshotを削除できません".to_string())
+}
+
+#[cfg(unix)]
+fn cleanup_gh_snapshots(root: &Path, now_nanos: u128) -> Result<(), String> {
+    let mut retained = 0usize;
+    let mut removed = false;
+    for entry in fs::read_dir(root).map_err(|_| "GH snapshot rootを検査できません".to_string())?
+    {
+        let entry = entry.map_err(|_| "GH snapshot rootを検査できません".to_string())?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(timestamp) = gh_snapshot_timestamp(&name) else {
+            continue;
+        };
+        if now_nanos.saturating_sub(timestamp) >= BODY_SNAPSHOT_TTL.as_nanos()
+            && remove_expired_gh_snapshot(&entry.path()).is_ok()
+        {
+            removed = true;
+            continue;
+        }
+        retained = retained.saturating_add(1);
+    }
+    if removed {
+        sync_body_snapshot_directory(root)?;
+    }
+    if retained >= BODY_SNAPSHOT_MAX_RETAINED {
+        return Err("GH snapshotの保持上限に達しました".into());
+    }
+    Ok(())
 }
 
 fn run_gh(cwd: &str, args: &[&str]) -> Option<(i32, Vec<u8>)> {
@@ -1226,15 +1329,15 @@ fn clean_worktree_reason(cwd: &str, operation: &str) -> Option<String> {
     }
 }
 
-fn git_fetch_reason(args: &[String]) -> Option<String> {
+fn git_fetch_reason(args: &[String], cwd: &str) -> Option<String> {
     if args.len() != 2 || args.first().map(String::as_str) != Some("origin") {
         return Some("git fetch はoriginと単一のbase branchを明示してください".into());
     }
     let base = args[1].strip_prefix("refs/heads/").unwrap_or(&args[1]);
-    if protected_branch(base) {
+    if protected_branch(base) && origin_repository(cwd).is_some() {
         None
     } else {
-        Some("git fetch のbase branchが許可範囲外です".into())
+        Some("git fetch のbase branchまたはGitHub originが許可範囲外です".into())
     }
 }
 
@@ -1246,7 +1349,7 @@ fn git_worktree_read_reason(args: &[String]) -> Option<String> {
     }
 }
 
-fn git_ls_remote_read_reason(args: &[String]) -> Option<String> {
+fn git_ls_remote_read_reason(args: &[String], cwd: &str) -> Option<String> {
     if args.len() != 3
         || !["--branches", "--heads"].contains(&args[0].as_str())
         || args[1] != "origin"
@@ -1259,6 +1362,7 @@ fn git_ls_remote_read_reason(args: &[String]) -> Option<String> {
     if valid_work_branch(branch)
         && valid_remote_branch(branch)
         && !args[2].chars().any(|c| "*?[]".contains(c))
+        && origin_repository(cwd).is_some()
     {
         None
     } else {
@@ -1931,7 +2035,10 @@ fn git_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String>
             return git_worktree_read_reason(&command_args);
         }
         if command == "ls-remote" {
-            return git_ls_remote_read_reason(&command_args);
+            let Some(cwd) = cwd.filter(|value| !value.is_empty()) else {
+                return Some("git ls-remoteのrepository cwdを確認できません".into());
+            };
+            return git_ls_remote_read_reason(&command_args, cwd);
         }
         if GIT_READ_ONLY.contains(&command) {
             return git_read_reason(
@@ -1966,7 +2073,7 @@ fn git_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String>
         let reason = match command {
             "add" => git_add_reason(&command_args),
             "commit" => git_commit_reason(&command_args),
-            "fetch" => git_fetch_reason(&command_args),
+            "fetch" => git_fetch_reason(&command_args, &effective),
             "push" => git_push_reason(&command_args, &effective),
             "pull" => git_pull_reason(&command_args, &effective),
             "switch" => git_switch_reason(&command_args, &effective),
@@ -2885,7 +2992,7 @@ fn shell_quote_token(token: &str) -> String {
     format!("'{}'", token.replace('\'', "'\\''"))
 }
 
-fn git_subcommand_index(tokens: &[String]) -> Option<(usize, &str)> {
+fn git_subcommand_index(tokens: &[String]) -> Option<(usize, usize, &str)> {
     let start = command_start(tokens)?;
     if tokens.get(start).map(|token| basename(token)) != Some("git") {
         return None;
@@ -2905,7 +3012,7 @@ fn git_subcommand_index(tokens: &[String]) -> Option<(usize, &str)> {
             index += 1;
             continue;
         }
-        return Some((index, token));
+        return Some((start, index, token));
     }
     None
 }
@@ -2913,13 +3020,13 @@ fn git_subcommand_index(tokens: &[String]) -> Option<(usize, &str)> {
 /// Add only guard-owned Git configuration after the original command has
 /// passed the strict parser. Repository hooks and user SSH configuration must
 /// not become a second execution path for an otherwise allowed command.
-fn rewrite_git_safety_command(command: &str) -> Result<Option<String>, String> {
+fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option<String>, String> {
     let segments = command_segments(command);
     if segments.len() != 1 {
         return Ok(None);
     }
     let mut tokens = segments.into_iter().next().unwrap_or_default();
-    let Some((subcommand_index, subcommand)) = git_subcommand_index(&tokens) else {
+    let Some((git_index, subcommand_index, subcommand)) = git_subcommand_index(&tokens) else {
         return Ok(None);
     };
     let write = GIT_SAFE_WRITE.contains(&subcommand);
@@ -2928,29 +3035,287 @@ fn rewrite_git_safety_command(command: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
 
-    let mut configs = Vec::with_capacity(if network { 14 } else { 2 });
+    let git = trust::trusted_system_binary(SYSTEM_GIT, "Git")?;
+    tokens[git_index] = git;
+    let mut configs: Vec<String> = Vec::with_capacity(if network { 18 } else { 2 });
     if write {
-        configs.extend(["-c", "core.hooksPath=/dev/null"]);
+        configs.extend(["-c", "core.hooksPath=/dev/null"].map(str::to_string));
     }
     if network {
         trust::trusted_system_binary(SYSTEM_SSH, "SSH")?;
+        let cwd = cwd
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "network Gitのrepository cwdを確認できません".to_string())?;
+        let repository = origin_repository(cwd)
+            .ok_or_else(|| "network GitのGitHub originを確認できません".to_string())?;
+        let origin = format!("https://github.com/{repository}.git");
+        configs.extend(
+            [
+                "-c",
+                "core.sshCommand=/usr/bin/ssh -F /dev/null -o BatchMode=yes",
+                "-c",
+                "protocol.ext.allow=never",
+                "-c",
+                "protocol.file.allow=never",
+                "-c",
+                "protocol.git.allow=never",
+                "-c",
+                "http.sslVerify=true",
+            ]
+            .map(str::to_string),
+        );
         configs.extend([
-            "-c",
-            "core.sshCommand=/usr/bin/ssh -F /dev/null -o BatchMode=yes",
-            "-c",
-            "protocol.ext.allow=never",
-            "-c",
-            "protocol.file.allow=never",
-            "-c",
-            "protocol.git.allow=never",
-            "-c",
-            "http.sslVerify=true",
+            "-c".to_string(),
+            format!("remote.origin.url={origin}"),
+            "-c".to_string(),
+            format!("remote.origin.pushurl={origin}"),
         ]);
     }
+    tokens.splice(subcommand_index..subcommand_index, configs);
+    if network {
+        trust::trusted_system_binary(SYSTEM_ENV, "Env")?;
+        if git_index != 0 && tokens[..git_index] != ["env", "-u", "SSH_ASKPASS"] {
+            return Err("network Git wrapperを安全に再構成できません".into());
+        }
+        tokens.splice(
+            0..git_index,
+            [
+                SYSTEM_ENV,
+                "-u",
+                "SSH_ASKPASS",
+                "-u",
+                "SSH_ASKPASS_REQUIRE",
+                "-u",
+                "HTTP_PROXY",
+                "-u",
+                "HTTPS_PROXY",
+                "-u",
+                "ALL_PROXY",
+                "-u",
+                "NO_PROXY",
+                "-u",
+                "http_proxy",
+                "-u",
+                "https_proxy",
+                "-u",
+                "all_proxy",
+                "-u",
+                "no_proxy",
+                "-u",
+                "SSL_CERT_FILE",
+                "-u",
+                "SSL_CERT_DIR",
+                "GIT_CONFIG_NOSYSTEM=1",
+                "GIT_CONFIG_GLOBAL=/dev/null",
+                "GIT_CONFIG_SYSTEM=/dev/null",
+                "GIT_TERMINAL_PROMPT=0",
+                "GIT_PAGER=cat",
+                "PATH=/usr/bin:/bin",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
+    Ok(Some(
+        tokens
+            .iter()
+            .map(|token| shell_quote_token(token))
+            .collect::<Vec<_>>()
+            .join(" "),
+    ))
+}
+
+fn rewrite_gh_safety_command(command: &str) -> Result<Option<String>, String> {
+    let segments = command_segments(command);
+    if segments.len() != 1 {
+        return Ok(None);
+    }
+    let mut tokens = segments.into_iter().next().unwrap_or_default();
+    if tokens.first().map(String::as_str) != Some("gh") {
+        return Ok(None);
+    }
+    let gh = trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI")?;
+    trust::trusted_system_binary(SYSTEM_ENV, "Env")?;
+    let snapshot = GuardGhSandbox::create()
+        .ok_or_else(|| "GitHub configをprivate snapshotへ固定できません".to_string())?
+        .into_persistent();
+    let snapshot = snapshot
+        .to_str()
+        .ok_or_else(|| "GitHub config snapshot pathを確認できません".to_string())?;
+    tokens[0] = gh;
     tokens.splice(
-        subcommand_index..subcommand_index,
-        configs.into_iter().map(str::to_string),
+        0..0,
+        [
+            SYSTEM_ENV.to_string(),
+            "-u".into(),
+            "GH_CONFIG_DIR".into(),
+            "-u".into(),
+            "GH_HOST".into(),
+            "-u".into(),
+            "GH_ENTERPRISE_TOKEN".into(),
+            "-u".into(),
+            "HTTPS_PROXY".into(),
+            "-u".into(),
+            "HTTP_PROXY".into(),
+            "-u".into(),
+            "ALL_PROXY".into(),
+            "-u".into(),
+            "NO_PROXY".into(),
+            "-u".into(),
+            "https_proxy".into(),
+            "-u".into(),
+            "http_proxy".into(),
+            "-u".into(),
+            "all_proxy".into(),
+            "-u".into(),
+            "no_proxy".into(),
+            "-u".into(),
+            "SSL_CERT_FILE".into(),
+            "-u".into(),
+            "SSL_CERT_DIR".into(),
+            "-u".into(),
+            "GH_PAGER".into(),
+            "-u".into(),
+            "PAGER".into(),
+            "-u".into(),
+            "BROWSER".into(),
+            "-u".into(),
+            "EDITOR".into(),
+            "-u".into(),
+            "VISUAL".into(),
+            "GH_PROMPT_DISABLED=1".into(),
+            "GH_HOST=github.com".into(),
+            format!("GH_CONFIG_DIR={snapshot}"),
+            "GH_PAGER=cat".into(),
+            "PATH=/usr/bin:/bin".into(),
+        ],
     );
+    Ok(Some(
+        tokens
+            .iter()
+            .map(|token| shell_quote_token(token))
+            .collect::<Vec<_>>()
+            .join(" "),
+    ))
+}
+
+#[cfg(unix)]
+fn trusted_helper_ancestor_owner(uid: u32) -> bool {
+    uid == 0
+        || uid == unsafe { libc::getuid() }
+        || cfg!(target_os = "linux")
+            && fs::read_to_string("/proc/sys/kernel/overflowuid")
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                == Some(uid)
+}
+
+#[cfg(unix)]
+fn trusted_installed_helper(name: &str) -> Result<String, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    if !["codex-worktree", "codex-delivery"].contains(&name) {
+        return Err("helper名を確認できません".into());
+    }
+    // SAFETY: getpwuid returns process-account data owned by libc.
+    let home = unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        if entry.is_null() {
+            None
+        } else {
+            CStr::from_ptr((*entry).pw_dir)
+                .to_str()
+                .ok()
+                .map(PathBuf::from)
+        }
+    }
+    .ok_or_else(|| "account homeを確認できません".to_string())?;
+    let helper = home.join(".local/bin").join(name);
+    let mut component = PathBuf::new();
+    for part in helper.parent().into_iter().flat_map(Path::components) {
+        component.push(part.as_os_str());
+        let metadata = fs::symlink_metadata(&component)
+            .map_err(|_| "helperの祖先directoryを確認できません".to_string())?;
+        let trusted_owner = trusted_helper_ancestor_owner(metadata.uid());
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || !trusted_owner
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err("helperの祖先directoryが安全ではありません".into());
+        }
+    }
+    let current =
+        std::env::current_exe().map_err(|_| "実行中hook binaryを確認できません".to_string())?;
+    let open = |path: &Path| -> Result<(fs::File, u64), String> {
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options
+            .open(path)
+            .map_err(|_| "helper binaryを安全に開けません".to_string())?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| "helper binaryを検査できません".to_string())?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::getuid() }
+            || metadata.mode() & 0o022 != 0
+            || metadata.mode() & 0o111 == 0
+            || metadata.len() == 0
+            || metadata.len() > 64 * 1024 * 1024
+        {
+            return Err("helper binaryのowner、mode、sizeが安全ではありません".into());
+        }
+        Ok((file, metadata.len()))
+    };
+    let (mut current_file, current_len) = open(&current)?;
+    let (mut helper_file, helper_len) = open(&helper)?;
+    if current_len != helper_len {
+        return Err("helper binaryが実行中hookと一致しません".into());
+    }
+    let mut current_chunk = [0_u8; 64 * 1024];
+    let mut helper_chunk = [0_u8; 64 * 1024];
+    loop {
+        let current_read = current_file
+            .read(&mut current_chunk)
+            .map_err(|_| "実行中hook binaryを読み取れません".to_string())?;
+        let helper_read = helper_file
+            .read(&mut helper_chunk)
+            .map_err(|_| "helper binaryを読み取れません".to_string())?;
+        if current_read != helper_read
+            || current_chunk[..current_read] != helper_chunk[..helper_read]
+        {
+            return Err("helper binaryが実行中hookと一致しません".into());
+        }
+        if current_read == 0 {
+            break;
+        }
+    }
+    helper
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "helper pathを確認できません".into())
+}
+
+#[cfg(not(unix))]
+fn trusted_installed_helper(_name: &str) -> Result<String, String> {
+    Err("helper binaryの信頼検証はUnixだけに対応しています".into())
+}
+
+fn rewrite_helper_safety_command(command: &str) -> Result<Option<String>, String> {
+    let segments = command_segments(command);
+    if segments.len() != 1 {
+        return Ok(None);
+    }
+    let mut tokens = segments.into_iter().next().unwrap_or_default();
+    let Some(name) = tokens.first().map(String::as_str) else {
+        return Ok(None);
+    };
+    if !["codex-worktree", "codex-delivery"].contains(&name) {
+        return Ok(None);
+    }
+    tokens[0] = trusted_installed_helper(name)?;
     Ok(Some(
         tokens
             .iter()
@@ -4802,7 +5167,23 @@ pub fn entrypoint() -> i32 {
             return 2;
         }
     };
-    let updated_command = match rewrite_git_safety_command(&updated_command) {
+    let updated_command = match rewrite_git_safety_command(&updated_command, cwd) {
+        Ok(Some(updated_command)) => updated_command,
+        Ok(None) => updated_command,
+        Err(reason) => {
+            deny(&reason);
+            return 2;
+        }
+    };
+    let updated_command = match rewrite_gh_safety_command(&updated_command) {
+        Ok(Some(updated_command)) => updated_command,
+        Ok(None) => updated_command,
+        Err(reason) => {
+            deny(&reason);
+            return 2;
+        }
+    };
+    let updated_command = match rewrite_helper_safety_command(&updated_command) {
         Ok(Some(updated_command)) => updated_command,
         Ok(None) => updated_command,
         Err(reason) => {
@@ -5316,22 +5697,23 @@ mod tests {
     fn allowed_git_commands_are_rewritten_with_fixed_execution_boundaries() {
         let commit = rewrite_git_safety_command(
             "env -u SSH_ASKPASS git -C /managed/worktree commit -m ':bug: fix'",
+            None,
         )
         .expect("rewrite commit")
         .expect("commit requires a rewrite");
-        assert!(
-            commit.contains(
-                "'git' '-C' '/managed/worktree' '-c' 'core.hooksPath=/dev/null' 'commit'"
-            )
-        );
+        assert!(commit.contains(
+            "'/usr/bin/git' '-C' '/managed/worktree' '-c' 'core.hooksPath=/dev/null' 'commit'"
+        ));
         assert!(!commit.contains("core.sshCommand"));
 
+        let cwd = std::env::current_dir().expect("current test repository");
+        let cwd = cwd.to_str().expect("UTF-8 test repository");
         for command in [
             "git fetch --no-tags origin refs/heads/feature/example",
             "git push -u origin feature/example",
             "git ls-remote --branches origin feature/example",
         ] {
-            let rewritten = rewrite_git_safety_command(command)
+            let rewritten = rewrite_git_safety_command(command, Some(cwd))
                 .expect("rewrite network command")
                 .expect("network command requires a rewrite");
             assert!(
@@ -5341,12 +5723,57 @@ mod tests {
             assert!(rewritten.contains("protocol.file.allow=never"));
             assert!(rewritten.contains("protocol.git.allow=never"));
             assert!(rewritten.contains("http.sslVerify=true"));
+            assert!(rewritten.contains("GIT_CONFIG_GLOBAL=/dev/null"));
+            assert!(rewritten.contains("GIT_CONFIG_SYSTEM=/dev/null"));
+            assert!(rewritten.contains("GIT_CONFIG_NOSYSTEM=1"));
+            assert!(
+                rewritten.contains("remote.origin.url=https://github.com/Daiki48/dotfiles.git")
+            );
+            assert!(rewritten.starts_with("'/usr/bin/env'"));
         }
         assert!(
-            rewrite_git_safety_command("git status")
+            rewrite_git_safety_command("git status", None)
                 .expect("inspect status")
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allowed_gh_command_uses_a_private_fixed_environment_snapshot() {
+        use std::os::unix::fs::MetadataExt;
+
+        let rewritten = rewrite_gh_safety_command("gh issue view 31 --repo Daiki48/dotfiles")
+            .expect("rewrite GitHub command")
+            .expect("GitHub command requires a rewrite");
+        assert!(rewritten.starts_with("'/usr/bin/env'"));
+        assert!(rewritten.contains("'-u' 'HTTPS_PROXY'"));
+        assert!(rewritten.contains("'-u' 'GH_CONFIG_DIR'"));
+        assert!(rewritten.contains("'GH_HOST=github.com'"));
+        assert!(rewritten.contains("'/usr/bin/gh' 'issue' 'view'"));
+
+        let tokens = command_segments(&rewritten)
+            .into_iter()
+            .next()
+            .expect("rewritten GitHub tokens");
+        let snapshot = tokens
+            .iter()
+            .find_map(|token| token.strip_prefix("GH_CONFIG_DIR="))
+            .map(PathBuf::from)
+            .expect("GitHub snapshot path");
+        let metadata = fs::symlink_metadata(&snapshot).expect("inspect GitHub snapshot");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.mode() & 0o777, 0o500);
+        remove_expired_gh_snapshot(&snapshot).expect("remove test GitHub snapshot");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_trust_accepts_the_runtime_root_owner_representation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = fs::symlink_metadata("/").expect("inspect runtime root");
+        assert!(trusted_helper_ancestor_owner(root.uid()));
     }
 
     #[cfg(unix)]
@@ -5381,7 +5808,7 @@ mod tests {
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))
             .expect("make repository hook executable");
 
-        let rewritten = rewrite_git_safety_command("git commit -m ':test_tube: fixture'")
+        let rewritten = rewrite_git_safety_command("git commit -m ':test_tube: fixture'", None)
             .expect("rewrite commit")
             .expect("commit requires a rewrite");
         let status = Command::new("/bin/sh")
@@ -5405,8 +5832,6 @@ mod tests {
             "git remote -v",
             "git worktree list --porcelain",
             "git worktree list --porcelain -z",
-            "git ls-remote --branches origin feature/example",
-            "git ls-remote --heads origin refs/heads/feature/example",
             "git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'",
             "git --version",
             "gh issue list",
@@ -5431,6 +5856,8 @@ mod tests {
             "git worktree list",
             "git worktree list --porcelain --verbose",
             "git ls-remote origin feature/example",
+            "git ls-remote --branches origin feature/example",
+            "git ls-remote --heads origin refs/heads/feature/example",
             "git ls-remote --branches upstream feature/example",
             "git ls-remote --branches origin main",
             "git status > /tmp/status",

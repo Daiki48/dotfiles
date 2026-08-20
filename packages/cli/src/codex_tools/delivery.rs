@@ -1069,6 +1069,10 @@ fn repository(root: &Path) -> Result<String> {
     Ok(fetched)
 }
 
+fn canonical_remote_url(root: &Path) -> Result<String> {
+    Ok(format!("https://github.com/{}.git", repository(root)?))
+}
+
 fn manifest(root: &Path, task: &str, repository_name_value: &str) -> Result<(Value, PathBuf)> {
     let path = snapshot_path(repository_name_value, task)?;
     let payload = read_json_file(&path, "worktree manifest")?;
@@ -1972,12 +1976,11 @@ fn ruleset(root: &Path, repository: &str) -> Result<()> {
 }
 
 fn fetch_main(root: &Path) -> Result<String> {
-    let args = [
-        "fetch",
-        "origin",
-        "refs/heads/main:refs/remotes/origin/main",
+    let args_vec = vec![
+        "fetch".into(),
+        canonical_remote_url(root)?,
+        "refs/heads/main:refs/remotes/origin/main".into(),
     ];
-    let args_vec: Vec<String> = args.iter().map(|v| (*v).into()).collect();
     if !run(
         &git_command(&args_vec)?,
         root,
@@ -2210,12 +2213,13 @@ fn worktree_records(root: &Path) -> Result<Vec<HashMap<String, String>>> {
     Ok(records)
 }
 fn remote_branch(root: &Path, branch: &str) -> Result<Option<String>> {
+    let remote = canonical_remote_url(root)?;
     let output = git(
         root,
         &[
             "ls-remote",
             "--heads",
-            "origin",
+            &remote,
             &format!("refs/heads/{branch}"),
         ],
         true,
@@ -2554,10 +2558,11 @@ fn finish_locked(
         worktree_clean_head(&worktree_path, &head)?;
         if remote.is_some() {
             state = save_stage(&repository, task, &state, "remote_delete_started", "")?;
+            let remote_url = canonical_remote_url(root)?;
             let args = [
                 "push".into(),
                 format!("--force-with-lease=refs/heads/{branch}:{head}"),
-                "origin".into(),
+                remote_url,
                 "--delete".into(),
                 branch.clone(),
             ];
