@@ -575,6 +575,7 @@ fn safe_environment(command: &mut Command) {
     #[cfg(windows)]
     command.env("GIT_CONFIG_GLOBAL", "NUL");
     command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env("GIT_SSH_VARIANT", "ssh");
     command.env("GIT_PAGER", "cat");
     command.env("PATH", SYSTEM_PATH);
 }
@@ -592,7 +593,7 @@ fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Result<Command, Workt
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-c")
-        .arg(format!("core.sshCommand={ssh}"))
+        .arg(format!("core.sshCommand={ssh} -F /dev/null"))
         .arg("-c")
         .arg("core.gitProxy=")
         .arg("-c")

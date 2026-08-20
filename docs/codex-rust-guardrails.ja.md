@@ -25,12 +25,15 @@ hookのallow/deny、helperのCLI、worktree manifest、delivery receipt v1/v2/v3
 
 入力、path、schema、repository identityを検証できない場合は処理を続行せず、hookはdeny、helperは非0で
 終了します。外部commandは標準出力と標準エラーを同時に回収し、それぞれ4 MiBを上限とします。deadline
-または上限超過時はchildだけでなくprocess groupを停止し、`wait`で回収してからerrorを返します。process
-group外へ脱出した子孫がpipeを保持しても、capture readerはnon-blocking cancelとhard deadlineで停止します。
+または上限超過時はchildだけでなくprocess groupを停止し、`wait`で回収してからerrorを返します。Linuxでは
+subreaperとPIDの開始時刻を使って子孫を追跡し、`setsid`でprocess group外へ離脱した子孫もTERM、KILL、
+`waitpid`の順で停止・回収します。capture readerにもnon-blocking cancelとhard deadlineを設けています。
 managed file、manifest、receipt、stateは一時fileの同期とrenameを使い、途中状態を明示的に再開または拒否します。
 Git実行時はsystem/global設定と環境変数を隔離し、repository-localの外部実行・transport変更設定を検出した場合も
-停止します。GitHub CLIは認証情報だけをprivateな一時設定へsnapshotし、proxyや`http_unix_socket`などの既存設定を
-引き継ぎません。`--body-file`は同じfile descriptorから検査した内容をprivate snapshotへ固定してから実行します。
+停止します。SSHは`-F /dev/null`でuser設定を隔離します。GitHub CLIは認証情報だけをprivateな一時設定へsnapshotし、
+proxyや`http_unix_socket`などの既存設定を引き継ぎません。browser・editorを起動するoptionも拒否します。
+`--body-file`は同じfile descriptorから検査した内容をprivate snapshotへ固定してから実行し、内容を安全に検査できない
+binary差分はcommit・push前に拒否します。
 
 `codex-worktree`は安全境界としてglobalの`credential.helper`を無効化します。そのためprivate HTTPS remoteで
 credential helperだけに依存する構成はfail-closedになります。private repositoryでは検証可能なSSH originを使うか、
@@ -49,4 +52,7 @@ helperのmanifest/receipt/state互換性、timeout、出力上限、改竄時の
 cargo run -- codex
 ```
 
-setupは`packages/cli`を`--release --locked`でbuildしてから3つの配置先を同一hashへ更新します。
+setupは`~/.local/bin/codex`、`~/.cargo/bin/cargo`、Rust compilerの所有者・mode・symlink target・祖先を検証し、
+PATHやbuild overrideを隔離します。Codex CLIの自動npm installは行わないため、先に固定pathへ導入してください。
+config、symlink、legacy state、managed binary transactionをread-onlyでpreflightした後、`packages/cli`を
+`--release --locked`でbuildし、3つの配置先を同一hashへ更新します。

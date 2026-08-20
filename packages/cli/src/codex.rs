@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::{
@@ -106,37 +106,151 @@ timeout = 10
 statusMessage = "Git/GitHub操作を確認中""#;
 const PRE_TOOL_USE_HEADER: &str = "[[hooks.PreToolUse]]";
 const PRE_TOOL_USE_HOOK_HEADER: &str = "[[hooks.PreToolUse.hooks]]";
+const CARGO_RELATIVE_PATH: &str = ".cargo/bin/cargo";
+const CODEX_RELATIVE_PATH: &str = ".local/bin/codex";
+const RUSTUP_RELATIVE_PATH: &str = ".cargo/bin/rustup";
+const SYSTEM_BUILD_PATH: &str = "/usr/bin";
 
-fn is_codex_installed() -> bool {
-    Command::new("codex")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: getuid only reads the identity of this process.
+    unsafe { libc::getuid() }
 }
 
-fn codex_install() -> Result<()> {
-    println!("Installing Codex CLI via npm...");
-    let mut cmd = Command::new("npm");
-    cmd.args(["install", "-g", "@openai/codex"]);
-    run_command(cmd, "Failed to install Codex CLI")
+#[cfg(unix)]
+fn trusted_user_owner(metadata: &fs::Metadata) -> bool {
+    metadata.uid() == current_uid()
 }
 
-fn codex_check() -> Result<()> {
-    println!("\nCodex CLI version:");
-    match Command::new("codex").arg("--version").output() {
-        Ok(output) => {
-            if output.status.success() {
-                print!("{}", String::from_utf8_lossy(&output.stdout));
-            } else {
-                eprintln!("Failed to get version info.");
-                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+fn trusted_directory_metadata(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        (metadata.uid() == current_uid() || metadata.uid() == 0) && metadata.mode() & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn validate_trusted_path_components(path: &Path, allow_final_symlink: bool) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)
+            .with_context(|| format!("Failed to inspect trusted path {}", current.display()))?;
+        let is_final = current == path;
+        if metadata.file_type().is_symlink() {
+            if !is_final || !allow_final_symlink {
+                anyhow::bail!(
+                    "Trusted path has an unexpected symlink: {}",
+                    current.display()
+                );
             }
+            #[cfg(unix)]
+            if !trusted_user_owner(&metadata) {
+                anyhow::bail!(
+                    "Trusted symlink is not owned by the current user: {}",
+                    current.display()
+                );
+            }
+            continue;
         }
-        Err(e) => eprintln!("Failed to execute codex: {}", e),
+        if !is_final && !trusted_directory_metadata(&metadata) {
+            anyhow::bail!(
+                "Trusted path component is not private: {}",
+                current.display()
+            );
+        }
     }
     Ok(())
+}
+
+fn trusted_user_executable(home: &Path, relative: &str, name: &str) -> Result<PathBuf> {
+    let path = home.join(relative);
+    validate_absolute_path(&path)?;
+    validate_trusted_path_components(&path, true)?;
+    let canonical = fs::canonicalize(&path)
+        .with_context(|| format!("Failed to resolve {name} symlink target {}", path.display()))?;
+    validate_resolved_user_executable(home, &canonical, name)?;
+    Ok(path)
+}
+
+fn validate_resolved_user_executable(home: &Path, canonical: &Path, name: &str) -> Result<()> {
+    if !canonical.starts_with(home) {
+        anyhow::bail!(
+            "{name} executable escapes the current account home: {}",
+            canonical.display()
+        );
+    }
+    validate_trusted_path_components(canonical, false)?;
+    let metadata = fs::symlink_metadata(canonical)
+        .with_context(|| format!("Failed to inspect resolved {name} {}", canonical.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        anyhow::bail!("{name} is not a regular file: {}", canonical.display());
+    }
+    #[cfg(unix)]
+    if !trusted_user_owner(&metadata)
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        anyhow::bail!("{name} has unsafe owner or mode: {}", canonical.display());
+    }
+    Ok(())
+}
+
+fn codex_binary_path(home: &Path) -> Result<PathBuf> {
+    trusted_user_executable(home, CODEX_RELATIVE_PATH, "Codex CLI")
+}
+
+fn codex_check(path: &Path) -> Result<()> {
+    println!("\nCodex CLI version:");
+    let output = Command::new(path)
+        .env_clear()
+        .env("PATH", SYSTEM_BUILD_PATH)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("Failed to execute trusted Codex CLI {}", path.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Codex CLI precondition failed (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    Ok(())
+}
+
+fn trusted_rustc_path(home: &Path) -> Result<PathBuf> {
+    let rustup = trusted_user_executable(home, RUSTUP_RELATIVE_PATH, "Rustup")?;
+    let output = Command::new(rustup)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", SYSTEM_BUILD_PATH)
+        .args(["which", "rustc"])
+        .output()
+        .context("Failed to resolve the trusted Rust compiler")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Rustup could not resolve rustc (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let output = std::str::from_utf8(&output.stdout)
+        .context("Rustup returned a non-UTF-8 rustc path")?
+        .trim();
+    if output.is_empty() || output.lines().count() != 1 {
+        anyhow::bail!("Rustup returned an invalid rustc path");
+    }
+    let rustc = fs::canonicalize(output)
+        .with_context(|| format!("Failed to resolve Rust compiler {output}"))?;
+    validate_resolved_user_executable(home, &rustc, "Rustc")?;
+    Ok(rustc)
 }
 
 fn contains_legacy_profile_config(contents: &str) -> bool {
@@ -276,6 +390,51 @@ fn ensure_shared_symlink(source: &str, destination: &str) -> Result<()> {
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
     let home = home::home_dir().context("Cannot find home directory")?;
     verify_managed_symlink(&dotfiles_path.join(source), &home.join(destination))
+}
+
+fn preflight_shared_symlink(
+    dotfiles_path: &Path,
+    home: &Path,
+    source: &str,
+    destination: &str,
+) -> Result<()> {
+    let source_path = dotfiles_path.join(source);
+    let source_metadata = fs::symlink_metadata(&source_path)
+        .with_context(|| format!("Failed to inspect shared source {}", source_path.display()))?;
+    if source_metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "Shared source must not be a symlink: {}",
+            source_path.display()
+        );
+    }
+    if !source_metadata.is_file() && !source_metadata.is_dir() {
+        anyhow::bail!(
+            "Shared source must be a regular file or directory: {}",
+            source_path.display()
+        );
+    }
+
+    let destination_path = home.join(destination);
+    validate_absolute_path(&destination_path)?;
+    match fs::symlink_metadata(&destination_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            verify_managed_symlink(&source_path, &destination_path)?;
+        }
+        Ok(_) => anyhow::bail!(
+            "Shared destination is not the expected symlink: {}",
+            destination_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to inspect shared destination {}",
+                    destination_path.display()
+                )
+            });
+        }
+    }
+    Ok(())
 }
 
 fn is_assignment_for(line: &str, keys: &[&str]) -> bool {
@@ -850,6 +1009,201 @@ fn inspect_managed_state(path: &Path) -> Result<Option<String>> {
         anyhow::bail!("Managed state is invalid: {}", path.display());
     }
     Ok(Some(value))
+}
+
+fn preflight_managed_state(path: &Path) -> Result<Option<String>> {
+    let state = inspect_managed_state(path)?;
+    if state.is_some() {
+        #[cfg(unix)]
+        {
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("Failed to inspect managed state {}", path.display()))?;
+            if metadata.mode() & 0o077 != 0 {
+                anyhow::bail!("Managed state is not private: {}", path.display());
+            }
+        }
+    }
+    Ok(state)
+}
+
+fn preflight_managed_binary_destination(
+    source: &Path,
+    destination: &Path,
+    legacy_hash: Option<&str>,
+) -> Result<()> {
+    let source_contents = fs::read(source)
+        .with_context(|| format!("Failed to read release binary {}", source.display()))?;
+    let source_hash = sha256(&source_contents);
+    validate_absolute_path(destination)?;
+    let state_path = managed_hook_state_path(destination);
+    let state = preflight_managed_state(&state_path)?;
+    let transaction_path = managed_transaction_path(destination);
+    let transaction = read_managed_transaction(&transaction_path)?;
+    if let Some(transaction) = transaction.as_ref() {
+        if transaction.target_hash != source_hash {
+            anyhow::bail!(
+                "Managed transaction target does not match release binary: {}",
+                transaction_path.display()
+            );
+        }
+        if transaction.kind == ManagedTransactionKind::LegacyUpdate
+            && transaction.previous_hash.as_deref() != legacy_hash
+        {
+            anyhow::bail!(
+                "Legacy managed transaction does not match the known helper: {}",
+                transaction_path.display()
+            );
+        }
+    }
+
+    let destination_state = match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            verify_managed_symlink(source, destination)?;
+            ManagedDestinationState::Symlink
+        }
+        Ok(metadata) => {
+            verify_current_user_regular_file(destination, &metadata)?;
+            ManagedDestinationState::Regular(sha256(fs::read(destination).with_context(|| {
+                format!(
+                    "Failed to read managed destination {}",
+                    destination.display()
+                )
+            })?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ManagedDestinationState::Missing
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to inspect managed destination {}",
+                    destination.display()
+                )
+            });
+        }
+    };
+
+    match transaction.as_ref().map(|transaction| transaction.kind) {
+        None => match (&destination_state, state.as_deref()) {
+            (ManagedDestinationState::Missing, None) | (ManagedDestinationState::Symlink, None) => {
+            }
+            (ManagedDestinationState::Regular(hash), Some(recorded)) if hash == recorded => {}
+            (ManagedDestinationState::Regular(hash), None)
+                if legacy_hash.is_some_and(|expected| expected == hash) =>
+            {
+                let metadata = fs::symlink_metadata(destination).with_context(|| {
+                    format!("Failed to inspect legacy helper {}", destination.display())
+                })?;
+                verify_legacy_helper_file(destination, &metadata)?;
+            }
+            _ => anyhow::bail!(
+                "Managed destination has an invalid state before installation: {}",
+                destination.display()
+            ),
+        },
+        Some(ManagedTransactionKind::Install) => match (&destination_state, state.as_deref()) {
+            (ManagedDestinationState::Missing, None) => {}
+            (ManagedDestinationState::Regular(hash), None) if hash == &source_hash => {}
+            (ManagedDestinationState::Regular(hash), Some(recorded))
+                if hash == &source_hash && recorded == source_hash => {}
+            _ => anyhow::bail!(
+                "Managed install transaction has an invalid state: {}",
+                destination.display()
+            ),
+        },
+        Some(ManagedTransactionKind::Migrate) => match (&destination_state, state.as_deref()) {
+            (ManagedDestinationState::Symlink, None) => {}
+            (ManagedDestinationState::Regular(hash), None) if hash == &source_hash => {}
+            (ManagedDestinationState::Regular(hash), Some(recorded))
+                if hash == &source_hash && recorded == source_hash => {}
+            _ => anyhow::bail!(
+                "Managed migration transaction has an invalid state: {}",
+                destination.display()
+            ),
+        },
+        Some(ManagedTransactionKind::LegacyUpdate) => {
+            let previous_hash = transaction
+                .as_ref()
+                .and_then(|transaction| transaction.previous_hash.as_deref())
+                .context("Legacy managed transaction is missing previous hash")?;
+            match (&destination_state, state.as_deref()) {
+                (ManagedDestinationState::Regular(hash), None)
+                    if hash == previous_hash || hash == &source_hash =>
+                {
+                    if hash == previous_hash {
+                        let metadata = fs::symlink_metadata(destination).with_context(|| {
+                            format!("Failed to inspect legacy helper {}", destination.display())
+                        })?;
+                        verify_legacy_helper_file(destination, &metadata)?;
+                    }
+                }
+                (ManagedDestinationState::Regular(hash), Some(recorded))
+                    if hash == &source_hash
+                        && (recorded == previous_hash || recorded == source_hash) => {}
+                _ => anyhow::bail!(
+                    "Legacy managed transaction has an invalid state: {}",
+                    destination.display()
+                ),
+            }
+        }
+        Some(ManagedTransactionKind::Update) => {
+            let previous_hash = transaction
+                .as_ref()
+                .and_then(|transaction| transaction.previous_hash.as_deref())
+                .context("Managed update transaction is missing previous hash")?;
+            match (&destination_state, state.as_deref()) {
+                (ManagedDestinationState::Regular(hash), Some(recorded))
+                    if (hash == previous_hash && recorded == previous_hash)
+                        || (hash == &source_hash
+                            && (recorded == previous_hash || recorded == source_hash)) => {}
+                _ => anyhow::bail!(
+                    "Managed update transaction has an invalid state: {}",
+                    destination.display()
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn preflight_managed_binary_destinations(source: &Path, home: &Path) -> Result<()> {
+    for destination in MANAGED_BINARY_DESTINATIONS {
+        preflight_managed_binary_destination(
+            source,
+            &home.join(destination),
+            legacy_hash_for_destination(destination),
+        )?;
+    }
+    Ok(())
+}
+
+fn preflight_managed_binary_paths(home: &Path) -> Result<()> {
+    for relative in MANAGED_BINARY_DESTINATIONS {
+        let destination = home.join(relative);
+        validate_absolute_path(&destination)?;
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() =>
+            {
+                #[cfg(unix)]
+                if !trusted_user_owner(&metadata) {
+                    anyhow::bail!(
+                        "Managed binary symlink is not owned by the current user: {}",
+                        destination.display()
+                    );
+                }
+            }
+            Ok(metadata) => verify_current_user_regular_file(&destination, &metadata)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to inspect managed binary {}", destination.display())
+                });
+            }
+        }
+        preflight_managed_state(&managed_hook_state_path(&destination))?;
+        read_managed_transaction(&managed_transaction_path(&destination))?;
+    }
+    Ok(())
 }
 
 fn reject_symlink_directory_components(path: &Path) -> Result<()> {
@@ -1575,6 +1929,21 @@ fn archive_retired_profiles(codex_dir: &Path) -> Result<()> {
             continue;
         }
         let backup_path = codex_dir.join(format!("{name}.bak.retired.{timestamp}"));
+        match fs::symlink_metadata(&backup_path) {
+            Ok(_) => anyhow::bail!(
+                "Retired profile backup already exists: {}",
+                backup_path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect retired profile backup {}",
+                        backup_path.display()
+                    )
+                });
+            }
+        }
         fs::rename(&profile_path, &backup_path).with_context(|| {
             format!(
                 "Failed to archive retired profile {} to {}",
@@ -1853,6 +2222,129 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn preflight_private_directory(path: &Path) -> Result<()> {
+    validate_absolute_path(path)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect directory {}", path.display()));
+        }
+    };
+    if !trusted_directory_metadata(&metadata) {
+        anyhow::bail!(
+            "Existing managed directory is not private: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    if metadata.uid() != current_uid() || metadata.mode() & 0o022 != 0 {
+        anyhow::bail!(
+            "Existing managed directory has unsafe owner or mode: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn preflight_config_state(codex_dir: &Path, template_path: &Path) -> Result<()> {
+    let template_metadata = fs::symlink_metadata(template_path).with_context(|| {
+        format!(
+            "Failed to inspect config template {}",
+            template_path.display()
+        )
+    })?;
+    verify_current_user_regular_file(template_path, &template_metadata)?;
+    let template = fs::read_to_string(template_path)
+        .with_context(|| format!("Failed to read config template {}", template_path.display()))?;
+    let managed_root = canonical_or_absolute(&codex_dir.join("worktrees"))?;
+    let config_path = codex_dir.join("config.toml");
+    let metadata = match fs::symlink_metadata(&config_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect config {}", config_path.display()));
+        }
+    };
+    if let Some(metadata) = metadata {
+        if metadata.file_type().is_symlink() {
+            let target = fs::canonicalize(&config_path).with_context(|| {
+                format!("Failed to resolve config symlink {}", config_path.display())
+            })?;
+            let target_metadata = fs::symlink_metadata(&target)
+                .with_context(|| format!("Failed to inspect config target {}", target.display()))?;
+            verify_current_user_regular_file(&target, &target_metadata)?;
+        } else {
+            verify_current_user_regular_file(&config_path, &metadata)?;
+        }
+        let existing = fs::read_to_string(&config_path)
+            .with_context(|| format!("Failed to read config {}", config_path.display()))?;
+        merge_managed_config_with_root(&template, &existing, &managed_root)?;
+    } else {
+        ensure_managed_writable_root(&template, &managed_root)?;
+    }
+    Ok(())
+}
+
+fn preflight_retired_state(codex_dir: &Path) -> Result<()> {
+    preflight_private_directory(&codex_dir.join("hooks"))?;
+    for name in ["teacher.config.toml", "autonomous.config.toml"] {
+        let path = codex_dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => verify_current_user_regular_file(&path, &metadata)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to inspect retired profile {}", path.display())
+                });
+            }
+        }
+    }
+    let hooks = codex_dir.join("hooks");
+    for (name, expected_hash) in LEGACY_PYTHON_HOOKS {
+        let path = hooks.join(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect legacy hook {}", path.display()));
+            }
+        };
+        verify_current_user_regular_file(&path, &metadata)?;
+        let contents = fs::read(&path)
+            .with_context(|| format!("Failed to read legacy hook {}", path.display()))?;
+        if sha256(&contents) != *expected_hash {
+            continue;
+        }
+        let state = managed_hook_state_path(&path);
+        match fs::symlink_metadata(&state) {
+            Ok(state_metadata) => {
+                verify_current_user_regular_file(&state, &state_metadata)?;
+                #[cfg(unix)]
+                if state_metadata.mode() & 0o077 != 0 {
+                    anyhow::bail!("Legacy hook state is not private: {}", state.display());
+                }
+                let recorded = fs::read_to_string(&state).with_context(|| {
+                    format!("Failed to read legacy hook state {}", state.display())
+                })?;
+                if recorded.trim() != *expected_hash {
+                    anyhow::bail!("Legacy hook state does not match: {}", state.display());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to inspect legacy hook state {}", state.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         fs::canonicalize(path)
@@ -1862,25 +2354,99 @@ fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn build_managed_binary(dotfiles_path: &Path) -> Result<PathBuf> {
+fn verify_release_binary(dotfiles_path: &Path, binary: &Path) -> Result<()> {
+    let expected = dotfiles_path
+        .join("target/release")
+        .join(format!("cli{}", std::env::consts::EXE_SUFFIX));
+    if binary != expected {
+        anyhow::bail!(
+            "Release artifact provenance path is unexpected: {}",
+            binary.display()
+        );
+    }
+    validate_absolute_path(binary)?;
+    validate_trusted_path_components(binary, false)?;
+    let metadata = fs::symlink_metadata(binary)
+        .with_context(|| format!("Failed to inspect release artifact {}", binary.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        anyhow::bail!(
+            "Release artifact is not a non-empty regular file: {}",
+            binary.display()
+        );
+    }
+    #[cfg(unix)]
+    if !trusted_user_owner(&metadata)
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        anyhow::bail!(
+            "Release artifact has unsafe owner or mode: {}",
+            binary.display()
+        );
+    }
+    let mut file = fs::File::open(binary)
+        .with_context(|| format!("Failed to open release artifact {}", binary.display()))?;
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic)
+        .with_context(|| format!("Failed to read release artifact {}", binary.display()))?;
+    #[cfg(target_os = "linux")]
+    if magic != *b"\x7fELF" {
+        anyhow::bail!(
+            "Release artifact is not an ELF binary: {}",
+            binary.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    if !matches!(
+        magic,
+        [0xfe, 0xed, 0xfa, 0xce]
+            | [0xce, 0xfa, 0xed, 0xfe]
+            | [0xfe, 0xed, 0xfa, 0xcf]
+            | [0xcf, 0xfa, 0xed, 0xfe]
+    ) {
+        anyhow::bail!(
+            "Release artifact is not a Mach-O binary: {}",
+            binary.display()
+        );
+    }
+    Ok(())
+}
+
+fn preflight_setup_state(home: &Path, codex_dir: &Path, dotfiles_path: &Path) -> Result<()> {
+    validate_absolute_path(dotfiles_path)?;
+    preflight_private_directory(codex_dir)?;
+    preflight_private_directory(&codex_dir.join("worktrees"))?;
+    for (source, destination) in CODEX_FILES {
+        preflight_shared_symlink(dotfiles_path, home, source, destination)?;
+    }
+    for (source, destination) in CODEX_DIRS {
+        preflight_shared_symlink(dotfiles_path, home, source, destination)?;
+    }
+    preflight_config_state(codex_dir, &dotfiles_path.join(CODEX_CONFIG_TEMPLATE))?;
+    preflight_retired_state(codex_dir)?;
+    preflight_managed_binary_paths(home)?;
+    validate_absolute_path(&dotfiles_path.join("target/release"))?;
+    Ok(())
+}
+
+fn build_managed_binary(dotfiles_path: &Path, home: &Path) -> Result<PathBuf> {
     println!("\nBuilding optimized Codex guardrail binary...");
-    let mut command = Command::new("cargo");
+    let cargo = trusted_user_executable(home, CARGO_RELATIVE_PATH, "Cargo")?;
+    let rustc = trusted_rustc_path(home)?;
+    let mut command = Command::new(cargo);
     command
         .current_dir(dotfiles_path)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", SYSTEM_BUILD_PATH)
+        .env("RUSTC", rustc)
         .args(["build", "--release", "--locked", "-p", "cli"]);
     run_command(command, "Failed to build the Codex guardrail binary")?;
 
     let binary = dotfiles_path
         .join("target/release")
         .join(format!("cli{}", std::env::consts::EXE_SUFFIX));
-    let metadata = fs::symlink_metadata(&binary)
-        .with_context(|| format!("Failed to inspect built binary {}", binary.display()))?;
-    if !metadata.file_type().is_file() {
-        anyhow::bail!(
-            "Built guardrail is not a regular file: {}",
-            binary.display()
-        );
-    }
+    verify_release_binary(dotfiles_path, &binary)?;
     Ok(binary)
 }
 
@@ -1897,15 +2463,23 @@ pub fn setup() -> Result<()> {
         );
     }
     let codex_dir = resolve_codex_home(&home)?;
+    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    preflight_setup_state(&home, &codex_dir, &dotfiles_path)?;
 
-    if !is_codex_installed() {
-        println!("Codex CLI is not found.");
-        codex_install()?;
-    } else {
-        println!("Codex CLI is already installed.");
-    }
+    let codex_binary = codex_binary_path(&home).with_context(|| {
+        format!(
+            "Codex CLI must already be installed at {} (automatic npm install is disabled)",
+            home.join(CODEX_RELATIVE_PATH).display()
+        )
+    })?;
+    println!(
+        "Codex CLI is already installed at {}.",
+        codex_binary.display()
+    );
+    codex_check(&codex_binary)?;
 
-    codex_check()?;
+    let managed_binary = build_managed_binary(&dotfiles_path, &home)?;
+    preflight_managed_binary_destinations(&managed_binary, &home)?;
 
     if !codex_dir.exists() {
         println!("\nCreating CODEX_HOME directory: {}", codex_dir.display());
@@ -1918,8 +2492,6 @@ pub fn setup() -> Result<()> {
     for (source, dest) in CODEX_FILES {
         ensure_shared_symlink(source, dest)?;
     }
-    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
-    let managed_binary = build_managed_binary(&dotfiles_path)?;
     for destination in MANAGED_BINARY_DESTINATIONS {
         ensure_managed_hook_with_legacy_hash(
             &managed_binary,
@@ -1962,8 +2534,10 @@ mod tests {
         ensure_managed_hook_with_legacy_hash, ensure_managed_writable_root,
         ensure_private_directory, legacy_hash_for_destination, managed_hook_state_path,
         managed_transaction_path, merge_managed_config, merge_managed_config_with_root,
-        migrate_managed_config_from_template, publish_regular_file_exclusive, sha256,
-        validate_setup_home, verify_managed_symlink,
+        migrate_managed_config_from_template, preflight_config_state,
+        preflight_managed_binary_destination, preflight_shared_symlink,
+        publish_regular_file_exclusive, sha256, trusted_user_executable, validate_setup_home,
+        verify_managed_symlink,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2003,6 +2577,82 @@ mod tests {
                 ".local/bin/codex-delivery",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_user_executable_rejects_untrusted_symlink_target_and_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = TestDirectory::new("trusted-installer-tool");
+        let home = directory.path().join("home");
+        let bin = home.join(".local/bin");
+        let outside = directory.path().join("outside-tool");
+        fs::create_dir_all(&bin).expect("create tool directory");
+        fs::write(&outside, b"ELF").expect("write outside tool");
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755))
+            .expect("set outside tool mode");
+        symlink(&outside, bin.join("codex")).expect("link outside tool");
+        assert!(trusted_user_executable(&home, ".local/bin/codex", "Codex CLI").is_err());
+
+        fs::remove_file(bin.join("codex")).expect("remove outside link");
+        let cargo = bin.join("cargo");
+        fs::write(&cargo, b"ELF").expect("write unsafe tool");
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o777))
+            .expect("set unsafe tool mode");
+        assert!(trusted_user_executable(&home, ".local/bin/cargo", "Cargo").is_err());
+    }
+
+    #[test]
+    fn preflight_rejects_existing_shared_file_without_mutation() {
+        let directory = TestDirectory::new("preflight-shared-file");
+        let dotfiles = directory.path().join("dotfiles");
+        let home = directory.path().join("home");
+        fs::create_dir_all(dotfiles.join(".codex")).expect("create shared source");
+        fs::create_dir_all(home.join(".codex")).expect("create shared destination");
+        fs::write(dotfiles.join(".codex/AGENTS.md"), b"source").expect("write shared source");
+        let destination = home.join(".codex/AGENTS.md");
+        fs::write(&destination, b"local").expect("write conflicting destination");
+
+        assert!(
+            preflight_shared_symlink(&dotfiles, &home, ".codex/AGENTS.md", ".codex/AGENTS.md")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&destination).expect("read conflicting destination"),
+            b"local"
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_unmanaged_binary_without_mutation() {
+        let directory = TestDirectory::new("preflight-binary");
+        let source = directory.path().join("release-cli");
+        let destination = directory.path().join("destination");
+        fs::write(&source, b"release").expect("write release source");
+        fs::write(&destination, b"local").expect("write unmanaged destination");
+
+        assert!(preflight_managed_binary_destination(&source, &destination, None).is_err());
+        assert_eq!(
+            fs::read(&destination).expect("read unmanaged destination"),
+            b"local"
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_invalid_late_config_without_creating_it() {
+        let directory = TestDirectory::new("preflight-config");
+        let codex_dir = directory.path().join("codex");
+        let template = directory.path().join("config.base.toml");
+        fs::create_dir_all(codex_dir.join("worktrees")).expect("create config root");
+        fs::write(
+            &template,
+            "[sandbox_workspace_write]\nwritable_roots = 42\n",
+        )
+        .expect("write invalid template");
+
+        assert!(preflight_config_state(&codex_dir, &template).is_err());
+        assert!(!codex_dir.join("config.toml").exists());
     }
 
     #[test]

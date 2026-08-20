@@ -328,6 +328,7 @@ fn safe_environment(command: &mut Command, gh_config: Option<&Path>) {
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_VARIANT", "ssh")
         .env("GH_HOST", "github.com")
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
@@ -348,7 +349,7 @@ fn git_command(args: &[String]) -> Result<Vec<String>> {
         "-c".into(),
         "core.hooksPath=/dev/null".into(),
         "-c".into(),
-        format!("core.sshCommand={ssh}"),
+        format!("core.sshCommand={ssh} -F /dev/null"),
         "-c".into(),
         "core.gitProxy=none".into(),
         "-c".into(),
@@ -486,7 +487,8 @@ fn dangerous_local_git_key(key: &str) -> bool {
 }
 
 fn validate_local_git_config(cwd: &Path) -> Result<()> {
-    let mut command = Command::new(GIT_BINARY);
+    let git = trusted_binary(GIT_BINARY, "Git")?;
+    let mut command = Command::new(git);
     command
         .current_dir(cwd)
         .arg("config")

@@ -2185,6 +2185,14 @@ fn changes_secret_reason(names: &str, patch: &str, label: &str) -> Option<String
     None
 }
 
+fn binary_numstat_reason(numstat: &str, label: &str) -> Option<String> {
+    let contains_binary = numstat.lines().any(|line| {
+        let mut fields = line.splitn(3, '\t');
+        matches!((fields.next(), fields.next()), (Some("-"), Some("-")))
+    });
+    contains_binary.then(|| format!("{label}に内容を安全に検査できないbinary変更が含まれています"))
+}
+
 fn staged_secret_reason(cwd: &str) -> Option<String> {
     let Some(names) = run_git(
         cwd,
@@ -2205,6 +2213,15 @@ fn staged_secret_reason(cwd: &str) -> Option<String> {
     ) else {
         return Some("staged changesを検査できないためcommitを拒否しました".into());
     };
+    let Some(numstat) = run_git(
+        cwd,
+        &["diff", "--cached", "--numstat", "--diff-filter=ACMR", "--"],
+    ) else {
+        return Some("staged binary changesを検査できないためcommitを拒否しました".into());
+    };
+    if let Some(reason) = binary_numstat_reason(&numstat, "staged changes") {
+        return Some(reason);
+    }
     changes_secret_reason(&names, &patch, "staged changes")
 }
 
@@ -2275,6 +2292,16 @@ fn push_preflight_reason(cwd: &str, branch: &str) -> Option<String> {
     ) else {
         return Some("未push commitを検査できません".into());
     };
+    let range = format!("{base}..HEAD");
+    let Some(numstat) = run_git(
+        cwd,
+        &["diff", "--numstat", "--diff-filter=ACMR", &range, "--"],
+    ) else {
+        return Some("未push binary変更を検査できません".into());
+    };
+    if let Some(reason) = binary_numstat_reason(&numstat, "未push commit") {
+        return Some(reason);
+    }
     changes_secret_reason(&names, &patch, "未push commit")
 }
 
@@ -3536,6 +3563,79 @@ fn gh_read_only_subcommand(command: &str, subcommand: Option<&str>) -> bool {
     }
 }
 
+fn gh_read_only_args_reason(args: &[String], label: &str) -> Option<String> {
+    // Read-only subcommands still receive a strict option allowlist.  This is
+    // intentionally shared and conservative: unsupported display/filter
+    // options fail closed instead of inheriting future gh side effects.
+    const VALUE_OPTIONS: &[(&str, &str)] = &[
+        ("-R", "--repo"),
+        ("", "--json"),
+        ("-q", "--jq"),
+        ("-t", "--template"),
+        ("-L", "--limit"),
+        ("-s", "--state"),
+        ("-a", "--assignee"),
+        ("-A", "--author"),
+        ("-l", "--label"),
+        ("", "--milestone"),
+        ("-S", "--search"),
+        ("", "--sort"),
+        ("", "--order"),
+        ("-B", "--base"),
+        ("-H", "--head"),
+        ("-b", "--branch"),
+        ("-c", "--commit"),
+        ("-e", "--event"),
+        ("-w", "--workflow"),
+        ("-u", "--user"),
+        ("-j", "--job"),
+        ("-i", "--interval"),
+        ("-a", "--attempt"),
+        ("", "--color"),
+        ("", "--language"),
+        ("", "--topic"),
+        ("", "--visibility"),
+        ("-r", "--ref"),
+        ("", "--org"),
+        ("", "--env"),
+        ("", "--exclude"),
+        ("", "--include"),
+        ("", "--match"),
+        ("", "--owner"),
+        ("", "--filename"),
+        ("", "--extension"),
+    ];
+    const SWITCHES: &[&str] = &[
+        "--comments",
+        "--watch",
+        "--required",
+        "--fail-fast",
+        "--name-only",
+        "--patch",
+        "--log",
+        "--log-failed",
+        "--exit-status",
+        "--compact",
+        "--archived",
+        "--no-archived",
+        "--fork",
+        "--no-forks",
+        "--source",
+        "--all",
+        "--exclude-drafts",
+        "--exclude-pre-releases",
+        "--yaml",
+        "--parents",
+        "--draft",
+        "--merged",
+        "--public",
+        "--private",
+    ];
+    strict_gh_args(args, VALUE_OPTIONS, SWITCHES)
+        .is_none()
+        .then(|| format!("{label}では許可された読み取り専用引数だけを指定してください"))
+}
+
 fn gh_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> {
     let start = command_start(tokens)?;
     if basename(tokens.get(start)?) != "gh" {
@@ -3549,6 +3649,14 @@ fn gh_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> 
         .any(|token| token.contains('$') || token.contains('`'))
     {
         return Some("GitHub commandでshell展開を使用できません".into());
+    }
+    if tokens.iter().any(|token| {
+        ["--web", "-w", "--browser", "--editor"].contains(&token.as_str())
+            || token.starts_with("--web=")
+            || token.starts_with("--browser=")
+            || token.starts_with("--editor=")
+    }) {
+        return Some("GitHub commandからbrowserまたはeditorを起動できません".into());
     }
     if std::env::var("GH_HOST")
         .ok()
@@ -3580,7 +3688,10 @@ fn gh_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> 
         "issue" => {
             let (sub, subargs) = first_command(&args, GH_GLOBAL_VALUE_OPTIONS);
             match sub.as_deref() {
-                None | Some("list") | Some("status") | Some("view") => None,
+                None => None,
+                Some("list") | Some("status") | Some("view") => {
+                    gh_read_only_args_reason(&subargs, "GitHub Issue読み取り")
+                }
                 Some("create") | Some("edit") | Some("comment") | Some("close")
                 | Some("reopen") => issue_write_reason(sub.as_deref().unwrap_or(""), &subargs, cwd),
                 Some("delete") => Some("GitHub Issueの削除は許可されていません".into()),
@@ -3615,8 +3726,10 @@ fn gh_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> 
         "pr" => {
             let (sub, subargs) = first_command(&args, GH_GLOBAL_VALUE_OPTIONS);
             match sub.as_deref() {
-                None | Some("list") | Some("view") | Some("status") | Some("checks")
-                | Some("diff") => None,
+                None => None,
+                Some("list") | Some("view") | Some("status") | Some("checks") | Some("diff") => {
+                    gh_read_only_args_reason(&subargs, "GitHub PR読み取り")
+                }
                 Some("create")
                 | Some("edit")
                 | Some("comment")
@@ -3633,7 +3746,10 @@ fn gh_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> 
         "run" => {
             let (sub, subargs) = first_command(&args, GH_GLOBAL_VALUE_OPTIONS);
             match sub.as_deref() {
-                None | Some("list") | Some("view") | Some("watch") => None,
+                None => None,
+                Some("list") | Some("view") | Some("watch") => {
+                    gh_read_only_args_reason(&subargs, "GitHub Actions読み取り")
+                }
                 Some("cancel") => {
                     let mut full = Vec::with_capacity(subargs.len() + 1);
                     full.push("cancel".to_string());
@@ -3643,11 +3759,22 @@ fn gh_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> 
                 _ => Some("gh runはcancelまたは読み取り専用操作だけ許可されます".into()),
             }
         }
-        "status" | "search" => None,
+        "status" => gh_read_only_args_reason(&args, "GitHub status読み取り"),
+        "search" => {
+            let (subcommand, subargs) = first_command(&args, GH_GLOBAL_VALUE_OPTIONS);
+            if subcommand
+                .as_deref()
+                .is_some_and(|value| ["code", "commits", "issues", "prs", "repos"].contains(&value))
+            {
+                gh_read_only_args_reason(&subargs, "GitHub search")
+            } else {
+                Some("許可されていないGitHub search操作です".into())
+            }
+        }
         "repo" | "release" | "workflow" | "label" | "cache" | "variable" | "secret" | "ruleset" => {
-            let (subcommand, _) = first_command(&args, GH_GLOBAL_VALUE_OPTIONS);
+            let (subcommand, subargs) = first_command(&args, GH_GLOBAL_VALUE_OPTIONS);
             if gh_read_only_subcommand(&command, subcommand.as_deref()) {
-                None
+                gh_read_only_args_reason(&subargs, "GitHub読み取り")
             } else {
                 Some("許可されていないGitHub書き込み操作です".into())
             }
@@ -4647,6 +4774,13 @@ mod tests {
     }
 
     #[test]
+    fn binary_numstat_is_rejected_before_secret_scan() {
+        assert!(binary_numstat_reason("-\t-\tpayload.bin\n", "changes").is_some());
+        assert!(binary_numstat_reason("1\t0\tREADME.md\n", "changes").is_none());
+        assert!(binary_numstat_reason("12\t3\tpath with spaces\n", "changes").is_none());
+    }
+
+    #[test]
     fn commit_subject_and_options_match_python_contract() {
         assert!(git_commit_reason(&["-m".into(), ":bug: summary".into()]).is_none());
         assert!(git_commit_reason(&["-m".into(), ":bad emoji: summary".into()]).is_some());
@@ -4761,6 +4895,18 @@ mod tests {
             assert!(
                 gh_invocation_reason(&tokens, None).is_some(),
                 "write command was allowed: {command}"
+            );
+        }
+        for command in [
+            "gh pr view 1 --web",
+            "gh issue view 1 -w",
+            "gh repo view owner/repo --browser=custom",
+            "gh workflow view build.yml --editor custom",
+            "gh pr view 1 --future-side-effect",
+        ] {
+            assert!(
+                blocked_reason(command, None, 0).is_some(),
+                "external UI option was allowed: {command}"
             );
         }
     }
