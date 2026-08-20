@@ -2178,7 +2178,7 @@ def _has_command_resolution_mutation(tokens):
     if start is None:
         return False
     return os.path.basename(tokens[start]) in {
-        ".", "alias", "autoload", "emulate", "enable", "eval", "function",
+        ".", "alias", "autoload", "builtin", "emulate", "enable", "eval", "function",
         "hash", "rehash", "source", "unalias",
     }
 

@@ -919,6 +919,8 @@ class GuardTest(unittest.TestCase):
             "if hash x=/usr/bin/git; then x reset --hard HEAD; fi",
             "if hash x=/usr/bin/gh; then x issue delete 1 --repo owner/repo; fi",
             "if alias x=git; then x reset --hard HEAD; fi",
+            "builtin hash x=/usr/bin/git; x reset --hard HEAD",
+            "if builtin hash x=/usr/bin/git; then x reset --hard HEAD; fi",
             "hash git=/bin/echo; git status",
             "chdir /tmp/other-repository && git status",
             "autoload -Uz helper; git status",
