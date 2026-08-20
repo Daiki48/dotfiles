@@ -249,6 +249,10 @@ class GuardTest(unittest.TestCase):
             "sudo -U root git reset --hard HEAD",
             "xargs --process-slot-var SLOT git reset --hard HEAD",
             "env -a ARG0 git reset --hard HEAD",
+            "env -Sgit reset --hard HEAD",
+            "env -Sgh issue delete 1 --repo owner/repo",
+            "env -Scodex-worktree create --issue 1",
+            "env -Srm -rf README.md",
             "sudo --future-option value git reset --hard HEAD",
             "sudo --future-option value $GIT reset --hard HEAD",
             "exec rm README.md",
@@ -294,6 +298,9 @@ class GuardTest(unittest.TestCase):
             "python3 /home/user/.local/bin/codex-delivery deliver",
             "env python3 /home/user/.local/bin/codex-worktree list",
             "python3 -m codex-delivery deliver",
+            "python3 -B -m codex-delivery deliver",
+            "python3 -X dev -m codex-worktree list",
+            "python3 -B -m runpy /home/user/.local/bin/codex-delivery",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command)
@@ -913,6 +920,9 @@ class GuardTest(unittest.TestCase):
             "repeat 1 codex-worktree create --issue 1",
             "if time -p gh pr close 1 --repo owner/repo; then true; fi",
             "coproc gh pr close 1 --repo owner/repo",
+            "coproc MYJOB git reset --hard HEAD",
+            "function f { git reset --hard HEAD; }; f",
+            "function f { gh issue delete 1 --repo owner/repo; }; f",
             "- git reset --hard HEAD",
             "if sudo --close-from 3 git add -- README.md; then true; fi",
             "if sudo --close-from 3 gh pr close 1 --repo owner/repo; then true; fi",
@@ -930,7 +940,6 @@ class GuardTest(unittest.TestCase):
             "if echo codex-delivery; then true; fi",
             "if rg --files /tmp/codex-delivery; then true; fi",
             "repeat 1 echo git",
-            "coproc echo git",
         ):
             with self.subTest(command=command):
                 self.assert_allowed(command)

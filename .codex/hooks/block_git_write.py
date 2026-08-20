@@ -1508,24 +1508,47 @@ def _python_script_operand(tokens, start):
     return None
 
 
+def _python_module_operand(tokens, start):
+    """Python optionを消費し、-mのmodule名と後続引数位置を返す。"""
+    index = start + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-m":
+            if index + 1 >= len(tokens):
+                return None
+            return tokens[index + 1], index + 2
+        if token.startswith("-m") and token != "-m":
+            return token[2:], index + 1
+        if token == "-c" or token.startswith("-c"):
+            return None
+        if token in PYTHON_SCRIPT_OPTS_WITH_VALUE - {"-c", "-m"}:
+            index += 2
+            continue
+        if token.startswith("--check-hash-based-pycs="):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return None
+    return None
+
+
 def _python_helper_invocation_reason(tokens):
     start = _command_start(tokens)
     if start is None or not re.fullmatch(r"python(?:3(?:\.[0-9]+)?)?", os.path.basename(tokens[start])):
         return None
-    index = start + 1
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "-m" and index + 1 < len(tokens):
-            module = tokens[index + 1]
-            if module in {"codex-worktree", "codex-delivery"}:
-                return "helperはPython moduleまたはinterpreter経由で実行できません"
-            return None
-        if token.startswith("-m") and token != "-m":
-            module = token[2:]
-            if module in {"codex-worktree", "codex-delivery"}:
-                return "helperはPython moduleまたはinterpreter経由で実行できません"
-            return None
-        break
+    module_operand = _python_module_operand(tokens, start)
+    if module_operand is not None:
+        module, arguments_start = module_operand
+        if module in {"codex-worktree", "codex-delivery"}:
+            return "helperはPython moduleまたはinterpreter経由で実行できません"
+        if module == "runpy" and any(
+            os.path.basename(argument) in {"codex-worktree", "codex-delivery"}
+            for argument in tokens[arguments_start:]
+        ):
+            return "helperはPython moduleまたはinterpreter経由で実行できません"
+        return None
     operand = _python_script_operand(tokens, start)
     if operand is None:
         return None
@@ -2080,6 +2103,7 @@ def _has_unparsed_guarded_command(tokens):
     if not tokens or tokens[0] not in SHELL_COMPOUND_PREFIXES:
         return False
     arguments = list(tokens)
+    ambiguous_compound = None
     while arguments:
         while arguments and re.match(
             r"^[A-Za-z_][A-Za-z0-9_]*=", arguments[0]
@@ -2088,6 +2112,10 @@ def _has_unparsed_guarded_command(tokens):
         if not arguments:
             return False
         prefix = arguments[0]
+        if prefix in {"coproc", "function"}:
+            ambiguous_compound = prefix
+            arguments.pop(0)
+            break
         if prefix in SHELL_COMMAND_PREFIXES:
             arguments.pop(0)
             continue
@@ -2101,16 +2129,18 @@ def _has_unparsed_guarded_command(tokens):
                 return False
             arguments = arguments[2:]
             continue
-        if prefix == "coproc":
-            arguments.pop(0)
-            continue
         break
-    start = _command_start(arguments)
-    if start is None:
-        return False
     guarded = RESTRICTED_COMMANDS | DESTRUCTIVE_COMMANDS | SHELLS | {
         ".", "eval", "find", "source",
     }
+    if ambiguous_compound is not None:
+        return any(
+            os.path.basename(token) in guarded or _command_word_has_expansion(token)
+            for token in arguments
+        )
+    start = _command_start(arguments)
+    if start is None:
+        return False
     if _has_ambiguous_wrapper_options(arguments) and (
         any(os.path.basename(token) in guarded for token in arguments)
         or any(_command_word_has_expansion(token) for token in arguments)
@@ -2206,6 +2236,7 @@ def blocked_reason(command, cwd=None, depth=0):
             and os.path.basename(tokens[0]) == "env"
             and any(
                 token in {"-S", "--split-string"}
+                or (token.startswith("-S") and token != "-S")
                 or token.startswith("--split-string=")
                 for token in tokens[1:]
             )
