@@ -2038,6 +2038,13 @@ SHELL_COMMAND_PREFIXES = {
 }
 
 
+def _is_git_subcommand_executable(token):
+    """git-reset等、canonicalな`git <subcommand>`を迂回する実体を検出する。"""
+    return re.fullmatch(
+        r"git-[A-Za-z0-9][A-Za-z0-9._-]*", os.path.basename(token)
+    ) is not None
+
+
 def _has_unquoted_shell_character(command, characters):
     """quoted/escaped文字とcommentを除き、指定shell文字の有無を調べる。"""
     quote = None
@@ -2220,7 +2227,9 @@ def _has_unparsed_guarded_command(tokens):
     }
     if ambiguous_compound is not None:
         return _contains_env_split_string(arguments) or any(
-            os.path.basename(token) in guarded or _command_word_has_expansion(token)
+            os.path.basename(token) in guarded
+            or _is_git_subcommand_executable(token)
+            or _command_word_has_expansion(token)
             for token in arguments
         )
     if _has_command_resolution_mutation(arguments):
@@ -2231,13 +2240,20 @@ def _has_unparsed_guarded_command(tokens):
     if start is None:
         return False
     if _has_ambiguous_wrapper_options(arguments) and (
-        any(os.path.basename(token) in guarded for token in arguments)
+        any(
+            os.path.basename(token) in guarded
+            or _is_git_subcommand_executable(token)
+            for token in arguments
+        )
         or any(_command_word_has_expansion(token) for token in arguments)
     ):
         return True
     if _command_word_has_expansion(arguments[start]):
         return True
-    if os.path.basename(arguments[start]) in guarded:
+    if (
+        os.path.basename(arguments[start]) in guarded
+        or _is_git_subcommand_executable(arguments[start])
+    ):
         return True
     if _python_helper_invocation_reason(arguments) is not None:
         return True
@@ -2248,7 +2264,10 @@ def _contains_restricted_command(tokens, depth=0):
     if depth > 3:
         return False
     start = _command_start(tokens)
-    if start is not None and os.path.basename(tokens[start]) in RESTRICTED_COMMANDS:
+    if start is not None and (
+        os.path.basename(tokens[start]) in RESTRICTED_COMMANDS
+        or _is_git_subcommand_executable(tokens[start])
+    ):
         return True
     for nested_command in _nested_shell_commands(tokens):
         if any(
@@ -2311,6 +2330,7 @@ def blocked_reason(command, cwd=None, depth=0):
                 os.path.basename(token) in (
                     RESTRICTED_COMMANDS | DESTRUCTIVE_COMMANDS | SHELLS | {"find"}
                 )
+                or _is_git_subcommand_executable(token)
                 for token in tokens
             )
         ):
@@ -2318,6 +2338,8 @@ def blocked_reason(command, cwd=None, depth=0):
         start = _command_start(tokens)
         if start is not None and _command_word_has_expansion(tokens[start]):
             return "shell展開で実行commandを決定する操作は許可されていません"
+        if start is not None and _is_git_subcommand_executable(tokens[start]):
+            return "Git内部commandはcanonicalなgit <subcommand>で実行してください"
         if start is not None and os.path.basename(tokens[start]) in {"source", "."}:
             return "sourceによる未検査scriptの実行は許可されていません"
         if (
