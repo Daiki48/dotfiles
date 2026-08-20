@@ -7,15 +7,14 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::{
-    ffi::{CStr, OsStr},
+    ffi::{CStr, CString, OsStr},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::codex_tools::process;
-use crate::utils::create_symlink;
-
 const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
     (".codex/rules/default.rules", ".codex/rules/default.rules"),
@@ -390,11 +389,185 @@ fn copy_symlink_exclusive(_source: &Path, _destination: &Path) -> Result<()> {
     anyhow::bail!("Codex config symlink migration is supported only on Unix")
 }
 
-fn ensure_shared_symlink(source: &str, destination: &str) -> Result<()> {
-    create_symlink(source, destination)?;
-    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
-    let home = home::home_dir().context("Cannot find home directory")?;
-    verify_managed_symlink(&dotfiles_path.join(source), &home.join(destination))
+#[cfg(unix)]
+fn c_string(value: &OsStr, label: &str) -> Result<CString> {
+    CString::new(value.as_bytes()).with_context(|| format!("{label} contains a NUL byte"))
+}
+
+#[cfg(unix)]
+fn validate_open_directory(directory: &OwnedFd, label: &str) -> Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: directory is an open descriptor and stat points to writable storage.
+    if unsafe { libc::fstat(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to inspect {label}"));
+    }
+    // SAFETY: fstat succeeded and initialized stat.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || stat.st_uid != current_uid()
+        || stat.st_mode & 0o022 != 0
+    {
+        anyhow::bail!("{label} has an unsafe owner, mode, or file type");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path, label: &str) -> Result<OwnedFd> {
+    let path = c_string(path.as_os_str(), label)?;
+    // SAFETY: path is NUL terminated; returned descriptor is uniquely owned.
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to open {label} without following symlinks"));
+    }
+    // SAFETY: open returned a new descriptor owned by this function.
+    let directory = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    validate_open_directory(&directory, label)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_or_create_directory_at(parent: &OwnedFd, name: &OsStr, label: &str) -> Result<OwnedFd> {
+    let name = c_string(name, label)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: parent and name remain valid for this call.
+    let mut descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if descriptor < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+        // SAFETY: parent and name remain valid; mkdirat is atomic relative to parent.
+        let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+        if created != 0
+            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Failed to create {label}"));
+        }
+        // SAFETY: parent and name remain valid for this call.
+        descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    }
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to open {label} without following symlinks"));
+    }
+    // SAFETY: openat returned a new descriptor owned by this function.
+    let directory = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    validate_open_directory(&directory, label)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn read_link_at(parent: &OwnedFd, name: &CStr, label: &str) -> Result<PathBuf> {
+    let mut target = vec![0_u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: all pointers reference live storage and target has the advertised capacity.
+    let length = unsafe {
+        libc::readlinkat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            target.as_mut_ptr().cast(),
+            target.len(),
+        )
+    };
+    if length < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to read {label}"));
+    }
+    let length = usize::try_from(length).context("Managed symlink length is invalid")?;
+    if length == target.len() {
+        anyhow::bail!("{label} target exceeds the safe path limit");
+    }
+    target.truncate(length);
+    Ok(PathBuf::from(OsStr::from_bytes(&target)))
+}
+
+#[cfg(unix)]
+fn ensure_shared_symlink(
+    dotfiles_path: &Path,
+    home: &Path,
+    source: &str,
+    destination: &str,
+) -> Result<()> {
+    let expected = fs::canonicalize(dotfiles_path.join(source))
+        .with_context(|| format!("Failed to resolve managed source {source}"))?;
+    let expected_c = c_string(expected.as_os_str(), "Managed symlink source")?;
+    let destination_path = Path::new(destination);
+    if destination_path.is_absolute()
+        || destination_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("Managed symlink destination must be a normalized relative path");
+    }
+    let components = destination_path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let (name, parents) = components
+        .split_last()
+        .context("Managed symlink destination has no file name")?;
+
+    let mut directory = open_directory(home, "setup home directory")?;
+    for component in parents {
+        directory = open_or_create_directory_at(&directory, component, "managed symlink parent")?;
+    }
+    let name = c_string(name, "Managed symlink name")?;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: directory, name, and stat storage remain valid for this call.
+    let status = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status == 0 {
+        // SAFETY: fstatat succeeded and initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFLNK
+            || read_link_at(&directory, &name, "managed symlink")? != expected
+        {
+            anyhow::bail!("Managed destination is not the expected symlink: {destination}");
+        }
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return Err(error).with_context(|| format!("Failed to inspect {destination}"));
+    }
+    // SAFETY: target, directory, and name remain valid for this call.
+    if unsafe { libc::symlinkat(expected_c.as_ptr(), directory.as_raw_fd(), name.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to create managed symlink {destination}"));
+    }
+    if read_link_at(&directory, &name, "new managed symlink")? != expected {
+        anyhow::bail!("Managed symlink changed during creation: {destination}");
+    }
+    // SAFETY: directory is an open directory descriptor.
+    if unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to sync managed symlink {destination}"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_shared_symlink(
+    _dotfiles_path: &Path,
+    _home: &Path,
+    _source: &str,
+    _destination: &str,
+) -> Result<()> {
+    anyhow::bail!("Codex shared symlink installation is supported only on Unix")
 }
 
 fn preflight_shared_symlink(
@@ -2599,7 +2772,7 @@ pub fn setup() -> Result<()> {
 
     println!("\nLinking shared configuration files...");
     for (source, dest) in CODEX_FILES {
-        ensure_shared_symlink(source, dest)?;
+        ensure_shared_symlink(&dotfiles_path, &home, source, dest)?;
     }
     for destination in MANAGED_BINARY_DESTINATIONS {
         ensure_managed_hook_with_legacy_hash(
@@ -2611,7 +2784,7 @@ pub fn setup() -> Result<()> {
     }
     println!("\nLinking shared skill directories...");
     for (source, dest) in CODEX_DIRS {
-        ensure_shared_symlink(source, dest)?;
+        ensure_shared_symlink(&dotfiles_path, &home, source, dest)?;
     }
 
     backup_legacy_config(&codex_dir)?;
@@ -2635,6 +2808,8 @@ pub fn setup() -> Result<()> {
 mod tests {
     #[cfg(unix)]
     use super::account_home_dir;
+    #[cfg(unix)]
+    use super::ensure_shared_symlink;
     use super::{
         LEGACY_CODEX_DELIVERY_SHA256, LEGACY_CODEX_WORKTREE_SHA256, MANAGED_BINARY_DESTINATIONS,
         MANAGED_HOOK_COMMAND, MANAGED_HOOK_DESTINATION, ManagedInstallMode, ManagedTransaction,
@@ -2754,6 +2929,36 @@ mod tests {
             preflight_shared_symlink(&dotfiles, &home, ".agents/skills", ".agents/skills").is_err()
         );
         assert!(!outside.join("skills").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_symlink_mutation_is_anchored_to_verified_directories() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("anchored-shared-symlink");
+        let dotfiles = directory.path().join("dotfiles");
+        let home = directory.path().join("home");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(dotfiles.join(".codex")).expect("create shared source parent");
+        fs::create_dir(&home).expect("create home");
+        fs::create_dir(&outside).expect("create outside directory");
+        fs::write(dotfiles.join(".codex/AGENTS.md"), b"source").expect("write shared source");
+
+        symlink(&outside, home.join(".codex")).expect("swap destination parent with symlink");
+        assert!(
+            ensure_shared_symlink(&dotfiles, &home, ".codex/AGENTS.md", ".codex/AGENTS.md")
+                .is_err()
+        );
+        assert!(!outside.join("AGENTS.md").exists());
+
+        fs::remove_file(home.join(".codex")).expect("remove fixture parent symlink");
+        ensure_shared_symlink(&dotfiles, &home, ".codex/AGENTS.md", ".codex/AGENTS.md")
+            .expect("create anchored managed symlink");
+        assert_eq!(
+            fs::read_link(home.join(".codex/AGENTS.md")).expect("read managed symlink"),
+            fs::canonicalize(dotfiles.join(".codex/AGENTS.md")).expect("resolve shared source")
+        );
     }
 
     #[test]

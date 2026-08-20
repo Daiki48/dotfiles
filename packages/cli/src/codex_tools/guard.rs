@@ -34,6 +34,7 @@ const BODY_SNAPSHOT_MAX_RETAINED: usize = 128;
 const BODY_SNAPSHOT_TTL: Duration = Duration::from_secs(60 * 60);
 const SYSTEM_GIT: &str = "/usr/bin/git";
 const SYSTEM_GH: &str = "/usr/bin/gh";
+const SYSTEM_SSH: &str = "/usr/bin/ssh";
 const SYSTEM_PATH: &str = "/usr/bin:/bin";
 
 static BODY_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2884,6 +2885,81 @@ fn shell_quote_token(token: &str) -> String {
     format!("'{}'", token.replace('\'', "'\\''"))
 }
 
+fn git_subcommand_index(tokens: &[String]) -> Option<(usize, &str)> {
+    let start = command_start(tokens)?;
+    if tokens.get(start).map(|token| basename(token)) != Some("git") {
+        return None;
+    }
+    let mut index = start + 1;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if GIT_VALUE_OPTIONS.contains(&token.as_str()) {
+            index = index.checked_add(2)?;
+            continue;
+        }
+        if GIT_VALUE_OPTIONS
+            .iter()
+            .any(|option| starts_with_option(token, option) && *option != "-C")
+            || token.starts_with('-')
+        {
+            index += 1;
+            continue;
+        }
+        return Some((index, token));
+    }
+    None
+}
+
+/// Add only guard-owned Git configuration after the original command has
+/// passed the strict parser. Repository hooks and user SSH configuration must
+/// not become a second execution path for an otherwise allowed command.
+fn rewrite_git_safety_command(command: &str) -> Result<Option<String>, String> {
+    let segments = command_segments(command);
+    if segments.len() != 1 {
+        return Ok(None);
+    }
+    let mut tokens = segments.into_iter().next().unwrap_or_default();
+    let Some((subcommand_index, subcommand)) = git_subcommand_index(&tokens) else {
+        return Ok(None);
+    };
+    let write = GIT_SAFE_WRITE.contains(&subcommand);
+    let network = ["fetch", "pull", "push", "ls-remote"].contains(&subcommand);
+    if !write && !network {
+        return Ok(None);
+    }
+
+    let mut configs = Vec::with_capacity(if network { 14 } else { 2 });
+    if write {
+        configs.extend(["-c", "core.hooksPath=/dev/null"]);
+    }
+    if network {
+        trust::trusted_system_binary(SYSTEM_SSH, "SSH")?;
+        configs.extend([
+            "-c",
+            "core.sshCommand=/usr/bin/ssh -F /dev/null -o BatchMode=yes",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "protocol.file.allow=never",
+            "-c",
+            "protocol.git.allow=never",
+            "-c",
+            "http.sslVerify=true",
+        ]);
+    }
+    tokens.splice(
+        subcommand_index..subcommand_index,
+        configs.into_iter().map(str::to_string),
+    );
+    Ok(Some(
+        tokens
+            .iter()
+            .map(|token| shell_quote_token(token))
+            .collect::<Vec<_>>()
+            .join(" "),
+    ))
+}
+
 fn rewrite_body_file_command(command: &str, cwd: Option<&str>) -> Result<Option<String>, String> {
     let segments = command_segments(command);
     if segments.len() != 1 {
@@ -4718,13 +4794,24 @@ pub fn entrypoint() -> i32 {
         deny(&reason);
         return 2;
     }
-    match rewrite_body_file_command(command, cwd) {
-        Ok(Some(updated_command)) => allow_updated_input(&updated_command),
-        Ok(None) => {}
+    let updated_command = match rewrite_body_file_command(command, cwd) {
+        Ok(Some(updated_command)) => updated_command,
+        Ok(None) => command.to_string(),
         Err(reason) => {
             deny(&reason);
             return 2;
         }
+    };
+    let updated_command = match rewrite_git_safety_command(&updated_command) {
+        Ok(Some(updated_command)) => updated_command,
+        Ok(None) => updated_command,
+        Err(reason) => {
+            deny(&reason);
+            return 2;
+        }
+    };
+    if updated_command != command {
+        allow_updated_input(&updated_command);
     }
     0
 }
@@ -5223,6 +5310,88 @@ mod tests {
                 .or_else(|| object.get("cmd").and_then(StrictJsonValue::as_str)),
             Some("git status")
         );
+    }
+
+    #[test]
+    fn allowed_git_commands_are_rewritten_with_fixed_execution_boundaries() {
+        let commit = rewrite_git_safety_command(
+            "env -u SSH_ASKPASS git -C /managed/worktree commit -m ':bug: fix'",
+        )
+        .expect("rewrite commit")
+        .expect("commit requires a rewrite");
+        assert!(
+            commit.contains(
+                "'git' '-C' '/managed/worktree' '-c' 'core.hooksPath=/dev/null' 'commit'"
+            )
+        );
+        assert!(!commit.contains("core.sshCommand"));
+
+        for command in [
+            "git fetch --no-tags origin refs/heads/feature/example",
+            "git push -u origin feature/example",
+            "git ls-remote --branches origin feature/example",
+        ] {
+            let rewritten = rewrite_git_safety_command(command)
+                .expect("rewrite network command")
+                .expect("network command requires a rewrite");
+            assert!(
+                rewritten.contains("core.sshCommand=/usr/bin/ssh -F /dev/null -o BatchMode=yes")
+            );
+            assert!(rewritten.contains("protocol.ext.allow=never"));
+            assert!(rewritten.contains("protocol.file.allow=never"));
+            assert!(rewritten.contains("protocol.git.allow=never"));
+            assert!(rewritten.contains("http.sslVerify=true"));
+        }
+        assert!(
+            rewrite_git_safety_command("git status")
+                .expect("inspect status")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewritten_commit_does_not_execute_repository_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-guard-git-hook-{suffix}"));
+        fs::create_dir(&root).expect("create Git hook fixture");
+        let run_git = |arguments: &[&str]| {
+            let status = Command::new(SYSTEM_GIT)
+                .current_dir(&root)
+                .args(arguments)
+                .status()
+                .expect("run fixture Git command");
+            assert!(status.success(), "Git fixture failed: {arguments:?}");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.name", "Codex Test"]);
+        run_git(&["config", "user.email", "codex@example.invalid"]);
+        fs::write(root.join("tracked.txt"), b"fixture\n").expect("write tracked fixture");
+        run_git(&["add", "tracked.txt"]);
+
+        let marker = root.join("hook-ran");
+        let hook = root.join(".git/hooks/pre-commit");
+        fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))
+            .expect("write repository hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))
+            .expect("make repository hook executable");
+
+        let rewritten = rewrite_git_safety_command("git commit -m ':test_tube: fixture'")
+            .expect("rewrite commit")
+            .expect("commit requires a rewrite");
+        let status = Command::new("/bin/sh")
+            .current_dir(&root)
+            .args(["-c", &rewritten])
+            .status()
+            .expect("run rewritten commit");
+        assert!(status.success());
+        assert!(!marker.exists(), "repository pre-commit hook was executed");
+        fs::remove_dir_all(root).expect("remove Git hook fixture");
     }
 
     #[test]
