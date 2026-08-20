@@ -3352,6 +3352,12 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
                 "protocol.git.allow=never",
                 "-c",
                 "http.sslVerify=true",
+                "-c",
+                "http.extraHeader=",
+                "-c",
+                "http.followRedirects=initial",
+                "-c",
+                "remote.origin.proxy=",
             ]
             .map(str::to_string),
         );
@@ -3368,6 +3374,8 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
             format!("credential.{origin}.helper="),
             "-c".to_string(),
             format!("http.{origin}.proxy="),
+            "-c".to_string(),
+            format!("http.{origin}.extraHeader="),
             "-c".to_string(),
             format!("http.{origin}.sslVerify=true"),
         ]);
@@ -6082,6 +6090,10 @@ mod tests {
             assert!(rewritten.contains("fetch.recurseSubmodules=false"));
             assert!(rewritten.contains("push.recurseSubmodules=no"));
             assert!(rewritten.contains("http.sslVerify=true"));
+            assert!(rewritten.contains("http.extraHeader="));
+            assert!(rewritten.contains("http.followRedirects=initial"));
+            assert!(rewritten.contains("remote.origin.proxy="));
+            assert!(rewritten.contains(".extraHeader="));
             assert!(rewritten.contains("GIT_CONFIG_GLOBAL=/dev/null"));
             assert!(rewritten.contains("GIT_CONFIG_SYSTEM=/dev/null"));
             assert!(rewritten.contains("GIT_CONFIG_NOSYSTEM=1"));
