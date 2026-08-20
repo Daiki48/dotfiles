@@ -103,6 +103,11 @@ MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
 GIT_COMMAND_TIMEOUT_SECONDS = 2
 GH_COMMAND_TIMEOUT_SECONDS = 5
 MAX_MANIFEST_BYTES = 256 * 1024
+GH_UNSAFE_TRANSPORT_ENVIRONMENT_KEYS = {
+    "GH_CONFIG_DIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy", "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+}
 # launcherが設定するpagerだけは、非対話の許可commandで外部programを起動しない。
 # その他のGIT_*は将来追加されるものも含め、repository状態・外部command・出力先を
 # 変更し得るためfail closedで拒否し、内部probeからも除去する。
@@ -1028,7 +1033,9 @@ def _remote_refs_snapshot(cwd, head=None):
 def _run_gh_json(cwd, *args):
     """固定したread-only gh commandをtimeout付きで実行し、JSON objectを返す。"""
     environment = os.environ.copy()
-    for key in {"GH_HOST", "GH_REPO", "GH_FORCE_TTY", "GH_PAGER", "PAGER"}:
+    for key in {
+        "GH_HOST", "GH_REPO", "GH_FORCE_TTY", "GH_PAGER", "PAGER",
+    } | GH_UNSAFE_TRANSPORT_ENVIRONMENT_KEYS:
         environment.pop(key, None)
     environment["GH_PROMPT_DISABLED"] = "1"
     try:
@@ -1048,6 +1055,40 @@ def _run_gh_json(cwd, *args):
     except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _gh_transport_reason(cwd):
+    """ghの接続先を変更し得るambient設定がないことを確認する。"""
+    if any(os.environ.get(key) for key in GH_UNSAFE_TRANSPORT_ENVIRONMENT_KEYS):
+        return "gh run cancelではGitHub transportを変更する環境変数を使用できません"
+    environment = os.environ.copy()
+    for key in GH_UNSAFE_TRANSPORT_ENVIRONMENT_KEYS | {
+        "GH_HOST", "GH_REPO", "GH_FORCE_TTY", "GH_PAGER", "PAGER",
+    }:
+        environment.pop(key, None)
+    environment["GH_PROMPT_DISABLED"] = "1"
+    try:
+        result = subprocess.run(
+            ["gh", "config", "get", "http_unix_socket", "--host", "github.com"],
+            cwd=cwd,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=GH_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "gh run cancelのGitHub transport設定を確認できません"
+    if len(result.stdout) > MAX_BODY_FILE_BYTES:
+        return "gh run cancelのGitHub transport設定を確認できません"
+    if result.returncode == 0:
+        if result.stdout.strip():
+            return "gh run cancelではhttp_unix_socketを使用できません"
+        return None
+    if result.returncode == 1 and not result.stdout:
+        return None
+    return "gh run cancelのGitHub transport設定を確認できません"
 
 
 def _pr_update_branch_preflight_reason(cwd, repository, number):
@@ -1094,6 +1135,9 @@ def _run_cancel_reason(args, cwd):
         return "gh run cancelはrun-idとrepoを指定する正規形だけ許可されます"
     if os.environ.get("GH_REPO"):
         return "gh run cancelではGH_REPO環境変数を使用できません"
+    transport_reason = _gh_transport_reason(cwd)
+    if transport_reason:
+        return transport_reason
     run_id, repository = args[1], args[3]
     repository_reason = _repository_reason(repository, cwd)
     if repository_reason:
@@ -2183,6 +2227,14 @@ def _without_unquoted_redirection_fds(command):
             if end < len(command) and command[end] in "<>":
                 index = end
                 continue
+        if quote is None and char == ">" and command[index:index + 2] == ">!":
+            result.append(">")
+            index += 2
+            continue
+        if quote is None and command[index:index + 3] == "<<-":
+            result.extend(("<", "<"))
+            index += 3
+            continue
         result.append(char)
         index += 1
     return "".join(result)
@@ -2230,14 +2282,6 @@ def _leading_redirection_wraps_guarded_command(command, cwd=None, depth=0):
             ):
                 consumed = True
                 index += 1
-                if (
-                    index < len(chunk)
-                    and (
-                        (">" in operator and chunk[index] == "!")
-                        or (operator == "<<" and chunk[index] == "-")
-                    )
-                ):
-                    index += 1
                 if index < len(chunk):
                     index += 1
                 continue

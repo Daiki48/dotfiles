@@ -86,6 +86,8 @@ class GuardTest(unittest.TestCase):
             "2>! /tmp/status rm -rf README.md",
             "<<- EOF git reset --hard HEAD",
             "2<<- EOF gh issue delete 1 --repo owner/repo",
+            "> ! git reset --hard HEAD",
+            "<< - git reset --hard HEAD",
             "if > /tmp/status git reset --hard HEAD; then true; fi",
             "command > /tmp/status git reset --hard HEAD",
             "env > /tmp/status gh issue delete 1 --repo owner/repo",
@@ -834,6 +836,7 @@ class GuardTest(unittest.TestCase):
         }
         with (
             mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+            mock.patch.object(GUARD, "_gh_transport_reason", return_value=None),
             mock.patch.object(GUARD, "_run_gh_json", return_value=payload) as run_json,
         ):
             self.assert_allowed(
@@ -897,7 +900,10 @@ class GuardTest(unittest.TestCase):
             "conclusion": None,
             "cancel_url": "https://api.github.com/repos/owner/repo/actions/runs/123/cancel",
         }
-        with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
+        with (
+            mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+            mock.patch.object(GUARD, "_gh_transport_reason", return_value=None),
+        ):
             for override in (
                 None,
                 {"id": True},
@@ -953,6 +959,40 @@ class GuardTest(unittest.TestCase):
         kwargs = run.call_args.kwargs
         self.assertIs(kwargs["stdin"], GUARD.subprocess.DEVNULL)
         self.assertEqual(kwargs["env"]["GH_PROMPT_DISABLED"], "1")
+
+    def test_run_cancel_rejects_unsafe_github_transport(self):
+        command = "gh run cancel 123 --repo owner/repo"
+        with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
+            for key in ("GH_CONFIG_DIR", "HTTPS_PROXY", "SSL_CERT_FILE"):
+                with (
+                    self.subTest(key=key),
+                    mock.patch.dict(GUARD.os.environ, {key: "/tmp/untrusted"}),
+                ):
+                    self.assert_blocked(command, "/workspace")
+
+    def test_gh_transport_rejects_unix_socket_and_fails_closed(self):
+        configured = GUARD.subprocess.CompletedProcess(
+            ["gh"], 0, b"/tmp/gh.sock\n", b""
+        )
+        missing = GUARD.subprocess.CompletedProcess(["gh"], 1, b"", b"")
+        failed = GUARD.subprocess.CompletedProcess(["gh"], 2, b"", b"")
+        with (
+            mock.patch.dict(GUARD.os.environ, {}, clear=True),
+            mock.patch.object(
+                GUARD.subprocess, "run", side_effect=(configured, missing, failed)
+            ) as run,
+        ):
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+        args, kwargs = run.call_args_list[0]
+        self.assertEqual(
+            args[0],
+            ["gh", "config", "get", "http_unix_socket", "--host", "github.com"],
+        )
+        self.assertIs(kwargs["stdin"], GUARD.subprocess.DEVNULL)
+        for key in GUARD.GH_UNSAFE_TRANSPORT_ENVIRONMENT_KEYS:
+            self.assertNotIn(key, kwargs["env"])
 
     def test_restricted_commands_reject_prior_shell_context_mutation(self):
         for command in (
