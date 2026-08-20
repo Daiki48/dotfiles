@@ -272,6 +272,53 @@ def _has_ambiguous_wrapper_options(tokens):
     return False
 
 
+def _env_uses_split_string(tokens):
+    """実行位置のenv optionにsplit-string形があればTrue。"""
+    index = 0
+    while index < len(tokens) and re.match(
+        r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[index]
+    ):
+        index += 1
+    if index >= len(tokens) or os.path.basename(tokens[index]) != "env":
+        return False
+    index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            index += 1
+            continue
+        if (
+            token in {"-S", "--split-string"}
+            or (token.startswith("-S") and token != "-S")
+            or token.startswith("--split-string=")
+        ):
+            return True
+        if token == "--":
+            return False
+        if token in ENV_OPTS_WITH_VALUE:
+            index += 2
+            continue
+        if any(
+            token.startswith(f"{option}=")
+            for option in ENV_OPTS_WITH_VALUE
+            if option.startswith("--")
+        ):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return False
+    return False
+
+
+def _contains_env_split_string(tokens):
+    return any(
+        os.path.basename(token) == "env" and _env_uses_split_string(tokens[index:])
+        for index, token in enumerate(tokens)
+    )
+
+
 def _is_protected_branch(branch):
     branch = branch.removeprefix("refs/heads/")
     return branch in PROTECTED_BRANCHES or any(
@@ -768,7 +815,8 @@ def _gh_api_endpoint(args):
     """gh apiのendpointだけを抽出し、option値をendpointと誤認しない。"""
     value_options = {
         "-X", "--method", "-H", "--header", "-f", "--raw-field", "-F", "--field",
-        "--input", "--jq", "--cache", "--hostname",
+        "--input", "-q", "--jq", "--cache", "--hostname", "-p", "--preview",
+        "-t", "--template",
     }
     index = 0
     while index < len(args):
@@ -2134,10 +2182,12 @@ def _has_unparsed_guarded_command(tokens):
         ".", "eval", "find", "source",
     }
     if ambiguous_compound is not None:
-        return any(
+        return _contains_env_split_string(arguments) or any(
             os.path.basename(token) in guarded or _command_word_has_expansion(token)
             for token in arguments
         )
+    if _env_uses_split_string(arguments):
+        return True
     start = _command_start(arguments)
     if start is None:
         return False
@@ -2231,16 +2281,7 @@ def blocked_reason(command, cwd=None, depth=0):
             and not any(_nested_shell_commands(tokens))
         ):
             return "shellは検査可能な-c inline commandだけを実行できます"
-        if (
-            tokens
-            and os.path.basename(tokens[0]) == "env"
-            and any(
-                token in {"-S", "--split-string"}
-                or (token.startswith("-S") and token != "-S")
-                or token.startswith("--split-string=")
-                for token in tokens[1:]
-            )
-        ):
+        if _env_uses_split_string(tokens):
             return "envのsplit-stringは安全に解析できません"
         if _shell_wraps_restricted_command(tokens):
             return "shell経由のGit/GitHub/削除commandは実行できません"

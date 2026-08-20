@@ -750,6 +750,15 @@ class GuardTest(unittest.TestCase):
         ):
             with self.subTest(endpoint=endpoint):
                 self.assert_blocked(f"gh api '{endpoint}'", "/workspace")
+        for command in (
+            "gh api --preview corsair graphql",
+            "gh api -p corsair graphql",
+            "gh api -q . graphql",
+            "gh api -t '{{.}}' graphql",
+            "gh api --template '{{.}}' graphql",
+        ):
+            with self.subTest(command=command):
+                self.assert_blocked(command, "/workspace")
 
     def test_run_cancel_requires_exact_shape_and_rest_readback(self):
         payload = {
@@ -934,6 +943,11 @@ class GuardTest(unittest.TestCase):
             "if $GIT add -- README.md; then true; fi",
             "if ${GIT} add -- README.md; then true; fi",
             "if g* add -- README.md; then true; fi",
+            "if env -S 'git reset --hard HEAD'; then true; fi",
+            "if env --split-string 'git add -- README.md'; then true; fi",
+            "if env -S \"$CMD\"; then true; fi",
+            "time env -Sgh issue delete 1 --repo owner/repo",
+            "function f { env -Sgit reset --hard HEAD; }; f",
         ):
             with self.subTest(command=command):
                 self.assert_blocked(command, "/workspace")
