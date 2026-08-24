@@ -838,7 +838,7 @@ impl GhSandbox {
         fs::set_permissions(&sandbox.path, fs::Permissions::from_mode(0o700))
             .map_err(|_| error("GitHub CLIのprivate config directoryを保護できません"))?;
         if let Some(hosts) = gh_auth_hosts()? {
-            sandbox.write_private("hosts.yml", &hosts, "GitHub auth hosts.yml")?;
+            sandbox.write_auth_hosts(&hosts)?;
         }
         sync_directory(&sandbox.path, "GitHub CLI private config")?;
         Ok(sandbox)
@@ -866,6 +866,14 @@ impl GhSandbox {
         #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(0o400))
             .map_err(|_| error(format!("{label}のprivate snapshotを固定できません")))?;
+        Ok(path)
+    }
+
+    fn write_auth_hosts(&self, bytes: &[u8]) -> Result<PathBuf> {
+        let path = self.write_private("hosts.yml", bytes, "GitHub auth hosts.yml")?;
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| error("GitHub auth hosts.ymlのprivate snapshotを保護できません"))?;
         Ok(path)
     }
 
@@ -902,9 +910,6 @@ impl GhSandbox {
             index += 1;
         }
         sync_directory(&self.path, "GitHub CLI private snapshot")?;
-        #[cfg(unix)]
-        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o500))
-            .map_err(|_| error("GitHub CLIのprivate config directoryを固定できません"))?;
         Ok(result)
     }
 }
@@ -3817,7 +3822,7 @@ mod tests {
     }
 
     #[test]
-    fn gh_body_file_is_copied_to_a_private_snapshot_before_execution() {
+    fn gh_snapshots_keep_auth_writable_and_body_immutable() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -3835,6 +3840,7 @@ mod tests {
         #[cfg(unix)]
         fs::set_permissions(&sandbox_path, fs::Permissions::from_mode(0o700)).unwrap();
         let sandbox = GhSandbox { path: sandbox_path };
+        let hosts = sandbox.write_auth_hosts(b"github.com:\n").unwrap();
         let args = vec![
             "pr".into(),
             "create".into(),
@@ -3846,10 +3852,20 @@ mod tests {
         let snapshot = rewritten.last().unwrap();
         assert_eq!(fs::read(snapshot).unwrap(), b"safe body");
         #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(snapshot).unwrap().permissions().mode() & 0o777,
-            0o400
-        );
+        {
+            assert_eq!(
+                fs::metadata(snapshot).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+            assert_eq!(
+                fs::metadata(&hosts).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&sandbox.path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
         drop(sandbox);
         fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
