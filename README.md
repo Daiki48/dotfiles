@@ -122,7 +122,15 @@ server-side強制がないためriskをhigh/criticalへ引き上げますが、d
 確認待ちせずdeliveryできます。
 
 `~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
-`~/.agents/skills` are symlinked from this repository.
+`~/.agents/skills`, and `~/.codex/agents` are symlinked from this repository.
+The custom agents use Luna xhigh for non-writing exploration and scoped independent review,
+while the root Sol high agent owns requirements, implementation, integration, and acceptance.
+Subagents inherit the parent runtime permissions, so role-local sandbox settings are not treated
+as a security boundary. The single-writer contract and explicit no-mutation instructions are the
+operational controls against delegated writes, not hard sandbox enforcement. Automated tests,
+lint, type checks, and builds provide exhaustive mechanical
+assurance; review stays focused on the fixed diff, affected paths, risk boundaries, and gaps that
+automation cannot prove.
 `~/.codex/config.toml` remains local because it contains machine-specific
 project trust, hook trust, and TUI state. `cargo run -- codex` backs up the local config
 before migrating the shared top-level settings. If an older setup left `config.toml` as a

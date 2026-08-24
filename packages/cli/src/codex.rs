@@ -73,9 +73,12 @@ const LEGACY_PYTHON_HOOKS: &[(&str, &str)] = &[
     ),
 ];
 
-// Skill は Codex と他の対応エージェントで共有できる標準パスへ配置する。
-// ディレクトリごとリンクすることで、Skill の追加時に CLI 側の列挙を更新せずに済む。
-const CODEX_DIRS: &[(&str, &str)] = &[(".agents/skills", ".agents/skills")];
+// Skill とcustom agentは標準パスへディレクトリごと配置する。
+// 個別項目の追加時にCLI側の列挙を更新せずに済む。
+const CODEX_DIRS: &[(&str, &str)] = &[
+    (".agents/skills", ".agents/skills"),
+    (".codex/agents", ".codex/agents"),
+];
 
 // config.tomlはproject trustやhook trustなどの端末固有値を保持するため、
 // symlinkせず、共有するtop-level keyとagents keyだけをsetup時に移行する。
@@ -3061,7 +3064,7 @@ pub fn setup() -> Result<()> {
             legacy_hash_for_destination(destination),
         )?;
     }
-    println!("\nLinking shared skill directories...");
+    println!("\nLinking shared skill and agent directories...");
     for (source, dest) in CODEX_DIRS {
         ensure_shared_symlink(&dotfiles_path, &home, source, dest)?;
     }
@@ -3090,16 +3093,17 @@ mod tests {
     #[cfg(unix)]
     use super::ensure_shared_symlink;
     use super::{
-        LEGACY_CODEX_DELIVERY_SHA256, LEGACY_CODEX_WORKTREE_SHA256, MANAGED_BINARY_DESTINATIONS,
-        MANAGED_HOOK_COMMAND, MANAGED_HOOK_DESTINATION, ManagedInstallMode, ManagedTransaction,
-        ManagedTransactionKind, PYTHON_MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND,
-        archive_legacy_python_hook, begin_managed_transaction, begin_setup_transaction,
-        complete_setup_transaction, contains_legacy_profile_config, copy_file_exclusive,
-        ensure_config_unchanged, ensure_managed_hook, ensure_managed_hook_with_legacy_hash,
-        ensure_managed_writable_root, ensure_private_directory, legacy_hash_for_destination,
-        managed_hook_state_path, managed_transaction_path, merge_managed_config,
-        merge_managed_config_with_root, migrate_managed_config_from_template,
-        preflight_config_state, preflight_managed_binary_destination, preflight_setup_transaction,
+        CODEX_DIRS, LEGACY_CODEX_DELIVERY_SHA256, LEGACY_CODEX_WORKTREE_SHA256,
+        MANAGED_BINARY_DESTINATIONS, MANAGED_HOOK_COMMAND, MANAGED_HOOK_DESTINATION,
+        ManagedInstallMode, ManagedTransaction, ManagedTransactionKind,
+        PYTHON_MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND, archive_legacy_python_hook,
+        begin_managed_transaction, begin_setup_transaction, complete_setup_transaction,
+        contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
+        ensure_managed_hook, ensure_managed_hook_with_legacy_hash, ensure_managed_writable_root,
+        ensure_private_directory, legacy_hash_for_destination, managed_hook_state_path,
+        managed_transaction_path, merge_managed_config, merge_managed_config_with_root,
+        migrate_managed_config_from_template, preflight_config_state,
+        preflight_managed_binary_destination, preflight_setup_transaction,
         preflight_shared_symlink, publish_regular_file_exclusive, reject_cargo_configuration,
         sha256, trusted_user_executable, valid_release_binary_magic, validate_setup_home,
         verify_managed_symlink, write_file_exclusive,
@@ -3142,6 +3146,42 @@ mod tests {
                 ".local/bin/codex-delivery",
             ]
         );
+    }
+
+    #[test]
+    fn shared_directories_include_skills_and_custom_agents() {
+        assert_eq!(
+            CODEX_DIRS,
+            &[
+                (".agents/skills", ".agents/skills"),
+                (".codex/agents", ".codex/agents"),
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_agents_are_non_writing_luna_xhigh_profiles() {
+        for contents in [
+            include_str!("../../../.codex/agents/explorer.toml"),
+            include_str!("../../../.codex/agents/reviewer.toml"),
+        ] {
+            let document = contents
+                .parse::<toml_edit::DocumentMut>()
+                .expect("parse custom agent profile");
+            assert!(
+                document["name"]
+                    .as_str()
+                    .is_some_and(|name| !name.is_empty())
+            );
+            assert_eq!(document["model"].as_str(), Some("gpt-5.6-luna"));
+            assert_eq!(document["model_reasoning_effort"].as_str(), Some("xhigh"));
+            assert!(
+                document["developer_instructions"]
+                    .as_str()
+                    .is_some_and(|instructions| instructions.contains("状態を変更しない"))
+            );
+            assert!(document.get("sandbox_mode").is_none());
+        }
     }
 
     #[cfg(unix)]

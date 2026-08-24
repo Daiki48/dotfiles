@@ -56,12 +56,12 @@ highとして十分な独立reviewを行うが、decision assessmentは別に判
 
 依存順に各実装単位を処理する。
 
-規模や並列性を問わず、Sol highを最初にleadとして起動する。Solは固定した最小証拠集合からgo/no-go、仕様解釈、最小実装単位を決め、workerはその判断に従う。Solがworker不要と判断した場合も判断結果を残す。互いに独立した事前調査、test結果の整理、非重複ファイルの実装だけをsubagentへ委譲する。workerの既定は`gpt-5.6-luna`のxhighとし、仕様が固定された実装・unit test・明確に切り出せる調査を任せる。Luna maxは、xhighで不足する具体的な根拠（複雑な失敗解析、複数案の探索、重要な検証の反復）があり、Sol leadが品質向上を見込む場合だけ使う。要件解釈、設計判断、統合、最終受入はSol highが担う。同じファイルを複数agentへ同時に編集させず、直列依存の単位はmain agentが処理する。main agentはsubagentの作業を重複せず、統合と受け入れ条件の確認に集中する。
+rootがSol highならroot自身がlead兼single writerとなり、監督のためだけのSolを追加起動しない。rootがSol highでない場合だけ、最初にSol highをleadとして起動する。leadは固定した最小証拠集合からgo/no-go、仕様解釈、test可能な受け入れ条件、最小実装単位を決める。独立した事前調査は状態変更を禁止した`explorer`、最終監査は状態変更を禁止した`reviewer`（いずれも`gpt-5.6-luna`, xhigh）へ委譲できる。subagentのruntime permissionは親から継承されるため、role-local sandboxを安全境界とみなさない。実装と統合は原則としてrootのSolが行う。writeを委譲する例外は、対象file、変更内容、不変条件、test、停止条件を一意に指定できる機械的な非重複作業だけとし、要件解釈や設計判断が必要になった時点で停止させる。Luna maxは、xhighで不足する具体的な根拠があり、Sol leadが品質向上を見込む場合だけ使う。同じファイルを複数agentへ同時に編集させない。
 
-1. 単位の目的、対象、受け入れ条件、依存する完了単位を確認する。
+1. 単位の目的、対象、観測可能な受け入れ条件、追加・更新する回帰test、依存する完了単位を確認する。
 2. 周辺実装とテストを読んでから、依頼スコープの最小変更を行う。無関係な整形や後続単位を混ぜない。
-3. 変更箇所に近いテスト、lint、型検査、buildから実行し、リスクに応じて範囲を広げる。
-4. 差分を正しさ、互換性、セキュリティ、堅牢性、性能、不要変更の観点でself-reviewする。
+3. 変更した挙動を可能な限り回帰testで固定する。変更箇所に近いtest、lint、型検査、buildから実行し、リスクに応じて範囲を広げる。
+4. 固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項だけを正しさ、互換性、セキュリティ、堅牢性、性能、不要変更の観点でself-reviewする。全コードの機械的な網羅確認はtest、lint、型検査、buildへ担わせる。
 5. 変更ファイル名と追加行をsecret検査し、認証情報、local state、個人情報、AI帰属がないことを確認する。
 6. `git -C <専用worktree> add -- <明示パス...>`だけでstageし、同じ専用worktreeで`git diff --cached`とstage対象を再確認する。`SSH_ASKPASS`がある環境では前述の`env -u SSH_ASKPASS`を先頭に付ける。
 7. repositoryの慣例に沿う`:gitmoji: 短い要約`を1件決め、author・signoff・AI帰属を上書きせずcommitする。
@@ -71,12 +71,12 @@ highとして十分な独立reviewを行うが、decision assessmentは別に判
 
 ## 独立した最終監査を行う
 
-全単位完了後、`review-branch` Skillを使う。通常は実装担当の結論を渡さず、次の2つを独立したsubagentへ並行して依頼する。
+全単位完了後、`review-branch` Skillを使う。通常は実装担当の結論を渡さず、状態変更を禁止した`reviewer`として次の2つを独立したsubagentへ並行して依頼する。
 
 1. `gpt-5.6-luna`のxhigh: 中立の立場で、正しさ、境界値、後方互換性、性能、受入条件、test不足を確認する
 2. `gpt-5.6-luna`のxhigh: mergeへ反対する立場で、セキュリティ、秘密情報、堅牢性、競合、resource枯渇、計画・外部仕様・運用との不一致を探す
 
-各subagentへは内部計画、固定したbaseとHEAD、差分、必要最小限の原典だけを渡し、期待する結論や既知の懸念を教えない。Sol highが検証結果と両reviewの指摘を統合し、重複、誤検知、根拠不足を再確認してdelivery準備可否を決める。高リスク変更でSolが必要と判断した場合だけ、Luna xhighによる肯定reviewを追加して受入条件を満たす積極的根拠と不足証拠を確認する。
+各subagentへは内部計画、固定したbaseとHEAD、変更file、影響する経路、必要最小限の原典、共有済みの自動検証結果だけを渡し、期待する結論や既知の懸念を教えない。repository全体の機械的走査や同じtestの再実行は依頼しない。Sol highが検証結果と両reviewの指摘を統合し、重複、誤検知、根拠不足を再確認してdelivery準備可否を決める。高リスク変更でSolが必要と判断した場合だけ、Luna xhighによる肯定reviewを追加して受入条件を満たす積極的根拠と不足証拠を確認する。
 
 依頼スコープ内の有効な指摘は修正、検証、追加commitし、影響箇所と反論観点を再監査する。重大な指摘や必須条件が残る間はpushしない。
 
