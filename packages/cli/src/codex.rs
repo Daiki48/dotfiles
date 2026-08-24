@@ -360,6 +360,23 @@ fn verify_managed_symlink(expected: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn verify_shared_symlink(expected: &Path, destination: &Path) -> Result<()> {
+    verify_managed_symlink(expected, destination)?;
+    let expected = fs::canonicalize(expected)
+        .with_context(|| format!("Failed to resolve managed source {}", expected.display()))?;
+    let actual = fs::read_link(destination)
+        .with_context(|| format!("Failed to read managed symlink {}", destination.display()))?;
+    if actual != expected {
+        anyhow::bail!(
+            "Managed symlink {} uses {}, expected the canonical target {}",
+            destination.display(),
+            actual.display(),
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn copy_symlink_exclusive(source: &Path, destination: &Path) -> Result<()> {
     let target = fs::read_link(source)
@@ -886,15 +903,14 @@ fn preflight_shared_symlink(
     }
 
     let destination_path = home.join(destination);
-    validate_absolute_path(&destination_path)?;
-    reject_symlink_directory_components(
-        destination_path
-            .parent()
-            .context("Shared destination has no parent directory")?,
-    )?;
+    let destination_parent = destination_path
+        .parent()
+        .context("Shared destination has no parent directory")?;
+    validate_absolute_path(destination_parent)?;
+    reject_symlink_directory_components(destination_parent)?;
     match fs::symlink_metadata(&destination_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            verify_managed_symlink(&source_path, &destination_path)?;
+            verify_shared_symlink(&source_path, &destination_path)?;
         }
         Ok(_) => anyhow::bail!(
             "Shared destination is not the expected symlink: {}",
@@ -3226,6 +3242,49 @@ mod tests {
         assert_eq!(
             fs::read(&destination).expect("read conflicting destination"),
             b"local"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_accepts_the_expected_existing_shared_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("preflight-existing-managed-symlink");
+        let dotfiles = directory.path().join("dotfiles");
+        let home = directory.path().join("home");
+        fs::create_dir_all(dotfiles.join(".codex")).expect("create shared source parent");
+        fs::create_dir_all(home.join(".codex")).expect("create shared destination parent");
+        let source = dotfiles.join(".codex/AGENTS.md");
+        fs::write(&source, b"source").expect("write shared source");
+        symlink(&source, home.join(".codex/AGENTS.md")).expect("create expected managed symlink");
+
+        preflight_shared_symlink(&dotfiles, &home, ".codex/AGENTS.md", ".codex/AGENTS.md")
+            .expect("accept expected managed symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_a_noncanonical_shared_symlink_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("preflight-noncanonical-managed-symlink");
+        let dotfiles = directory.path().join("dotfiles");
+        let home = directory.path().join("home");
+        fs::create_dir_all(dotfiles.join(".codex")).expect("create shared source parent");
+        fs::create_dir_all(home.join(".codex")).expect("create shared destination parent");
+        fs::write(dotfiles.join(".codex/AGENTS.md"), b"source").expect("write shared source");
+        let relative_target = Path::new("../../dotfiles/.codex/AGENTS.md");
+        let destination = home.join(".codex/AGENTS.md");
+        symlink(relative_target, &destination).expect("create canonical-equivalent symlink");
+
+        assert!(
+            preflight_shared_symlink(&dotfiles, &home, ".codex/AGENTS.md", ".codex/AGENTS.md")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_link(&destination).expect("read unchanged symlink"),
+            relative_target
         );
     }
 
