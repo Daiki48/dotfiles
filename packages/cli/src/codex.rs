@@ -3032,6 +3032,35 @@ fn build_managed_binary(dotfiles_path: &Path, home: &Path) -> Result<PathBuf> {
     Ok(binary)
 }
 
+/// task worktreeでdelivery安全境界を変更した場合に、共有symlinkやconfigを変更せず、
+/// hashとpending transactionで管理されるguard/helper binaryだけを更新する。
+pub fn refresh_guardrails() -> Result<()> {
+    println!("🛡️ Refreshing managed Codex guardrail binaries...\n");
+    let home = setup_home_dir()?;
+    let codex_dir = resolve_codex_home(&home)?;
+    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    validate_absolute_path(&dotfiles_path)?;
+    preflight_private_directory(&codex_dir)?;
+    preflight_setup_transaction(&codex_dir)?;
+    preflight_managed_binary_paths(&home)?;
+    validate_absolute_path(&dotfiles_path.join("target/release"))?;
+
+    let managed_binary = build_managed_binary(&dotfiles_path, &home)?;
+    preflight_managed_binary_destinations(&managed_binary, &home)?;
+    begin_setup_transaction(&codex_dir)?;
+    for destination in MANAGED_BINARY_DESTINATIONS {
+        ensure_managed_hook_with_legacy_hash(
+            &managed_binary,
+            &home.join(destination),
+            ManagedInstallMode::OwnerExecutable,
+            legacy_hash_for_destination(destination),
+        )?;
+    }
+    complete_setup_transaction(&codex_dir)?;
+    println!("\n✅ Managed Codex guardrail binaries refreshed.");
+    Ok(())
+}
+
 pub fn setup() -> Result<()> {
     println!("🧠 Setting up Codex CLI...\n");
     let home = setup_home_dir()?;
