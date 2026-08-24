@@ -589,12 +589,11 @@ fn validate_absolute_path(path: &Path, label: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-fn codex_home() -> Result<PathBuf> {
-    let candidate = env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
+fn resolve_codex_home(configured: Option<PathBuf>, home: PathBuf) -> Result<PathBuf> {
+    let candidate = configured
         .map(|path| validate_absolute_path(&path, "CODEX_HOME"))
         .transpose()?
-        .unwrap_or(current_user_home()?);
+        .unwrap_or_else(|| home.join(".codex"));
     if !candidate.is_absolute()
         || candidate
             .components()
@@ -617,6 +616,12 @@ fn codex_home() -> Result<PathBuf> {
         }
     }
     Ok(candidate)
+}
+fn codex_home() -> Result<PathBuf> {
+    resolve_codex_home(
+        env::var_os("CODEX_HOME").map(PathBuf::from),
+        current_user_home()?,
+    )
 }
 fn safe_directory(path: &Path) -> Result<()> {
     let metadata =
@@ -3154,6 +3159,23 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
+    }
+
+    #[test]
+    fn codex_home_defaults_to_dot_codex_below_the_account_home() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let home = env::temp_dir().join(format!("codex-delivery-home-{suffix}"));
+        fs::create_dir(&home).expect("create account home fixture");
+
+        assert_eq!(
+            resolve_codex_home(None, home.clone()).expect("resolve default CODEX_HOME"),
+            home.join(".codex")
+        );
+
+        fs::remove_dir(home).expect("remove account home fixture");
     }
 
     fn write_private(path: &Path, value: &Value) {
