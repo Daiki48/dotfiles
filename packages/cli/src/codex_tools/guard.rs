@@ -1120,7 +1120,7 @@ impl GuardGhSandbox {
             let mut destination_file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .mode(0o400)
+                .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(destination)
                 .ok()?;
@@ -1128,7 +1128,6 @@ impl GuardGhSandbox {
             destination_file.sync_all().ok()?;
         }
         sync_body_snapshot_directory(&sandbox.path).ok()?;
-        fs::set_permissions(&sandbox.path, fs::Permissions::from_mode(0o500)).ok()?;
         Some(sandbox)
     }
 
@@ -1203,7 +1202,7 @@ fn remove_expired_gh_snapshot(path: &Path) -> Result<(), String> {
             || file.file_type().is_symlink()
             || file.uid() != unsafe { libc::getuid() }
             || file.nlink() != 1
-            || file.mode() & 0o777 != 0o400
+            || ![0o400, 0o600].contains(&(file.mode() & 0o777))
             || file.len() > MAX_MANIFEST_BYTES
         {
             return Err("expired GH snapshotを安全に検査できません".into());
@@ -6203,7 +6202,19 @@ mod tests {
             .expect("GitHub snapshot path");
         let metadata = fs::symlink_metadata(&snapshot).expect("inspect GitHub snapshot");
         assert!(metadata.is_dir());
-        assert_eq!(metadata.mode() & 0o777, 0o500);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        let hosts = snapshot.join("hosts.yml");
+        if hosts.exists() {
+            let hosts_metadata =
+                fs::symlink_metadata(hosts).expect("inspect GitHub hosts snapshot");
+            assert!(hosts_metadata.is_file());
+            assert_eq!(hosts_metadata.mode() & 0o777, 0o600);
+            fs::set_permissions(
+                snapshot.join("hosts.yml"),
+                fs::Permissions::from_mode(0o400),
+            )
+            .expect("emulate a legacy GitHub hosts snapshot");
+        }
         remove_expired_gh_snapshot(&snapshot).expect("remove test GitHub snapshot");
     }
 
