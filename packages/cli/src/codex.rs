@@ -180,7 +180,10 @@ fn validate_trusted_path_components(path: &Path, allow_final_symlink: bool) -> R
 
 fn trusted_user_executable(home: &Path, relative: &str, name: &str) -> Result<PathBuf> {
     let path = home.join(relative);
-    validate_absolute_path(&path)?;
+    validate_absolute_path(
+        path.parent()
+            .with_context(|| format!("{name} executable has no parent directory"))?,
+    )?;
     validate_trusted_path_components(&path, true)?;
     let canonical = fs::canonicalize(&path)
         .with_context(|| format!("Failed to resolve {name} symlink target {}", path.display()))?;
@@ -3202,6 +3205,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn trusted_user_executable_accepts_a_trusted_symlink_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let trusted_test_root = account_home_dir().expect("resolve account home");
+        let directory = TestDirectory::new_in(&trusted_test_root, "trusted-installer-symlink");
+        let home = directory.path().join("home");
+        let bin = home.join(".local/bin");
+        let release = home.join(".codex/releases/current/codex");
+        fs::create_dir_all(&bin).expect("create tool directory");
+        fs::create_dir_all(release.parent().expect("release parent"))
+            .expect("create release directory");
+        fs::write(&release, b"ELF").expect("write release tool");
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o755))
+            .expect("set release tool mode");
+        let link = bin.join("codex");
+        symlink(&release, &link).expect("link trusted release tool");
+
+        assert_eq!(
+            trusted_user_executable(&home, ".local/bin/codex", "Codex CLI")
+                .expect("accept trusted symlink target"),
+            link
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn trusted_user_executable_rejects_untrusted_symlink_target_and_mode() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -3511,11 +3540,16 @@ mod tests {
 
     impl TestDirectory {
         fn new(label: &str) -> Self {
+            Self::new_in(&std::env::temp_dir(), label)
+        }
+
+        fn new_in(parent: &Path, label: &str) -> Self {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock is after UNIX_EPOCH")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
+            fs::create_dir_all(parent).expect("create temporary test parent");
+            let path = parent.join(format!(
                 "dotfiles-codex-{label}-{}-{timestamp}",
                 std::process::id()
             ));
