@@ -1452,6 +1452,19 @@ fn review_receipt_scope_matches(existing: &Value, proposed: &Value) -> bool {
     .iter()
     .all(|key| existing.get(*key) == proposed.get(*key))
 }
+fn review_request_is_idempotent(
+    existing_risk: &str,
+    requested_risk: &str,
+    existing_decision: &str,
+    approved: bool,
+) -> bool {
+    let requested_decision = if approved {
+        "human-approved"
+    } else {
+        "autonomous"
+    };
+    existing_risk == requested_risk && existing_decision == requested_decision
+}
 #[allow(clippy::too_many_arguments)]
 fn write_review_locked(
     root: &Path,
@@ -1541,7 +1554,7 @@ fn write_review_locked(
         {
             return Err(error("同じheadのreceiptをdowngradeできません"));
         }
-        if risk_value == old_risk && (approved || old_decision == "autonomous") {
+        if review_request_is_idempotent(&old_risk, risk_value, &old_decision, approved) {
             return Ok(existing);
         }
         atomic_json(&path, &payload)?;
@@ -2872,15 +2885,17 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             .strip_prefix("--")
             .ok_or_else(|| error("argumentが不正です"))?
             .to_string();
-        if [
+        let flag_options = [
             "tests-passed",
             "independent-review-passed",
             "specialist-review-passed",
-        ]
-        .contains(&normalized.as_str())
-        {
-            flags.insert(normalized);
-        } else {
+        ];
+        let value_options = ["task-id", "pr", "head", "risk", "plan-id", "gate-mode"];
+        if flag_options.contains(&normalized.as_str()) {
+            if !flags.insert(normalized) {
+                return Err(error("argumentが重複しています"));
+            }
+        } else if value_options.contains(&normalized.as_str()) {
             let value = current
                 .next()
                 .ok_or_else(|| error(format!("--{normalized}の値が不足しています")))?
@@ -2889,6 +2904,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             if values.insert(normalized.clone(), value).is_some() {
                 return Err(error("argumentが重複しています"));
             }
+        } else {
+            return Err(error(format!("--{normalized}は許可されていません")));
         }
     }
     let task = task_id(
@@ -3238,6 +3255,34 @@ mod tests {
     }
 
     #[test]
+    fn review_request_only_reuses_the_same_decision_and_risk() {
+        assert!(review_request_is_idempotent(
+            "low",
+            "low",
+            "autonomous",
+            false
+        ));
+        assert!(review_request_is_idempotent(
+            "high",
+            "high",
+            "human-approved",
+            true
+        ));
+        assert!(!review_request_is_idempotent(
+            "low",
+            "low",
+            "autonomous",
+            true
+        ));
+        assert!(!review_request_is_idempotent(
+            "low",
+            "high",
+            "autonomous",
+            false
+        ));
+    }
+
+    #[test]
     fn receipt_v1_and_v2_are_normalized_without_relaxing_legacy_approval() {
         let common = [
             ("kind", string("review")),
@@ -3515,6 +3560,48 @@ mod tests {
         assert!(parse_args(args("low", true)).is_err());
         assert!(parse_args(args("high", false)).is_err());
         assert!(parse_args(args("high", true)).is_ok());
+    }
+
+    #[test]
+    fn parser_rejects_unknown_legacy_options_and_duplicate_flags() {
+        let mut legacy = vec![
+            OsString::from("record-review"),
+            OsString::from("--task-id"),
+            OsString::from("issue-24"),
+            OsString::from("--pr"),
+            OsString::from("24"),
+            OsString::from("--head"),
+            OsString::from("b".repeat(40)),
+            OsString::from("--risk"),
+            OsString::from("low"),
+            OsString::from("--plan-id"),
+            OsString::from("CODEX-DELIVERY-TEST-v1"),
+            OsString::from("--tests-passed"),
+            OsString::from("--independent-review-passed"),
+        ];
+        legacy.extend([
+            OsString::from("--neutral-review-passed"),
+            OsString::from("true"),
+        ]);
+        assert!(parse_args(legacy).is_err());
+
+        let mut duplicate = vec![
+            OsString::from("record-review"),
+            OsString::from("--task-id"),
+            OsString::from("issue-24"),
+            OsString::from("--pr"),
+            OsString::from("24"),
+            OsString::from("--head"),
+            OsString::from("b".repeat(40)),
+            OsString::from("--risk"),
+            OsString::from("low"),
+            OsString::from("--plan-id"),
+            OsString::from("CODEX-DELIVERY-TEST-v1"),
+            OsString::from("--tests-passed"),
+            OsString::from("--independent-review-passed"),
+        ];
+        duplicate.push(OsString::from("--independent-review-passed"));
+        assert!(parse_args(duplicate).is_err());
     }
 
     #[test]
