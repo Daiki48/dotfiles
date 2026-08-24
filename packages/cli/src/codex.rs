@@ -16,7 +16,7 @@ use std::{
 };
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
-use crate::codex_tools::process;
+use crate::codex_tools::{process, worktree};
 const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
     (".codex/rules/default.rules", ".codex/rules/default.rules"),
@@ -52,6 +52,8 @@ const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 const MANAGED_TRANSACTION_SUFFIX: &str = ".managed.pending";
 const SETUP_TRANSACTION_NAME: &str = ".rust-guardrails-setup.pending";
 const SETUP_TRANSACTION_CONTENTS: &str = "v1\nrust-guardrails\n";
+const REFRESH_TRANSACTION_NAME: &str = ".rust-guardrails-refresh.pending";
+const REFRESH_TRANSACTION_CONTENTS: &str = "v1\nrust-guardrails-refresh\n";
 
 // These are the exact SHA-256 values of
 // `origin/main:.codex/helpers/codex-{worktree,delivery}` from the last Python
@@ -2881,6 +2883,53 @@ fn complete_setup_transaction(codex_dir: &Path) -> Result<()> {
     sync_parent_directory(&path)
 }
 
+fn preflight_refresh_transaction(codex_dir: &Path) -> Result<bool> {
+    let path = codex_dir.join(REFRESH_TRANSACTION_NAME);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to inspect refresh transaction {}", path.display())
+            });
+        }
+    };
+    verify_current_user_regular_file(&path, &metadata)?;
+    #[cfg(unix)]
+    if metadata.mode() & 0o077 != 0 {
+        anyhow::bail!("Refresh transaction is not private: {}", path.display());
+    }
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read refresh transaction {}", path.display()))?;
+    if contents != REFRESH_TRANSACTION_CONTENTS {
+        anyhow::bail!("Refresh transaction is invalid: {}", path.display());
+    }
+    Ok(true)
+}
+
+fn begin_refresh_transaction(codex_dir: &Path) -> Result<()> {
+    if preflight_refresh_transaction(codex_dir)? {
+        println!("- Resuming the interrupted Codex guardrail refresh transaction.");
+        return Ok(());
+    }
+    let path = codex_dir.join(REFRESH_TRANSACTION_NAME);
+    publish_regular_file_exclusive(
+        &path,
+        REFRESH_TRANSACTION_CONTENTS,
+        private_file_permissions(&fs::metadata(codex_dir)?.permissions()),
+    )
+}
+
+fn complete_refresh_transaction(codex_dir: &Path) -> Result<()> {
+    let path = codex_dir.join(REFRESH_TRANSACTION_NAME);
+    if !preflight_refresh_transaction(codex_dir)? {
+        anyhow::bail!("Refresh transaction disappeared before completion");
+    }
+    remove_managed_file(&path)
+        .with_context(|| format!("Failed to complete refresh transaction {}", path.display()))?;
+    sync_parent_directory(&path)
+}
+
 fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         fs::canonicalize(path)
@@ -2997,6 +3046,9 @@ fn preflight_setup_state(home: &Path, codex_dir: &Path, dotfiles_path: &Path) ->
     preflight_config_state(codex_dir, &dotfiles_path.join(CODEX_CONFIG_TEMPLATE))?;
     preflight_retired_state(codex_dir)?;
     preflight_setup_transaction(codex_dir)?;
+    if preflight_refresh_transaction(codex_dir)? {
+        anyhow::bail!("Complete the interrupted Codex guardrail refresh before full setup");
+    }
     preflight_managed_binary_paths(home)?;
     validate_absolute_path(&dotfiles_path.join("target/release"))?;
     Ok(())
@@ -3040,14 +3092,19 @@ pub fn refresh_guardrails() -> Result<()> {
     let codex_dir = resolve_codex_home(&home)?;
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
     validate_absolute_path(&dotfiles_path)?;
+    worktree::verify_managed_refresh_source(&dotfiles_path)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     preflight_private_directory(&codex_dir)?;
-    preflight_setup_transaction(&codex_dir)?;
+    if preflight_setup_transaction(&codex_dir)? {
+        anyhow::bail!("Complete the interrupted full Codex setup before guardrail refresh");
+    }
+    preflight_refresh_transaction(&codex_dir)?;
     preflight_managed_binary_paths(&home)?;
     validate_absolute_path(&dotfiles_path.join("target/release"))?;
 
     let managed_binary = build_managed_binary(&dotfiles_path, &home)?;
     preflight_managed_binary_destinations(&managed_binary, &home)?;
-    begin_setup_transaction(&codex_dir)?;
+    begin_refresh_transaction(&codex_dir)?;
     for destination in MANAGED_BINARY_DESTINATIONS {
         ensure_managed_hook_with_legacy_hash(
             &managed_binary,
@@ -3056,7 +3113,7 @@ pub fn refresh_guardrails() -> Result<()> {
             legacy_hash_for_destination(destination),
         )?;
     }
-    complete_setup_transaction(&codex_dir)?;
+    complete_refresh_transaction(&codex_dir)?;
     println!("\n✅ Managed Codex guardrail binaries refreshed.");
     Ok(())
 }
@@ -3145,16 +3202,17 @@ mod tests {
         MANAGED_BINARY_DESTINATIONS, MANAGED_HOOK_COMMAND, MANAGED_HOOK_DESTINATION,
         ManagedInstallMode, ManagedTransaction, ManagedTransactionKind,
         PYTHON_MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND, archive_legacy_python_hook,
-        begin_managed_transaction, begin_setup_transaction, complete_setup_transaction,
-        contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
-        ensure_managed_hook, ensure_managed_hook_with_legacy_hash, ensure_managed_writable_root,
+        begin_managed_transaction, begin_refresh_transaction, begin_setup_transaction,
+        complete_refresh_transaction, complete_setup_transaction, contains_legacy_profile_config,
+        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook,
+        ensure_managed_hook_with_legacy_hash, ensure_managed_writable_root,
         ensure_private_directory, legacy_hash_for_destination, managed_hook_state_path,
         managed_transaction_path, merge_managed_config, merge_managed_config_with_root,
         migrate_managed_config_from_template, preflight_config_state,
-        preflight_managed_binary_destination, preflight_setup_transaction,
-        preflight_shared_symlink, publish_regular_file_exclusive, reject_cargo_configuration,
-        sha256, trusted_user_executable, valid_release_binary_magic, validate_setup_home,
-        verify_managed_symlink, write_file_exclusive,
+        preflight_managed_binary_destination, preflight_refresh_transaction,
+        preflight_setup_transaction, preflight_shared_symlink, publish_regular_file_exclusive,
+        reject_cargo_configuration, sha256, trusted_user_executable, valid_release_binary_magic,
+        validate_setup_home, verify_managed_symlink, write_file_exclusive,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3443,6 +3501,23 @@ mod tests {
         begin_setup_transaction(directory.path()).expect("resume setup transaction");
         complete_setup_transaction(directory.path()).expect("complete setup transaction");
         assert!(!preflight_setup_transaction(directory.path()).expect("completed preflight"));
+    }
+
+    #[test]
+    fn refresh_transaction_is_separate_and_resumable() {
+        let directory = TestDirectory::new("refresh-transaction");
+        fs::create_dir_all(directory.path()).expect("create refresh directory");
+
+        begin_setup_transaction(directory.path()).expect("begin setup transaction");
+        assert!(complete_refresh_transaction(directory.path()).is_err());
+        assert!(preflight_setup_transaction(directory.path()).expect("setup remains pending"));
+        complete_setup_transaction(directory.path()).expect("complete setup transaction");
+
+        begin_refresh_transaction(directory.path()).expect("begin refresh transaction");
+        assert!(preflight_refresh_transaction(directory.path()).expect("refresh is pending"));
+        begin_refresh_transaction(directory.path()).expect("resume refresh transaction");
+        complete_refresh_transaction(directory.path()).expect("complete refresh transaction");
+        assert!(!preflight_refresh_transaction(directory.path()).expect("refresh completed"));
     }
 
     #[test]
