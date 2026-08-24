@@ -50,6 +50,7 @@ const MANAGED_BINARY_DESTINATIONS: &[&str] = &[
 ];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 const MANAGED_TRANSACTION_SUFFIX: &str = ".managed.pending";
+const GUARDRAIL_OPERATION_LOCK_NAME: &str = ".codex-rust-guardrails.lock";
 const SETUP_TRANSACTION_NAME: &str = ".rust-guardrails-setup.pending";
 const SETUP_TRANSACTION_CONTENTS: &str = "v1\nrust-guardrails\n";
 const REFRESH_TRANSACTION_CONTENTS: &str = "v1\nrust-guardrails-refresh\n";
@@ -2859,6 +2860,73 @@ fn preflight_operation_transaction(codex_dir: &Path) -> Result<Option<String>> {
     Ok(Some(contents))
 }
 
+#[cfg(unix)]
+struct GuardrailOperationLock {
+    _file: OwnedFd,
+}
+
+#[cfg(unix)]
+impl GuardrailOperationLock {
+    fn acquire(home: &Path) -> Result<Self> {
+        let path = home.join(GUARDRAIL_OPERATION_LOCK_NAME);
+        let (parent, name) = open_anchored_parent(&path, false)?;
+        // SAFETY: parent and name remain valid; the returned descriptor is owned here.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Failed to open guardrail lock {}", path.display()));
+        }
+        // SAFETY: openat returned a new descriptor owned by this guard.
+        let file = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: file is open and stat points to writable storage.
+        if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Failed to inspect guardrail lock {}", path.display()));
+        }
+        // SAFETY: fstat succeeded and initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || stat.st_uid != current_uid()
+            || stat.st_mode & 0o077 != 0
+            || stat.st_nlink != 1
+        {
+            anyhow::bail!(
+                "Guardrail lock has an unsafe owner, mode, link count, or file type: {}",
+                path.display()
+            );
+        }
+        // SAFETY: file is an open regular-file descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!("Another Codex guardrail operation is active");
+            }
+            return Err(error)
+                .with_context(|| format!("Failed to lock guardrail operation {}", path.display()));
+        }
+        sync_open_directory(&parent, &path)?;
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(not(unix))]
+struct GuardrailOperationLock;
+
+#[cfg(not(unix))]
+impl GuardrailOperationLock {
+    fn acquire(_home: &Path) -> Result<Self> {
+        anyhow::bail!("Codex guardrail operation locking is supported only on Unix")
+    }
+}
+
 fn preflight_expected_operation(codex_dir: &Path, expected: &str) -> Result<bool> {
     match preflight_operation_transaction(codex_dir)? {
         None => Ok(false),
@@ -3083,6 +3151,7 @@ pub fn refresh_guardrails() -> Result<()> {
     validate_absolute_path(&dotfiles_path)?;
     worktree::verify_managed_refresh_source(&dotfiles_path)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let _operation_lock = GuardrailOperationLock::acquire(&home)?;
     preflight_private_directory(&codex_dir)?;
     preflight_refresh_transaction(&codex_dir)?;
     preflight_managed_binary_paths(&home)?;
@@ -3118,6 +3187,7 @@ pub fn setup() -> Result<()> {
     }
     let codex_dir = resolve_codex_home(&home)?;
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    let _operation_lock = GuardrailOperationLock::acquire(&home)?;
     preflight_setup_state(&home, &codex_dir, &dotfiles_path)?;
 
     let codex_binary = codex_binary_path(&home).with_context(|| {
@@ -3543,6 +3613,24 @@ mod tests {
             assert_eq!(operation, super::REFRESH_TRANSACTION_CONTENTS);
             complete_refresh_transaction(directory.path()).expect("complete refresh winner");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guardrail_operation_lock_rejects_concurrent_resume() {
+        let directory = TestDirectory::new("guardrail-operation-lock");
+        let first = super::GuardrailOperationLock::acquire(directory.path())
+            .expect("acquire first operation lock");
+        begin_refresh_transaction(directory.path()).expect("begin refresh transaction");
+
+        assert!(super::GuardrailOperationLock::acquire(directory.path()).is_err());
+
+        drop(first);
+        let resumed = super::GuardrailOperationLock::acquire(directory.path())
+            .expect("acquire operation lock after interrupted owner exits");
+        begin_refresh_transaction(directory.path()).expect("resume refresh after lock release");
+        complete_refresh_transaction(directory.path()).expect("complete resumed refresh");
+        drop(resumed);
     }
 
     #[test]
