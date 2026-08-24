@@ -886,12 +886,11 @@ fn preflight_shared_symlink(
     }
 
     let destination_path = home.join(destination);
-    validate_absolute_path(&destination_path)?;
-    reject_symlink_directory_components(
-        destination_path
-            .parent()
-            .context("Shared destination has no parent directory")?,
-    )?;
+    let destination_parent = destination_path
+        .parent()
+        .context("Shared destination has no parent directory")?;
+    validate_absolute_path(destination_parent)?;
+    reject_symlink_directory_components(destination_parent)?;
     match fs::symlink_metadata(&destination_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             verify_managed_symlink(&source_path, &destination_path)?;
@@ -3227,6 +3226,24 @@ mod tests {
             fs::read(&destination).expect("read conflicting destination"),
             b"local"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_accepts_the_expected_existing_shared_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("preflight-existing-managed-symlink");
+        let dotfiles = directory.path().join("dotfiles");
+        let home = directory.path().join("home");
+        fs::create_dir_all(dotfiles.join(".codex")).expect("create shared source parent");
+        fs::create_dir_all(home.join(".codex")).expect("create shared destination parent");
+        let source = dotfiles.join(".codex/AGENTS.md");
+        fs::write(&source, b"source").expect("write shared source");
+        symlink(&source, home.join(".codex/AGENTS.md")).expect("create expected managed symlink");
+
+        preflight_shared_symlink(&dotfiles, &home, ".codex/AGENTS.md", ".codex/AGENTS.md")
+            .expect("accept expected managed symlink");
     }
 
     #[cfg(unix)]
