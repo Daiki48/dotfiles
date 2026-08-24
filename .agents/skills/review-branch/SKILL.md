@@ -20,7 +20,7 @@ commit、push、Ready化、merge、cleanupは呼び出し元が行う。レビ�
 
 ## 2つの独立reviewを並行実行する
 
-可能なら実装を担当していない読み取り専用の`reviewer`を2つ使う。各subagentへ期待する結論、既知の懸念、他reviewerの所見を渡さず、ファイルを変更しないよう指示する。review範囲は固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項に限定する。網羅的な機械検証は共有済みのtest、lint、型検査、buildへ担わせ、各reviewerは同じ検証を繰り返さない。
+可能なら実装を担当していない`reviewer`を2つ使い、状態変更を明示的に禁止する。subagentのruntime permissionは親から継承されるため、role-local sandboxを安全境界とみなさない。各subagentへ期待する結論、既知の懸念、他reviewerの所見を渡さず、ファイルを変更しないよう指示する。review範囲は固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項に限定する。網羅的な機械検証は共有済みのtest、lint、型検査、buildへ担わせ、各reviewerは同じ検証を繰り返さない。
 
 1. **中立reviewer** (`gpt-5.6-luna`, xhigh): 要件、制御flow、境界値、error処理、設定・CLI・保存形式の後方互換性、性能、受入条件、test不足を確認する。
 2. **反論reviewer** (`gpt-5.6-luna`, xhigh): 「mergeすべきでない」と仮定し、入力検証、認証・認可、秘密情報、注入、path traversal、競合、timeout、retry、依存関係、resource枯渇、計画からの逸脱、外部仕様、運用、rollbackの弱点を探す。

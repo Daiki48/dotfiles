@@ -3160,7 +3160,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_agents_are_read_only_luna_xhigh_profiles() {
+    fn custom_agents_are_non_writing_luna_xhigh_profiles() {
         for contents in [
             include_str!("../../../.codex/agents/explorer.toml"),
             include_str!("../../../.codex/agents/reviewer.toml"),
@@ -3175,12 +3175,12 @@ mod tests {
             );
             assert_eq!(document["model"].as_str(), Some("gpt-5.6-luna"));
             assert_eq!(document["model_reasoning_effort"].as_str(), Some("xhigh"));
-            assert_eq!(document["sandbox_mode"].as_str(), Some("read-only"));
             assert!(
                 document["developer_instructions"]
                     .as_str()
-                    .is_some_and(|instructions| !instructions.trim().is_empty())
+                    .is_some_and(|instructions| instructions.contains("状態を変更しない"))
             );
+            assert!(document.get("sandbox_mode").is_none());
         }
     }
 

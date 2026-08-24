@@ -56,7 +56,7 @@ highとして十分な独立reviewを行うが、decision assessmentは別に判
 
 依存順に各実装単位を処理する。
 
-rootがSol highならroot自身がlead兼single writerとなり、監督のためだけのSolを追加起動しない。rootがSol highでない場合だけ、最初にSol highをleadとして起動する。leadは固定した最小証拠集合からgo/no-go、仕様解釈、test可能な受け入れ条件、最小実装単位を決める。独立した事前調査は読み取り専用の`explorer`、最終監査は読み取り専用の`reviewer`（いずれも`gpt-5.6-luna`, xhigh）へ委譲できる。実装と統合は原則としてrootのSolが行う。writeを委譲する例外は、対象file、変更内容、不変条件、test、停止条件を一意に指定できる機械的な非重複作業だけとし、要件解釈や設計判断が必要になった時点で停止させる。Luna maxは、xhighで不足する具体的な根拠があり、Sol leadが品質向上を見込む場合だけ使う。同じファイルを複数agentへ同時に編集させない。
+rootがSol highならroot自身がlead兼single writerとなり、監督のためだけのSolを追加起動しない。rootがSol highでない場合だけ、最初にSol highをleadとして起動する。leadは固定した最小証拠集合からgo/no-go、仕様解釈、test可能な受け入れ条件、最小実装単位を決める。独立した事前調査は状態変更を禁止した`explorer`、最終監査は状態変更を禁止した`reviewer`（いずれも`gpt-5.6-luna`, xhigh）へ委譲できる。subagentのruntime permissionは親から継承されるため、role-local sandboxを安全境界とみなさない。実装と統合は原則としてrootのSolが行う。writeを委譲する例外は、対象file、変更内容、不変条件、test、停止条件を一意に指定できる機械的な非重複作業だけとし、要件解釈や設計判断が必要になった時点で停止させる。Luna maxは、xhighで不足する具体的な根拠があり、Sol leadが品質向上を見込む場合だけ使う。同じファイルを複数agentへ同時に編集させない。
 
 1. 単位の目的、対象、観測可能な受け入れ条件、追加・更新する回帰test、依存する完了単位を確認する。
 2. 周辺実装とテストを読んでから、依頼スコープの最小変更を行う。無関係な整形や後続単位を混ぜない。
@@ -71,7 +71,7 @@ rootがSol highならroot自身がlead兼single writerとなり、監督のた�
 
 ## 独立した最終監査を行う
 
-全単位完了後、`review-branch` Skillを使う。通常は実装担当の結論を渡さず、読み取り専用の`reviewer`として次の2つを独立したsubagentへ並行して依頼する。
+全単位完了後、`review-branch` Skillを使う。通常は実装担当の結論を渡さず、状態変更を禁止した`reviewer`として次の2つを独立したsubagentへ並行して依頼する。
 
 1. `gpt-5.6-luna`のxhigh: 中立の立場で、正しさ、境界値、後方互換性、性能、受入条件、test不足を確認する
 2. `gpt-5.6-luna`のxhigh: mergeへ反対する立場で、セキュリティ、秘密情報、堅牢性、競合、resource枯渇、計画・外部仕様・運用との不一致を探す
