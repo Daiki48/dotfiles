@@ -25,16 +25,18 @@
 - Draft PRの作成は実装の中間点であり、完了条件ではありません。Draft作成後は専用の
   `codex-delivery` helperを唯一の`record-review`、`approve-review`、`deliver`、`finish`経路として使い、
   review receipt、Ready化・merge、main同期、managed cleanupを一続きで検証します。すべての
-  commandで`--task-id`、`--pr`、`--head`、`--plan-id`を明示し、review記録時はriskと3つの
-  検証完了flagも固定します。
+  commandで`--task-id`、`--pr`、`--head`、`--plan-id`を明示し、review記録時はrisk、test、標準review、
+  high/criticalだけ変更固有の専門reviewの完了証拠も固定します。
 - risk分類とDaikiの意思決定要否を分離します。low/medium/high/criticalのいずれでも、仕様、既存権限、
   rollback、検証をCodexが根拠付きで確定できる場合は`record-review`で自律deliveryします。製品判断、
   追加権限、費用、不可逆性、重大な残存リスクの受容などDaikiだけが決められる事項がある場合だけ、
   明示判断後に`approve-review`を使います。技術gateの失敗や不明状態はapprovalで迂回せずblockedとします。
-- すべてのタスクで、固定したPR head SHAに対するCIと独立reviewを行います。
+- すべてのタスクで、固定したPR head SHAに対するCIと1つの標準独立reviewを行います。high/criticalだけ、
+  変更で実際に触れる主要な高リスク境界を対象とする専門reviewを1つ追加します。一般的な反論役や肯定役は使いません。
   `actionable=0`、未解決thread=0、required checkが文字通り`success`、選択したremote gateが
   成立する同一SHAだけをdeliver対象とし、修正可能な指摘は自律的に修正して新SHAで
-  reviewと検証をやり直します。条件成立後のReady、merge、mainのfetch後の`merge --ff-only`、
+  reviewと検証をやり直します。review起因の修正roundは最大2回とし、それでも実欠陥が残る場合は
+  新しい修正loopを始めずblockedとします。条件成立後のReady、merge、mainのfetch後の`merge --ff-only`、
   managed cleanupまでをhelperに委ねます。
 - live Rulesetを既定のremote gateとします。GitHub Freeのprivate repositoryでは、
   `--gate-mode github-free-private`をreview receipt、deliver、finishで明示できます。このmodeでは

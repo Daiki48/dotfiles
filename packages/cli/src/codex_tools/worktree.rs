@@ -1688,6 +1688,53 @@ fn load_manifests(repository: &Repository) -> Result<Vec<(PathBuf, Manifest)>, W
     Ok(manifests)
 }
 
+fn verify_managed_refresh_source_with_local_origin(
+    root: &Path,
+    allow_local_origin: bool,
+) -> Result<(), WorktreeError> {
+    let root = fs::canonicalize(root)
+        .map_err(|cause| error(format!("refresh sourceを解決できません: {cause}")))?;
+    let common_git_dir = absolute_git_path(&root, "--git-common-dir")?;
+    let repository_root = common_git_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| error("refresh source repositoryを確認できません"))?;
+    let (github_name, origin_url) = origin_identity(&repository_root, allow_local_origin)?;
+    let repository = Repository {
+        root: repository_root,
+        common_git_dir,
+        github_name,
+        origin_url,
+        default_branch: String::new(),
+        default_oid: String::new(),
+    };
+    let branch = git_stdout(&root, &["rev-parse", "--abbrev-ref", "HEAD"])?
+        .trim()
+        .to_string();
+    let status = git_stdout(
+        &root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    let matches = load_manifests(&repository)?
+        .into_iter()
+        .filter(|(_, manifest)| {
+            manifest.status == "ready"
+                && manifest.branch == branch
+                && Path::new(&manifest.worktree) == root
+        })
+        .count();
+    if matches != 1 || !status.trim().is_empty() || is_protected(&branch) {
+        return Err(error(
+            "guardrail refreshはcleanなready managed task worktreeから実行してください",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_managed_refresh_source(root: &Path) -> Result<(), WorktreeError> {
+    verify_managed_refresh_source_with_local_origin(root, false)
+}
+
 fn diagnose(
     cwd: &Path,
     task_id: Option<&str>,
@@ -2164,6 +2211,20 @@ mod tests {
         assert_ne!(
             repository_key("a--b/c").unwrap(),
             repository_key("a/b--c").unwrap()
+        );
+    }
+
+    #[test]
+    fn guardrail_refresh_source_requires_a_clean_ready_managed_worktree() {
+        let fixture = TemporaryRepository::new();
+        let target =
+            create_worktree(&fixture.repository, "feat/refresh", "task-refresh", true).unwrap();
+        assert!(verify_managed_refresh_source_with_local_origin(&target, true).is_ok());
+
+        fs::write(target.join("untracked.txt"), "dirty\n").expect("dirty managed worktree");
+        assert!(verify_managed_refresh_source_with_local_origin(&target, true).is_err());
+        assert!(
+            verify_managed_refresh_source_with_local_origin(&fixture.repository, true).is_err()
         );
     }
 

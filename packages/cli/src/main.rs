@@ -73,6 +73,9 @@ enum Commands {
     Claude,
     /// Setup for Codex CLI
     Codex,
+    /// Refresh only managed Codex guardrail binaries from a task worktree
+    #[command(hide = true)]
+    CodexGuardrails,
     /// Setup for Gemini CLI
     Gemini,
 }
@@ -188,6 +191,9 @@ fn run() -> anyhow::Result<()> {
         }
         Commands::Codex => {
             codex::setup()?;
+        }
+        Commands::CodexGuardrails => {
+            codex::refresh_guardrails()?;
         }
         Commands::Gemini => {
             gemini::setup()?;

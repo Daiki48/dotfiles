@@ -16,7 +16,7 @@ use std::{
 };
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
-use crate::codex_tools::process;
+use crate::codex_tools::{process, worktree};
 const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
     (".codex/rules/default.rules", ".codex/rules/default.rules"),
@@ -50,8 +50,10 @@ const MANAGED_BINARY_DESTINATIONS: &[&str] = &[
 ];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 const MANAGED_TRANSACTION_SUFFIX: &str = ".managed.pending";
+const GUARDRAIL_OPERATION_LOCK_NAME: &str = ".codex-rust-guardrails.lock";
 const SETUP_TRANSACTION_NAME: &str = ".rust-guardrails-setup.pending";
 const SETUP_TRANSACTION_CONTENTS: &str = "v1\nrust-guardrails\n";
+const REFRESH_TRANSACTION_CONTENTS: &str = "v1\nrust-guardrails-refresh\n";
 
 // These are the exact SHA-256 values of
 // `origin/main:.codex/helpers/codex-{worktree,delivery}` from the last Python
@@ -2834,11 +2836,11 @@ fn preflight_retired_state(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn preflight_setup_transaction(codex_dir: &Path) -> Result<bool> {
+fn preflight_operation_transaction(codex_dir: &Path) -> Result<Option<String>> {
     let path = codex_dir.join(SETUP_TRANSACTION_NAME);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("Failed to inspect setup transaction {}", path.display())
@@ -2852,33 +2854,140 @@ fn preflight_setup_transaction(codex_dir: &Path) -> Result<bool> {
     }
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read setup transaction {}", path.display()))?;
-    if contents != SETUP_TRANSACTION_CONTENTS {
+    if ![SETUP_TRANSACTION_CONTENTS, REFRESH_TRANSACTION_CONTENTS].contains(&contents.as_str()) {
         anyhow::bail!("Setup transaction is invalid: {}", path.display());
     }
-    Ok(true)
+    Ok(Some(contents))
 }
 
-fn begin_setup_transaction(codex_dir: &Path) -> Result<()> {
-    if preflight_setup_transaction(codex_dir)? {
-        println!("- Resuming the interrupted Rust guardrail setup transaction.");
+#[cfg(unix)]
+struct GuardrailOperationLock {
+    _file: OwnedFd,
+}
+
+#[cfg(unix)]
+impl GuardrailOperationLock {
+    fn acquire(home: &Path) -> Result<Self> {
+        let path = home.join(GUARDRAIL_OPERATION_LOCK_NAME);
+        let (parent, name) = open_anchored_parent(&path, false)?;
+        // SAFETY: parent and name remain valid; the returned descriptor is owned here.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Failed to open guardrail lock {}", path.display()));
+        }
+        // SAFETY: openat returned a new descriptor owned by this guard.
+        let file = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: file is open and stat points to writable storage.
+        if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Failed to inspect guardrail lock {}", path.display()));
+        }
+        // SAFETY: fstat succeeded and initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || stat.st_uid != current_uid()
+            || stat.st_mode & 0o077 != 0
+            || stat.st_nlink != 1
+        {
+            anyhow::bail!(
+                "Guardrail lock has an unsafe owner, mode, link count, or file type: {}",
+                path.display()
+            );
+        }
+        // SAFETY: file is an open regular-file descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!("Another Codex guardrail operation is active");
+            }
+            return Err(error)
+                .with_context(|| format!("Failed to lock guardrail operation {}", path.display()));
+        }
+        sync_open_directory(&parent, &path)?;
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(not(unix))]
+struct GuardrailOperationLock;
+
+#[cfg(not(unix))]
+impl GuardrailOperationLock {
+    fn acquire(_home: &Path) -> Result<Self> {
+        anyhow::bail!("Codex guardrail operation locking is supported only on Unix")
+    }
+}
+
+fn preflight_expected_operation(codex_dir: &Path, expected: &str) -> Result<bool> {
+    match preflight_operation_transaction(codex_dir)? {
+        None => Ok(false),
+        Some(contents) if contents == expected => Ok(true),
+        Some(_) => anyhow::bail!("Another Codex guardrail operation is incomplete"),
+    }
+}
+
+fn begin_operation_transaction(codex_dir: &Path, contents: &str, label: &str) -> Result<()> {
+    if preflight_expected_operation(codex_dir, contents)? {
+        println!("- Resuming the interrupted {label} transaction.");
         return Ok(());
     }
     let path = codex_dir.join(SETUP_TRANSACTION_NAME);
     publish_regular_file_exclusive(
         &path,
-        SETUP_TRANSACTION_CONTENTS,
+        contents,
         private_file_permissions(&fs::metadata(codex_dir)?.permissions()),
     )
 }
 
-fn complete_setup_transaction(codex_dir: &Path) -> Result<()> {
+fn complete_operation_transaction(codex_dir: &Path, contents: &str, label: &str) -> Result<()> {
     let path = codex_dir.join(SETUP_TRANSACTION_NAME);
-    if !preflight_setup_transaction(codex_dir)? {
-        anyhow::bail!("Setup transaction disappeared before completion");
+    if !preflight_expected_operation(codex_dir, contents)? {
+        anyhow::bail!("{label} transaction disappeared before completion");
     }
     remove_managed_file(&path)
-        .with_context(|| format!("Failed to complete setup transaction {}", path.display()))?;
+        .with_context(|| format!("Failed to complete {label} transaction {}", path.display()))?;
     sync_parent_directory(&path)
+}
+
+fn preflight_setup_transaction(codex_dir: &Path) -> Result<bool> {
+    preflight_expected_operation(codex_dir, SETUP_TRANSACTION_CONTENTS)
+}
+
+fn begin_setup_transaction(codex_dir: &Path) -> Result<()> {
+    begin_operation_transaction(
+        codex_dir,
+        SETUP_TRANSACTION_CONTENTS,
+        "Rust guardrail setup",
+    )
+}
+
+fn complete_setup_transaction(codex_dir: &Path) -> Result<()> {
+    complete_operation_transaction(codex_dir, SETUP_TRANSACTION_CONTENTS, "setup")
+}
+
+fn preflight_refresh_transaction(codex_dir: &Path) -> Result<bool> {
+    preflight_expected_operation(codex_dir, REFRESH_TRANSACTION_CONTENTS)
+}
+
+fn begin_refresh_transaction(codex_dir: &Path) -> Result<()> {
+    begin_operation_transaction(
+        codex_dir,
+        REFRESH_TRANSACTION_CONTENTS,
+        "Codex guardrail refresh",
+    )
+}
+
+fn complete_refresh_transaction(codex_dir: &Path) -> Result<()> {
+    complete_operation_transaction(codex_dir, REFRESH_TRANSACTION_CONTENTS, "refresh")
 }
 
 fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
@@ -3032,6 +3141,38 @@ fn build_managed_binary(dotfiles_path: &Path, home: &Path) -> Result<PathBuf> {
     Ok(binary)
 }
 
+/// task worktreeでdelivery安全境界を変更した場合に、共有symlinkやconfigを変更せず、
+/// hashとpending transactionで管理されるguard/helper binaryだけを更新する。
+pub fn refresh_guardrails() -> Result<()> {
+    println!("🛡️ Refreshing managed Codex guardrail binaries...\n");
+    let home = setup_home_dir()?;
+    let codex_dir = resolve_codex_home(&home)?;
+    let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    validate_absolute_path(&dotfiles_path)?;
+    worktree::verify_managed_refresh_source(&dotfiles_path)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let _operation_lock = GuardrailOperationLock::acquire(&home)?;
+    preflight_private_directory(&codex_dir)?;
+    preflight_refresh_transaction(&codex_dir)?;
+    preflight_managed_binary_paths(&home)?;
+    validate_absolute_path(&dotfiles_path.join("target/release"))?;
+
+    let managed_binary = build_managed_binary(&dotfiles_path, &home)?;
+    preflight_managed_binary_destinations(&managed_binary, &home)?;
+    begin_refresh_transaction(&codex_dir)?;
+    for destination in MANAGED_BINARY_DESTINATIONS {
+        ensure_managed_hook_with_legacy_hash(
+            &managed_binary,
+            &home.join(destination),
+            ManagedInstallMode::OwnerExecutable,
+            legacy_hash_for_destination(destination),
+        )?;
+    }
+    complete_refresh_transaction(&codex_dir)?;
+    println!("\n✅ Managed Codex guardrail binaries refreshed.");
+    Ok(())
+}
+
 pub fn setup() -> Result<()> {
     println!("🧠 Setting up Codex CLI...\n");
     let home = setup_home_dir()?;
@@ -3046,6 +3187,7 @@ pub fn setup() -> Result<()> {
     }
     let codex_dir = resolve_codex_home(&home)?;
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
+    let _operation_lock = GuardrailOperationLock::acquire(&home)?;
     preflight_setup_state(&home, &codex_dir, &dotfiles_path)?;
 
     let codex_binary = codex_binary_path(&home).with_context(|| {
@@ -3116,15 +3258,17 @@ mod tests {
         MANAGED_BINARY_DESTINATIONS, MANAGED_HOOK_COMMAND, MANAGED_HOOK_DESTINATION,
         ManagedInstallMode, ManagedTransaction, ManagedTransactionKind,
         PYTHON_MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND, archive_legacy_python_hook,
-        begin_managed_transaction, begin_setup_transaction, complete_setup_transaction,
-        contains_legacy_profile_config, copy_file_exclusive, ensure_config_unchanged,
-        ensure_managed_hook, ensure_managed_hook_with_legacy_hash, ensure_managed_writable_root,
+        begin_managed_transaction, begin_refresh_transaction, begin_setup_transaction,
+        complete_refresh_transaction, complete_setup_transaction, contains_legacy_profile_config,
+        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook,
+        ensure_managed_hook_with_legacy_hash, ensure_managed_writable_root,
         ensure_private_directory, legacy_hash_for_destination, managed_hook_state_path,
         managed_transaction_path, merge_managed_config, merge_managed_config_with_root,
         migrate_managed_config_from_template, preflight_config_state,
-        preflight_managed_binary_destination, preflight_setup_transaction,
-        preflight_shared_symlink, publish_regular_file_exclusive, reject_cargo_configuration,
-        sha256, trusted_user_executable, valid_release_binary_magic, validate_setup_home,
+        preflight_managed_binary_destination, preflight_operation_transaction,
+        preflight_refresh_transaction, preflight_setup_transaction, preflight_shared_symlink,
+        publish_regular_file_exclusive, reject_cargo_configuration, sha256,
+        trusted_user_executable, valid_release_binary_magic, validate_setup_home,
         verify_managed_symlink, write_file_exclusive,
     };
     use std::fs;
@@ -3414,6 +3558,79 @@ mod tests {
         begin_setup_transaction(directory.path()).expect("resume setup transaction");
         complete_setup_transaction(directory.path()).expect("complete setup transaction");
         assert!(!preflight_setup_transaction(directory.path()).expect("completed preflight"));
+    }
+
+    #[test]
+    fn refresh_transaction_is_separate_and_resumable() {
+        let directory = TestDirectory::new("refresh-transaction");
+        fs::create_dir_all(directory.path()).expect("create refresh directory");
+
+        begin_setup_transaction(directory.path()).expect("begin setup transaction");
+        assert!(complete_refresh_transaction(directory.path()).is_err());
+        assert!(preflight_setup_transaction(directory.path()).expect("setup remains pending"));
+        complete_setup_transaction(directory.path()).expect("complete setup transaction");
+
+        begin_refresh_transaction(directory.path()).expect("begin refresh transaction");
+        assert!(preflight_refresh_transaction(directory.path()).expect("refresh is pending"));
+        begin_refresh_transaction(directory.path()).expect("resume refresh transaction");
+        complete_refresh_transaction(directory.path()).expect("complete refresh transaction");
+        assert!(!preflight_refresh_transaction(directory.path()).expect("refresh completed"));
+    }
+
+    #[test]
+    fn setup_and_refresh_transactions_are_mutually_exclusive() {
+        use std::sync::{Arc, Barrier};
+
+        let directory = TestDirectory::new("operation-transaction-race");
+        fs::create_dir_all(directory.path()).expect("create operation directory");
+        let operation_dir = directory.path();
+        let barrier = Arc::new(Barrier::new(3));
+        let (setup_result, refresh_result) = std::thread::scope(|scope| {
+            let setup_barrier = Arc::clone(&barrier);
+            let setup = scope.spawn(move || {
+                setup_barrier.wait();
+                begin_setup_transaction(operation_dir)
+            });
+            let refresh_barrier = Arc::clone(&barrier);
+            let refresh = scope.spawn(move || {
+                refresh_barrier.wait();
+                begin_refresh_transaction(operation_dir)
+            });
+            barrier.wait();
+            (
+                setup.join().expect("setup thread"),
+                refresh.join().expect("refresh thread"),
+            )
+        });
+        assert_ne!(setup_result.is_ok(), refresh_result.is_ok());
+
+        let operation = preflight_operation_transaction(directory.path())
+            .expect("inspect winning operation")
+            .expect("operation marker exists");
+        if operation == super::SETUP_TRANSACTION_CONTENTS {
+            complete_setup_transaction(directory.path()).expect("complete setup winner");
+        } else {
+            assert_eq!(operation, super::REFRESH_TRANSACTION_CONTENTS);
+            complete_refresh_transaction(directory.path()).expect("complete refresh winner");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guardrail_operation_lock_rejects_concurrent_resume() {
+        let directory = TestDirectory::new("guardrail-operation-lock");
+        let first = super::GuardrailOperationLock::acquire(directory.path())
+            .expect("acquire first operation lock");
+        begin_refresh_transaction(directory.path()).expect("begin refresh transaction");
+
+        assert!(super::GuardrailOperationLock::acquire(directory.path()).is_err());
+
+        drop(first);
+        let resumed = super::GuardrailOperationLock::acquire(directory.path())
+            .expect("acquire operation lock after interrupted owner exits");
+        begin_refresh_transaction(directory.path()).expect("resume refresh after lock release");
+        complete_refresh_transaction(directory.path()).expect("complete resumed refresh");
+        drop(resumed);
     }
 
     #[test]

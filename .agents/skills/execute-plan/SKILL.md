@@ -69,16 +69,11 @@ rootがSol highならroot自身がlead兼single writerとなり、監督のた�
 
 依頼スコープ内のテスト失敗や軽微な欠陥は同じ単位で修正する。実質的なスコープ変更、データ損失、重大な互換性・セキュリティ判断が必要なら作業を広げず停止する。
 
-## 独立した最終監査を行う
+## Draft PR前の統合確認を行う
 
-全単位完了後、`review-branch` Skillを使う。通常は実装担当の結論を渡さず、状態変更を禁止した`reviewer`として次の2つを独立したsubagentへ並行して依頼する。
+全単位完了後、rootのSol highが固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項を統合確認する。この段階では独立reviewerを起動せず、実装単位ごとのself-reviewと自動検証の不足、計画外差分、secret、AI帰属、不要なlocal情報だけを確認する。独立reviewはDraft PR作成後の固定SHAに対して1回だけ開始する。
 
-1. `gpt-5.6-luna`のxhigh: 中立の立場で、正しさ、境界値、後方互換性、性能、受入条件、test不足を確認する
-2. `gpt-5.6-luna`のxhigh: mergeへ反対する立場で、セキュリティ、秘密情報、堅牢性、競合、resource枯渇、計画・外部仕様・運用との不一致を探す
-
-各subagentへは内部計画、固定したbaseとHEAD、変更file、影響する経路、必要最小限の原典、共有済みの自動検証結果だけを渡し、期待する結論や既知の懸念を教えない。repository全体の機械的走査や同じtestの再実行は依頼しない。Sol highが検証結果と両reviewの指摘を統合し、重複、誤検知、根拠不足を再確認してdelivery準備可否を決める。高リスク変更でSolが必要と判断した場合だけ、Luna xhighによる肯定reviewを追加して受入条件を満たす積極的根拠と不足証拠を確認する。
-
-依頼スコープ内の有効な指摘は修正、検証、追加commitし、影響箇所と反論観点を再監査する。重大な指摘や必須条件が残る間はpushしない。
+依頼スコープ内の欠陥はまとめて修正、検証、追加commitする。重大な問題や必須条件が残る間はpushしない。
 
 ## push前監査とDraft PRを作成する
 
@@ -93,17 +88,17 @@ rootがSol highならroot自身がlead兼single writerとなり、監督のた�
 
 Draft PR作成後は、専用`codex-delivery` helperだけをreceipt、delivery、finishの経路として使う。
 すべてのcommandで`--task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID>`を
-明示し、review記録では`--risk`と`--tests-passed`、`--neutral-review-passed`、
-`--adversarial-review-passed`も指定する。明示認可されたGitHub Free/private repositoryでは
+明示し、review記録では`--risk`と`--tests-passed`、`--independent-review-passed`を指定する。
+high/criticalだけ`--specialist-review-passed`も指定する。明示認可されたGitHub Free/private repositoryでは
  `record-review`または`approve-review`、`deliver`、`finish`の各commandへ`--gate-mode github-free-private`も指定し、
  strict modeでは省略する。
 
 1. PRのbase、head、head SHAを固定し、`review-branch`を読み取り専用で実行する。reviewerは固定SHAの
-   差分、実装計画、test結果、既存仕様を確認し、actionable件数と未解決thread件数を返す。
+   差分、実装計画、test結果、既存仕様を確認し、actionable件数と未解決thread件数を返す。low/mediumは標準reviewerを1つだけ使い、high/criticalは変更で実際に触れる高リスク境界を確認する専門reviewerを1つ追加する。反論役、肯定役、変更と無関係な専門観点は追加しない。
 2. decisionが`autonomous`ならriskに関係なく、review結果とSHA、CI結果、risk分類を
    `codex-delivery record-review`でreceiptに記録する。
-   actionableな指摘があれば同じworktreeで修正、検証、commit、pushし、新しいhead SHAで手順1へ戻る。
-   以前のreceipt、review、CIを新SHAの完了根拠として再利用しない。
+   actionableな指摘があればSolがコード、test、履歴、一次情報で再現し、誤検知と根拠不足を除外する。確定した指摘を1つのbatchで修正、検証、commit、pushし、新しいhead SHAで手順1へ戻る。以前のreceipt、review、CIを新SHAの完了根拠として再利用しない。
+   review起因の修正roundは最大2回とし、その後の固定SHAで最終reviewを行う。最終reviewで確定したactionableが残る場合はSol xhighが反証し、誤検知なら根拠を記録して除外し、実欠陥なら新しい修正loopを始めずblockedとして具体的な残存事項を返す。
 3. decisionが`human-required`なら、必要な判断を具体化してDaikiの明示回答を得る。判断後だけ同じ証拠を
    `codex-delivery approve-review`へ渡す。自動approval reviewだけを回答とは扱わない。判断の前提を変える
    後続pushやscope変更があれば再判定する。blockedではreceiptを作らない。
@@ -131,7 +126,7 @@ PRが未mergeの間はworktreeを安全な再開点として保持する。`git 
 
 - Plan IDと版、task ID、worktree path、base、branch、HEAD、Draft PR URL、risk分類
 - 実装単位とcommit hashの対応
-- 自動検証、固定SHAごとの独立レビュー、receipt、修正結果、delivery/finish結果
+- 自動検証、固定SHAごとの標準review、高リスク時の専門review、receipt、修正結果、delivery/finish結果
 - 未実施の手動確認、残存リスク、計画との差異
 - push・PR作成・delivery・finishを実施できなかった場合は、PR、branch、worktreeを保持した安全な再開条件
 

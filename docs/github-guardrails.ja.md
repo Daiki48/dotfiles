@@ -91,7 +91,8 @@ review済みhead SHAの固定とrisk-based reviewは`codex-delivery`による完
 
 Rulesetを利用できないGitHub Free/private repositoryは、既定のstrict gateを暗黙に緩和しません。
 `--gate-mode github-free-private`を明示したcurrent private repositoryだけが低保証profileを使用できます。
-receipt v3へmode、risk、decisionを別々に保存し、既存v1/v2 receiptの意味を遡及的に緩和しません。
+receipt v4へmode、risk、decision、標準review、専門reviewの完了証拠を別々に保存し、
+既存v1〜v3 receiptの意味を遡及的に緩和しません。
 
 Free/private profileでも唯一の`required-ci`、GitHub Actions App ID `15368`、文字どおりの
 `success`、PR identity、最新mainのancestor、review thread、mergeabilityを検証します。
@@ -106,12 +107,14 @@ riskと分離し、根拠を確定できる場合は`record-review`、Daikiだ�
 ## Delivery gate（Issue #24）
 
 Draft PR作成後は、PRのrepository、base branch、head branch、head SHAを固定し、固定SHAに対する
-testと独立reviewの完了証拠をreceiptへ記録し、CIとGitHub review状態はdelivery直前にも再取得します。
+testと標準独立review、high/criticalでは変更固有の専門reviewの完了証拠をreceiptへ記録し、
+CIとGitHub review状態はdelivery直前にも再取得します。
 review後にpushされた場合、以前のreceipt、review、CIを
 再利用せず、新しいSHAで最初からやり直します。`review-branch`は読み取り専用であり、receiptの記録と
 delivery判断は呼び出し元の専用`codex-delivery` helperが担当します。
 
-修正可能なactionable指摘はriskに関係なく自律修正して再pushし、同じloopを繰り返します。
+修正可能なactionable指摘はSolが反証して1つのbatchで自律修正し、review起因の修正roundを最大2回まで
+再pushします。その後の最終reviewで実欠陥が残る場合は新しい修正loopを始めずblockedとします。
 次の条件が同一SHAで同時に成立した場合だけReady化・merge候補になります。
 
 - required-ciなどrequired checkがすべて文字通り`success`である（skipped、cancelled、timed out、
