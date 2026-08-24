@@ -4747,8 +4747,8 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
     ];
     let switches = [
         "--tests-passed",
-        "--neutral-review-passed",
-        "--adversarial-review-passed",
+        "--independent-review-passed",
+        "--specialist-review-passed",
     ];
     let mut values = HashMap::new();
     let mut seen = Vec::new();
@@ -4781,12 +4781,18 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
             );
         }
     }
-    if (command == "record-review" || command == "approve-review")
-        && (!["low", "medium", "high", "critical"]
-            .contains(&values.get("--risk").map(String::as_str).unwrap_or(""))
-            || seen.len() != 3)
-    {
-        return Some("delivery helperのreview evidenceまたはriskが不正です".into());
+    if command == "record-review" || command == "approve-review" {
+        let risk = values.get("--risk").map(String::as_str).unwrap_or("");
+        let specialist_required = ["high", "critical"].contains(&risk);
+        if !["low", "medium", "high", "critical"].contains(&risk)
+            || !seen.iter().any(|v| v == "--tests-passed")
+            || !seen.iter().any(|v| v == "--independent-review-passed")
+            || seen.iter().any(|v| v == "--specialist-review-passed") != specialist_required
+        {
+            return Some("delivery helperのreview evidenceまたはriskが不正です".into());
+        }
+    } else if values.contains_key("--risk") || !seen.is_empty() {
+        return Some("deliver/finishへreview evidenceまたはriskを指定できません".into());
     }
     if values
         .get("--gate-mode")
@@ -6199,6 +6205,36 @@ mod tests {
         assert!(metadata.is_dir());
         assert_eq!(metadata.mode() & 0o777, 0o500);
         remove_expired_gh_snapshot(&snapshot).expect("remove test GitHub snapshot");
+    }
+
+    #[test]
+    fn delivery_helper_guard_enforces_the_risk_based_review_profile() {
+        let command = |risk: &str, specialist: bool| {
+            let mut tokens = vec![
+                "codex-delivery".to_string(),
+                "record-review".to_string(),
+                "--task-id".to_string(),
+                "issue-24".to_string(),
+                "--pr".to_string(),
+                "24".to_string(),
+                "--head".to_string(),
+                "b".repeat(40),
+                "--risk".to_string(),
+                risk.to_string(),
+                "--plan-id".to_string(),
+                "CODEX-DELIVERY-TEST-v1".to_string(),
+                "--tests-passed".to_string(),
+                "--independent-review-passed".to_string(),
+            ];
+            if specialist {
+                tokens.push("--specialist-review-passed".to_string());
+            }
+            tokens
+        };
+        assert!(delivery_helper_invocation_reason(&command("low", false)).is_none());
+        assert!(delivery_helper_invocation_reason(&command("low", true)).is_some());
+        assert!(delivery_helper_invocation_reason(&command("high", false)).is_some());
+        assert!(delivery_helper_invocation_reason(&command("high", true)).is_none());
     }
 
     #[cfg(unix)]

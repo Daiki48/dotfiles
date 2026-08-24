@@ -14,13 +14,15 @@ managed worktree cleanupまでを同じdeliveryとして扱います。
 
 すべてのcommandはcurrent repositoryのrootで実行し、`--task-id`、`--pr`、`--head`、
 `--plan-id`を必須とします。review記録では`--risk`と`--tests-passed`、
-`--neutral-review-passed`、`--adversarial-review-passed`も必須です。Codexや利用者が直接
+`--independent-review-passed`を必須とし、high/criticalだけ`--specialist-review-passed`も必須です。Codexや利用者が直接
 `gh pr ready`、`gh pr merge`、任意のGitHub
 merge API、`git worktree remove/prune`、任意branch削除を実行してこの経路を迂回してはいけません。
 
 ```sh
-codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium|high|critical> --plan-id <Plan ID> --tests-passed --neutral-review-passed --adversarial-review-passed
-codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium|high|critical> --plan-id <Plan ID> --tests-passed --neutral-review-passed --adversarial-review-passed
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --tests-passed --independent-review-passed
+codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --tests-passed --independent-review-passed
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --tests-passed --independent-review-passed --specialist-review-passed
+codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --tests-passed --independent-review-passed --specialist-review-passed
 codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID>
 codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID>
 ```
@@ -29,8 +31,8 @@ codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --pl
 明示できます。API errorからこのmodeへ自動fallbackしません。
 
 ```sh
-codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --gate-mode github-free-private --tests-passed --neutral-review-passed --adversarial-review-passed
-codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --gate-mode github-free-private --tests-passed --neutral-review-passed --adversarial-review-passed
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --gate-mode github-free-private --tests-passed --independent-review-passed --specialist-review-passed
+codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --gate-mode github-free-private --tests-passed --independent-review-passed --specialist-review-passed
 codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --gate-mode github-free-private
 codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --gate-mode github-free-private
 ```
@@ -56,15 +58,17 @@ Draft PRを作成したら、receiptとmanaged manifestを合わせて次の対�
 - review対象のhead SHAとbase SHA
 - task ID、worktree path、risk分類
 - remote gate mode
-- 独立reviewとtestの完了判定、actionable件数
+- 標準独立review、high/criticalでは変更固有の専門review、testの完了判定、actionable件数
 
 receiptは対象SHAに束縛します。review後にcommitをpushしてhead SHAが変わった場合、以前の
 receipt、CI、review、確認を新SHAへ引き継ぎません。新しいSHAでCIと独立reviewを実行し、
 新しいreceiptを記録します。
 
-receipt v3は`gate_mode`と`decision`（`autonomous`または`human-approved`）を固定し、riskから
-意思決定要否を推測しません。既存v1 receiptは`strict-ruleset`、v2 receiptは保存済みmodeとして
-読み取りますが、旧形式のhigh/criticalやFree/privateを遡及的にautonomousへ緩和しません。CLIで
+receipt v4は`independent_review_passed`を全riskで固定し、`specialist_review_passed`を
+low/mediumではfalse、high/criticalではtrueに固定します。`gate_mode`とdecision
+（`autonomous`または`human-approved`）も固定し、riskから意思決定要否を推測しません。
+既存v1〜v3 receiptは従来の中立・反論review証拠を含む読み取り互換形式として受理しますが、
+旧形式のhigh/criticalやFree/privateを遡及的にautonomousへ緩和しません。CLIで
 指定したmodeとreceiptが一致しない場合はdeliveryもfinishも停止します。
 
 receiptのreview/test flagは、定めた手順を完了したことをmachine-readableに束縛する構造証拠であり、
@@ -84,9 +88,11 @@ required checkは文字通り`success`だけを成功とします。`skipped`、
 通常の実装・修正で、delivery安全境界や高リスクデータ・権限に影響しないタスクをlow/mediumと
 します。CI/workflow、hook、rules、AGENTS、Skills、helper、installer、auth/secrets、production、
 不可逆migration、breaking change、重大なsecurity・互換性・データ損失影響はhigh/criticalです。
-riskはreview深度と残存影響を決めますが、人間確認を自動決定しません。固定SHAに対する独立reviewで
-actionableな指摘があれば、同じworktreeで修正、検証、commit、pushを自律的に行います。そのpushで
-SHAが変わるため、review、CI、receiptを最初からやり直します。
+riskはreview深度と残存影響を決めますが、人間確認を自動決定しません。low/mediumは標準独立reviewを
+1つだけ実行し、high/criticalは変更で実際に触れる主要な高リスク境界を対象とする専門reviewを1つ追加します。
+一般的な反論役や肯定役は使いません。actionableな指摘はSolが反証してから1つのbatchで修正、検証、
+commit、pushします。そのpushでSHAが変わるためreview、CI、receiptを最初からやり直しますが、
+review起因の修正roundは最大2回です。その後の最終reviewで実欠陥が残る場合はblockedとします。
 
 次の条件が同じhead SHAで成立した場合だけ、`codex-delivery deliver`へ進みます。
 

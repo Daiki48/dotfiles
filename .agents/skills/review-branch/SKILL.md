@@ -1,6 +1,6 @@
 ---
 name: review-branch
-description: 内部計画に基づく全実装完了後、baseとの差分を固定し、中立・反論の独立reviewとSolの最終技術判断を行う。「最終レビュー」「PR前確認」「反論意見レビュー」「リリース前確認」で使う。方針未確定の調査、個別実装、未commit変更がある状態には使わない。
+description: 内部計画に基づく全実装とDraft PR作成後、固定SHAを1つの標準独立reviewで監査し、high/criticalだけ変更固有の専門reviewを追加してSolが最終判断する。「最終レビュー」「Draft PRレビュー」「リリース前確認」で使う。方針未確定の調査、個別実装、未commit変更がある状態には使わない。
 ---
 
 # 作業branchを独立監査する
@@ -18,20 +18,15 @@ commit、push、Ready化、merge、cleanupは呼び出し元が行う。レビ�
 5. 計画、差分、原典、検証結果を、各reviewerが同じbaseとHEADを参照できる証拠集合にする。証拠集合には
    repository、PR、base/head ref、対象head SHA、required CIの状態、actionable件数、未解決thread件数を含める。
 
-## 2つの独立reviewを並行実行する
+## riskに応じた独立reviewを行う
 
-可能なら実装を担当していない`reviewer`を2つ使い、状態変更を明示的に禁止する。subagentのruntime permissionは親から継承されるため、role-local sandboxを安全境界とみなさない。各subagentへ期待する結論、既知の懸念、他reviewerの所見を渡さず、ファイルを変更しないよう指示する。review範囲は固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項に限定する。網羅的な機械検証は共有済みのtest、lint、型検査、buildへ担わせ、各reviewerは同じ検証を繰り返さない。
+すべてのriskで、実装を担当していない`reviewer` (`gpt-5.6-luna`, xhigh)を1つ使う。状態変更を明示的に禁止し、期待する結論や既知の懸念を渡さない。固定差分、影響する経路、受け入れ条件、後方互換性、高リスク境界、testで保証できない事項だけを確認し、再現可能で今回修正すべき指摘だけを返すよう依頼する。「問題なし」を有効な結論として扱い、指摘を作ること自体を目的にしない。網羅的な機械検証は共有済みのtest、lint、型検査、buildへ担わせ、reviewerへ同じ検証を繰り返させない。
 
-1. **中立reviewer** (`gpt-5.6-luna`, xhigh): 要件、制御flow、境界値、error処理、設定・CLI・保存形式の後方互換性、性能、受入条件、test不足を確認する。
-2. **反論reviewer** (`gpt-5.6-luna`, xhigh): 「mergeすべきでない」と仮定し、入力検証、認証・認可、秘密情報、注入、path traversal、競合、timeout、retry、依存関係、resource枯渇、計画からの逸脱、外部仕様、運用、rollbackの弱点を探す。
+high/criticalでは標準reviewに加え、変更で実際に触れる主要な高リスク境界を1つの専門reviewerへ割り当てる。authなら認証・認可、migrationならデータ損失・rollback、public APIなら後方互換性、concurrencyなら競合・timeout・retry、delivery安全境界ならgate・権限・fail-closed挙動のように、変更固有の観点だけを確認する。一般的な反論役、肯定役、複数の専門reviewerは追加しない。専門reviewerへ標準reviewerの所見を渡さず、同じ証拠集合から独立して判定させる。
 
-Sol highが固定した証拠集合と両reviewを再判定して、delivery準備可否の最終技術判断を行う。重大なセキュリティ・
-互換性・データ移行、2回の修正ループ失敗、またはreview結論の衝突ではSol xhighへ昇格する。肯定reviewは、Solが
-高リスク変更で必要と判断した場合だけ`gpt-5.6-luna`のxhighで追加する。Luna maxは、xhighで不足する具体的な
-根拠がある場合だけ使う。risk分類とdecision requirement（autonomous / human-required / blocked）を
-別々に判定し、receiptの記録は呼び出し元の`codex-delivery`へ返す。
+Sol highが固定した証拠集合とreview結果を再判定し、重複、誤検知、根拠不足を除外してdelivery準備可否を決める。重大なセキュリティ・互換性・データ移行、2回の修正loop後も確定指摘が残る場合、またはreview結論の衝突ではSol xhighへ昇格する。Luna maxは、xhighで不足する具体的な根拠がある場合だけ使う。risk分類とdecision requirement（autonomous / human-required / blocked）を別々に判定し、receiptの記録は呼び出し元の`codex-delivery`へ返す。
 
-subagentを利用できない場合は、main agentが証拠集合を固定したまま2観点を独立したpassとして実施し、その制約を結果へ明記する。
+subagentを利用できない場合はmain agentが同じ証拠集合で標準reviewを独立passとして行い、high/criticalだけ変更固有の専門passを追加する。その制約を結果へ明記する。
 
 ## 指摘を反証して統合する
 
@@ -44,13 +39,13 @@ subagentを利用できない場合は、main agentが証拠集合を固定し�
 ## 判定を返す
 
 - Plan IDと版、base、branch、HEAD、commit列
-- 中立・反論reviewerそれぞれの確認範囲と判定、およびSolの最終判断
+- 標準reviewerの確認範囲と判定、high/criticalでは変更固有の専門reviewerの確認範囲と判定、およびSolの最終判断
 - repository、PR、base/head ref、固定head SHA、required CI状態、actionable件数、未解決thread件数
 - 実行した自動検証と結果
 - 確定した指摘を重大度順に整理した一覧
 - 受け入れ条件、docs、Issue、外部仕様への適合状況
 - risk分類と、そのriskから独立したdecision requirementおよび根拠
-- 未実施の手動確認、残存リスク、push・Draft PR・`codex-delivery record-review`準備可否。receipt、Ready化、merge、cleanupは実行しない
+- 未実施の手動確認、残存リスク、`codex-delivery record-review`準備可否。receipt、Ready化、merge、cleanupは実行しない
 
 重大な問題、計画との差異、必須条件の未確認が残る状態を準備完了と判定しない。監査結果をIssueやreceiptへ
 記録する場合は呼び出し元が`codex-delivery record-review`を使い、repository、head SHA、送信本文を確認する。

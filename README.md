@@ -109,7 +109,8 @@ server-side.
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, Draft PRs, and the delivery
 loop are used when the task or an explicit request warrants them. risk分類とDaikiの意思決定要否は
-別々に判定します。全riskで固定head SHAの独立review、actionable=0、未解決thread=0、required
+別々に判定します。全riskで固定head SHAの標準独立reviewを1つ行い、high/criticalだけ変更固有の
+専門reviewを1つ追加します。actionable=0、未解決thread=0、required
 checkの文字どおりの`success`、選択したremote gateを満たし、仕様・既存権限・rollback・検証を
 Codexが確定できる場合に`codex-delivery`がReady、merge、mainのfetch後の`merge --ff-only`、
 managed cleanupまで進めます。delivery安全境界、auth/secrets、production、不可逆migration、

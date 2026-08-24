@@ -174,13 +174,15 @@ review、CI、Ruleset、risk確認は[Codex delivery運用ガイド](codex-deliv
 
 Draft PR後のdeliveryは、専用`codex-delivery` helperの次の経路だけを使います。
 各commandでは`--task-id`、`--pr`、`--head`、`--plan-id`を明示します。review記録では
-`--risk`と3つの検証完了flagも必須です。
+`--risk`、`--tests-passed`、`--independent-review-passed`を必須とし、high/criticalだけ
+`--specialist-review-passed`も必須です。
 
 ```text
 (autonomous: record-review | human-required: approve-review)  ->  deliver  ->  finish
 ```
 
-`record-review`は、repository、PR、固定head SHA、Plan ID、risk分類、testと独立reviewの完了証拠を
+`record-review`は、repository、PR、固定head SHA、Plan ID、risk分類、testと標準独立review、
+high/criticalでは変更固有の専門reviewの完了証拠を
 receiptとして記録します。riskとは別にdecision requirementを判定し、仕様・既存権限・rollback・検証を
 確定できる場合は全riskで`record-review`を使います。Daikiだけが決められる事項がある場合は明示回答後に
 `approve-review`を使い、技術gateが不明または失敗ならblockedとしてreceiptを作りません。receiptと

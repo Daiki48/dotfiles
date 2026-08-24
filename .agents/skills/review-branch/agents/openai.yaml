@@ -1,4 +1,4 @@
 interface:
   display_name: "作業ブランチを最終監査"
-  short_description: "中立・反論の独立reviewとSol最終判断で作業ブランチを監査します"
-  default_prompt: "$review-branch を使い、完了した作業ブランチを中立・反論の2観点で最終監査し、Solによる最終技術判断を行ってください。"
+  short_description: "標準reviewと高リスク専門reviewで固定SHAを監査します"
+  default_prompt: "$review-branch を使い、固定SHAを標準reviewで監査し、高リスクの場合だけ変更固有の専門reviewを追加してください。"

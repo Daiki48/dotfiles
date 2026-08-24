@@ -21,7 +21,7 @@ use super::{process, trust};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const MANIFEST_VERSION: i64 = 1;
-const RECEIPT_VERSION: i64 = 3;
+const RECEIPT_VERSION: i64 = 4;
 const STATE_VERSION: i64 = 1;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -1293,8 +1293,6 @@ fn receipt(
         "plan_id",
         "actionable",
         "tests_passed",
-        "neutral_review_passed",
-        "adversarial_review_passed",
         "changed_files",
         "created_at",
     ];
@@ -1306,7 +1304,11 @@ fn receipt(
     let mut normalized = object_ref.clone();
     if version == 1 {
         let mut keys = common.to_vec();
-        keys.push("human_approved");
+        keys.extend([
+            "human_approved",
+            "neutral_review_passed",
+            "adversarial_review_passed",
+        ]);
         expected_keys(payload, &keys, "legacy receipt")?;
         if payload
             .get("human_approved")
@@ -1320,7 +1322,12 @@ fn receipt(
         normalized.remove("human_approved");
     } else if version == 2 {
         let mut keys = common.to_vec();
-        keys.extend(["human_approved", "gate_mode"]);
+        keys.extend([
+            "human_approved",
+            "gate_mode",
+            "neutral_review_passed",
+            "adversarial_review_passed",
+        ]);
         expected_keys(payload, &keys, "legacy receipt")?;
         if payload
             .get("human_approved")
@@ -1331,9 +1338,23 @@ fn receipt(
         }
         normalized.insert("decision".into(), string(receipt_decision(payload)?));
         normalized.remove("human_approved");
+    } else if version == 3 {
+        let mut keys = common.to_vec();
+        keys.extend([
+            "decision",
+            "gate_mode",
+            "neutral_review_passed",
+            "adversarial_review_passed",
+        ]);
+        expected_keys(payload, &keys, "legacy receipt")?;
     } else if version == RECEIPT_VERSION {
         let mut keys = common.to_vec();
-        keys.extend(["decision", "gate_mode"]);
+        keys.extend([
+            "decision",
+            "gate_mode",
+            "independent_review_passed",
+            "specialist_review_passed",
+        ]);
         expected_keys(payload, &keys, "receipt")?;
     } else {
         return Err(error("receipt schemaが一致しません"));
@@ -1364,10 +1385,17 @@ fn receipt(
     if !plan_id(&str_value(&normalized, "plan_id")?) {
         return Err(error("receipt Plan IDが不正です"));
     }
+    let review_evidence_valid = if version <= 3 {
+        bool_value(&normalized, "neutral_review_passed")?
+            && bool_value(&normalized, "adversarial_review_passed")?
+    } else {
+        let specialist_required = ["high", "critical"].contains(&risk_value.as_str());
+        bool_value(&normalized, "independent_review_passed")?
+            && bool_value(&normalized, "specialist_review_passed")? == specialist_required
+    };
     if int_value(&normalized, "actionable")? != 0
         || !bool_value(&normalized, "tests_passed")?
-        || !bool_value(&normalized, "neutral_review_passed")?
-        || !bool_value(&normalized, "adversarial_review_passed")?
+        || !review_evidence_valid
     {
         return Err(error("receiptの必須検証flagが不足しています"));
     }
@@ -1394,6 +1422,36 @@ fn load_receipt(
     let payload = read_json_file(&path, "receipt")?;
     receipt(&payload, root, task, &oid(head, "SHA")?, Some(&repository))
 }
+fn validate_review_evidence_flags(
+    risk_value: &str,
+    tests: bool,
+    independent: bool,
+    specialist: bool,
+) -> Result<()> {
+    let specialist_required = ["high", "critical"].contains(&risk(risk_value)?);
+    if !tests || !independent || specialist != specialist_required {
+        return Err(error(
+            "tests/independent reviewとriskに応じたspecialist reviewの完了flagが必要です",
+        ));
+    }
+    Ok(())
+}
+fn review_receipt_scope_matches(existing: &Value, proposed: &Value) -> bool {
+    [
+        "kind",
+        "task_id",
+        "repository",
+        "pr",
+        "head_sha",
+        "plan_id",
+        "actionable",
+        "tests_passed",
+        "changed_files",
+        "gate_mode",
+    ]
+    .iter()
+    .all(|key| existing.get(*key) == proposed.get(*key))
+}
 #[allow(clippy::too_many_arguments)]
 fn write_review_locked(
     root: &Path,
@@ -1404,8 +1462,8 @@ fn write_review_locked(
     plan: &str,
     approved: bool,
     tests: bool,
-    neutral: bool,
-    adversarial: bool,
+    independent: bool,
+    specialist: bool,
     gate: &str,
 ) -> Result<Value> {
     gate_mode(gate)?;
@@ -1413,11 +1471,7 @@ fn write_review_locked(
     if !(1..=999_999_999).contains(&pr) || !plan_id(plan) {
         return Err(error("PR番号またはPlan IDが安全ではありません"));
     }
-    if !(tests && neutral && adversarial) {
-        return Err(error(
-            "tests/neutral/adversarial reviewの完了flagが必要です",
-        ));
-    }
+    validate_review_evidence_flags(risk_value, tests, independent, specialist)?;
     let repository = repository(root)?;
     validate_gate_repository(&repository, gate)?;
     let (manifest_value, worktree_path) = manifest(root, task, &repository)?;
@@ -1463,8 +1517,8 @@ fn write_review_locked(
             }),
         ),
         ("tests_passed", Value::Bool(true)),
-        ("neutral_review_passed", Value::Bool(true)),
-        ("adversarial_review_passed", Value::Bool(true)),
+        ("independent_review_passed", Value::Bool(true)),
+        ("specialist_review_passed", Value::Bool(specialist)),
         (
             "changed_files",
             Value::Array(changed.into_iter().map(Value::String).collect()),
@@ -1475,25 +1529,10 @@ fn write_review_locked(
     let path = receipt_path(&repository, task, &head)?;
     if path.exists() || path.is_symlink() {
         let existing = load_receipt(root, task, &head, Some(&repository))?;
-        for key in [
-            "kind",
-            "task_id",
-            "repository",
-            "pr",
-            "head_sha",
-            "plan_id",
-            "actionable",
-            "tests_passed",
-            "neutral_review_passed",
-            "adversarial_review_passed",
-            "changed_files",
-            "gate_mode",
-        ] {
-            if existing.get(key) != payload.get(key) {
-                return Err(error(
-                    "同じheadのreceiptのfield/mode/Plan/evidenceが異なります",
-                ));
-            }
+        if !review_receipt_scope_matches(&existing, &payload) {
+            return Err(error(
+                "同じheadのreceiptのfield/mode/Plan/evidenceが異なります",
+            ));
         }
         let old_risk = str_value(&existing, "risk")?;
         let old_decision = receipt_decision(&existing)?;
@@ -1522,8 +1561,8 @@ fn write_review(
     plan: &str,
     approved: bool,
     tests: bool,
-    neutral: bool,
-    adversarial: bool,
+    independent: bool,
+    specialist: bool,
     gate: &str,
 ) -> Result<Value> {
     task_id(task)?;
@@ -1538,8 +1577,8 @@ fn write_review(
         plan,
         approved,
         tests,
-        neutral,
-        adversarial,
+        independent,
+        specialist,
         gate,
     )
 }
@@ -2808,8 +2847,8 @@ struct CliArgs {
     risk: Option<String>,
     plan: String,
     tests: bool,
-    neutral: bool,
-    adversarial: bool,
+    independent: bool,
+    specialist: bool,
     gate: String,
 }
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
@@ -2835,8 +2874,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             .to_string();
         if [
             "tests-passed",
-            "neutral-review-passed",
-            "adversarial-review-passed",
+            "independent-review-passed",
+            "specialist-review-passed",
         ]
         .contains(&normalized.as_str())
         {
@@ -2897,6 +2936,10 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             .ok_or_else(|| error("--riskが必要です"))?
             .clone();
         risk(&risk_value)?;
+        let tests = flags.contains("tests-passed");
+        let independent = flags.contains("independent-review-passed");
+        let specialist = flags.contains("specialist-review-passed");
+        validate_review_evidence_flags(&risk_value, tests, independent, specialist)?;
         Ok(CliArgs {
             command,
             task,
@@ -2904,9 +2947,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             head,
             risk: Some(risk_value),
             plan,
-            tests: flags.contains("tests-passed"),
-            neutral: flags.contains("neutral-review-passed"),
-            adversarial: flags.contains("adversarial-review-passed"),
+            tests,
+            independent,
+            specialist,
             gate,
         })
     } else {
@@ -2921,8 +2964,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             risk: None,
             plan,
             tests: false,
-            neutral: false,
-            adversarial: false,
+            independent: false,
+            specialist: false,
             gate,
         })
     }
@@ -2947,8 +2990,8 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 &parsed.plan,
                 false,
                 parsed.tests,
-                parsed.neutral,
-                parsed.adversarial,
+                parsed.independent,
+                parsed.specialist,
                 &parsed.gate,
             ),
             "approve-review" => write_review(
@@ -2960,8 +3003,8 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 &parsed.plan,
                 true,
                 parsed.tests,
-                parsed.neutral,
-                parsed.adversarial,
+                parsed.independent,
+                parsed.specialist,
                 &parsed.gate,
             ),
             "deliver" => deliver(
@@ -3022,6 +3065,27 @@ mod tests {
             ("tests_passed", Value::Bool(true)),
             ("neutral_review_passed", Value::Bool(true)),
             ("adversarial_review_passed", Value::Bool(true)),
+            ("changed_files", Value::Array(vec![string("src/main.rs")])),
+            ("created_at", string("now")),
+            ("gate_mode", string(STRICT_GATE_MODE)),
+        ])
+    }
+
+    fn receipt_v4(risk_value: &str, specialist: bool) -> Value {
+        object([
+            ("version", Value::Number(RECEIPT_VERSION.into())),
+            ("kind", string("review")),
+            ("task_id", string("issue-24")),
+            ("repository", string("owner/repo")),
+            ("pr", Value::Number(24.into())),
+            ("head_sha", string("b".repeat(40))),
+            ("risk", string(risk_value)),
+            ("plan_id", string("CODEX-DELIVERY-TEST-v1")),
+            ("actionable", Value::Number(0.into())),
+            ("decision", string("autonomous")),
+            ("tests_passed", Value::Bool(true)),
+            ("independent_review_passed", Value::Bool(true)),
+            ("specialist_review_passed", Value::Bool(specialist)),
             ("changed_files", Value::Array(vec![string("src/main.rs")])),
             ("created_at", string("now")),
             ("gate_mode", string(STRICT_GATE_MODE)),
@@ -3125,6 +3189,55 @@ mod tests {
     }
 
     #[test]
+    fn receipt_v4_requires_standard_review_and_risk_matched_specialist_review() {
+        for (risk_value, specialist) in [
+            ("low", false),
+            ("medium", false),
+            ("high", true),
+            ("critical", true),
+        ] {
+            assert!(
+                receipt(
+                    &receipt_v4(risk_value, specialist),
+                    Path::new("/unused"),
+                    "issue-24",
+                    &"b".repeat(40),
+                    Some("owner/repo"),
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            receipt(
+                &receipt_v4("low", true),
+                Path::new("/unused"),
+                "issue-24",
+                &"b".repeat(40),
+                Some("owner/repo"),
+            )
+            .is_err()
+        );
+        assert!(
+            receipt(
+                &receipt_v4("high", false),
+                Path::new("/unused"),
+                "issue-24",
+                &"b".repeat(40),
+                Some("owner/repo"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn receipt_v3_remains_idempotent_with_the_v4_review_scope() {
+        assert!(review_receipt_scope_matches(
+            &receipt_v3(),
+            &receipt_v4("low", false)
+        ));
+    }
+
+    #[test]
     fn receipt_v1_and_v2_are_normalized_without_relaxing_legacy_approval() {
         let common = [
             ("kind", string("review")),
@@ -3193,7 +3306,7 @@ mod tests {
 
     #[test]
     fn receipt_schema_and_type_spoofing_fail_closed() {
-        let base = receipt_v3();
+        let base = receipt_v4("low", false);
         let mut bool_version = base.as_object().unwrap().clone();
         bool_version.insert("version".into(), Value::Bool(true));
         assert!(
@@ -3207,7 +3320,7 @@ mod tests {
             .is_err()
         );
         let mut legacy_field = base.as_object().unwrap().clone();
-        legacy_field.insert("human_approved".into(), Value::Bool(true));
+        legacy_field.insert("neutral_review_passed".into(), Value::Bool(true));
         assert!(
             receipt(
                 &Value::Object(legacy_field),
@@ -3357,6 +3470,9 @@ mod tests {
             OsString::from("high"),
             OsString::from("--plan-id"),
             OsString::from("CODEX-DELIVERY-TEST-v1"),
+            OsString::from("--tests-passed"),
+            OsString::from("--independent-review-passed"),
+            OsString::from("--specialist-review-passed"),
         ];
         let mut strict = common.clone();
         strict.extend([
@@ -3370,6 +3486,35 @@ mod tests {
             OsString::from(FREE_PRIVATE_GATE_MODE),
         ]);
         assert_eq!(parse_args(free).unwrap().gate, FREE_PRIVATE_GATE_MODE);
+    }
+
+    #[test]
+    fn parser_enforces_the_risk_based_review_profile() {
+        let args = |risk_value: &str, specialist: bool| {
+            let mut values = vec![
+                OsString::from("record-review"),
+                OsString::from("--task-id"),
+                OsString::from("issue-24"),
+                OsString::from("--pr"),
+                OsString::from("24"),
+                OsString::from("--head"),
+                OsString::from("b".repeat(40)),
+                OsString::from("--risk"),
+                OsString::from(risk_value),
+                OsString::from("--plan-id"),
+                OsString::from("CODEX-DELIVERY-TEST-v1"),
+                OsString::from("--tests-passed"),
+                OsString::from("--independent-review-passed"),
+            ];
+            if specialist {
+                values.push(OsString::from("--specialist-review-passed"));
+            }
+            values
+        };
+        assert!(parse_args(args("low", false)).is_ok());
+        assert!(parse_args(args("low", true)).is_err());
+        assert!(parse_args(args("high", false)).is_err());
+        assert!(parse_args(args("high", true)).is_ok());
     }
 
     #[test]
