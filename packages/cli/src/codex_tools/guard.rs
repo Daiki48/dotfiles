@@ -33,6 +33,7 @@ const BODY_SNAPSHOT_DIR_PREFIX: &str = ".codex-hook-body-";
 const BODY_SNAPSHOT_MAX_RETAINED: usize = 128;
 const BODY_SNAPSHOT_TTL: Duration = Duration::from_secs(60 * 60);
 const GH_SNAPSHOT_DIR_PREFIX: &str = ".codex-hook-gh-";
+const GH_SNAPSHOT_TTL: Duration = Duration::from_secs(5 * 60);
 const SYSTEM_GIT: &str = "/usr/bin/git";
 const SYSTEM_GH: &str = "/usr/bin/gh";
 const SYSTEM_SSH: &str = "/usr/bin/ssh";
@@ -1050,13 +1051,13 @@ fn run_git(cwd: &str, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-struct GuardGhSandbox {
+pub(crate) struct GuardGhSandbox {
     path: PathBuf,
 }
 
 impl GuardGhSandbox {
     #[cfg(unix)]
-    fn create() -> Option<Self> {
+    pub(crate) fn create() -> Option<Self> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         let root = fs::canonicalize("/tmp").ok()?;
@@ -1132,8 +1133,12 @@ impl GuardGhSandbox {
     }
 
     #[cfg(not(unix))]
-    fn create() -> Option<Self> {
+    pub(crate) fn create() -> Option<Self> {
         None
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     fn into_persistent(self) -> PathBuf {
@@ -1188,14 +1193,14 @@ fn remove_expired_gh_snapshot(path: &Path) -> Result<(), String> {
         .map_err(|_| "expired GH snapshotを検査できません".to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "expired GH snapshotを検査できません".to_string())?;
-    if entries.len() > 1
+    if entries.len() > 2
         || entries
-            .first()
-            .is_some_and(|entry| entry.file_name() != "hosts.yml")
+            .iter()
+            .any(|entry| !matches!(entry.file_name().to_str(), Some("hosts.yml" | "config.yml")))
     {
         return Err("expired GH snapshotの構造が不正です".into());
     }
-    if let Some(entry) = entries.first() {
+    for entry in &entries {
         let file = fs::symlink_metadata(entry.path())
             .map_err(|_| "expired GH snapshotを検査できません".to_string())?;
         if !file.is_file()
@@ -1210,7 +1215,7 @@ fn remove_expired_gh_snapshot(path: &Path) -> Result<(), String> {
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|_| "expired GH snapshotを削除可能にできません".to_string())?;
-    if let Some(entry) = entries.first() {
+    for entry in entries {
         fs::remove_file(entry.path())
             .map_err(|_| "expired GH snapshotを削除できません".to_string())?;
     }
@@ -1230,7 +1235,7 @@ fn cleanup_gh_snapshots(root: &Path, now_nanos: u128) -> Result<(), String> {
         let Some(timestamp) = gh_snapshot_timestamp(&name) else {
             continue;
         };
-        if now_nanos.saturating_sub(timestamp) >= BODY_SNAPSHOT_TTL.as_nanos()
+        if now_nanos.saturating_sub(timestamp) >= GH_SNAPSHOT_TTL.as_nanos()
             && remove_expired_gh_snapshot(&entry.path()).is_ok()
         {
             removed = true;
@@ -6042,6 +6047,74 @@ mod tests {
 
         fs::remove_dir(&unrelated).expect("remove unrelated directory");
         fs::remove_dir(&root).expect("remove GC fixture root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_snapshot_gc_removes_migrated_snapshots_at_the_retention_limit() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-guard-gh-gc-{suffix}"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("create GH GC fixture root");
+
+        for counter in 0..BODY_SNAPSHOT_MAX_RETAINED {
+            let snapshot = root.join(format!("{GH_SNAPSHOT_DIR_PREFIX}1-1-{counter}"));
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&snapshot)
+                .expect("create expired GH snapshot");
+            for (name, contents) in [
+                ("hosts.yml", b"github.com:\n".as_slice()),
+                ("config.yml", b"version: 1\n".as_slice()),
+            ] {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(snapshot.join(name))
+                    .expect("create migrated GH snapshot file");
+                file.write_all(contents)
+                    .expect("write migrated GH snapshot file");
+            }
+        }
+        let malformed = root.join(format!("{GH_SNAPSHOT_DIR_PREFIX}2-1-0"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&malformed)
+            .expect("create malformed GH snapshot");
+        let mut unexpected = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(malformed.join("unexpected.yml"))
+            .expect("create unexpected GH snapshot file");
+        unexpected
+            .write_all(b"unmanaged\n")
+            .expect("write unexpected GH snapshot file");
+
+        cleanup_gh_snapshots(&root, GH_SNAPSHOT_TTL.as_nanos() + 2)
+            .expect("clean migrated GH snapshots at the retention limit");
+        assert_eq!(
+            fs::read_dir(&root)
+                .expect("read GH GC fixture root")
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
+        assert!(
+            malformed.exists(),
+            "unknown snapshot contents must fail closed"
+        );
+
+        fs::remove_file(malformed.join("unexpected.yml"))
+            .expect("remove unexpected GH snapshot file");
+        fs::remove_dir(&malformed).expect("remove malformed GH snapshot");
+        fs::remove_dir(&root).expect("remove GH GC fixture root");
     }
 
     #[test]
