@@ -41,10 +41,11 @@ proxyや`http_unix_socket`などの既存設定を引き継ぎません。browse
 `--body-file`は同じfile descriptorから検査した内容をprivate snapshotへ固定してから実行し、内容を安全に検査できない
 binary差分はcommit・push前に拒否します。
 
-`codex-worktree`は安全境界としてglobalの`credential.helper`を無効化します。そのためprivate HTTPS remoteで
-credential helperだけに依存する構成はfail-closedになります。private repositoryでは検証可能なSSH originを使うか、
-helperに依存しない認証経路を事前に用意してください。`codex-delivery`のHTTPS認証は固定したsystem `gh`の
-`auth git-credential`だけを使用します。
+`codex-worktree`は安全境界としてglobalとrepository固有の`credential.helper`を無効化します。canonicalな
+`https://github.com/<owner>/<repository>`だけは、認証情報をprivateな一時設定へsnapshotし、固定したsystem `gh`の
+`auth git-credential`を1件だけ復元します。SSH、GitHub以外、不正形式やcredentialを含むURLにはHTTPS helperを
+追加しません。`codex-delivery`も同じ固定済みの認証経路だけを使用します。hook用の一時GH設定は、GitHub CLIが
+移行時に生成する`config.yml`を含めて所有者・mode・link数・size・名前を検証し、短いTTL後に回収します。
 
 ## 性能と品質保証
 
