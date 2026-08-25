@@ -16,7 +16,7 @@ use serde::Deserializer;
 use serde::de::{self, MapAccess, Visitor};
 use serde_json::{Map, Value};
 
-use super::trust;
+use super::{guard::GuardGhSandbox, trust};
 
 #[cfg(test)]
 use std::io::Read;
@@ -45,6 +45,8 @@ const TRUSTED_GIT_COMMAND: &str = "git";
 const TRUSTED_SSH_COMMAND: &str = "/usr/bin/ssh";
 #[cfg(not(unix))]
 const TRUSTED_SSH_COMMAND: &str = "ssh";
+#[cfg(unix)]
+const TRUSTED_GH_COMMAND: &str = "/usr/bin/gh";
 const SYSTEM_PATH: &str = "/usr/bin:/bin";
 
 const BRANCH_PREFIXES: &[&str] = &[
@@ -534,14 +536,34 @@ struct GitOutput {
     stderr: String,
 }
 
-fn safe_environment(command: &mut Command) {
-    command.env_remove("SSH_ASKPASS");
+struct IsolatedGitCommand {
+    command: Command,
+    _gh_snapshot: Option<GuardGhSandbox>,
+}
+
+fn safe_environment(command: &mut Command, gh_config: Option<&Path>) {
+    for key in [
+        "SSH_ASKPASS",
+        "GH_CONFIG_DIR",
+        "GH_HOST",
+        "GH_REPO",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_DEBUG",
+    ] {
+        command.env_remove(key);
+    }
     // `env_clear` would drop PATH and locale, so explicitly remove only Git's
     // environment controls. GIT_CONFIG_NOSYSTEM and an empty global config
     // keep system/global configuration out of every internal Git invocation.
     for (key, _) in std::env::vars_os() {
         let text = key.to_string_lossy();
         if text.starts_with("GIT_")
+            || text.starts_with("GH_")
+            || text.eq_ignore_ascii_case("GITHUB_TOKEN")
+            || text.eq_ignore_ascii_case("GITHUB_ENTERPRISE_TOKEN")
             || text.eq_ignore_ascii_case("HTTP_PROXY")
             || text.eq_ignore_ascii_case("HTTPS_PROXY")
             || text.eq_ignore_ascii_case("ALL_PROXY")
@@ -558,6 +580,9 @@ fn safe_environment(command: &mut Command) {
             let text = key.to_string_lossy();
             value.is_some()
                 && (text.starts_with("GIT_")
+                    || text.starts_with("GH_")
+                    || text.eq_ignore_ascii_case("GITHUB_TOKEN")
+                    || text.eq_ignore_ascii_case("GITHUB_ENTERPRISE_TOKEN")
                     || text.eq_ignore_ascii_case("HTTP_PROXY")
                     || text.eq_ignore_ascii_case("HTTPS_PROXY")
                     || text.eq_ignore_ascii_case("ALL_PROXY")
@@ -579,9 +604,19 @@ fn safe_environment(command: &mut Command) {
     command.env("GIT_SSH_VARIANT", "ssh");
     command.env("GIT_PAGER", "cat");
     command.env("PATH", SYSTEM_PATH);
+    if let Some(path) = gh_config {
+        command
+            .env("GH_CONFIG_DIR", path)
+            .env("GH_HOST", "github.com")
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1");
+    }
 }
 
-fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Result<Command, WorktreeError> {
+fn isolated_git_command(
+    cwd: &Path,
+    arguments: &[&str],
+) -> Result<IsolatedGitCommand, WorktreeError> {
     let git = trust::trusted_system_binary(TRUSTED_GIT_COMMAND, "Git").map_err(error)?;
     let ssh = trust::trusted_system_binary(TRUSTED_SSH_COMMAND, "SSH").map_err(error)?;
     let mut command = Command::new(git);
@@ -637,8 +672,13 @@ fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Result<Command, Workt
         .arg("core.bare=false")
         .arg("--work-tree")
         .arg(cwd);
+    #[cfg(unix)]
+    let mut gh_snapshot = None;
+    #[cfg(not(unix))]
+    let gh_snapshot: Option<GuardGhSandbox> = None;
     if let Some(origin) = arguments.iter().copied().find(|argument| {
-        github_repository(argument).is_some() || cfg!(test) && safe_local_origin(argument)
+        github_repository(argument).is_some()
+            || cfg!(test) && Path::new(argument).is_absolute() && safe_local_origin(argument)
     }) {
         command
             .arg("-c")
@@ -653,14 +693,31 @@ fn isolated_git_command(cwd: &Path, arguments: &[&str]) -> Result<Command, Workt
             .arg(format!("http.{origin}.extraHeader="))
             .arg("-c")
             .arg(format!("http.{origin}.sslVerify=true"));
+        if github_https_origin(origin) {
+            #[cfg(unix)]
+            {
+                let gh = trust::trusted_system_binary(TRUSTED_GH_COMMAND, "GitHub CLI")
+                    .map_err(error)?;
+                let snapshot = GuardGhSandbox::create().ok_or_else(|| {
+                    error("Git credential configをprivate snapshotへ固定できません")
+                })?;
+                command.arg("-c").arg(format!(
+                    "credential.https://github.com.helper=!{gh} auth git-credential"
+                ));
+                gh_snapshot = Some(snapshot);
+            }
+        }
     }
     command
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    safe_environment(&mut command);
-    Ok(command)
+    safe_environment(&mut command, gh_snapshot.as_ref().map(GuardGhSandbox::path));
+    Ok(IsolatedGitCommand {
+        command,
+        _gh_snapshot: gh_snapshot,
+    })
 }
 
 fn local_config_keys(cwd: &Path) -> Result<Vec<String>, WorktreeError> {
@@ -675,7 +732,7 @@ fn local_config_keys(cwd: &Path) -> Result<Vec<String>, WorktreeError> {
             "--list",
         ],
     )?;
-    let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
+    let output = crate::codex_tools::process::run(&mut command.command, GIT_TIMEOUT)
         .map_err(|cause| error(format!("repository configを確認できません: {cause}")))?;
     if !output.status.success() {
         return Err(error("repository configを安全に確認できません"));
@@ -762,7 +819,7 @@ impl EmptyFallback for String {
 fn git(cwd: &Path, arguments: &[&str]) -> Result<GitOutput, WorktreeError> {
     validate_local_config(cwd)?;
     let mut command = isolated_git_command(cwd, arguments)?;
-    let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
+    let output = crate::codex_tools::process::run(&mut command.command, GIT_TIMEOUT)
         .map_err(|cause| error(format!("gitを実行できません: {cause}")))?;
     let stdout =
         String::from_utf8(output.stdout).map_err(|_| error("git stdoutがUTF-8ではありません"))?;
@@ -781,7 +838,7 @@ fn git_allow_failure(cwd: &Path, arguments: &[&str]) -> Result<(i32, GitOutput),
     // used, but non-zero output is not converted into WorktreeError here.
     validate_local_config(cwd)?;
     let mut command = isolated_git_command(cwd, arguments)?;
-    let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
+    let output = crate::codex_tools::process::run(&mut command.command, GIT_TIMEOUT)
         .map_err(|cause| error(format!("gitを実行できません: {cause}")))?;
     let stdout =
         String::from_utf8(output.stdout).map_err(|_| error("git stdoutがUTF-8ではありません"))?;
@@ -809,7 +866,7 @@ fn local_config_values(cwd: &Path, key: &str) -> Result<Vec<String>, WorktreeErr
             key,
         ],
     )?;
-    let output = crate::codex_tools::process::run(&mut command, GIT_TIMEOUT)
+    let output = crate::codex_tools::process::run(&mut command.command, GIT_TIMEOUT)
         .map_err(|cause| error(format!("repository configを確認できません: {cause}")))?;
     if !output.status.success() {
         if output.status.code() == Some(1) {
@@ -886,14 +943,23 @@ fn github_repository(remote: &str) -> Option<String> {
     let valid = repository.split_once('/').is_some_and(|(owner, name)| {
         !owner.is_empty()
             && !name.is_empty()
+            && !name.contains('/')
             && owner.bytes().all(valid_github_byte)
             && name.bytes().all(valid_github_byte)
     });
     valid.then(|| repository.to_string())
 }
 
+fn github_https_origin(remote: &str) -> bool {
+    remote
+        .trim()
+        .trim_end_matches('/')
+        .starts_with("https://github.com/")
+        && github_repository(remote).is_some()
+}
+
 fn valid_github_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'/')
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
 }
 
 fn origin_identity(
@@ -2308,14 +2374,20 @@ mod tests {
         let mut command = Command::new("env");
         command
             .env("GIT_SSH_COMMAND", "unsafe")
+            .env("GH_CONFIG_DIR", "/tmp/untrusted-gh")
+            .env("GH_TOKEN", "sensitive-token")
+            .env("GITHUB_TOKEN", "sensitive-token")
             .env("HTTPS_PROXY", "http://proxy.invalid")
             .env("SSL_CERT_FILE", "/tmp/untrusted.pem");
-        safe_environment(&mut command);
+        safe_environment(&mut command, None);
         let values: BTreeMap<OsString, Option<OsString>> = command
             .get_envs()
             .map(|(key, value)| (key.to_os_string(), value.map(OsString::from)))
             .collect();
         assert_eq!(values.get(OsStr::new("GIT_SSH_COMMAND")), Some(&None));
+        assert_eq!(values.get(OsStr::new("GH_CONFIG_DIR")), Some(&None));
+        assert_eq!(values.get(OsStr::new("GH_TOKEN")), Some(&None));
+        assert_eq!(values.get(OsStr::new("GITHUB_TOKEN")), Some(&None));
         assert_eq!(values.get(OsStr::new("HTTPS_PROXY")), Some(&None));
         assert_eq!(values.get(OsStr::new("SSL_CERT_FILE")), Some(&None));
         assert_eq!(
@@ -2350,6 +2422,7 @@ mod tests {
 
         let command = isolated_git_command(Path::new("/tmp"), &["fetch", "origin"]).unwrap();
         let arguments = command
+            .command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -2364,6 +2437,110 @@ mod tests {
             assert!(
                 arguments.iter().any(|argument| argument == expected),
                 "{expected}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_https_uses_one_private_scoped_credential_helper() {
+        use std::os::unix::fs::MetadataExt;
+
+        let origin = "https://github.com/owner/repository.git";
+        let isolated = isolated_git_command(Path::new("/tmp"), &["ls-remote", origin]).unwrap();
+        let arguments = isolated
+            .command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let helper = "credential.https://github.com.helper=!/usr/bin/gh auth git-credential";
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| argument.as_str() == helper)
+                .count(),
+            1,
+            "{arguments:?}"
+        );
+        let global_reset = arguments
+            .iter()
+            .position(|argument| argument == "credential.helper=")
+            .expect("global credential helper reset");
+        let origin_reset = arguments
+            .iter()
+            .position(|argument| argument == &format!("credential.{origin}.helper="))
+            .expect("origin credential helper reset");
+        let trusted_helper = arguments
+            .iter()
+            .position(|argument| argument == helper)
+            .expect("trusted GitHub credential helper");
+        assert!(global_reset < origin_reset && origin_reset < trusted_helper);
+
+        let environment: BTreeMap<OsString, Option<OsString>> = isolated
+            .command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsString::from)))
+            .collect();
+        let snapshot = environment
+            .get(OsStr::new("GH_CONFIG_DIR"))
+            .and_then(Option::as_ref)
+            .map(PathBuf::from)
+            .expect("private GitHub config snapshot");
+        assert_eq!(snapshot.parent(), Some(Path::new("/tmp")));
+        assert!(
+            snapshot
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(".codex-hook-gh-"))
+        );
+        assert_eq!(
+            fs::symlink_metadata(&snapshot)
+                .expect("inspect private GitHub config snapshot")
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GH_HOST")),
+            Some(&Some(OsString::from("github.com")))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GH_PROMPT_DISABLED")),
+            Some(&Some(OsString::from("1")))
+        );
+        assert_eq!(environment.get(OsStr::new("GH_TOKEN")), Some(&None));
+        assert_eq!(environment.get(OsStr::new("GITHUB_TOKEN")), Some(&None));
+        assert!(!format!("{arguments:?}{environment:?}").contains("sensitive-token"));
+
+        drop(isolated);
+        assert!(!snapshot.exists());
+    }
+
+    #[test]
+    fn noncanonical_origins_do_not_receive_the_github_https_helper() {
+        let helper = "credential.https://github.com.helper=!/usr/bin/gh auth git-credential";
+        for origin in [
+            "git@github.com:owner/repository.git",
+            "ssh://git@github.com/owner/repository.git",
+            "https://example.com/owner/repository.git",
+            "https://github.com/owner/repository/extra.git",
+            "https://user@github.com/owner/repository.git",
+            "https://github.com/owner/repository.git?redirect=1",
+        ] {
+            let isolated = isolated_git_command(Path::new("/tmp"), &["ls-remote", origin]).unwrap();
+            assert!(
+                isolated
+                    .command
+                    .get_args()
+                    .all(|argument| argument != OsStr::new(helper)),
+                "unexpected helper for {origin}"
+            );
+            assert!(
+                isolated
+                    .command
+                    .get_envs()
+                    .all(|(key, value)| key != OsStr::new("GH_CONFIG_DIR") || value.is_none()),
+                "unexpected GitHub config for {origin}"
             );
         }
     }
