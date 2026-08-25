@@ -3407,8 +3407,6 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
                 "credential.helper=".into(),
                 "-c".into(),
                 "credential.https://github.com.helper=!/usr/bin/gh auth git-credential".into(),
-                "-c".into(),
-                format!("credential.{origin}.helper=!/usr/bin/gh auth git-credential"),
             ]);
             gh_snapshot = Some(snapshot);
         }
@@ -6219,6 +6217,16 @@ mod tests {
                 rewritten.contains(
                     "credential.https://github.com.helper=!/usr/bin/gh auth git-credential"
                 )
+            );
+            assert_eq!(
+                rewritten
+                    .matches("!/usr/bin/gh auth git-credential")
+                    .count(),
+                1,
+                "trusted credential helper must be configured exactly once"
+            );
+            assert!(
+                rewritten.contains("credential.https://github.com/Daiki48/dotfiles.git.helper=")
             );
             assert!(rewritten.contains("GH_CONFIG_DIR=/tmp/.codex-hook-gh-"));
             #[cfg(unix)]
