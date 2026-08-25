@@ -144,9 +144,10 @@ before migrating the shared top-level settings. If an older setup left `config.t
 symlink, setup archives the link and writes a regular local config without modifying the
 link target. A legacy profile config is backed up; deprecated profile selectors and
 tables are removed while shared settings are merged without discarding project trust,
-hook trust, TUI state, custom agents, or legacy `writable_roots`. Legacy home-relative and
-working-directory-relative roots are normalized to absolute paths, and invalid root value types
-fail closed instead of being silently discarded. Retired teacher/autonomous profile files are
+hook trust, TUI state, custom agents, or legacy `writable_roots`. Legacy home-relative roots use
+the verified account home even when `CODEX_HOME` is elsewhere, while working-directory-relative
+roots are normalized to absolute paths. Existing regular or inline root tables are preserved, and
+invalid container or value types fail closed. Retired teacher/autonomous profile files are
 renamed to timestamped backups instead of being deleted.
 
 After the first install or an update of the safety hook, restart Codex and use `/hooks` to

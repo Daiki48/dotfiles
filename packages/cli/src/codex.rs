@@ -1159,8 +1159,9 @@ fn merge_managed_config_with_root(
     template: &str,
     existing: &str,
     managed_root: &Path,
+    home: &Path,
 ) -> Result<String> {
-    let legacy_roots = legacy_workspace_roots(existing, managed_root)?;
+    let legacy_roots = legacy_workspace_roots(existing, home)?;
     let profile_roots = managed_profile_workspace_roots(existing)?;
     let merged = merge_managed_config(template, existing);
     let merged = profile_roots
@@ -1174,7 +1175,7 @@ fn merge_managed_config_with_root(
     ensure_managed_workspace_root(&merged, managed_root)
 }
 
-fn legacy_workspace_roots(contents: &str, managed_root: &Path) -> Result<Vec<String>> {
+fn legacy_workspace_roots(contents: &str, home: &Path) -> Result<Vec<String>> {
     if contents.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -1208,18 +1209,7 @@ fn legacy_workspace_roots(contents: &str, managed_root: &Path) -> Result<Vec<Str
     let Some(roots) = roots else {
         return Ok(Vec::new());
     };
-    let config_dir = managed_root.parent().with_context(|| {
-        format!(
-            "Managed worktree root has no Codex config parent: {}",
-            managed_root.display()
-        )
-    })?;
-    let home = config_dir.parent().with_context(|| {
-        format!(
-            "Codex config directory has no home parent: {}",
-            config_dir.display()
-        )
-    })?;
+    validate_absolute_path(home).context("Account home must be valid before migrating roots")?;
     let relative_base = std::env::current_dir()
         .context("Failed to resolve the current directory for legacy writable_roots")?;
     roots
@@ -1255,25 +1245,44 @@ fn managed_profile_workspace_roots(contents: &str) -> Result<Vec<(String, bool)>
     let document = contents
         .parse::<DocumentMut>()
         .context("Existing Codex config must be valid TOML before preserving workspace_roots")?;
-    let Some(roots) = document
-        .get("permissions")
-        .and_then(Item::as_table)
-        .and_then(|permissions| permissions.get(MANAGED_PERMISSION_PROFILE))
-        .and_then(Item::as_table)
-        .and_then(|profile| profile.get("workspace_roots"))
-        .and_then(Item::as_table)
-    else {
+    let Some(permissions) = document.get("permissions") else {
         return Ok(Vec::new());
     };
-    roots
-        .iter()
-        .map(|(root, enabled)| {
-            let enabled = enabled.as_bool().with_context(|| {
-                format!("managed permission workspace root must be boolean: {root}")
-            })?;
-            Ok((root.to_string(), enabled))
-        })
-        .collect()
+    let permissions = permissions
+        .as_table()
+        .context("permissions must be a TOML table")?;
+    let Some(profile) = permissions.get(MANAGED_PERMISSION_PROFILE) else {
+        return Ok(Vec::new());
+    };
+    let profile = profile
+        .as_table()
+        .context("managed permission profile must be a TOML table")?;
+    let Some(roots) = profile.get("workspace_roots") else {
+        return Ok(Vec::new());
+    };
+    if let Some(roots) = roots.as_table() {
+        return roots
+            .iter()
+            .map(|(root, enabled)| {
+                let enabled = enabled.as_bool().with_context(|| {
+                    format!("managed permission workspace root must be boolean: {root}")
+                })?;
+                Ok((root.to_string(), enabled))
+            })
+            .collect();
+    }
+    if let Some(roots) = roots.as_inline_table() {
+        return roots
+            .iter()
+            .map(|(root, enabled)| {
+                let enabled = enabled.as_bool().with_context(|| {
+                    format!("managed permission workspace root must be boolean: {root}")
+                })?;
+                Ok((root.to_string(), enabled))
+            })
+            .collect();
+    }
+    anyhow::bail!("managed permission workspace_roots must be a TOML table")
 }
 
 fn sync_managed_hook(template: &str, existing: &str) -> String {
@@ -2441,15 +2450,20 @@ fn ensure_config_unchanged(
     Ok(())
 }
 
-fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) -> Result<()> {
+fn migrate_managed_config_from_template(
+    codex_dir: &Path,
+    template_path: &Path,
+    home: &Path,
+) -> Result<()> {
     let managed_root = canonical_or_absolute(&codex_dir.join("worktrees"))?;
-    migrate_managed_config_from_template_with_root(codex_dir, template_path, &managed_root)
+    migrate_managed_config_from_template_with_root(codex_dir, template_path, &managed_root, home)
 }
 
 fn migrate_managed_config_from_template_with_root(
     codex_dir: &Path,
     template_path: &Path,
     managed_root: &Path,
+    home: &Path,
 ) -> Result<()> {
     let config_path = codex_dir.join("config.toml");
     let metadata = match fs::symlink_metadata(&config_path) {
@@ -2485,7 +2499,7 @@ fn migrate_managed_config_from_template_with_root(
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
     let template = fs::read_to_string(template_path)
         .with_context(|| format!("Failed to read {}", template_path.display()))?;
-    let migrated = merge_managed_config_with_root(&template, &existing, managed_root)?;
+    let migrated = merge_managed_config_with_root(&template, &existing, managed_root, home)?;
     if migrated == existing && !is_symlink {
         println!("- Shared Codex settings are up to date.");
         return Ok(());
@@ -2542,10 +2556,10 @@ fn migrate_managed_config_from_template_with_root(
     Ok(())
 }
 
-fn migrate_managed_config(codex_dir: &Path) -> Result<()> {
+fn migrate_managed_config(codex_dir: &Path, home: &Path) -> Result<()> {
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
     let template_path = dotfiles_path.join(CODEX_CONFIG_TEMPLATE);
-    migrate_managed_config_from_template(codex_dir, &template_path)
+    migrate_managed_config_from_template(codex_dir, &template_path, home)
 }
 
 fn archive_retired_profiles(codex_dir: &Path) -> Result<()> {
@@ -2891,7 +2905,7 @@ fn preflight_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn preflight_config_state(codex_dir: &Path, template_path: &Path) -> Result<()> {
+fn preflight_config_state(codex_dir: &Path, template_path: &Path, home: &Path) -> Result<()> {
     let template_metadata = fs::symlink_metadata(template_path).with_context(|| {
         format!(
             "Failed to inspect config template {}",
@@ -2924,7 +2938,7 @@ fn preflight_config_state(codex_dir: &Path, template_path: &Path) -> Result<()> 
         }
         let existing = fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read config {}", config_path.display()))?;
-        merge_managed_config_with_root(&template, &existing, &managed_root)?;
+        merge_managed_config_with_root(&template, &existing, &managed_root, home)?;
     } else {
         ensure_managed_workspace_root(&template, &managed_root)?;
     }
@@ -3269,7 +3283,7 @@ fn preflight_setup_state(home: &Path, codex_dir: &Path, dotfiles_path: &Path) ->
     for (source, destination) in CODEX_DIRS {
         preflight_shared_symlink(dotfiles_path, home, source, destination)?;
     }
-    preflight_config_state(codex_dir, &dotfiles_path.join(CODEX_CONFIG_TEMPLATE))?;
+    preflight_config_state(codex_dir, &dotfiles_path.join(CODEX_CONFIG_TEMPLATE), home)?;
     preflight_retired_state(codex_dir)?;
     preflight_setup_transaction(codex_dir)?;
     preflight_managed_binary_paths(home)?;
@@ -3400,7 +3414,7 @@ pub fn setup() -> Result<()> {
     archive_retired_profiles(&codex_dir)?;
 
     println!("\nMigrating shared Codex settings...");
-    migrate_managed_config(&codex_dir)?;
+    migrate_managed_config(&codex_dir, &home)?;
     archive_legacy_python_hooks(&codex_dir)?;
     complete_setup_transaction(&codex_dir)?;
 
@@ -3879,7 +3893,7 @@ mod tests {
         )
         .expect("write invalid template");
 
-        assert!(preflight_config_state(&codex_dir, &template).is_err());
+        assert!(preflight_config_state(&codex_dir, &template, directory.path()).is_err());
         assert!(!codex_dir.join("config.toml").exists());
     }
 
@@ -5092,7 +5106,7 @@ description = "local"
         fs::write(&template_path, template).expect("write template");
         symlink(&target_path, &config_path).expect("create config symlink");
 
-        migrate_managed_config_from_template(directory.path(), &template_path)
+        migrate_managed_config_from_template(directory.path(), &template_path, directory.path())
             .expect("migrate symlinked config");
 
         assert_eq!(
@@ -5161,7 +5175,7 @@ description = "local"
             .expect("set config permissions");
         fs::write(&template_path, template).expect("write template");
 
-        migrate_managed_config_from_template(directory.path(), &template_path)
+        migrate_managed_config_from_template(directory.path(), &template_path, directory.path())
             .expect("migrate regular config");
 
         let migrated = fs::read_to_string(&config_path).expect("read migrated config");
@@ -5231,8 +5245,9 @@ writable_roots = ["~/.codex/worktrees", "./relative-root", "/srv/legacy"]
 "/srv/other" = true
 "#;
 
-        let merged = merge_managed_config_with_root(template, existing, &managed_root)
-            .expect("merge managed workspace root");
+        let merged =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("merge managed workspace root");
         assert!(
             merged.contains("[permissions.local-audit.workspace_roots]\n\"/srv/other\" = true")
         );
@@ -5242,10 +5257,38 @@ writable_roots = ["~/.codex/worktrees", "./relative-root", "/srv/legacy"]
         assert!(!merged.contains("sandbox_mode"));
         assert!(!merged.contains("[sandbox_workspace_write]"));
         assert_eq!(
-            merge_managed_config_with_root(template, &merged, &managed_root)
+            merge_managed_config_with_root(template, &merged, &managed_root, directory.path())
                 .expect("repeat migration"),
             merged
         );
+    }
+
+    #[test]
+    fn legacy_home_root_uses_account_home_outside_custom_codex_home() {
+        let directory = TestDirectory::new("custom-codex-home-roots");
+        let home = directory.path().join("account-home");
+        let managed_root = directory
+            .path()
+            .join("custom")
+            .join("codex")
+            .join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create custom managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"[sandbox_workspace_write]
+writable_roots = ["~/.codex/worktrees"]
+"#;
+
+        let merged = merge_managed_config_with_root(template, existing, &managed_root, &home)
+            .expect("resolve legacy home root");
+        assert!(merged.contains(&format!(
+            "\"{}\" = true",
+            home.join(".codex/worktrees").display()
+        )));
+        assert!(merged.contains(&format!("\"{}\" = true", managed_root.display())));
     }
 
     #[test]
@@ -5261,8 +5304,9 @@ extends = ":workspace"
         let existing = r#"sandbox_workspace_write = { network_access = true, writable_roots = ["/srv/inline"] }
 "#;
 
-        let merged = merge_managed_config_with_root(template, existing, &managed_root)
-            .expect("migrate inline legacy workspace roots");
+        let merged =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate inline legacy workspace roots");
         assert!(merged.contains("\"/srv/inline\" = true"));
         assert!(!merged.contains("sandbox_workspace_write"));
     }
@@ -5283,7 +5327,15 @@ extends = ":workspace"
             "[sandbox_workspace_write]\nwritable_roots = [1]\n",
             "sandbox_workspace_write = true\n",
         ] {
-            assert!(merge_managed_config_with_root(template, existing, &managed_root).is_err());
+            assert!(
+                merge_managed_config_with_root(
+                    template,
+                    existing,
+                    &managed_root,
+                    directory.path(),
+                )
+                .is_err()
+            );
         }
     }
 
@@ -5302,15 +5354,49 @@ extends = ":workspace"
 "/srv/disabled" = false
 "#;
 
-        let merged = merge_managed_config_with_root(template, existing, &managed_root)
-            .expect("preserve managed workspace root values");
+        let merged =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("preserve managed workspace root values");
         assert!(merged.contains("\"/srv/enabled\" = true"));
         assert!(merged.contains("\"/srv/disabled\" = false"));
 
         let invalid = r#"[permissions.codex-autonomous.workspace_roots]
 "/srv/invalid" = "yes"
 "#;
-        assert!(merge_managed_config_with_root(template, invalid, &managed_root).is_err());
+        assert!(
+            merge_managed_config_with_root(template, invalid, &managed_root, directory.path())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn inline_managed_workspace_roots_are_preserved_and_invalid_containers_fail_closed() {
+        let directory = TestDirectory::new("inline-managed-workspace-roots");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"[permissions.codex-autonomous]
+extends = ":workspace"
+workspace_roots = { "/srv/inline-enabled" = true, "/srv/inline-disabled" = false }
+"#;
+
+        let merged =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("preserve inline managed workspace roots");
+        assert!(merged.contains("\"/srv/inline-enabled\" = true"));
+        assert!(merged.contains("\"/srv/inline-disabled\" = false"));
+
+        let invalid = r#"[permissions.codex-autonomous]
+workspace_roots = []
+"#;
+        assert!(
+            merge_managed_config_with_root(template, invalid, &managed_root, directory.path())
+                .is_err()
+        );
     }
 
     #[test]
