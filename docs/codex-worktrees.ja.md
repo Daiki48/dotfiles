@@ -17,7 +17,7 @@ worktreeの管理rootは、OpenAIのGit worktree運用に合わせて `$CODEX_HO
 
 ## 初回インストール
 
-CLIとRust製hook/helperのrelease build・配布、managed writable rootの設定・移行は次のコマンドで行います。何度実行
+CLIとRust製hook/helperのrelease build・配布、`codex-autonomous` permission profileとmanaged workspace rootの設定・移行は次のコマンドで行います。何度実行
 しても既存のローカル設定や認証情報を壊さない冪等な移行です。
 
 ```sh
@@ -28,6 +28,14 @@ installerは`HOME`がpassword database上のcurrent account homeと一致し、`
 `PATH`に含まれることを事前検査します。不一致時は書き込み前に停止します。設定を反映するため、
 実行後はCodexを再起動してください。同じmulti-call binaryをowner-onlyのregular fileとして
 hookとhelperのcanonical pathへatomic installし、内容hashで更新を管理します。
+profileはbuilt-in workspace権限を継承し、各workspace rootの`.git`だけを明示的にwriteへ
+上書きします。旧`sandbox_workspace_write.writable_roots`も新profileへ保持移行し、`~`は検証済みの
+account home、相対pathは移行実行directoryを基準に絶対pathへ正規化します。既存profileの通常table・
+inline・quoted・dotted表現を正規化して保持し、legacy rootとの競合では新profileの明示値を優先します。
+root path自体も`~`・相対・末尾slash・実在symlinkを同じ基準で正規化します。同値pathに矛盾する
+profile値、不正なcontainerや値の型は黙って選ばず停止します。
+このpath権限はprocessを限定しません。managed PreToolUse hookは通常のGit、GitHub、helperと明示的な
+破壊操作を検査する運用guardであり、任意programを敵対的に封じ込めるsandboxとは扱いません。
 helperをcanonical pathから起動できることを確認できます。
 private helperの導入・更新中に中断した場合は、owner-onlyのpending journalと内容hashが示す
 到達可能な途中状態だけを次回setupで再開し、不整合なfileやstateは変更せず停止します。

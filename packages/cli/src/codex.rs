@@ -14,7 +14,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, PermissionsExt},
 };
-use toml_edit::{Array, DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, value};
 
 use crate::codex_tools::{process, worktree};
 const CODEX_FILES: &[(&str, &str)] = &[
@@ -91,9 +91,14 @@ const MANAGED_CONFIG_KEYS: &[&str] = &[
     "plan_mode_reasoning_effort",
     "approval_policy",
     "approvals_reviewer",
-    "sandbox_mode",
+    "default_permissions",
     "commit_attribution",
 ];
+const RETIRED_CONFIG_KEYS: &[&str] = &["sandbox_mode", "sandbox_workspace_write"];
+const RETIRED_SANDBOX_TABLE: &str = "[sandbox_workspace_write]";
+const MANAGED_PERMISSION_PROFILE: &str = "codex-autonomous";
+const MANAGED_PERMISSION_PROFILE_HEADER: &str = "[permissions.codex-autonomous]";
+const MANAGED_FEATURE_KEYS: &[&str] = &["hooks"];
 const MANAGED_AGENT_KEYS: &[&str] = &[
     "enabled",
     "max_concurrent_threads_per_session",
@@ -973,6 +978,26 @@ fn managed_assignments(template: &str, section: Option<&str>, keys: &[&str]) -> 
         .collect()
 }
 
+fn is_managed_permission_profile_header(header: &str) -> bool {
+    header == MANAGED_PERMISSION_PROFILE_HEADER
+        || header
+            .strip_prefix("[permissions.codex-autonomous.")
+            .is_some_and(|rest| rest.ends_with(']'))
+}
+
+fn managed_permission_profile_sections(template: &str) -> Vec<String> {
+    let mut in_managed_profile = false;
+    template
+        .lines()
+        .filter_map(|line| {
+            if let Some(header) = table_header(line) {
+                in_managed_profile = is_managed_permission_profile_header(header);
+            }
+            in_managed_profile.then(|| line.to_string())
+        })
+        .collect()
+}
+
 fn remove_retired_managed_hook(existing: &str) -> String {
     let existing_lines = existing.lines().collect::<Vec<_>>();
     let mut merged = Vec::new();
@@ -1043,64 +1068,79 @@ fn is_retired_managed_hook_command(line: &str) -> bool {
 
 fn merge_managed_config(template: &str, existing: &str) -> String {
     let managed = managed_assignments(template, None, MANAGED_CONFIG_KEYS).join("\n");
+    let managed_features = managed_assignments(template, Some("[features]"), MANAGED_FEATURE_KEYS);
     let managed_agents = managed_assignments(template, Some("[agents]"), MANAGED_AGENT_KEYS);
+    let managed_permissions = managed_permission_profile_sections(template);
 
     let mut in_top_level = true;
-    let mut in_workspace_sandbox = false;
     let mut in_agents = false;
     let mut in_legacy_profile_table = false;
-    let mut workspace_sandbox_found = false;
+    let mut in_retired_sandbox_table = false;
+    let mut in_managed_permission_profile = false;
+    let mut in_features = false;
     let mut agents_found = false;
+    let mut features_found = false;
     let mut preserved_lines = Vec::new();
     for line in existing.lines() {
-        let trimmed = line.trim_start();
         let header = table_header(line);
         if let Some(header) = header {
             in_top_level = false;
             in_legacy_profile_table = header == "[profiles]" || header.starts_with("[profiles.");
-            in_workspace_sandbox = header == "[sandbox_workspace_write]";
+            in_retired_sandbox_table = header == RETIRED_SANDBOX_TABLE;
+            in_managed_permission_profile = is_managed_permission_profile_header(header);
+            in_features = header == "[features]";
             in_agents = header == "[agents]";
-            if in_workspace_sandbox {
-                workspace_sandbox_found = true;
+            if in_features {
+                features_found = true;
             }
             if in_agents {
                 agents_found = true;
             }
         }
-        if in_legacy_profile_table {
+        if in_legacy_profile_table || in_retired_sandbox_table || in_managed_permission_profile {
             continue;
         }
         if in_top_level && is_assignment_for(line, &["profile"]) {
             continue;
         }
-        if in_top_level && is_assignment_for(line, MANAGED_CONFIG_KEYS) {
-            continue;
-        }
-        if in_workspace_sandbox
-            && trimmed
-                .strip_prefix("network_access")
-                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        if in_top_level
+            && (is_assignment_for(line, MANAGED_CONFIG_KEYS)
+                || is_assignment_for(line, RETIRED_CONFIG_KEYS))
         {
             continue;
         }
         if in_agents && is_assignment_for(line, MANAGED_AGENT_KEYS) {
             continue;
         }
+        if in_features && is_assignment_for(line, MANAGED_FEATURE_KEYS) {
+            continue;
+        }
         preserved_lines.push(line);
-        if in_workspace_sandbox && header == Some("[sandbox_workspace_write]") {
-            preserved_lines.push("network_access = true");
+        if in_features && header == Some("[features]") {
+            preserved_lines.extend(managed_features.iter().map(String::as_str));
         }
         if in_agents && header == Some("[agents]") {
             preserved_lines.extend(managed_agents.iter().map(String::as_str));
         }
     }
-    if !workspace_sandbox_found {
-        preserved_lines.extend(["", "[sandbox_workspace_write]", "network_access = true"]);
+    if !features_found && !managed_features.is_empty() {
+        preserved_lines.push("");
+        preserved_lines.push("[features]");
+        preserved_lines.extend(managed_features.iter().map(String::as_str));
     }
     if !agents_found && !managed_agents.is_empty() {
         preserved_lines.push("");
         preserved_lines.push("[agents]");
         preserved_lines.extend(managed_agents.iter().map(String::as_str));
+    }
+    if !managed_permissions.is_empty() {
+        if preserved_lines
+            .last()
+            .is_some_and(|line| !line.trim().is_empty())
+        {
+            preserved_lines.push("");
+        }
+        preserved_lines.extend(managed_permissions.iter().map(String::as_str));
     }
     let preserved = preserved_lines
         .join("\n")
@@ -1119,9 +1159,232 @@ fn merge_managed_config_with_root(
     template: &str,
     existing: &str,
     managed_root: &Path,
+    home: &Path,
 ) -> Result<String> {
-    let merged = merge_managed_config(template, existing);
-    ensure_managed_writable_root(&merged, managed_root)
+    let legacy_roots = legacy_workspace_roots(existing, home)?;
+    let profile_roots = managed_profile_workspace_roots(existing, home)?;
+    let existing = remove_managed_permission_profile(existing)?;
+    let merged = merge_managed_config(template, &existing);
+    let merged = legacy_roots.iter().try_fold(merged, |contents, root| {
+        ensure_permission_workspace_root(&contents, root)
+    })?;
+    let merged = profile_roots
+        .iter()
+        .try_fold(merged, |contents, (root, enabled)| {
+            set_permission_workspace_root(&contents, root, *enabled)
+        })?;
+    ensure_managed_workspace_root(&merged, managed_root)
+}
+
+fn legacy_workspace_roots(contents: &str, home: &Path) -> Result<Vec<String>> {
+    if contents.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let document = contents
+        .parse::<DocumentMut>()
+        .context("Existing Codex config must be valid TOML before migrating writable_roots")?;
+    let Some(sandbox) = document.get("sandbox_workspace_write") else {
+        return Ok(Vec::new());
+    };
+    let roots = if let Some(table) = sandbox.as_table() {
+        table
+            .get("writable_roots")
+            .map(|roots| {
+                roots
+                    .as_array()
+                    .context("sandbox_workspace_write.writable_roots must be an array")
+            })
+            .transpose()?
+    } else if let Some(table) = sandbox.as_inline_table() {
+        table
+            .get("writable_roots")
+            .map(|roots| {
+                roots
+                    .as_array()
+                    .context("sandbox_workspace_write.writable_roots must be an array")
+            })
+            .transpose()?
+    } else {
+        anyhow::bail!("sandbox_workspace_write must be a table");
+    };
+    let Some(roots) = roots else {
+        return Ok(Vec::new());
+    };
+    validate_absolute_path(home).context("Account home must be valid before migrating roots")?;
+    let relative_base = std::env::current_dir()
+        .context("Failed to resolve the current directory for legacy writable_roots")?;
+    roots
+        .iter()
+        .map(|root| {
+            let root = root
+                .as_str()
+                .context("sandbox_workspace_write.writable_roots must contain strings")?;
+            normalize_workspace_root(root, home, &relative_base)
+        })
+        .collect()
+}
+
+fn managed_profile_workspace_roots(contents: &str, home: &Path) -> Result<Vec<(String, bool)>> {
+    if contents.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let document = contents
+        .parse::<DocumentMut>()
+        .context("Existing Codex config must be valid TOML before preserving workspace_roots")?;
+    let Some(permissions) = document.get("permissions") else {
+        return Ok(Vec::new());
+    };
+    let roots = if let Some(permissions) = permissions.as_table() {
+        let Some(profile) = permissions.get(MANAGED_PERMISSION_PROFILE) else {
+            return Ok(Vec::new());
+        };
+        managed_workspace_roots_from_profile_item(profile)?
+    } else if let Some(permissions) = permissions.as_inline_table() {
+        let Some(profile) = permissions.get(MANAGED_PERMISSION_PROFILE) else {
+            return Ok(Vec::new());
+        };
+        let profile = profile
+            .as_inline_table()
+            .context("managed permission profile must be a TOML table")?;
+        managed_workspace_roots_from_inline_profile(profile)?
+    } else {
+        anyhow::bail!("permissions must be a TOML table");
+    };
+    normalize_managed_workspace_roots(roots, home)
+}
+
+fn normalize_managed_workspace_roots(
+    roots: Vec<(String, bool)>,
+    home: &Path,
+) -> Result<Vec<(String, bool)>> {
+    validate_absolute_path(home).context("Account home must be valid before migrating roots")?;
+    let relative_base = std::env::current_dir()
+        .context("Failed to resolve the current directory for managed workspace_roots")?;
+    let mut normalized_roots = Vec::with_capacity(roots.len());
+    for (root, enabled) in roots {
+        let normalized = normalize_workspace_root(&root, home, &relative_base)?;
+        if let Some((_, existing)) = normalized_roots
+            .iter()
+            .find(|(candidate, _)| candidate == &normalized)
+        {
+            if *existing != enabled {
+                anyhow::bail!(
+                    "managed permission workspace root has conflicting equivalent values: {root}"
+                );
+            }
+            continue;
+        }
+        normalized_roots.push((normalized, enabled));
+    }
+    Ok(normalized_roots)
+}
+
+fn normalize_workspace_root(root: &str, home: &Path, relative_base: &Path) -> Result<String> {
+    let path = if root == "~" {
+        home.to_path_buf()
+    } else if let Some(relative) = root.strip_prefix("~/") {
+        home.join(relative)
+    } else {
+        let path = PathBuf::from(root);
+        if path.is_absolute() {
+            path
+        } else {
+            relative_base.join(path)
+        }
+    };
+    let path = normalize_absolute_path(&canonical_or_absolute(&path)?);
+    path.to_str()
+        .map(str::to_string)
+        .with_context(|| format!("Workspace root is not valid UTF-8: {root}"))
+}
+
+fn managed_workspace_roots_from_profile_item(profile: &Item) -> Result<Vec<(String, bool)>> {
+    if let Some(profile) = profile.as_table() {
+        let Some(roots) = profile.get("workspace_roots") else {
+            return Ok(Vec::new());
+        };
+        if let Some(roots) = roots.as_table() {
+            return boolean_workspace_roots_from_table(roots);
+        }
+        if let Some(roots) = roots.as_inline_table() {
+            return boolean_workspace_roots_from_inline_table(roots);
+        }
+        anyhow::bail!("managed permission workspace_roots must be a TOML table");
+    }
+    if let Some(profile) = profile.as_inline_table() {
+        return managed_workspace_roots_from_inline_profile(profile);
+    }
+    anyhow::bail!("managed permission profile must be a TOML table")
+}
+
+fn managed_workspace_roots_from_inline_profile(
+    profile: &InlineTable,
+) -> Result<Vec<(String, bool)>> {
+    let Some(roots) = profile.get("workspace_roots") else {
+        return Ok(Vec::new());
+    };
+    let roots = roots
+        .as_inline_table()
+        .context("managed permission workspace_roots must be a TOML table")?;
+    boolean_workspace_roots_from_inline_table(roots)
+}
+
+fn boolean_workspace_roots_from_table(roots: &Table) -> Result<Vec<(String, bool)>> {
+    roots
+        .iter()
+        .map(|(root, enabled)| {
+            let enabled = enabled.as_bool().with_context(|| {
+                format!("managed permission workspace root must be boolean: {root}")
+            })?;
+            Ok((root.to_string(), enabled))
+        })
+        .collect()
+}
+
+fn boolean_workspace_roots_from_inline_table(roots: &InlineTable) -> Result<Vec<(String, bool)>> {
+    roots
+        .iter()
+        .map(|(root, enabled)| {
+            let enabled = enabled.as_bool().with_context(|| {
+                format!("managed permission workspace root must be boolean: {root}")
+            })?;
+            Ok((root.to_string(), enabled))
+        })
+        .collect()
+}
+
+fn remove_managed_permission_profile(contents: &str) -> Result<String> {
+    if contents.trim().is_empty() {
+        return Ok(contents.to_string());
+    }
+    let mut document = contents
+        .parse::<DocumentMut>()
+        .context("Existing Codex config must be valid TOML before normalizing permissions")?;
+    let Some(permissions) = document.get("permissions") else {
+        return Ok(contents.to_string());
+    };
+    let mut normalized = if let Some(permissions) = permissions.as_table() {
+        permissions.clone()
+    } else if let Some(permissions) = permissions.as_inline_table() {
+        let mut normalized = Table::new();
+        for (name, profile) in permissions.iter() {
+            normalized.insert(name, Item::Value(profile.clone()));
+        }
+        normalized
+    } else {
+        anyhow::bail!("permissions must be a TOML table");
+    };
+    normalized.remove(MANAGED_PERMISSION_PROFILE);
+    if normalized.is_empty() {
+        document.remove("permissions");
+    } else {
+        document.insert("permissions", Item::Table(normalized));
+    }
+    let mut rendered = document.to_string();
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    Ok(rendered)
 }
 
 fn sync_managed_hook(template: &str, existing: &str) -> String {
@@ -1136,7 +1399,7 @@ fn sync_managed_hook(template: &str, existing: &str) -> String {
     format!("{}\n\n{MANAGED_HOOK_CONFIG}\n", cleaned.trim_end())
 }
 
-fn ensure_managed_writable_root(contents: &str, managed_root: &Path) -> Result<String> {
+fn ensure_managed_workspace_root(contents: &str, managed_root: &Path) -> Result<String> {
     let root = managed_root.to_str().with_context(|| {
         format!(
             "Managed worktree root is not valid UTF-8: {}",
@@ -1146,25 +1409,38 @@ fn ensure_managed_writable_root(contents: &str, managed_root: &Path) -> Result<S
     if !managed_root.is_absolute() {
         anyhow::bail!("Managed worktree root must be absolute: {root}");
     }
+    ensure_permission_workspace_root(contents, root)
+}
+
+fn ensure_permission_workspace_root(contents: &str, root: &str) -> Result<String> {
+    set_permission_workspace_root(contents, root, true)
+}
+
+fn set_permission_workspace_root(contents: &str, root: &str, enabled: bool) -> Result<String> {
     let mut document = contents
         .parse::<DocumentMut>()
-        .context("Codex config must be valid TOML before adding writable_roots")?;
-    let sandbox = document
-        .entry("sandbox_workspace_write")
+        .context("Codex config must be valid TOML before adding a managed workspace root")?;
+    let permissions = document
+        .entry("permissions")
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_mut()
-        .context("sandbox_workspace_write must be a TOML table")?;
-    let roots = sandbox
-        .entry("writable_roots")
-        .or_insert_with(|| value(Array::new()))
-        .as_array_mut()
-        .context("writable_roots must be a TOML string array")?;
-    if roots.iter().any(|item| item.as_str().is_none()) {
-        anyhow::bail!("writable_roots must contain only TOML strings");
+        .context("permissions must be a TOML table")?;
+    let profile = permissions
+        .entry(MANAGED_PERMISSION_PROFILE)
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .context("managed permission profile must be a TOML table")?;
+    let roots = profile
+        .entry("workspace_roots")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .context("managed permission workspace_roots must be a TOML table")?;
+    if let Some(existing) = roots.get(root)
+        && existing.as_bool() == Some(enabled)
+    {
+        return Ok(contents.to_string());
     }
-    if !roots.iter().any(|item| item.as_str() == Some(root)) {
-        roots.push(root);
-    }
+    roots.insert(root, value(enabled));
     let mut rendered = document.to_string();
     if !rendered.ends_with('\n') {
         rendered.push('\n');
@@ -2276,15 +2552,20 @@ fn ensure_config_unchanged(
     Ok(())
 }
 
-fn migrate_managed_config_from_template(codex_dir: &Path, template_path: &Path) -> Result<()> {
+fn migrate_managed_config_from_template(
+    codex_dir: &Path,
+    template_path: &Path,
+    home: &Path,
+) -> Result<()> {
     let managed_root = canonical_or_absolute(&codex_dir.join("worktrees"))?;
-    migrate_managed_config_from_template_with_root(codex_dir, template_path, &managed_root)
+    migrate_managed_config_from_template_with_root(codex_dir, template_path, &managed_root, home)
 }
 
 fn migrate_managed_config_from_template_with_root(
     codex_dir: &Path,
     template_path: &Path,
     managed_root: &Path,
+    home: &Path,
 ) -> Result<()> {
     let config_path = codex_dir.join("config.toml");
     let metadata = match fs::symlink_metadata(&config_path) {
@@ -2302,16 +2583,7 @@ fn migrate_managed_config_from_template_with_root(
     if metadata.is_none() {
         let template = fs::read_to_string(template_path)
             .with_context(|| format!("Failed to read {}", template_path.display()))?;
-        let default_root = home::home_dir().map(|home| home.join(".codex/worktrees"));
-        let installed = if default_root
-            .as_deref()
-            .and_then(|root| canonical_or_absolute(root).ok())
-            .is_some_and(|root| root == managed_root)
-        {
-            template.clone()
-        } else {
-            ensure_managed_writable_root(&template, managed_root)?
-        };
+        let installed = ensure_managed_workspace_root(&template, managed_root)?;
         let permissions = fs::metadata(template_path)
             .with_context(|| {
                 format!(
@@ -2320,11 +2592,7 @@ fn migrate_managed_config_from_template_with_root(
                 )
             })?
             .permissions();
-        if installed == template {
-            copy_file_exclusive(template_path, &config_path)?;
-        } else {
-            write_file_exclusive(&config_path, &installed, permissions)?;
-        }
+        write_file_exclusive(&config_path, &installed, permissions)?;
         println!("- Installed base config: {}", config_path.display());
         return Ok(());
     }
@@ -2333,7 +2601,7 @@ fn migrate_managed_config_from_template_with_root(
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
     let template = fs::read_to_string(template_path)
         .with_context(|| format!("Failed to read {}", template_path.display()))?;
-    let migrated = merge_managed_config_with_root(&template, &existing, managed_root)?;
+    let migrated = merge_managed_config_with_root(&template, &existing, managed_root, home)?;
     if migrated == existing && !is_symlink {
         println!("- Shared Codex settings are up to date.");
         return Ok(());
@@ -2390,10 +2658,10 @@ fn migrate_managed_config_from_template_with_root(
     Ok(())
 }
 
-fn migrate_managed_config(codex_dir: &Path) -> Result<()> {
+fn migrate_managed_config(codex_dir: &Path, home: &Path) -> Result<()> {
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
     let template_path = dotfiles_path.join(CODEX_CONFIG_TEMPLATE);
-    migrate_managed_config_from_template(codex_dir, &template_path)
+    migrate_managed_config_from_template(codex_dir, &template_path, home)
 }
 
 fn archive_retired_profiles(codex_dir: &Path) -> Result<()> {
@@ -2739,7 +3007,7 @@ fn preflight_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn preflight_config_state(codex_dir: &Path, template_path: &Path) -> Result<()> {
+fn preflight_config_state(codex_dir: &Path, template_path: &Path, home: &Path) -> Result<()> {
     let template_metadata = fs::symlink_metadata(template_path).with_context(|| {
         format!(
             "Failed to inspect config template {}",
@@ -2772,9 +3040,9 @@ fn preflight_config_state(codex_dir: &Path, template_path: &Path) -> Result<()> 
         }
         let existing = fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read config {}", config_path.display()))?;
-        merge_managed_config_with_root(&template, &existing, &managed_root)?;
+        merge_managed_config_with_root(&template, &existing, &managed_root, home)?;
     } else {
-        ensure_managed_writable_root(&template, &managed_root)?;
+        ensure_managed_workspace_root(&template, &managed_root)?;
     }
     Ok(())
 }
@@ -2999,6 +3267,20 @@ fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
     }
 }
 
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn reject_cargo_configuration(dotfiles_path: &Path, home: &Path) -> Result<()> {
     let mut directories = dotfiles_path
         .ancestors()
@@ -3103,7 +3385,7 @@ fn preflight_setup_state(home: &Path, codex_dir: &Path, dotfiles_path: &Path) ->
     for (source, destination) in CODEX_DIRS {
         preflight_shared_symlink(dotfiles_path, home, source, destination)?;
     }
-    preflight_config_state(codex_dir, &dotfiles_path.join(CODEX_CONFIG_TEMPLATE))?;
+    preflight_config_state(codex_dir, &dotfiles_path.join(CODEX_CONFIG_TEMPLATE), home)?;
     preflight_retired_state(codex_dir)?;
     preflight_setup_transaction(codex_dir)?;
     preflight_managed_binary_paths(home)?;
@@ -3234,15 +3516,15 @@ pub fn setup() -> Result<()> {
     archive_retired_profiles(&codex_dir)?;
 
     println!("\nMigrating shared Codex settings...");
-    migrate_managed_config(&codex_dir)?;
+    migrate_managed_config(&codex_dir, &home)?;
     archive_legacy_python_hooks(&codex_dir)?;
     complete_setup_transaction(&codex_dir)?;
 
     println!("\n✅ Codex CLI setup completed!");
     println!("\n💡 Next steps:");
     println!("   1. Run 'codex login' if authentication is not configured");
-    println!("   2. Run 'codex' (workspace-write + auto-review is the default)");
-    println!("   3. Restart Codex after installation so writable roots are reloaded");
+    println!("   2. Run 'codex' (codex-autonomous + auto-review is the default)");
+    println!("   3. Restart Codex after installation so permissions are reloaded");
 
     Ok(())
 }
@@ -3256,12 +3538,12 @@ mod tests {
     use super::{
         CODEX_DIRS, LEGACY_CODEX_DELIVERY_SHA256, LEGACY_CODEX_WORKTREE_SHA256,
         MANAGED_BINARY_DESTINATIONS, MANAGED_HOOK_COMMAND, MANAGED_HOOK_DESTINATION,
-        ManagedInstallMode, ManagedTransaction, ManagedTransactionKind,
+        MANAGED_PERMISSION_PROFILE, ManagedInstallMode, ManagedTransaction, ManagedTransactionKind,
         PYTHON_MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND, archive_legacy_python_hook,
         begin_managed_transaction, begin_refresh_transaction, begin_setup_transaction,
         complete_refresh_transaction, complete_setup_transaction, contains_legacy_profile_config,
         copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook,
-        ensure_managed_hook_with_legacy_hash, ensure_managed_writable_root,
+        ensure_managed_hook_with_legacy_hash, ensure_managed_workspace_root,
         ensure_private_directory, legacy_hash_for_destination, managed_hook_state_path,
         managed_transaction_path, merge_managed_config, merge_managed_config_with_root,
         migrate_managed_config_from_template, preflight_config_state,
@@ -3345,6 +3627,45 @@ mod tests {
             );
             assert!(document.get("sandbox_mode").is_none());
         }
+    }
+
+    #[test]
+    fn base_config_uses_a_git_writable_permission_profile() {
+        let document = include_str!("../../../.codex/config.base.toml")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse base config");
+
+        assert_eq!(
+            document["default_permissions"].as_str(),
+            Some(MANAGED_PERMISSION_PROFILE)
+        );
+        assert!(document.get("sandbox_mode").is_none());
+        assert!(document.get("sandbox_workspace_write").is_none());
+        assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["extends"].as_str(),
+            Some(":workspace")
+        );
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["filesystem"]
+                [":workspace_roots"][".git"]
+                .as_str(),
+            Some("write")
+        );
+        assert!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["filesystem"][":workspace_roots"]
+                .get(".agents")
+                .is_none()
+        );
+        assert!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["filesystem"][":workspace_roots"]
+                .get(".codex")
+                .is_none()
+        );
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["network"]["enabled"].as_bool(),
+            Some(true)
+        );
     }
 
     #[cfg(unix)]
@@ -3670,11 +3991,11 @@ mod tests {
         fs::create_dir_all(codex_dir.join("worktrees")).expect("create config root");
         fs::write(
             &template,
-            "[sandbox_workspace_write]\nwritable_roots = 42\n",
+            "default_permissions = \"codex-autonomous\"\npermissions = 42\n",
         )
         .expect("write invalid template");
 
-        assert!(preflight_config_state(&codex_dir, &template).is_err());
+        assert!(preflight_config_state(&codex_dir, &template, directory.path()).is_err());
         assert!(!codex_dir.join("config.toml").exists());
     }
 
@@ -3791,11 +4112,20 @@ mod tests {
 model = "gpt-5.6-terra"
 approval_policy = "on-request"
 approvals_reviewer = "auto_review"
-sandbox_mode = "workspace-write"
+default_permissions = "codex-autonomous"
 commit_attribution = ""
 
-[sandbox_workspace_write]
-network_access = true
+[features]
+hooks = true
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+
+[permissions.codex-autonomous.filesystem.":workspace_roots"]
+".git" = "write"
+
+[permissions.codex-autonomous.network]
+enabled = true
 
 [agents]
 enabled = true
@@ -3809,6 +4139,19 @@ sandbox_mode = "read-only"
 [sandbox_workspace_write]
 network_access = false
 exclude_tmpdir_env_var = true
+
+[features]
+hooks = false
+network_proxy = true
+
+[permissions.codex-autonomous]
+extends = ":read-only"
+
+[permissions.codex-autonomous.filesystem.":workspace_roots"]
+".git" = "read"
+
+[permissions.local-audit]
+extends = ":read-only"
 
 [projects."/work"]
 trust_level = "trusted"
@@ -3828,11 +4171,17 @@ description = "local"
 
         let actual = merge_managed_config(template, existing);
         assert!(actual.contains("model = \"gpt-5.6-terra\""));
-        assert!(actual.contains("sandbox_mode = \"workspace-write\""));
+        assert!(actual.contains("default_permissions = \"codex-autonomous\""));
         assert!(actual.contains("approvals_reviewer = \"auto_review\""));
         assert!(actual.contains("commit_attribution = \"\""));
-        assert!(actual.contains("[sandbox_workspace_write]\nnetwork_access = true"));
-        assert!(actual.contains("exclude_tmpdir_env_var = true"));
+        assert!(actual.contains("[features]\nhooks = true\nnetwork_proxy = true"));
+        assert!(actual.contains("[permissions.codex-autonomous]\nextends = \":workspace\""));
+        assert!(actual.contains("\".git\" = \"write\""));
+        assert!(actual.contains("[permissions.codex-autonomous.network]\nenabled = true"));
+        assert!(actual.contains("[permissions.local-audit]\nextends = \":read-only\""));
+        assert!(!actual.contains("sandbox_mode"));
+        assert!(!actual.contains("[sandbox_workspace_write]"));
+        assert!(!actual.contains("exclude_tmpdir_env_var"));
         assert!(!actual.contains("network_access = false"));
         assert!(!actual.contains("model = \"old\""));
         assert!(actual.contains("[projects.\"/work\"]"));
@@ -4680,12 +5029,14 @@ description = "local"
     }
 
     #[test]
-    fn workspace_sandbox_table_is_added_when_missing() {
+    fn managed_permission_profile_is_added_when_missing() {
         let actual = merge_managed_config(
-            "model = \"gpt-5.6-terra\"\n\n[agents]\nenabled = true\ndefault_subagent_model = \"gpt-5.6-terra\"\n",
+            "model = \"gpt-5.6-terra\"\ndefault_permissions = \"codex-autonomous\"\n\n[permissions.codex-autonomous]\nextends = \":workspace\"\n\n[permissions.codex-autonomous.filesystem.\":workspace_roots\"]\n\".git\" = \"write\"\n\n[agents]\nenabled = true\ndefault_subagent_model = \"gpt-5.6-terra\"\n",
             "model = \"old\"\n[projects.\"/work\"]\ntrust_level = \"trusted\"\n",
         );
-        assert!(actual.contains("[sandbox_workspace_write]\nnetwork_access = true"));
+        assert!(actual.contains("default_permissions = \"codex-autonomous\""));
+        assert!(actual.contains("[permissions.codex-autonomous]\nextends = \":workspace\""));
+        assert!(actual.contains("\".git\" = \"write\""));
         assert!(
             actual.contains("[agents]\nenabled = true\ndefault_subagent_model = \"gpt-5.6-terra\"")
         );
@@ -4695,9 +5046,13 @@ description = "local"
     #[test]
     fn commented_managed_table_headers_are_reused_and_idempotent() {
         let template = r#"model = "gpt-5.6-terra"
+default_permissions = "codex-autonomous"
 
-[sandbox_workspace_write]
-network_access = true
+[permissions.codex-autonomous]
+extends = ":workspace"
+
+[permissions.codex-autonomous.filesystem.":workspace_roots"]
+".git" = "write"
 
 [agents]
 enabled = true
@@ -4705,10 +5060,20 @@ max_concurrent_threads_per_session = 3
 default_subagent_model = "gpt-5.6-terra"
 "#;
         let existing = r#"model = "old"
+sandbox_mode = "workspace-write"
 
 [sandbox_workspace_write]   # local sandbox options
 network_access = false
 exclude_tmpdir_env_var = true
+
+[permissions.codex-autonomous] # stale managed profile
+extends = ":read-only"
+
+[permissions.codex-autonomous.filesystem.":workspace_roots"]
+".git" = "read"
+
+[permissions.local-audit] # local profile
+extends = ":read-only"
 
 [agents] # local agent defaults
 enabled = false
@@ -4720,16 +5085,20 @@ description = "local"
 "#;
 
         let actual = merge_managed_config(template, existing);
-        assert!(actual.contains(
-            "[sandbox_workspace_write]   # local sandbox options\nnetwork_access = true"
-        ));
-        assert!(actual.contains("exclude_tmpdir_env_var = true"));
+        assert!(actual.contains("default_permissions = \"codex-autonomous\""));
+        assert!(actual.contains("[permissions.codex-autonomous]\nextends = \":workspace\""));
+        assert!(actual.contains("\".git\" = \"write\""));
+        assert!(
+            actual.contains("[permissions.local-audit] # local profile\nextends = \":read-only\"")
+        );
+        assert!(!actual.contains("sandbox_mode"));
+        assert!(!actual.contains("[sandbox_workspace_write]"));
+        assert!(!actual.contains("exclude_tmpdir_env_var"));
         assert!(!actual.contains("network_access = false"));
         assert!(actual.contains("[agents] # local agent defaults\nenabled = true"));
         assert!(actual.contains("max_concurrent_threads_per_session = 3"));
         assert!(actual.contains("custom_setting = \"preserved\""));
         assert!(actual.contains("[agents.local_reviewer] # custom agent\ndescription = \"local\""));
-        assert!(!actual.contains("\n[sandbox_workspace_write]\n"));
         assert!(!actual.contains("\n[agents]\n"));
         assert_eq!(merge_managed_config(template, &actual), actual);
     }
@@ -4839,7 +5208,7 @@ description = "local"
         fs::write(&template_path, template).expect("write template");
         symlink(&target_path, &config_path).expect("create config symlink");
 
-        migrate_managed_config_from_template(directory.path(), &template_path)
+        migrate_managed_config_from_template(directory.path(), &template_path, directory.path())
             .expect("migrate symlinked config");
 
         assert_eq!(
@@ -4908,7 +5277,7 @@ description = "local"
             .expect("set config permissions");
         fs::write(&template_path, template).expect("write template");
 
-        migrate_managed_config_from_template(directory.path(), &template_path)
+        migrate_managed_config_from_template(directory.path(), &template_path, directory.path())
             .expect("migrate regular config");
 
         let migrated = fs::read_to_string(&config_path).expect("read migrated config");
@@ -4948,58 +5317,380 @@ description = "local"
     }
 
     #[test]
-    fn writable_roots_preserve_local_values_and_are_idempotent() {
+    fn managed_workspace_root_is_added_and_idempotent() {
         let directory = TestDirectory::new("writable-roots");
-        let managed_root = directory.path().join("codex").join("worktrees");
+        let managed_root = directory.path().join(".codex").join("worktrees");
         fs::create_dir_all(&managed_root).expect("create managed root");
+        let relative_root = std::env::current_dir()
+            .expect("resolve current directory")
+            .join("relative-root");
         let template = r#"model = "gpt-5.6-terra"
+default_permissions = "codex-autonomous"
 
-[sandbox_workspace_write]
-network_access = true
-writable_roots = ["~/.codex/worktrees"]
+[permissions.codex-autonomous]
+extends = ":workspace"
+
+[permissions.codex-autonomous.workspace_roots]
+
+[permissions.codex-autonomous.filesystem.":workspace_roots"]
+".git" = "write"
 "#;
         let existing = r#"model = "old"
+sandbox_mode = "workspace-write"
 
 [sandbox_workspace_write] # local options
 network_access = false
-writable_roots = ["./relative", "/srv/other"] # keep these roots
 exclude_tmpdir_env_var = true
+writable_roots = ["~/.codex/worktrees", "./relative-root", "/srv/legacy"]
+
+[permissions.local-audit.workspace_roots]
+"/srv/other" = true
 "#;
 
-        let merged = merge_managed_config_with_root(template, existing, &managed_root)
-            .expect("merge writable roots");
-        assert!(merged.contains("\"./relative\""));
-        assert!(merged.contains("\"/srv/other\""));
-        assert!(merged.contains(&format!("\"{}\"", managed_root.display())));
-        assert!(merged.contains("# keep these roots"));
+        let merged =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("merge managed workspace root");
+        assert!(
+            merged.contains("[permissions.local-audit.workspace_roots]\n\"/srv/other\" = true")
+        );
+        assert!(merged.contains(&format!("\"{}\" = true", managed_root.display())));
+        assert!(merged.contains(&format!("\"{}\" = true", relative_root.display())));
+        assert!(merged.contains("\"/srv/legacy\" = true"));
+        assert!(!merged.contains("sandbox_mode"));
+        assert!(!merged.contains("[sandbox_workspace_write]"));
         assert_eq!(
-            ensure_managed_writable_root(&merged, &managed_root).expect("repeat merge"),
+            merge_managed_config_with_root(template, &merged, &managed_root, directory.path())
+                .expect("repeat migration"),
             merged
         );
     }
 
     #[test]
-    fn writable_roots_accept_multiline_toml_and_preserve_comments_and_escapes() {
+    fn legacy_home_root_uses_account_home_outside_custom_codex_home() {
+        let directory = TestDirectory::new("custom-codex-home-roots");
+        let home = directory.path().join("account-home");
+        let managed_root = directory
+            .path()
+            .join("custom")
+            .join("codex")
+            .join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create custom managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"[sandbox_workspace_write]
+writable_roots = ["~/.codex/worktrees"]
+"#;
+
+        let merged = merge_managed_config_with_root(template, existing, &managed_root, &home)
+            .expect("resolve legacy home root");
+        assert!(merged.contains(&format!(
+            "\"{}\" = true",
+            home.join(".codex/worktrees").display()
+        )));
+        assert!(merged.contains(&format!("\"{}\" = true", managed_root.display())));
+    }
+
+    #[test]
+    fn inline_legacy_workspace_roots_are_migrated_and_removed() {
+        let directory = TestDirectory::new("inline-writable-roots");
+        let managed_root = directory.path().join(".codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"sandbox_workspace_write = { network_access = true, writable_roots = ["/srv/inline"] }
+"#;
+
+        let merged =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate inline legacy workspace roots");
+        assert!(merged.contains("\"/srv/inline\" = true"));
+        assert!(!merged.contains("sandbox_workspace_write"));
+    }
+
+    #[test]
+    fn legacy_workspace_roots_fail_closed_on_invalid_values() {
+        let directory = TestDirectory::new("invalid-legacy-writable-roots");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+
+        for existing in [
+            "[sandbox_workspace_write]\nwritable_roots = \"/srv/not-an-array\"\n",
+            "[sandbox_workspace_write]\nwritable_roots = [1]\n",
+            "sandbox_workspace_write = true\n",
+        ] {
+            assert!(
+                merge_managed_config_with_root(
+                    template,
+                    existing,
+                    &managed_root,
+                    directory.path(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn managed_workspace_roots_preserve_boolean_values_and_reject_invalid_values() {
+        let directory = TestDirectory::new("managed-workspace-root-values");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"[permissions.codex-autonomous.workspace_roots]
+"/srv/enabled" = true
+"/srv/disabled" = false
+"#;
+
+        let merged =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("preserve managed workspace root values");
+        assert!(merged.contains("\"/srv/enabled\" = true"));
+        assert!(merged.contains("\"/srv/disabled\" = false"));
+
+        let invalid = r#"[permissions.codex-autonomous.workspace_roots]
+"/srv/invalid" = "yes"
+"#;
+        assert!(
+            merge_managed_config_with_root(template, invalid, &managed_root, directory.path())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_profile_values_override_conflicting_legacy_roots() {
+        let directory = TestDirectory::new("conflicting-workspace-roots");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"[sandbox_workspace_write]
+writable_roots = ["/srv/conflict"]
+
+[permissions.codex-autonomous.workspace_roots]
+"/srv/conflict/" = false
+"#;
+
+        let merged =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("preserve explicit managed root value");
+        let document = merged
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse migrated config");
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]["/srv/conflict"]
+                .as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn equivalent_workspace_root_paths_preserve_profile_values() {
+        let directory = TestDirectory::new("equivalent-workspace-root-paths");
+        let home = directory.path().join("account-home");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let relative_root = std::env::current_dir()
+            .expect("resolve current directory")
+            .join("relative-conflict");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let cases = [
+            (
+                format!(
+                    "[sandbox_workspace_write]\nwritable_roots = [\"{}\"]\n\n[permissions.codex-autonomous.workspace_roots]\n\"~/tilde-conflict\" = false\n",
+                    home.join("tilde-conflict").display()
+                ),
+                home.join("tilde-conflict"),
+            ),
+            (
+                format!(
+                    "[sandbox_workspace_write]\nwritable_roots = [\"./relative-conflict\"]\n\n[permissions.codex-autonomous.workspace_roots]\n\"{}\" = false\n",
+                    relative_root.display()
+                ),
+                relative_root,
+            ),
+        ];
+
+        for (existing, expected_root) in cases {
+            let merged = merge_managed_config_with_root(template, &existing, &managed_root, &home)
+                .expect("preserve equivalent profile root value");
+            let document = merged
+                .parse::<toml_edit::DocumentMut>()
+                .expect("parse migrated config");
+            assert_eq!(
+                document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]
+                    [expected_root.to_str().expect("UTF-8 expected root")]
+                .as_bool(),
+                Some(false)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_equivalent_workspace_roots_preserve_profile_values() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("symlink-equivalent-workspace-roots");
+        let home = directory.path().join("account-home");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let real_root = directory.path().join("real-root");
+        let linked_root = directory.path().join("linked-root");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        fs::create_dir(&real_root).expect("create real root");
+        symlink(&real_root, &linked_root).expect("create root symlink");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = format!(
+            "[sandbox_workspace_write]\nwritable_roots = [\"{}\"]\n\n[permissions.codex-autonomous.workspace_roots]\n\"{}\" = false\n",
+            linked_root.display(),
+            real_root.display()
+        );
+
+        let merged = merge_managed_config_with_root(template, &existing, &managed_root, &home)
+            .expect("preserve symlink-equivalent profile value");
+        let document = merged
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse migrated config");
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]
+                [real_root.to_str().expect("UTF-8 real root")]
+            .as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn equivalent_managed_permission_toml_forms_are_migrated() {
+        let directory = TestDirectory::new("equivalent-permission-forms");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+
+        for (existing, expected_root) in [
+            (
+                r#"permissions = { "codex-autonomous" = { workspace_roots = { "/srv/top-inline" = true } }, local = { workspace_roots = { "/srv/local" = true } } }
+"#,
+                "/srv/top-inline",
+            ),
+            (
+                r#"[permissions."codex-autonomous"]
+workspace_roots = { "/srv/quoted" = true }
+"#,
+                "/srv/quoted",
+            ),
+            (
+                r#"permissions.codex-autonomous.workspace_roots."/srv/dotted" = true
+"#,
+                "/srv/dotted",
+            ),
+        ] {
+            let merged =
+                merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                    .expect("migrate equivalent permission form");
+            merged
+                .parse::<toml_edit::DocumentMut>()
+                .expect("render valid migrated TOML");
+            assert!(merged.contains(&format!("\"{expected_root}\" = true")));
+            if expected_root == "/srv/top-inline" {
+                assert!(merged.contains("/srv/local"));
+            }
+            assert_eq!(
+                merge_managed_config_with_root(template, &merged, &managed_root, directory.path(),)
+                    .expect("repeat equivalent migration"),
+                merged
+            );
+        }
+    }
+
+    #[test]
+    fn inline_managed_workspace_roots_are_preserved_and_invalid_containers_fail_closed() {
+        let directory = TestDirectory::new("inline-managed-workspace-roots");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"[permissions.codex-autonomous]
+extends = ":workspace"
+workspace_roots = { "/srv/inline-enabled" = true, "/srv/inline-disabled" = false }
+"#;
+
+        let merged =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("preserve inline managed workspace roots");
+        assert!(merged.contains("\"/srv/inline-enabled\" = true"));
+        assert!(merged.contains("\"/srv/inline-disabled\" = false"));
+
+        for invalid in [
+            "[permissions.codex-autonomous]\nworkspace_roots = []\n",
+            "permissions = []\n",
+            "[permissions]\ncodex-autonomous = []\n",
+        ] {
+            assert!(
+                merge_managed_config_with_root(template, invalid, &managed_root, directory.path(),)
+                    .is_err()
+            );
+        }
+
+        let conflicting = r#"[permissions.codex-autonomous.workspace_roots]
+"/srv/equivalent" = true
+"/srv/equivalent/" = false
+"#;
+        assert!(
+            merge_managed_config_with_root(template, conflicting, &managed_root, directory.path(),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_workspace_roots_preserve_local_values_and_comments() {
         let directory = TestDirectory::new("multiline-writable-roots");
         let managed_root = directory.path().join("codex").join("worktrees");
         fs::create_dir_all(&managed_root).expect("create managed root");
-        let existing = r#"[sandbox_workspace_write] # local options
-writable_roots = [
-  "/srv/other", # keep this root
-  "C:\\Users\\example",
-]
-exclude_tmpdir_env_var = true
+        let existing = r#"[permissions.codex-autonomous.workspace_roots] # local options
+"/srv/other" = true # keep this root
+"C:\\Users\\example" = true
 "#;
 
-        let merged = ensure_managed_writable_root(existing, &managed_root)
-            .expect("merge multiline writable roots");
+        let merged = ensure_managed_workspace_root(existing, &managed_root)
+            .expect("merge managed workspace roots");
         assert!(merged.contains("/srv/other"));
         assert!(merged.contains("# keep this root"));
         assert!(merged.contains(r#"C:\\Users\\example"#));
         assert!(merged.contains(&managed_root.to_string_lossy().to_string()));
-        assert!(merged.contains("exclude_tmpdir_env_var = true"));
         assert_eq!(
-            ensure_managed_writable_root(&merged, &managed_root).expect("repeat merge"),
+            ensure_managed_workspace_root(&merged, &managed_root).expect("repeat merge"),
             merged
         );
     }

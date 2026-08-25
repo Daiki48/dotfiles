@@ -70,15 +70,21 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 
 #### AI CLI configuration policy
 
-Codex uses a single default workflow. `workspace-write` allows implementation inside the
-workspace, while `on-request` approvals are routed through auto-review. A PreToolUse hook
-validates Git and GitHub writes before they run, and deny rules block destructive operations.
+Codex uses a single `codex-autonomous` permission profile. It extends the built-in workspace
+profile, explicitly grants Git metadata writes under each workspace root, and keeps the
+workspace network behavior enabled. `on-request` approvals are routed through auto-review. A
+PreToolUse hook validates Git and GitHub writes before they run, and deny rules block destructive
+operations.
 Implementation, fix, addition, and build requests use the managed `codex-worktree` command;
 investigation, design, review, and diagnosis alone do not create a worktree. See
 [Codex worktree運用ガイド](docs/codex-worktrees.ja.md) for the lifecycle, recovery, and safety
 boundaries. The managed root follows the [OpenAI Git worktrees documentation](https://learn.chatgpt.com/docs/environments/git-worktrees).
 
-Ordinary editing and testing run inside the sandbox. Hook-validated normal commits, pushes to
+Ordinary editing and testing run inside the sandbox. The explicit `.git` grant is process-agnostic:
+the managed hook is an operational policy guard for recognized Git, GitHub, helper, and destructive
+commands, not an adversarial process sandbox. Non-destructive tool internals may operate within the
+granted workspace, while recognized direct destructive operations remain prohibited. Hook-validated
+normal commits, pushes to
 the current non-protected work branch, Draft PR creation, and reversible Issue/PR lifecycle
 updates are allowlisted so the workflow does not pause for approval. The hook validates the
 current repository, explicit target IDs, canonical arguments, metadata, and detected secrets.
@@ -138,7 +144,14 @@ before migrating the shared top-level settings. If an older setup left `config.t
 symlink, setup archives the link and writes a regular local config without modifying the
 link target. A legacy profile config is backed up; deprecated profile selectors and
 tables are removed while shared settings are merged without discarding project trust,
-hook trust, TUI state, or custom agents. Retired teacher/autonomous profile files are
+hook trust, TUI state, custom agents, or legacy `writable_roots`. Legacy home-relative roots use
+the verified account home even when `CODEX_HOME` is elsewhere, while working-directory-relative
+roots are normalized to absolute paths. Existing regular or inline root tables are preserved, and
+equivalent inline, quoted, or dotted permission forms are normalized before the managed profile is
+replaced. Home-relative, working-directory-relative, trailing-separator, and existing symlink root
+forms share the same path normalization. Explicit managed-profile values take precedence over
+conflicting legacy roots, while equivalent conflicting profile values and invalid container or
+value types fail closed. Retired teacher/autonomous profile files are
 renamed to timestamped backups instead of being deleted.
 
 After the first install or an update of the safety hook, restart Codex and use `/hooks` to

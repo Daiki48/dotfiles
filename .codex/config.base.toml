@@ -14,15 +14,27 @@ model_reasoning_effort = "high"
 plan_mode_reasoning_effort = "high"
 approval_policy = "on-request"
 approvals_reviewer = "auto_review"
-sandbox_mode = "workspace-write"
+default_permissions = "codex-autonomous"
 
 # Codex/OpenAIのco-authorや生成表記をcommit messageへ追加しない。
-# Codex CLI 0.147.0でstrict config検証済み。
+# Codex CLI 0.149.1でstrict config検証済み。
 commit_attribution = ""
 
-[sandbox_workspace_write]
-network_access = true
-writable_roots = ["~/.codex/worktrees"]
+[features]
+hooks = true
+
+[permissions.codex-autonomous]
+description = "Autonomous workspace access with operational Git policy checks."
+extends = ":workspace"
+
+# install CLIが端末上の絶対pathを追加する。
+[permissions.codex-autonomous.workspace_roots]
+
+[permissions.codex-autonomous.filesystem.":workspace_roots"]
+".git" = "write"
+
+[permissions.codex-autonomous.network]
+enabled = true
 
 [agents]
 enabled = true
