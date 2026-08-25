@@ -80,8 +80,10 @@ investigation, design, review, and diagnosis alone do not create a worktree. See
 [Codex worktree運用ガイド](docs/codex-worktrees.ja.md) for the lifecycle, recovery, and safety
 boundaries. The managed root follows the [OpenAI Git worktrees documentation](https://learn.chatgpt.com/docs/environments/git-worktrees).
 
-Ordinary editing and testing run inside the sandbox. The explicit `.git` grant is paired with the
-managed hook; it is not an independent authorization to bypass the Git policy. Hook-validated
+Ordinary editing and testing run inside the sandbox. The explicit `.git` grant is process-agnostic:
+the managed hook is an operational policy guard for recognized Git, GitHub, helper, and destructive
+commands, not an adversarial process sandbox. Non-destructive tool internals may operate within the
+granted workspace, while recognized direct destructive operations remain prohibited. Hook-validated
 normal commits, pushes to
 the current non-protected work branch, Draft PR creation, and reversible Issue/PR lifecycle
 updates are allowlisted so the workflow does not pause for approval. The hook validates the
@@ -142,7 +144,7 @@ before migrating the shared top-level settings. If an older setup left `config.t
 symlink, setup archives the link and writes a regular local config without modifying the
 link target. A legacy profile config is backed up; deprecated profile selectors and
 tables are removed while shared settings are merged without discarding project trust,
-hook trust, TUI state, or custom agents. Retired teacher/autonomous profile files are
+hook trust, TUI state, custom agents, or legacy `writable_roots`. Retired teacher/autonomous profile files are
 renamed to timestamped backups instead of being deleted.
 
 After the first install or an update of the safety hook, restart Codex and use `/hooks` to

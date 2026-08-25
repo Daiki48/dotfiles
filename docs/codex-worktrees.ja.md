@@ -29,8 +29,9 @@ installerは`HOME`がpassword database上のcurrent account homeと一致し、`
 実行後はCodexを再起動してください。同じmulti-call binaryをowner-onlyのregular fileとして
 hookとhelperのcanonical pathへatomic installし、内容hashで更新を管理します。
 profileはbuilt-in workspace権限を継承し、各workspace rootの`.git`だけを明示的にwriteへ
-上書きします。この権限はmanaged PreToolUse hookと組み合わせる前提で、hookを迂回するGit操作の
-許可を意味しません。
+上書きします。旧`sandbox_workspace_write.writable_roots`も新profileへ保持移行します。
+このpath権限はprocessを限定しません。managed PreToolUse hookは通常のGit、GitHub、helperと明示的な
+破壊操作を検査する運用guardであり、任意programを敵対的に封じ込めるsandboxとは扱いません。
 helperをcanonical pathから起動できることを確認できます。
 private helperの導入・更新中に中断した場合は、owner-onlyのpending journalと内容hashが示す
 到達可能な途中状態だけを次回setupで再開し、不整合なfileやstateは変更せず停止します。

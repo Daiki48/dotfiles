@@ -20,8 +20,11 @@ default_permissions = "codex-autonomous"
 # Codex CLI 0.149.1でstrict config検証済み。
 commit_attribution = ""
 
+[features]
+hooks = true
+
 [permissions.codex-autonomous]
-description = "Workspace access with Git writes guarded by the managed PreToolUse hook."
+description = "Autonomous workspace access with operational Git policy checks."
 extends = ":workspace"
 
 # install CLIが端末上の絶対pathを追加する。
