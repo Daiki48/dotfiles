@@ -525,50 +525,50 @@ fn command_segments(command: &str) -> Vec<Vec<String>> {
     let mut segments = Vec::new();
     let mut segment = Vec::new();
     let mut token = String::new();
-    let mut quote: Option<u8> = None;
+    let mut quote: Option<char> = None;
     let mut escaped = false;
     let mut comment = false;
-    for c in command.bytes() {
+    for c in command.chars() {
         if comment {
-            if c == b'\n' {
+            if c == '\n' {
                 comment = false;
             } else {
                 continue;
             }
         }
         if escaped {
-            token.push(c as char);
+            token.push(c);
             escaped = false;
             continue;
         }
-        if quote == Some(b'\'') {
-            if c == b'\'' {
+        if quote == Some('\'') {
+            if c == '\'' {
                 quote = None;
             } else {
-                token.push(c as char);
+                token.push(c);
             }
             continue;
         }
-        if quote == Some(b'"') {
-            if c == b'"' {
+        if quote == Some('"') {
+            if c == '"' {
                 quote = None;
-            } else if c == b'\\' {
+            } else if c == '\\' {
                 escaped = true;
             } else {
-                token.push(c as char);
+                token.push(c);
             }
             continue;
         }
         match c {
-            b'\'' | b'"' => quote = Some(c),
-            b'\\' => escaped = true,
-            b'#' if token.is_empty() && segment.is_empty() => comment = true,
-            b' ' | b'\t' | b'\r' => {
+            '\'' | '"' => quote = Some(c),
+            '\\' => escaped = true,
+            '#' if token.is_empty() && segment.is_empty() => comment = true,
+            ' ' | '\t' | '\r' => {
                 if !token.is_empty() {
                     segment.push(std::mem::take(&mut token));
                 }
             }
-            b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' | b'\n' => {
+            ';' | '&' | '|' | '(' | ')' | '<' | '>' | '\n' => {
                 if !token.is_empty() {
                     segment.push(std::mem::take(&mut token));
                 }
@@ -576,7 +576,7 @@ fn command_segments(command: &str) -> Vec<Vec<String>> {
                     segments.push(std::mem::take(&mut segment));
                 }
             }
-            _ => token.push(c as char),
+            _ => token.push(c),
         }
     }
     if !token.is_empty() {
@@ -4932,64 +4932,56 @@ fn contains_restricted(tokens: &[String], depth: usize) -> bool {
 }
 
 fn shell_tokens_with_punctuation(command: &str) -> Option<Vec<String>> {
-    const PUNCTUATION: &[u8] = b";&|()<>\n";
+    const PUNCTUATION: &str = ";&|()<>\n";
     let mut tokens = Vec::new();
     let mut token = String::new();
     let mut quote = None;
     let mut escaped = false;
-    let bytes = command.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
         if escaped {
-            token.push(byte as char);
+            token.push(c);
             escaped = false;
-            index += 1;
             continue;
         }
-        if quote == Some(b'\'') {
-            if byte == b'\'' {
+        if quote == Some('\'') {
+            if c == '\'' {
                 quote = None;
             } else {
-                token.push(byte as char);
+                token.push(c);
             }
-            index += 1;
             continue;
         }
-        if quote == Some(b'"') {
-            if byte == b'"' {
+        if quote == Some('"') {
+            if c == '"' {
                 quote = None;
-            } else if byte == b'\\' {
+            } else if c == '\\' {
                 escaped = true;
             } else {
-                token.push(byte as char);
+                token.push(c);
             }
-            index += 1;
             continue;
         }
-        match byte {
-            b'\'' | b'"' => quote = Some(byte),
-            b'\\' => escaped = true,
-            b' ' | b'\t' | b'\r' => {
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '\\' => escaped = true,
+            ' ' | '\t' | '\r' => {
                 if !token.is_empty() {
                     tokens.push(std::mem::take(&mut token));
                 }
             }
-            byte if PUNCTUATION.contains(&byte) => {
+            c if PUNCTUATION.contains(c) => {
                 if !token.is_empty() {
                     tokens.push(std::mem::take(&mut token));
                 }
-                let start = index;
-                index += 1;
-                while index < bytes.len() && PUNCTUATION.contains(&bytes[index]) {
-                    index += 1;
+                let mut punctuation = c.to_string();
+                while let Some(next) = chars.next_if(|next| PUNCTUATION.contains(*next)) {
+                    punctuation.push(next);
                 }
-                tokens.push(String::from_utf8_lossy(&bytes[start..index]).into_owned());
-                continue;
+                tokens.push(punctuation);
             }
-            _ => token.push(byte as char),
+            _ => token.push(c),
         }
-        index += 1;
     }
     if escaped || quote.is_some() {
         return None;
@@ -5573,6 +5565,23 @@ pub fn entrypoint() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_parsers_preserve_utf8_tokens() {
+        let command = "git commit -m ':lock: agent Python入口を固定'";
+        let expected = vec![
+            "git".to_string(),
+            "commit".to_string(),
+            "-m".to_string(),
+            ":lock: agent Python入口を固定".to_string(),
+        ];
+        assert_eq!(command_segments(command), vec![expected.clone()]);
+        assert_eq!(shell_tokens_with_punctuation(command), Some(expected));
+        assert_eq!(
+            shell_tokens_with_punctuation("日本語>出力"),
+            Some(vec!["日本語".into(), ">".into(), "出力".into()])
+        );
+    }
 
     #[test]
     fn safe_read_commands_do_not_start_processes() {
@@ -6437,10 +6446,15 @@ mod tests {
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))
             .expect("make repository hook executable");
 
-        let rewritten =
-            rewrite_git_safety_command("git commit -m ':test_tube: fixture'", root.to_str())
-                .expect("rewrite commit")
-                .expect("commit requires a rewrite");
+        let subject = ":lock: agent Python入口を固定";
+        let command = format!("git commit -m '{subject}'");
+        let rewritten = rewrite_git_safety_command(&command, root.to_str())
+            .expect("rewrite commit")
+            .expect("commit requires a rewrite");
+        assert!(
+            rewritten.contains(subject),
+            "rewritten command changed UTF-8"
+        );
         let status = Command::new("/bin/sh")
             .current_dir(&root)
             .args(["-c", &rewritten])
@@ -6448,6 +6462,18 @@ mod tests {
             .expect("run rewritten commit");
         assert!(status.success());
         assert!(!marker.exists(), "repository pre-commit hook was executed");
+        let output = Command::new(SYSTEM_GIT)
+            .current_dir(&root)
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .expect("read committed subject");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .expect("commit subject is UTF-8")
+                .trim_end(),
+            subject
+        );
         fs::remove_dir_all(root).expect("remove Git hook fixture");
     }
 
