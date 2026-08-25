@@ -148,8 +148,10 @@ hook trust, TUI state, custom agents, or legacy `writable_roots`. Legacy home-re
 the verified account home even when `CODEX_HOME` is elsewhere, while working-directory-relative
 roots are normalized to absolute paths. Existing regular or inline root tables are preserved, and
 equivalent inline, quoted, or dotted permission forms are normalized before the managed profile is
-replaced. Explicit managed-profile values take precedence over conflicting legacy roots, while
-invalid container or value types fail closed. Retired teacher/autonomous profile files are
+replaced. Home-relative, working-directory-relative, trailing-separator, and existing symlink root
+forms share the same path normalization. Explicit managed-profile values take precedence over
+conflicting legacy roots, while equivalent conflicting profile values and invalid container or
+value types fail closed. Retired teacher/autonomous profile files are
 renamed to timestamped backups instead of being deleted.
 
 After the first install or an update of the safety hook, restart Codex and use `/hooks` to

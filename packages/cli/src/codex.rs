@@ -1162,7 +1162,7 @@ fn merge_managed_config_with_root(
     home: &Path,
 ) -> Result<String> {
     let legacy_roots = legacy_workspace_roots(existing, home)?;
-    let profile_roots = managed_profile_workspace_roots(existing)?;
+    let profile_roots = managed_profile_workspace_roots(existing, home)?;
     let existing = remove_managed_permission_profile(existing)?;
     let merged = merge_managed_config(template, &existing);
     let merged = legacy_roots.iter().try_fold(merged, |contents, root| {
@@ -1219,27 +1219,12 @@ fn legacy_workspace_roots(contents: &str, home: &Path) -> Result<Vec<String>> {
             let root = root
                 .as_str()
                 .context("sandbox_workspace_write.writable_roots must contain strings")?;
-            let path = if root == "~" {
-                home.to_path_buf()
-            } else if let Some(relative) = root.strip_prefix("~/") {
-                home.join(relative)
-            } else {
-                let path = PathBuf::from(root);
-                if path.is_absolute() {
-                    path
-                } else {
-                    relative_base.join(path)
-                }
-            };
-            let path = normalize_absolute_path(&canonical_or_absolute(&path)?);
-            path.to_str()
-                .map(str::to_string)
-                .with_context(|| format!("Legacy writable root is not valid UTF-8: {root}"))
+            normalize_workspace_root(root, home, &relative_base)
         })
         .collect()
 }
 
-fn managed_profile_workspace_roots(contents: &str) -> Result<Vec<(String, bool)>> {
+fn managed_profile_workspace_roots(contents: &str, home: &Path) -> Result<Vec<(String, bool)>> {
     if contents.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -1249,22 +1234,68 @@ fn managed_profile_workspace_roots(contents: &str) -> Result<Vec<(String, bool)>
     let Some(permissions) = document.get("permissions") else {
         return Ok(Vec::new());
     };
-    if let Some(permissions) = permissions.as_table() {
+    let roots = if let Some(permissions) = permissions.as_table() {
         let Some(profile) = permissions.get(MANAGED_PERMISSION_PROFILE) else {
             return Ok(Vec::new());
         };
-        return managed_workspace_roots_from_profile_item(profile);
-    }
-    if let Some(permissions) = permissions.as_inline_table() {
+        managed_workspace_roots_from_profile_item(profile)?
+    } else if let Some(permissions) = permissions.as_inline_table() {
         let Some(profile) = permissions.get(MANAGED_PERMISSION_PROFILE) else {
             return Ok(Vec::new());
         };
         let profile = profile
             .as_inline_table()
             .context("managed permission profile must be a TOML table")?;
-        return managed_workspace_roots_from_inline_profile(profile);
+        managed_workspace_roots_from_inline_profile(profile)?
+    } else {
+        anyhow::bail!("permissions must be a TOML table");
+    };
+    normalize_managed_workspace_roots(roots, home)
+}
+
+fn normalize_managed_workspace_roots(
+    roots: Vec<(String, bool)>,
+    home: &Path,
+) -> Result<Vec<(String, bool)>> {
+    validate_absolute_path(home).context("Account home must be valid before migrating roots")?;
+    let relative_base = std::env::current_dir()
+        .context("Failed to resolve the current directory for managed workspace_roots")?;
+    let mut normalized_roots = Vec::with_capacity(roots.len());
+    for (root, enabled) in roots {
+        let normalized = normalize_workspace_root(&root, home, &relative_base)?;
+        if let Some((_, existing)) = normalized_roots
+            .iter()
+            .find(|(candidate, _)| candidate == &normalized)
+        {
+            if *existing != enabled {
+                anyhow::bail!(
+                    "managed permission workspace root has conflicting equivalent values: {root}"
+                );
+            }
+            continue;
+        }
+        normalized_roots.push((normalized, enabled));
     }
-    anyhow::bail!("permissions must be a TOML table")
+    Ok(normalized_roots)
+}
+
+fn normalize_workspace_root(root: &str, home: &Path, relative_base: &Path) -> Result<String> {
+    let path = if root == "~" {
+        home.to_path_buf()
+    } else if let Some(relative) = root.strip_prefix("~/") {
+        home.join(relative)
+    } else {
+        let path = PathBuf::from(root);
+        if path.is_absolute() {
+            path
+        } else {
+            relative_base.join(path)
+        }
+    };
+    let path = normalize_absolute_path(&canonical_or_absolute(&path)?);
+    path.to_str()
+        .map(str::to_string)
+        .with_context(|| format!("Workspace root is not valid UTF-8: {root}"))
 }
 
 fn managed_workspace_roots_from_profile_item(profile: &Item) -> Result<Vec<(String, bool)>> {
@@ -5454,7 +5485,7 @@ extends = ":workspace"
 writable_roots = ["/srv/conflict"]
 
 [permissions.codex-autonomous.workspace_roots]
-"/srv/conflict" = false
+"/srv/conflict/" = false
 "#;
 
         let merged =
@@ -5466,6 +5497,89 @@ writable_roots = ["/srv/conflict"]
         assert_eq!(
             document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]["/srv/conflict"]
                 .as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn equivalent_workspace_root_paths_preserve_profile_values() {
+        let directory = TestDirectory::new("equivalent-workspace-root-paths");
+        let home = directory.path().join("account-home");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let relative_root = std::env::current_dir()
+            .expect("resolve current directory")
+            .join("relative-conflict");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let cases = [
+            (
+                format!(
+                    "[sandbox_workspace_write]\nwritable_roots = [\"{}\"]\n\n[permissions.codex-autonomous.workspace_roots]\n\"~/tilde-conflict\" = false\n",
+                    home.join("tilde-conflict").display()
+                ),
+                home.join("tilde-conflict"),
+            ),
+            (
+                format!(
+                    "[sandbox_workspace_write]\nwritable_roots = [\"./relative-conflict\"]\n\n[permissions.codex-autonomous.workspace_roots]\n\"{}\" = false\n",
+                    relative_root.display()
+                ),
+                relative_root,
+            ),
+        ];
+
+        for (existing, expected_root) in cases {
+            let merged = merge_managed_config_with_root(template, &existing, &managed_root, &home)
+                .expect("preserve equivalent profile root value");
+            let document = merged
+                .parse::<toml_edit::DocumentMut>()
+                .expect("parse migrated config");
+            assert_eq!(
+                document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]
+                    [expected_root.to_str().expect("UTF-8 expected root")]
+                .as_bool(),
+                Some(false)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_equivalent_workspace_roots_preserve_profile_values() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("symlink-equivalent-workspace-roots");
+        let home = directory.path().join("account-home");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let real_root = directory.path().join("real-root");
+        let linked_root = directory.path().join("linked-root");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        fs::create_dir(&real_root).expect("create real root");
+        symlink(&real_root, &linked_root).expect("create root symlink");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = format!(
+            "[sandbox_workspace_write]\nwritable_roots = [\"{}\"]\n\n[permissions.codex-autonomous.workspace_roots]\n\"{}\" = false\n",
+            linked_root.display(),
+            real_root.display()
+        );
+
+        let merged = merge_managed_config_with_root(template, &existing, &managed_root, &home)
+            .expect("preserve symlink-equivalent profile value");
+        let document = merged
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse migrated config");
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]
+                [real_root.to_str().expect("UTF-8 real root")]
+            .as_bool(),
             Some(false)
         );
     }
@@ -5548,6 +5662,15 @@ workspace_roots = { "/srv/inline-enabled" = true, "/srv/inline-disabled" = false
                     .is_err()
             );
         }
+
+        let conflicting = r#"[permissions.codex-autonomous.workspace_roots]
+"/srv/equivalent" = true
+"/srv/equivalent/" = false
+"#;
+        assert!(
+            merge_managed_config_with_root(template, conflicting, &managed_root, directory.path(),)
+                .is_err()
+        );
     }
 
     #[test]
