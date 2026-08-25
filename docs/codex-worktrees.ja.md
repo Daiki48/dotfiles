@@ -31,7 +31,8 @@ hookとhelperのcanonical pathへatomic installし、内容hashで更新を管�
 profileはbuilt-in workspace権限を継承し、各workspace rootの`.git`だけを明示的にwriteへ
 上書きします。旧`sandbox_workspace_write.writable_roots`も新profileへ保持移行し、`~`は検証済みの
 account home、相対pathは移行実行directoryを基準に絶対pathへ正規化します。既存profileの通常table・
-inline tableを保持し、不正なcontainerや値の型は黙って破棄せず停止します。
+inline・quoted・dotted表現を正規化して保持し、legacy rootとの競合では新profileの明示値を優先します。
+不正なcontainerや値の型は黙って破棄せず停止します。
 このpath権限はprocessを限定しません。managed PreToolUse hookは通常のGit、GitHub、helperと明示的な
 破壊操作を検査する運用guardであり、任意programを敵対的に封じ込めるsandboxとは扱いません。
 helperをcanonical pathから起動できることを確認できます。

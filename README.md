@@ -147,6 +147,8 @@ tables are removed while shared settings are merged without discarding project t
 hook trust, TUI state, custom agents, or legacy `writable_roots`. Legacy home-relative roots use
 the verified account home even when `CODEX_HOME` is elsewhere, while working-directory-relative
 roots are normalized to absolute paths. Existing regular or inline root tables are preserved, and
+equivalent inline, quoted, or dotted permission forms are normalized before the managed profile is
+replaced. Explicit managed-profile values take precedence over conflicting legacy roots, while
 invalid container or value types fail closed. Retired teacher/autonomous profile files are
 renamed to timestamped backups instead of being deleted.
 

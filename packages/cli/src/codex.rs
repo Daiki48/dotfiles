@@ -14,7 +14,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, PermissionsExt},
 };
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, value};
 
 use crate::codex_tools::{process, worktree};
 const CODEX_FILES: &[(&str, &str)] = &[
@@ -1163,15 +1163,16 @@ fn merge_managed_config_with_root(
 ) -> Result<String> {
     let legacy_roots = legacy_workspace_roots(existing, home)?;
     let profile_roots = managed_profile_workspace_roots(existing)?;
-    let merged = merge_managed_config(template, existing);
+    let existing = remove_managed_permission_profile(existing)?;
+    let merged = merge_managed_config(template, &existing);
+    let merged = legacy_roots.iter().try_fold(merged, |contents, root| {
+        ensure_permission_workspace_root(&contents, root)
+    })?;
     let merged = profile_roots
         .iter()
         .try_fold(merged, |contents, (root, enabled)| {
             set_permission_workspace_root(&contents, root, *enabled)
         })?;
-    let merged = legacy_roots.iter().try_fold(merged, |contents, root| {
-        ensure_permission_workspace_root(&contents, root)
-    })?;
     ensure_managed_workspace_root(&merged, managed_root)
 }
 
@@ -1248,41 +1249,111 @@ fn managed_profile_workspace_roots(contents: &str) -> Result<Vec<(String, bool)>
     let Some(permissions) = document.get("permissions") else {
         return Ok(Vec::new());
     };
-    let permissions = permissions
-        .as_table()
-        .context("permissions must be a TOML table")?;
-    let Some(profile) = permissions.get(MANAGED_PERMISSION_PROFILE) else {
-        return Ok(Vec::new());
-    };
-    let profile = profile
-        .as_table()
-        .context("managed permission profile must be a TOML table")?;
+    if let Some(permissions) = permissions.as_table() {
+        let Some(profile) = permissions.get(MANAGED_PERMISSION_PROFILE) else {
+            return Ok(Vec::new());
+        };
+        return managed_workspace_roots_from_profile_item(profile);
+    }
+    if let Some(permissions) = permissions.as_inline_table() {
+        let Some(profile) = permissions.get(MANAGED_PERMISSION_PROFILE) else {
+            return Ok(Vec::new());
+        };
+        let profile = profile
+            .as_inline_table()
+            .context("managed permission profile must be a TOML table")?;
+        return managed_workspace_roots_from_inline_profile(profile);
+    }
+    anyhow::bail!("permissions must be a TOML table")
+}
+
+fn managed_workspace_roots_from_profile_item(profile: &Item) -> Result<Vec<(String, bool)>> {
+    if let Some(profile) = profile.as_table() {
+        let Some(roots) = profile.get("workspace_roots") else {
+            return Ok(Vec::new());
+        };
+        if let Some(roots) = roots.as_table() {
+            return boolean_workspace_roots_from_table(roots);
+        }
+        if let Some(roots) = roots.as_inline_table() {
+            return boolean_workspace_roots_from_inline_table(roots);
+        }
+        anyhow::bail!("managed permission workspace_roots must be a TOML table");
+    }
+    if let Some(profile) = profile.as_inline_table() {
+        return managed_workspace_roots_from_inline_profile(profile);
+    }
+    anyhow::bail!("managed permission profile must be a TOML table")
+}
+
+fn managed_workspace_roots_from_inline_profile(
+    profile: &InlineTable,
+) -> Result<Vec<(String, bool)>> {
     let Some(roots) = profile.get("workspace_roots") else {
         return Ok(Vec::new());
     };
-    if let Some(roots) = roots.as_table() {
-        return roots
-            .iter()
-            .map(|(root, enabled)| {
-                let enabled = enabled.as_bool().with_context(|| {
-                    format!("managed permission workspace root must be boolean: {root}")
-                })?;
-                Ok((root.to_string(), enabled))
-            })
-            .collect();
+    let roots = roots
+        .as_inline_table()
+        .context("managed permission workspace_roots must be a TOML table")?;
+    boolean_workspace_roots_from_inline_table(roots)
+}
+
+fn boolean_workspace_roots_from_table(roots: &Table) -> Result<Vec<(String, bool)>> {
+    roots
+        .iter()
+        .map(|(root, enabled)| {
+            let enabled = enabled.as_bool().with_context(|| {
+                format!("managed permission workspace root must be boolean: {root}")
+            })?;
+            Ok((root.to_string(), enabled))
+        })
+        .collect()
+}
+
+fn boolean_workspace_roots_from_inline_table(roots: &InlineTable) -> Result<Vec<(String, bool)>> {
+    roots
+        .iter()
+        .map(|(root, enabled)| {
+            let enabled = enabled.as_bool().with_context(|| {
+                format!("managed permission workspace root must be boolean: {root}")
+            })?;
+            Ok((root.to_string(), enabled))
+        })
+        .collect()
+}
+
+fn remove_managed_permission_profile(contents: &str) -> Result<String> {
+    if contents.trim().is_empty() {
+        return Ok(contents.to_string());
     }
-    if let Some(roots) = roots.as_inline_table() {
-        return roots
-            .iter()
-            .map(|(root, enabled)| {
-                let enabled = enabled.as_bool().with_context(|| {
-                    format!("managed permission workspace root must be boolean: {root}")
-                })?;
-                Ok((root.to_string(), enabled))
-            })
-            .collect();
+    let mut document = contents
+        .parse::<DocumentMut>()
+        .context("Existing Codex config must be valid TOML before normalizing permissions")?;
+    let Some(permissions) = document.get("permissions") else {
+        return Ok(contents.to_string());
+    };
+    let mut normalized = if let Some(permissions) = permissions.as_table() {
+        permissions.clone()
+    } else if let Some(permissions) = permissions.as_inline_table() {
+        let mut normalized = Table::new();
+        for (name, profile) in permissions.iter() {
+            normalized.insert(name, Item::Value(profile.clone()));
+        }
+        normalized
+    } else {
+        anyhow::bail!("permissions must be a TOML table");
+    };
+    normalized.remove(MANAGED_PERMISSION_PROFILE);
+    if normalized.is_empty() {
+        document.remove("permissions");
+    } else {
+        document.insert("permissions", Item::Table(normalized));
     }
-    anyhow::bail!("managed permission workspace_roots must be a TOML table")
+    let mut rendered = document.to_string();
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    Ok(rendered)
 }
 
 fn sync_managed_hook(template: &str, existing: &str) -> String {
@@ -5370,6 +5441,83 @@ extends = ":workspace"
     }
 
     #[test]
+    fn managed_profile_values_override_conflicting_legacy_roots() {
+        let directory = TestDirectory::new("conflicting-workspace-roots");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"[sandbox_workspace_write]
+writable_roots = ["/srv/conflict"]
+
+[permissions.codex-autonomous.workspace_roots]
+"/srv/conflict" = false
+"#;
+
+        let merged =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("preserve explicit managed root value");
+        let document = merged
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse migrated config");
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]["/srv/conflict"]
+                .as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn equivalent_managed_permission_toml_forms_are_migrated() {
+        let directory = TestDirectory::new("equivalent-permission-forms");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+
+        for (existing, expected_root) in [
+            (
+                r#"permissions = { "codex-autonomous" = { workspace_roots = { "/srv/top-inline" = true } }, local = { workspace_roots = { "/srv/local" = true } } }
+"#,
+                "/srv/top-inline",
+            ),
+            (
+                r#"[permissions."codex-autonomous"]
+workspace_roots = { "/srv/quoted" = true }
+"#,
+                "/srv/quoted",
+            ),
+            (
+                r#"permissions.codex-autonomous.workspace_roots."/srv/dotted" = true
+"#,
+                "/srv/dotted",
+            ),
+        ] {
+            let merged =
+                merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                    .expect("migrate equivalent permission form");
+            merged
+                .parse::<toml_edit::DocumentMut>()
+                .expect("render valid migrated TOML");
+            assert!(merged.contains(&format!("\"{expected_root}\" = true")));
+            if expected_root == "/srv/top-inline" {
+                assert!(merged.contains("/srv/local"));
+            }
+            assert_eq!(
+                merge_managed_config_with_root(template, &merged, &managed_root, directory.path(),)
+                    .expect("repeat equivalent migration"),
+                merged
+            );
+        }
+    }
+
+    #[test]
     fn inline_managed_workspace_roots_are_preserved_and_invalid_containers_fail_closed() {
         let directory = TestDirectory::new("inline-managed-workspace-roots");
         let managed_root = directory.path().join("codex").join("worktrees");
@@ -5390,13 +5538,16 @@ workspace_roots = { "/srv/inline-enabled" = true, "/srv/inline-disabled" = false
         assert!(merged.contains("\"/srv/inline-enabled\" = true"));
         assert!(merged.contains("\"/srv/inline-disabled\" = false"));
 
-        let invalid = r#"[permissions.codex-autonomous]
-workspace_roots = []
-"#;
-        assert!(
-            merge_managed_config_with_root(template, invalid, &managed_root, directory.path())
-                .is_err()
-        );
+        for invalid in [
+            "[permissions.codex-autonomous]\nworkspace_roots = []\n",
+            "permissions = []\n",
+            "[permissions]\ncodex-autonomous = []\n",
+        ] {
+            assert!(
+                merge_managed_config_with_root(template, invalid, &managed_root, directory.path(),)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
