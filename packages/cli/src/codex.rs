@@ -94,7 +94,7 @@ const MANAGED_CONFIG_KEYS: &[&str] = &[
     "default_permissions",
     "commit_attribution",
 ];
-const RETIRED_CONFIG_KEYS: &[&str] = &["sandbox_mode"];
+const RETIRED_CONFIG_KEYS: &[&str] = &["sandbox_mode", "sandbox_workspace_write"];
 const RETIRED_SANDBOX_TABLE: &str = "[sandbox_workspace_write]";
 const MANAGED_PERMISSION_PROFILE: &str = "codex-autonomous";
 const MANAGED_PERMISSION_PROFILE_HEADER: &str = "[permissions.codex-autonomous]";
@@ -1160,53 +1160,95 @@ fn merge_managed_config_with_root(
     existing: &str,
     managed_root: &Path,
 ) -> Result<String> {
-    let legacy_roots = legacy_workspace_roots(existing)?;
+    let legacy_roots = legacy_workspace_roots(existing, managed_root)?;
     let profile_roots = managed_profile_workspace_roots(existing)?;
     let merged = merge_managed_config(template, existing);
-    let merged = ensure_managed_workspace_root(&merged, managed_root)?;
-    legacy_roots
+    let merged = profile_roots
         .iter()
-        .chain(profile_roots.iter())
-        .try_fold(merged, |contents, root| {
-            ensure_permission_workspace_root(&contents, root)
-        })
+        .try_fold(merged, |contents, (root, enabled)| {
+            set_permission_workspace_root(&contents, root, *enabled)
+        })?;
+    let merged = legacy_roots.iter().try_fold(merged, |contents, root| {
+        ensure_permission_workspace_root(&contents, root)
+    })?;
+    ensure_managed_workspace_root(&merged, managed_root)
 }
 
-fn legacy_workspace_roots(contents: &str) -> Result<Vec<String>> {
+fn legacy_workspace_roots(contents: &str, managed_root: &Path) -> Result<Vec<String>> {
     if contents.trim().is_empty() {
         return Ok(Vec::new());
     }
     let document = contents
         .parse::<DocumentMut>()
         .context("Existing Codex config must be valid TOML before migrating writable_roots")?;
-    let Some(sandbox) = document
-        .get("sandbox_workspace_write")
-        .and_then(Item::as_table)
-    else {
+    let Some(sandbox) = document.get("sandbox_workspace_write") else {
         return Ok(Vec::new());
     };
-    let Some(roots) = sandbox.get("writable_roots") else {
+    let roots = if let Some(table) = sandbox.as_table() {
+        table
+            .get("writable_roots")
+            .map(|roots| {
+                roots
+                    .as_array()
+                    .context("sandbox_workspace_write.writable_roots must be an array")
+            })
+            .transpose()?
+    } else if let Some(table) = sandbox.as_inline_table() {
+        table
+            .get("writable_roots")
+            .map(|roots| {
+                roots
+                    .as_array()
+                    .context("sandbox_workspace_write.writable_roots must be an array")
+            })
+            .transpose()?
+    } else {
+        anyhow::bail!("sandbox_workspace_write must be a table");
+    };
+    let Some(roots) = roots else {
         return Ok(Vec::new());
     };
-    let roots = roots
-        .as_array()
-        .context("sandbox_workspace_write.writable_roots must be an array")?;
+    let config_dir = managed_root.parent().with_context(|| {
+        format!(
+            "Managed worktree root has no Codex config parent: {}",
+            managed_root.display()
+        )
+    })?;
+    let home = config_dir.parent().with_context(|| {
+        format!(
+            "Codex config directory has no home parent: {}",
+            config_dir.display()
+        )
+    })?;
+    let relative_base = std::env::current_dir()
+        .context("Failed to resolve the current directory for legacy writable_roots")?;
     roots
         .iter()
         .map(|root| {
             let root = root
                 .as_str()
                 .context("sandbox_workspace_write.writable_roots must contain strings")?;
-            let path = PathBuf::from(root);
-            if !path.is_absolute() {
-                anyhow::bail!("Legacy writable root must be absolute: {root}");
-            }
-            Ok(root.to_string())
+            let path = if root == "~" {
+                home.to_path_buf()
+            } else if let Some(relative) = root.strip_prefix("~/") {
+                home.join(relative)
+            } else {
+                let path = PathBuf::from(root);
+                if path.is_absolute() {
+                    path
+                } else {
+                    relative_base.join(path)
+                }
+            };
+            let path = normalize_absolute_path(&canonical_or_absolute(&path)?);
+            path.to_str()
+                .map(str::to_string)
+                .with_context(|| format!("Legacy writable root is not valid UTF-8: {root}"))
         })
         .collect()
 }
 
-fn managed_profile_workspace_roots(contents: &str) -> Result<Vec<String>> {
+fn managed_profile_workspace_roots(contents: &str) -> Result<Vec<(String, bool)>> {
     if contents.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -1225,8 +1267,12 @@ fn managed_profile_workspace_roots(contents: &str) -> Result<Vec<String>> {
     };
     roots
         .iter()
-        .filter(|(_, enabled)| enabled.as_bool() == Some(true))
-        .map(|(root, _)| Ok(root.to_string()))
+        .map(|(root, enabled)| {
+            let enabled = enabled.as_bool().with_context(|| {
+                format!("managed permission workspace root must be boolean: {root}")
+            })?;
+            Ok((root.to_string(), enabled))
+        })
         .collect()
 }
 
@@ -1256,6 +1302,10 @@ fn ensure_managed_workspace_root(contents: &str, managed_root: &Path) -> Result<
 }
 
 fn ensure_permission_workspace_root(contents: &str, root: &str) -> Result<String> {
+    set_permission_workspace_root(contents, root, true)
+}
+
+fn set_permission_workspace_root(contents: &str, root: &str, enabled: bool) -> Result<String> {
     let mut document = contents
         .parse::<DocumentMut>()
         .context("Codex config must be valid TOML before adding a managed workspace root")?;
@@ -1274,13 +1324,12 @@ fn ensure_permission_workspace_root(contents: &str, root: &str) -> Result<String
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_mut()
         .context("managed permission workspace_roots must be a TOML table")?;
-    if let Some(existing) = roots.get(root) {
-        if existing.as_bool() != Some(true) {
-            anyhow::bail!("managed permission workspace root must be enabled");
-        }
-    } else {
-        roots.insert(root, value(true));
+    if let Some(existing) = roots.get(root)
+        && existing.as_bool() == Some(enabled)
+    {
+        return Ok(contents.to_string());
     }
+    roots.insert(root, value(enabled));
     let mut rendered = document.to_string();
     if !rendered.ends_with('\n') {
         rendered.push('\n');
@@ -3100,6 +3149,20 @@ fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(path.to_path_buf())
     }
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn reject_cargo_configuration(dotfiles_path: &Path, home: &Path) -> Result<()> {
@@ -5140,8 +5203,11 @@ description = "local"
     #[test]
     fn managed_workspace_root_is_added_and_idempotent() {
         let directory = TestDirectory::new("writable-roots");
-        let managed_root = directory.path().join("codex").join("worktrees");
+        let managed_root = directory.path().join(".codex").join("worktrees");
         fs::create_dir_all(&managed_root).expect("create managed root");
+        let relative_root = std::env::current_dir()
+            .expect("resolve current directory")
+            .join("relative-root");
         let template = r#"model = "gpt-5.6-terra"
 default_permissions = "codex-autonomous"
 
@@ -5159,7 +5225,7 @@ sandbox_mode = "workspace-write"
 [sandbox_workspace_write] # local options
 network_access = false
 exclude_tmpdir_env_var = true
-writable_roots = ["/srv/legacy", "/srv/legacy-two"]
+writable_roots = ["~/.codex/worktrees", "./relative-root", "/srv/legacy"]
 
 [permissions.local-audit.workspace_roots]
 "/srv/other" = true
@@ -5171,8 +5237,8 @@ writable_roots = ["/srv/legacy", "/srv/legacy-two"]
             merged.contains("[permissions.local-audit.workspace_roots]\n\"/srv/other\" = true")
         );
         assert!(merged.contains(&format!("\"{}\" = true", managed_root.display())));
+        assert!(merged.contains(&format!("\"{}\" = true", relative_root.display())));
         assert!(merged.contains("\"/srv/legacy\" = true"));
-        assert!(merged.contains("\"/srv/legacy-two\" = true"));
         assert!(!merged.contains("sandbox_mode"));
         assert!(!merged.contains("[sandbox_workspace_write]"));
         assert_eq!(
@@ -5180,6 +5246,25 @@ writable_roots = ["/srv/legacy", "/srv/legacy-two"]
                 .expect("repeat migration"),
             merged
         );
+    }
+
+    #[test]
+    fn inline_legacy_workspace_roots_are_migrated_and_removed() {
+        let directory = TestDirectory::new("inline-writable-roots");
+        let managed_root = directory.path().join(".codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"sandbox_workspace_write = { network_access = true, writable_roots = ["/srv/inline"] }
+"#;
+
+        let merged = merge_managed_config_with_root(template, existing, &managed_root)
+            .expect("migrate inline legacy workspace roots");
+        assert!(merged.contains("\"/srv/inline\" = true"));
+        assert!(!merged.contains("sandbox_workspace_write"));
     }
 
     #[test]
@@ -5196,10 +5281,36 @@ extends = ":workspace"
         for existing in [
             "[sandbox_workspace_write]\nwritable_roots = \"/srv/not-an-array\"\n",
             "[sandbox_workspace_write]\nwritable_roots = [1]\n",
-            "[sandbox_workspace_write]\nwritable_roots = [\"relative\"]\n",
+            "sandbox_workspace_write = true\n",
         ] {
             assert!(merge_managed_config_with_root(template, existing, &managed_root).is_err());
         }
+    }
+
+    #[test]
+    fn managed_workspace_roots_preserve_boolean_values_and_reject_invalid_values() {
+        let directory = TestDirectory::new("managed-workspace-root-values");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"[permissions.codex-autonomous.workspace_roots]
+"/srv/enabled" = true
+"/srv/disabled" = false
+"#;
+
+        let merged = merge_managed_config_with_root(template, existing, &managed_root)
+            .expect("preserve managed workspace root values");
+        assert!(merged.contains("\"/srv/enabled\" = true"));
+        assert!(merged.contains("\"/srv/disabled\" = false"));
+
+        let invalid = r#"[permissions.codex-autonomous.workspace_roots]
+"/srv/invalid" = "yes"
+"#;
+        assert!(merge_managed_config_with_root(template, invalid, &managed_root).is_err());
     }
 
     #[test]
