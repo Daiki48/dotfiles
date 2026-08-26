@@ -678,6 +678,7 @@ fn simple_chain_parts(command: &str) -> Option<Vec<SimpleChainPart>> {
                 start = index + 1;
             }
             b'&' | b'|' | b'(' | b')' | b'<' | b'>' => return None,
+            b'#' if index == start || bytes[index - 1].is_ascii_whitespace() => return None,
             _ => {}
         }
         index += 1;
@@ -5911,6 +5912,7 @@ mod tests {
             "git status && rg --files",
             "git status\nprintf done",
             "git status; gh issue list; printf done",
+            "printf foo#bar; git status",
         ] {
             assert!(
                 blocked_reason(command, None, 0).is_none(),
@@ -5938,6 +5940,7 @@ mod tests {
             "env FOO=bar printf done; git status",
             "sudo -D /tmp printf done; git status",
             "FOO=bar printf done; git status",
+            "printf start # comment; git status",
         ] {
             assert!(
                 blocked_reason(command, None, 0).is_some(),
