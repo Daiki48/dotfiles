@@ -716,11 +716,15 @@ fn has_shell_context_mutation(tokens: &[String]) -> bool {
     if tokens.is_empty() {
         return false;
     }
-    if tokens.iter().all(|token| is_assignment(token)) {
+    let command = command_start(tokens).unwrap_or(tokens.len());
+    if tokens[..command]
+        .iter()
+        .any(|token| is_assignment(token) || ["env", "sudo"].contains(&basename(token)))
+    {
         return true;
     }
-    command_start(tokens)
-        .and_then(|start| tokens.get(start))
+    tokens
+        .get(command)
         .is_some_and(|token| SHELL_CONTEXT_MUTATIONS.contains(&basename(token)))
 }
 
@@ -5930,6 +5934,10 @@ mod tests {
             "git status; printf done > /tmp/status",
             "git status; codex-worktree list",
             "git status; cd /tmp",
+            "env -C /tmp printf done; git status",
+            "env FOO=bar printf done; git status",
+            "sudo -D /tmp printf done; git status",
+            "FOO=bar printf done; git status",
         ] {
             assert!(
                 blocked_reason(command, None, 0).is_some(),
