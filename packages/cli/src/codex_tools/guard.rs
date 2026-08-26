@@ -588,6 +588,114 @@ fn command_segments(command: &str) -> Vec<Vec<String>> {
     segments
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SimpleChainSeparator {
+    Semicolon,
+    And,
+    Newline,
+}
+
+impl SimpleChainSeparator {
+    fn as_shell(self) -> &'static str {
+        match self {
+            Self::Semicolon => ";",
+            Self::And => "&&",
+            Self::Newline => "\n",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SimpleChainPart {
+    command: String,
+    separator: Option<SimpleChainSeparator>,
+}
+
+/// Preserve the raw commands in a simple sequential shell chain. Pipelines,
+/// fallback/background operators, grouping, and redirection intentionally fail
+/// closed because the guarded command rewriter cannot preserve their boundary.
+fn simple_chain_parts(command: &str) -> Option<Vec<SimpleChainPart>> {
+    let bytes = command.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    let mut quote = None;
+    let mut escaped = false;
+
+    let push_part = |part_start: usize,
+                     end: usize,
+                     separator: SimpleChainSeparator,
+                     parts: &mut Vec<SimpleChainPart>|
+     -> Option<()> {
+        let part = command.get(part_start..end)?.trim();
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(SimpleChainPart {
+            command: part.to_string(),
+            separator: Some(separator),
+        });
+        Some(())
+    };
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if quote == Some(b'\'') {
+            if byte == b'\'' {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if quote == Some(b'"') {
+            if byte == b'"' {
+                quote = None;
+            } else if byte == b'\\' {
+                escaped = true;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'\\' => escaped = true,
+            b';' => {
+                push_part(start, index, SimpleChainSeparator::Semicolon, &mut parts)?;
+                start = index + 1;
+            }
+            b'&' if bytes.get(index + 1) == Some(&b'&') => {
+                push_part(start, index, SimpleChainSeparator::And, &mut parts)?;
+                index += 1;
+                start = index + 1;
+            }
+            b'\n' => {
+                push_part(start, index, SimpleChainSeparator::Newline, &mut parts)?;
+                start = index + 1;
+            }
+            b'&' | b'|' | b'(' | b')' | b'<' | b'>' => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    let part = command.get(start..)?.trim();
+    if part.is_empty() {
+        return None;
+    }
+    parts.push(SimpleChainPart {
+        command: part.to_string(),
+        separator: None,
+    });
+    Some(parts)
+}
+
 fn guarded_executable_token(token: &str) -> bool {
     let name = basename(token);
     RESTRICTED_COMMANDS.contains(&name)
@@ -2308,7 +2416,7 @@ fn git_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String>
             );
         }
         if !GIT_SAFE_WRITE.contains(&command) {
-            return Some("許可されていないGit書き込み操作です".into());
+            return Some("Git subcommandは読み取り・書き込みの許可listに含まれていません".into());
         }
         if (command == "pull" || command == "switch")
             && std::env::var("CODEX_WORKTREE_MODE").ok().as_deref() != Some("single-checkout")
@@ -2337,7 +2445,7 @@ fn git_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String>
             "push" => git_push_reason(&command_args, &effective),
             "pull" => git_pull_reason(&command_args, &effective),
             "switch" => git_switch_reason(&command_args, &effective),
-            _ => Some("許可されていないGit書き込み操作です".into()),
+            _ => Some("Git subcommandは許可listに含まれていません".into()),
         };
         if reason.is_some() {
             return reason;
@@ -3775,6 +3883,67 @@ fn rewrite_body_file_command(command: &str, cwd: Option<&str>) -> Result<Option<
     Ok(Some(rewritten))
 }
 
+fn rewrite_single_safety_command(
+    command: &str,
+    cwd: Option<&str>,
+) -> Result<Option<String>, String> {
+    let mut updated = command.to_string();
+    let mut changed = false;
+    for rewrite in [
+        rewrite_body_file_command as fn(&str, Option<&str>) -> Result<Option<String>, String>,
+        rewrite_git_safety_command,
+    ] {
+        if let Some(next) = rewrite(&updated, cwd)? {
+            updated = next;
+            changed = true;
+        }
+    }
+    if let Some(next) = rewrite_gh_safety_command(&updated)? {
+        updated = next;
+        changed = true;
+    }
+    if let Some(next) = rewrite_helper_safety_command(&updated)? {
+        updated = next;
+        changed = true;
+    }
+    Ok(changed.then_some(updated))
+}
+
+fn rewrite_safety_command(command: &str, cwd: Option<&str>) -> Result<Option<String>, String> {
+    let segments = command_segments(command);
+    let restricted = segments.iter().any(|tokens| contains_restricted(tokens, 0));
+    if !restricted || segments.len() <= 1 {
+        return rewrite_single_safety_command(command, cwd);
+    }
+    let parts = simple_chain_parts(command).ok_or_else(|| {
+        "複数segmentの安全な境界を保持したままcommandを書き換えられません".to_string()
+    })?;
+    if parts.len() != segments.len() {
+        return Err("複数segmentの解析結果が一致しないためcommandを書き換えられません".into());
+    }
+
+    let mut changed = false;
+    let mut rewritten = String::new();
+    for part in parts {
+        if let Some(next) = rewrite_single_safety_command(&part.command, cwd)? {
+            rewritten.push_str(&next);
+            changed = true;
+        } else {
+            rewritten.push_str(&part.command);
+        }
+        if let Some(separator) = part.separator {
+            if separator == SimpleChainSeparator::Newline {
+                rewritten.push('\n');
+            } else {
+                rewritten.push(' ');
+                rewritten.push_str(separator.as_shell());
+                rewritten.push(' ');
+            }
+        }
+    }
+    Ok(changed.then_some(rewritten))
+}
+
 fn contains_copilot_mention(value: &str) -> bool {
     const NEEDLE: &[u8] = b"@copilot";
     value
@@ -5081,6 +5250,37 @@ fn leading_redirection_hides_guarded(command: &str) -> bool {
     false
 }
 
+fn readonly_git_or_github_segment(tokens: &[String], cwd: Option<&str>) -> bool {
+    if has_write_operation(tokens) {
+        return false;
+    }
+    let Some(start) = command_start(tokens) else {
+        return false;
+    };
+    match basename(&tokens[start]) {
+        "git" => git_invocation_reason(tokens, cwd).is_none(),
+        "gh" => gh_invocation_reason(tokens, cwd).is_none(),
+        _ => false,
+    }
+}
+
+fn supported_readonly_chain(command: &str, cwd: Option<&str>, segments: &[Vec<String>]) -> bool {
+    let Some(parts) = simple_chain_parts(command) else {
+        return false;
+    };
+    if parts.len() != segments.len() || parts.len() < 2 {
+        return false;
+    }
+    parts.iter().all(|part| {
+        let nested = command_segments(&part.command);
+        if nested.len() != 1 {
+            return false;
+        }
+        let tokens = &nested[0];
+        !contains_restricted(tokens, 0) || readonly_git_or_github_segment(tokens, cwd)
+    })
+}
+
 fn blocked_reason(command: &str, cwd: Option<&str>, depth: usize) -> Option<String> {
     if depth > 3 {
         return Some("入れ子が深いshellコマンドは安全性を確認できません".into());
@@ -5120,11 +5320,11 @@ fn blocked_reason(command: &str, cwd: Option<&str>, depth: usize) -> Option<Stri
     if restricted && has_compound {
         return Some("shell複合構文とGit/GitHub/helper commandを同じ入力で実行できません".into());
     }
-    if restricted
-        && segments.len() > 1
-        && !segments.iter().all(|tokens| contains_restricted(tokens, 0))
-    {
-        return Some("Git/GitHub/helper commandを他のshell segmentと連結できません".into());
+    if restricted && segments.len() > 1 && !supported_readonly_chain(command, cwd, &segments) {
+        return Some(
+            "複数segmentでは読み取り専用Git/GitHubを`;`、`&&`、改行で連結する形だけ許可されます"
+                .into(),
+        );
     }
     if restricted && shell_expansion(command) {
         return Some("Git/GitHub/helper commandでは未引用のshell展開を使用できません".into());
@@ -5452,12 +5652,132 @@ fn json_string(value: &str) -> String {
     output
 }
 
-fn deny(reason: &str) {
-    let full = format!("{reason}（PreToolUse hookが直接操作を拒否しました）。");
-    let payload = format!(
-        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":{}}}}}",
+struct DenialGuidance {
+    rule_id: &'static str,
+    safety_basis: &'static str,
+    next_action: &'static str,
+}
+
+fn denial_guidance(reason: &str) -> DenialGuidance {
+    if reason.contains("複数segment") || reason.contains("shell control operator") {
+        return DenialGuidance {
+            rule_id: "guarded-command-chain",
+            safety_basis: "状態変更やhelperを連結すると個別検証と安全なcommand rewriteの境界を保証できません。読み取り専用Git/GitHubだけは`;`、`&&`、改行の単純chainで個別検証します。",
+            next_action: "書き込み・helper・pipeは独立したtool callに分けてください。読み取りchainなら`;`、`&&`、改行だけを使い、環境変更やredirectionを含めないでください。",
+        };
+    }
+    if reason.contains("command substitution")
+        || reason.contains("shell展開")
+        || reason.contains("backslash-newline")
+    {
+        return DenialGuidance {
+            rule_id: "dynamic-shell-unverifiable",
+            safety_basis: "展開後の実行commandや引数をPreToolUse時点で一意に検証できず、禁止操作を生成できるためです。",
+            next_action: "探索commandを先に独立実行し、その結果をliteralな引数として次のtool callへ渡してください。同じ展開形式で再試行しないでください。",
+        };
+    }
+    if reason.contains("redirection") || reason.contains("出力先") {
+        return DenialGuidance {
+            rule_id: "guarded-output-redirection",
+            safety_basis: "guard対象commandの出力先を書き換えると、検査済みのfilesystem境界と実行結果の可視性を保証できません。",
+            next_action: "guard対象commandを単独で実行し、結果をCodexへ返してください。保存が必要なら、その後の別tool callで明示したworkspace内fileへ書いてください。",
+        };
+    }
+    if reason.contains("削除") || reason.contains("rm") || reason.contains("shred") {
+        return DenialGuidance {
+            rule_id: "direct-deletion-prohibited",
+            safety_basis: "直接削除は復旧不能または対象拡大の危険があるため、approvalの有無にかかわらずこの経路では実行しません。",
+            next_action: "削除を再試行せず、対象を確認してprojectの`.codex-trash/<日時>/`へ退避する手順を使ってください。必要な人間判断が未取得なら先に確認してください。",
+        };
+    }
+    if reason.contains("wrapper")
+        || reason.contains("環境")
+        || reason.contains("cwd")
+        || reason.contains("shell builtin")
+        || reason.contains("source")
+    {
+        return DenialGuidance {
+            rule_id: "guarded-command-not-canonical",
+            safety_basis: "wrapper、環境、cwd、shell組み込みによって検証後のcommand解決やrepository境界が変わる可能性があります。",
+            next_action: "Git/GitHub/helperを独立したcanonical commandで直接実行してください。managed worktreeへのGit書き込みだけは、案内済みの`env -u SSH_ASKPASS git -C <absolute-worktree> ...`形式を使ってください。",
+        };
+    }
+    if reason.contains("秘密情報") || reason.contains("PRIVATE KEY") {
+        return DenialGuidance {
+            rule_id: "sensitive-content-detected",
+            safety_basis: "commit、push、Issue、PRへ秘密情報らしい内容を記録または送信しないためです。",
+            next_action: "秘密情報を表示せず入力・差分・body fileから除外し、必要ならcredentialをローテーションしてから安全な内容だけで再実行してください。",
+        };
+    }
+    if reason.starts_with("git ")
+        || reason.contains("Git command")
+        || reason.contains("許可されていないGit") && !reason.contains("GitHub")
+        || reason.contains("Git subcommand")
+        || reason.contains("保護branch")
+        || reason.contains("履歴改変")
+        || reason.contains("force")
+    {
+        return DenialGuidance {
+            rule_id: "git-operation-not-allowed",
+            safety_basis: "人間用checkout、保護branch、履歴、remote refを直接変更する経路を閉じ、managed worktreeと検証済みhelperへ限定しています。",
+            next_action: "同等のGit操作を別構文で再試行しないでください。読み取り用allowlist、managed worktree、または`codex-delivery`の該当subcommandへ置き換えてください。",
+        };
+    }
+    if reason.contains("helper")
+        || reason.starts_with("delivery ")
+        || reason.starts_with("worktree ")
+    {
+        return DenialGuidance {
+            rule_id: "helper-contract-invalid",
+            safety_basis: "helperはtask、repository、固定SHA、plan、review evidenceを一意に検証できる正規形だけを受け付けます。",
+            next_action: "helperのusageを読み、要求された識別子とflagをすべてliteralに明示して、helperだけを独立したtool callで再実行してください。",
+        };
+    }
+    if reason.contains("GitHub")
+        || reason.contains("Issue")
+        || reason.contains("PR")
+        || reason.contains("gh ")
+    {
+        return DenialGuidance {
+            rule_id: "github-operation-not-allowed",
+            safety_basis: "対象repository、単一resource、許可済みlifecycle、body snapshotを固定できるGitHub操作だけを実行します。",
+            next_action: "repositoryとresource IDを明示し、許可済みの`gh issue`、`gh pr`、読み取り専用操作、または`codex-delivery`へ置き換えてください。",
+        };
+    }
+    if reason.contains("hook input") || reason == "command is required" {
+        return DenialGuidance {
+            rule_id: "hook-input-invalid",
+            safety_basis: "tool name、command、cwdを安全に解析できない入力では、許可判断を行えません。",
+            next_action: "Bash toolへ空でないliteral commandを渡してください。入力schemaを変えず、解析不能な値を除いてください。",
+        };
+    }
+    DenialGuidance {
+        rule_id: "safety-precondition-failed",
+        safety_basis: "操作前に必要な対象、状態、identity、path、または安全な実行境界を確認できなかったためfail closedにしました。",
+        next_action: "直接理由を解消し、同じ操作を迂回せず、対象と引数をliteralに固定した独立tool callで再検証してください。人間判断が必要な場合だけDaikiへ確認してください。",
+    }
+}
+
+fn detailed_denial(reason: &str) -> String {
+    let guidance = denial_guidance(reason);
+    format!(
+        "[codex-guard:{}]\n直接理由: {}\n安全上の根拠: {}\n次の行動: {}\n実行状態: commandは実行されていません。",
+        guidance.rule_id, reason, guidance.safety_basis, guidance.next_action
+    )
+}
+
+fn denial_payload(reason: &str) -> String {
+    let full = detailed_denial(reason);
+    format!(
+        "{{\"systemMessage\":{},\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":{}}}}}",
+        json_string(&full),
         json_string(&full)
-    );
+    )
+}
+
+fn deny(reason: &str) {
+    let full = detailed_denial(reason);
+    let payload = denial_payload(reason);
     let mut stdout = io::stdout().lock();
     let _ = stdout.write_all(payload.as_bytes());
     let _ = stdout.flush();
@@ -5524,33 +5844,9 @@ pub fn entrypoint() -> i32 {
         deny(&reason);
         return 2;
     }
-    let updated_command = match rewrite_body_file_command(command, cwd) {
+    let updated_command = match rewrite_safety_command(command, cwd) {
         Ok(Some(updated_command)) => updated_command,
         Ok(None) => command.to_string(),
-        Err(reason) => {
-            deny(&reason);
-            return 2;
-        }
-    };
-    let updated_command = match rewrite_git_safety_command(&updated_command, cwd) {
-        Ok(Some(updated_command)) => updated_command,
-        Ok(None) => updated_command,
-        Err(reason) => {
-            deny(&reason);
-            return 2;
-        }
-    };
-    let updated_command = match rewrite_gh_safety_command(&updated_command) {
-        Ok(Some(updated_command)) => updated_command,
-        Ok(None) => updated_command,
-        Err(reason) => {
-            deny(&reason);
-            return 2;
-        }
-    };
-    let updated_command = match rewrite_helper_safety_command(&updated_command) {
-        Ok(Some(updated_command)) => updated_command,
-        Ok(None) => updated_command,
         Err(reason) => {
             deny(&reason);
             return 2;
@@ -5581,6 +5877,23 @@ mod tests {
             shell_tokens_with_punctuation("日本語>出力"),
             Some(vec!["日本語".into(), ">".into(), "出力".into()])
         );
+        assert_eq!(
+            simple_chain_parts("printf '日本語;保持'; git status && printf 完了"),
+            Some(vec![
+                SimpleChainPart {
+                    command: "printf '日本語;保持'".into(),
+                    separator: Some(SimpleChainSeparator::Semicolon),
+                },
+                SimpleChainPart {
+                    command: "git status".into(),
+                    separator: Some(SimpleChainSeparator::And),
+                },
+                SimpleChainPart {
+                    command: "printf 完了".into(),
+                    separator: None,
+                },
+            ])
+        );
     }
 
     #[test]
@@ -5589,6 +5902,17 @@ mod tests {
         assert!(blocked_reason("git diff --stat", None, 0).is_none());
         assert!(blocked_reason("git branch --contains main", None, 0).is_none());
         assert!(blocked_reason("git remote -v", None, 0).is_none());
+        for command in [
+            "rg --files; git status",
+            "git status && rg --files",
+            "git status\nprintf done",
+            "git status; gh issue list; printf done",
+        ] {
+            assert!(
+                blocked_reason(command, None, 0).is_none(),
+                "safe read chain was rejected: {command}"
+            );
+        }
     }
 
     #[test]
@@ -5598,6 +5922,96 @@ mod tests {
         assert!(blocked_reason("git status $(printf x)", None, 0).is_some());
         assert!(blocked_reason("rm -rf README.md", None, 0).is_some());
         assert!(blocked_reason("git-reset --hard HEAD", None, 0).is_some());
+        for command in [
+            "git status | head",
+            "git status || printf fallback",
+            "git status; git reset --hard HEAD",
+            "git status; bash -c 'git reset --hard HEAD'",
+            "git status; printf done > /tmp/status",
+            "git status; codex-worktree list",
+            "git status; cd /tmp",
+        ] {
+            assert!(
+                blocked_reason(command, None, 0).is_some(),
+                "unsafe guarded chain was allowed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_chain_rewrites_each_guarded_segment() {
+        let command = "printf ready; git status && git diff --stat; printf done";
+        let rewritten = rewrite_safety_command(command, None)
+            .expect("rewrite read-only chain")
+            .expect("Git segment requires rewrite");
+        assert!(rewritten.starts_with("printf ready ; '/usr/bin/env'"));
+        assert!(rewritten.contains("'/usr/bin/git' '-c' 'core.hooksPath=/dev/null'"));
+        assert!(rewritten.ends_with("; printf done"));
+        assert_eq!(rewritten.matches("'/usr/bin/git'").count(), 2);
+    }
+
+    #[test]
+    fn denial_feedback_is_actionable_and_visible() {
+        let reason =
+            "複数segmentでは読み取り専用Git/GitHubを`;`、`&&`、改行で連結する形だけ許可されます";
+        let message = detailed_denial(reason);
+        assert!(message.contains("[codex-guard:guarded-command-chain]"));
+        assert!(message.contains("直接理由:"));
+        assert!(message.contains("安全上の根拠:"));
+        assert!(message.contains("次の行動:"));
+        assert!(message.contains("独立したtool call"));
+        assert!(message.contains("commandは実行されていません"));
+
+        let payload: StrictJsonValue =
+            serde_json::from_str(&denial_payload(reason)).expect("valid hook denial JSON");
+        assert_eq!(
+            payload
+                .get("systemMessage")
+                .and_then(StrictJsonValue::as_str),
+            Some(message.as_str())
+        );
+        assert_eq!(
+            payload
+                .get("hookSpecificOutput")
+                .and_then(StrictJsonValue::as_object)
+                .and_then(|value| value.get("permissionDecisionReason"))
+                .and_then(StrictJsonValue::as_str),
+            Some(message.as_str())
+        );
+
+        for (reason, rule_id) in [
+            (
+                "command substitutionを含むcommandは安全に検査できません",
+                "dynamic-shell-unverifiable",
+            ),
+            (
+                "削除コマンドは自動実行できません",
+                "direct-deletion-prohibited",
+            ),
+            (
+                "Git subcommandは読み取り・書き込みの許可listに含まれていません",
+                "git-operation-not-allowed",
+            ),
+            (
+                "PRのReady化はcodex-deliveryだけが実行できます",
+                "github-operation-not-allowed",
+            ),
+            (
+                "delivery helperのtask、PR、head、planを明示してください",
+                "helper-contract-invalid",
+            ),
+            (
+                "hook inputを安全に解析・検査できません",
+                "hook-input-invalid",
+            ),
+            ("remote状態を確認できません", "safety-precondition-failed"),
+        ] {
+            assert_eq!(
+                denial_guidance(reason).rule_id,
+                rule_id,
+                "unexpected guidance for: {reason}"
+            );
+        }
     }
 
     #[test]
@@ -6554,6 +6968,9 @@ mod tests {
             "codex-worktree list",
             "codex-worktree --help",
             "codex-delivery --help",
+            "rg --files; git status",
+            "git status && printf done",
+            "git status\ngh issue list",
             "printf '%s' 'git status > /tmp/status'",
             "printf '%s' git > /tmp/status",
             "rg --files /tmp/git > /tmp/path",
@@ -6596,6 +7013,9 @@ mod tests {
             "git status $(printf x)",
             "git status $CMD",
             "git status; git reset --hard HEAD",
+            "git status | head",
+            "git status || printf fallback",
+            "git status; codex-worktree list",
             "git-reset --hard HEAD",
         ];
         for command in blocked {
