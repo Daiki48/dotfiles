@@ -41,6 +41,15 @@ proxyや`http_unix_socket`などの既存設定を引き継ぎません。browse
 `--body-file`は同じfile descriptorから検査した内容をprivate snapshotへ固定してから実行し、内容を安全に検査できない
 binary差分はcommit・push前に拒否します。
 
+`PreToolUse`のdenyは、stableな`codex-guard:<rule-id>`、直接理由、安全上の根拠、次に取る操作、未実行であることを
+`systemMessage`と`permissionDecisionReason`の両方へ返します。Codexは同じ構文で再試行せず、表示された正規形または
+独立したtool callへ切り替えます。command本文や検出した秘密情報そのものはfeedbackへ複製しません。
+
+読み取り専用の`git`・`gh`は、`;`、`&&`、改行だけからなる単純chainであれば、他のcommandと連結できます。
+hookはguard対象segmentをそれぞれ独立して検証し、system Git/GitHub CLIと固定environmentへ個別にrewriteします。
+Git/GitHubの書き込み、`codex-worktree`、`codex-delivery`、pipe、fallback/background operator、redirection、
+shell環境・cwd変更は引き続き単独の直接commandへ限定します。
+
 `codex-worktree`は安全境界としてglobalとrepository固有の`credential.helper`を無効化します。canonicalな
 `https://github.com/<owner>/<repository>`だけは、認証情報をprivateな一時設定へsnapshotし、固定したsystem `gh`の
 `auth git-credential`を1件だけ復元します。SSH、GitHub以外、不正形式やcredentialを含むURLにはHTTPS helperを
