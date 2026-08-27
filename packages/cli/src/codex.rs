@@ -93,6 +93,7 @@ const MANAGED_CONFIG_KEYS: &[&str] = &[
     "approvals_reviewer",
     "default_permissions",
     "commit_attribution",
+    "suppress_unstable_features_warning",
 ];
 const RETIRED_CONFIG_KEYS: &[&str] = &["sandbox_mode", "sandbox_workspace_write"];
 const RETIRED_SANDBOX_TABLE: &str = "[sandbox_workspace_write]";
@@ -1113,6 +1114,20 @@ fn normalize_inline_feature_tables(existing: &str) -> String {
     {
         features.insert("rollout_budget", Item::Table(table_from_inline(&inline)));
         changed = true;
+    }
+    for key in MANAGED_FEATURE_KEYS {
+        changed |= features.remove(key).is_some();
+    }
+    if let Some(rollout_budget) = features
+        .get_mut("rollout_budget")
+        .and_then(Item::as_table_mut)
+    {
+        changed |= rollout_budget.is_implicit() || rollout_budget.is_dotted();
+        rollout_budget.set_implicit(false);
+        rollout_budget.set_dotted(false);
+        for key in MANAGED_ROLLOUT_BUDGET_KEYS {
+            changed |= rollout_budget.remove(key).is_some();
+        }
     }
     if changed {
         document.to_string()
@@ -3726,6 +3741,10 @@ mod tests {
         assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
         assert_eq!(document["features"]["goals"].as_bool(), Some(true));
         assert_eq!(
+            document["suppress_unstable_features_warning"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
             document["features"]["rollout_budget"]["enabled"].as_bool(),
             Some(true)
         );
@@ -4216,6 +4235,7 @@ approval_policy = "on-request"
 approvals_reviewer = "auto_review"
 default_permissions = "codex-autonomous"
 commit_attribution = ""
+suppress_unstable_features_warning = true
 
 [features]
 hooks = true
@@ -4245,6 +4265,7 @@ default_subagent_reasoning_effort = "medium"
 "#;
         let existing = r#"model = "old"
 sandbox_mode = "read-only"
+suppress_unstable_features_warning = false
 
 [sandbox_workspace_write]
 network_access = false
@@ -4291,6 +4312,7 @@ description = "local"
         assert!(actual.contains("default_permissions = \"codex-autonomous\""));
         assert!(actual.contains("approvals_reviewer = \"auto_review\""));
         assert!(actual.contains("commit_attribution = \"\""));
+        assert!(actual.contains("suppress_unstable_features_warning = true"));
         assert!(actual.contains("[features]\nhooks = true\ngoals = true\nnetwork_proxy = true"));
         assert!(actual.contains(
             "[features.rollout_budget]\nenabled = true\nlimit_tokens = 200000\nreminder_at_remaining_tokens = [180000, 160000, 140000, 120000, 100000, 80000, 60000, 40000, 20000]\nprefill_token_weight = 1.0\nsampling_token_weight = 1.0\nlocal_budget_note = \"preserved\""
@@ -4380,6 +4402,62 @@ network_proxy = true
             document["features"]["rollout_budget"]["local_budget_note"].as_str(),
             Some("preserved")
         );
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
+
+        let quoted = r#"[features]
+"hooks" = false
+
+[features.rollout_budget]
+"enabled" = false
+"reminder_at_remaining_tokens" = [
+  99999,
+  77777,
+]
+"sampling_token_weight" = 9.0
+"local_quoted_note" = "preserved"
+"#;
+        let migrated = merge_managed_config(template, quoted);
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("quoted rollout budget migration must remain valid TOML");
+        assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(
+            document["features"]["rollout_budget"]["reminder_at_remaining_tokens"]
+                .as_array()
+                .expect("managed rollout budget reminders")
+                .len(),
+            9
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["local_quoted_note"].as_str(),
+            Some("preserved")
+        );
+        assert!(!migrated.contains("reminder_interval_tokens"));
+        assert!(!migrated.contains("99999"));
+        assert!(!migrated.contains("77777"));
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
+
+        let dotted = r#"[features]
+rollout_budget."reminder_interval_tokens" = 99999
+rollout_budget."local_budget_note" = "preserved"
+"#;
+        let migrated = merge_managed_config(template, dotted);
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("dotted rollout budget migration must remain valid TOML");
+        assert_eq!(
+            document["features"]["rollout_budget"]["reminder_at_remaining_tokens"]
+                .as_array()
+                .expect("managed rollout budget reminders")
+                .len(),
+            9
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["local_budget_note"].as_str(),
+            Some("preserved")
+        );
+        assert!(!migrated.contains("reminder_interval_tokens"));
+        assert!(!migrated.contains("99999"));
         assert_eq!(merge_managed_config(template, &migrated), migrated);
 
         let root_inline_without_budget = r#"features = { hooks = false, local_feature = "preserved" }

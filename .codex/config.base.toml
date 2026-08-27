@@ -20,6 +20,9 @@ default_permissions = "codex-autonomous"
 # Codex CLI 0.150.1でstrict config検証済み。
 commit_attribution = ""
 
+# rollout_budgetは意図して有効化しているため、開発中featureの起動警告だけを抑制する。
+suppress_unstable_features_warning = true
+
 [features]
 hooks = true
 goals = true
