@@ -2002,6 +2002,10 @@ fn validate_gate_repository(repository: &str, gate: &str) -> Result<()> {
     }
     Ok(())
 }
+fn receipt_has_current_plan_version(payload: &Value) -> bool {
+    payload.get("version").and_then(Value::as_i64) == Some(RECEIPT_VERSION)
+        && payload.get("plan_version").is_some()
+}
 fn receipt(
     payload: &Value,
     root: &Path,
@@ -2093,9 +2097,13 @@ fn receipt(
             "specialist_review_passed",
             "ledger_comment_id",
             "ledger_body_sha256",
-            "plan_version",
         ]);
-        expected_keys(payload, &keys, "receipt")?;
+        if receipt_has_current_plan_version(payload) {
+            keys.push("plan_version");
+            expected_keys(payload, &keys, "receipt")?;
+        } else {
+            expected_keys(payload, &keys, "legacy v5 receipt")?;
+        }
     } else {
         return Err(error("receipt schemaが一致しません"));
     }
@@ -2141,7 +2149,8 @@ fn receipt(
     }
     if version == RECEIPT_VERSION
         && (int_value(&normalized, "ledger_comment_id")? < 1
-            || int_value(&normalized, "plan_version")? < 1
+            || receipt_has_current_plan_version(&normalized)
+                && int_value(&normalized, "plan_version")? < 1
             || oid(
                 &str_value(&normalized, "ledger_body_sha256")?,
                 "ledger digest",
@@ -2201,7 +2210,7 @@ fn review_receipt_scope_matches(existing: &Value, proposed: &Value) -> bool {
         "changed_files",
         "gate_mode",
     ];
-    if existing.get("version").and_then(Value::as_i64) == Some(RECEIPT_VERSION) {
+    if receipt_has_current_plan_version(existing) {
         keys.extend(["ledger_comment_id", "ledger_body_sha256", "plan_version"]);
     }
     keys.iter()
@@ -2318,7 +2327,7 @@ fn write_review_locked(
         {
             return Err(error("同じheadのreceiptをdowngradeできません"));
         }
-        if int_value(&existing, "version")? == RECEIPT_VERSION
+        if receipt_has_current_plan_version(&existing)
             && review_request_is_idempotent(&old_risk, risk_value, &old_decision, approved)
         {
             return Ok(existing);
@@ -2835,7 +2844,9 @@ fn fetch_main(root: &Path, repository: &str) -> Result<String> {
     )
 }
 fn validate_receipt_loop_ledger(root: &Path, receipt_value: &Value) -> Result<()> {
-    if int_value(receipt_value, "version")? < RECEIPT_VERSION {
+    if int_value(receipt_value, "version")? < RECEIPT_VERSION
+        || !receipt_has_current_plan_version(receipt_value)
+    {
         return Err(error(
             "legacy receiptは読み取り互換専用です。current headをv5で再reviewしてください",
         ));
@@ -3969,6 +3980,12 @@ mod tests {
         ])
     }
 
+    fn legacy_receipt_v5(risk_value: &str, specialist: bool) -> Value {
+        let mut receipt = receipt_v5(risk_value, specialist);
+        receipt.as_object_mut().unwrap().remove("plan_version");
+        receipt
+    }
+
     fn chunks(value: &str) -> Value {
         Value::Array(
             value
@@ -4667,6 +4684,20 @@ mod tests {
             &current,
             &different_plan_version
         ));
+        let legacy_v5 = legacy_receipt_v5("low", false);
+        assert!(review_receipt_scope_matches(&legacy_v5, &current));
+        assert!(!receipt_has_current_plan_version(&legacy_v5));
+        assert!(
+            receipt(
+                &legacy_v5,
+                Path::new("/unused"),
+                "issue-24",
+                &"b".repeat(40),
+                Some("owner/repo"),
+            )
+            .is_ok()
+        );
+        assert!(validate_receipt_loop_ledger(Path::new("/unused"), &legacy_v5).is_err());
         assert!(validate_receipt_loop_ledger(Path::new("/unused"), &receipt_v3()).is_err());
     }
 
@@ -4818,18 +4849,18 @@ mod tests {
             )
             .is_err()
         );
-        let mut missing_plan_version = base.as_object().unwrap().clone();
-        missing_plan_version.remove("plan_version");
+        let missing_plan_version = legacy_receipt_v5("low", false);
         assert!(
             receipt(
-                &Value::Object(missing_plan_version),
+                &missing_plan_version,
                 Path::new("/unused"),
                 "issue-24",
                 &"b".repeat(40),
                 Some("owner/repo"),
             )
-            .is_err()
+            .is_ok()
         );
+        assert!(validate_receipt_loop_ledger(Path::new("/unused"), &missing_plan_version).is_err());
     }
 
     #[test]
