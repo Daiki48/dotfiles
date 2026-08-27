@@ -39,7 +39,7 @@
   追跡します。同じ指摘が修正後も再発するか、2round連続で受け入れ条件・test・既知指摘に証拠上の進展が
   ないか、入力・外部stateを正規化した同じfailure signatureが反復すればSol xhighの診断モードでroot causeと
   計画を再検証します。診断は最大12 tool callまたは30分の早い方で終了します。tool call数はSolがledgerへ
-  audit記録し、wall-clockとtoken消費はruntimeの経過時間・rollout budget reminderで監視します。token残量不明時はPlanの有限な
+  audit記録し、wall-clockとtoken消費はruntimeが提示する経過時間・token情報で監視します。token残量不明時はPlanの有限な
   受け入れ条件・実装単位・対象経路をtask work budgetにします。受け入れ条件は弱めず、Draft PR後は直前commentの
   IDとdigestで連鎖するappend-only ledger commentを次のbatch前に保存します。
   診断後の修正でも同じ指摘が再発する、または次のroundも進展がない場合はその項目をblockedとします。

@@ -14,7 +14,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, PermissionsExt},
 };
-use toml_edit::{DocumentMut, InlineTable, Item, Table, value};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
 
 use crate::codex_tools::{process, worktree};
 const CODEX_FILES: &[(&str, &str)] = &[
@@ -1134,6 +1134,76 @@ fn normalize_inline_feature_tables(existing: &str) -> String {
     document.to_string()
 }
 
+#[derive(Clone, Copy)]
+enum ManagedFeatureValueKind {
+    Boolean,
+    PositiveInteger,
+    PositiveIntegerArray,
+    FiniteNonNegativeNumber,
+}
+
+fn rollout_budget_value_kind(key: &str) -> Option<ManagedFeatureValueKind> {
+    match key {
+        "enabled" => Some(ManagedFeatureValueKind::Boolean),
+        "limit_tokens" | "reminder_interval_tokens" => {
+            Some(ManagedFeatureValueKind::PositiveInteger)
+        }
+        "reminder_at_remaining_tokens" => Some(ManagedFeatureValueKind::PositiveIntegerArray),
+        "prefill_token_weight" | "sampling_token_weight" => {
+            Some(ManagedFeatureValueKind::FiniteNonNegativeNumber)
+        }
+        _ => None,
+    }
+}
+
+fn validate_managed_feature_value(
+    setting: &str,
+    value: &Value,
+    expected: ManagedFeatureValueKind,
+) -> Result<()> {
+    let valid = match expected {
+        ManagedFeatureValueKind::Boolean => value.as_bool().is_some(),
+        ManagedFeatureValueKind::PositiveInteger => {
+            value.as_integer().is_some_and(|number| number > 0)
+        }
+        ManagedFeatureValueKind::PositiveIntegerArray => value.as_array().is_some_and(|values| {
+            values
+                .iter()
+                .all(|value| value.as_integer().is_some_and(|number| number > 0))
+        }),
+        ManagedFeatureValueKind::FiniteNonNegativeNumber => {
+            value.as_integer().is_some_and(|number| number >= 0)
+                || value
+                    .as_float()
+                    .is_some_and(|number| number.is_finite() && number >= 0.0)
+        }
+    };
+    if !valid {
+        anyhow::bail!("Managed Codex feature setting has an invalid type or value: {setting}");
+    }
+    Ok(())
+}
+
+fn validate_managed_rollout_budget_item(setting: &str, item: &Item) -> Result<()> {
+    let value = item.as_value().with_context(|| {
+        format!("Managed rollout budget setting must be a TOML value: {setting}")
+    })?;
+    let kind = rollout_budget_value_kind(setting)
+        .with_context(|| format!("Unknown managed rollout budget setting: {setting}"))?;
+    validate_managed_feature_value(setting, value, kind)
+}
+
+fn validate_managed_rollout_budget_inline(inline: &InlineTable) -> Result<()> {
+    for key in MANAGED_ROLLOUT_BUDGET_KEYS {
+        if let Some(value) = inline.get(key) {
+            let kind = rollout_budget_value_kind(key)
+                .with_context(|| format!("Unknown managed rollout budget setting: {key}"))?;
+            validate_managed_feature_value(key, value, kind)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_managed_feature_value_types(existing: &str) -> Result<()> {
     if existing.trim().is_empty() {
         return Ok(());
@@ -1145,31 +1215,57 @@ fn validate_managed_feature_value_types(existing: &str) -> Result<()> {
         return Ok(());
     };
     if let Some(table) = features.as_table() {
-        for key in MANAGED_FEATURE_KEYS
-            .iter()
-            .chain(LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS)
-        {
-            if table.get(key).is_some_and(|item| item.as_value().is_none()) {
-                anyhow::bail!("Managed feature setting must be a TOML value: {key}");
+        for key in MANAGED_FEATURE_KEYS {
+            if let Some(item) = table.get(key) {
+                let value = item.as_value().with_context(|| {
+                    format!("Managed feature setting must be a TOML value: {key}")
+                })?;
+                validate_managed_feature_value(key, value, ManagedFeatureValueKind::Boolean)?;
+            }
+        }
+        for legacy_key in LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS {
+            if let Some(item) = table.get(legacy_key) {
+                let key = legacy_key
+                    .strip_prefix("rollout_budget.")
+                    .context("Managed rollout budget key must have the expected prefix")?;
+                validate_managed_rollout_budget_item(key, item)?;
             }
         }
         if let Some(rollout_budget) = table.get("rollout_budget") {
             if let Some(table) = rollout_budget.as_table() {
                 for key in MANAGED_ROLLOUT_BUDGET_KEYS {
-                    if table.get(key).is_some_and(|item| item.as_value().is_none()) {
-                        anyhow::bail!("Managed rollout budget setting must be a TOML value: {key}");
+                    if let Some(item) = table.get(key) {
+                        validate_managed_rollout_budget_item(key, item)?;
                     }
                 }
-            } else if rollout_budget.as_inline_table().is_none() {
+            } else if let Some(inline) = rollout_budget.as_inline_table() {
+                validate_managed_rollout_budget_inline(inline)?;
+            } else {
                 anyhow::bail!("features.rollout_budget must be a TOML table");
             }
         }
     } else if let Some(inline) = features.as_inline_table() {
-        if inline
-            .get("rollout_budget")
-            .is_some_and(|value| !value.is_inline_table())
-        {
-            anyhow::bail!("features.rollout_budget must be a TOML table");
+        for key in MANAGED_FEATURE_KEYS {
+            if let Some(value) = inline.get(key) {
+                validate_managed_feature_value(key, value, ManagedFeatureValueKind::Boolean)?;
+            }
+        }
+        for legacy_key in LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS {
+            if let Some(value) = inline.get(legacy_key) {
+                let key = legacy_key
+                    .strip_prefix("rollout_budget.")
+                    .context("Managed rollout budget key must have the expected prefix")?;
+                let kind = rollout_budget_value_kind(key)
+                    .with_context(|| format!("Unknown managed rollout budget setting: {key}"))?;
+                validate_managed_feature_value(key, value, kind)?;
+            }
+        }
+        if let Some(rollout_budget) = inline.get("rollout_budget") {
+            if let Some(rollout_budget) = rollout_budget.as_inline_table() {
+                validate_managed_rollout_budget_inline(rollout_budget)?;
+            } else {
+                anyhow::bail!("features.rollout_budget must be a TOML table");
+            }
         }
     } else {
         anyhow::bail!("features must be a TOML table");
@@ -1189,6 +1285,10 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     let managed_permissions = managed_permission_profile_sections(template);
 
     let existing = normalize_inline_feature_tables(existing);
+    // Add the managed hook before rebuilding managed permission sections so a
+    // config that did not already contain the hook reaches its stable section
+    // order in a single migration.
+    let existing = sync_managed_hook(template, &existing);
     let mut in_top_level = true;
     let mut in_agents = false;
     let mut in_legacy_profile_table = false;
@@ -1285,12 +1385,11 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         .trim_start_matches('\n')
         .to_string();
 
-    let merged = if preserved.is_empty() {
+    if preserved.is_empty() {
         format!("{managed}\n")
     } else {
         format!("{managed}\n\n{preserved}\n")
-    };
-    sync_managed_hook(template, &merged)
+    }
 }
 
 fn merge_managed_config_with_root(
@@ -3685,12 +3784,13 @@ mod tests {
         ensure_managed_hook_with_legacy_hash, ensure_managed_workspace_root,
         ensure_private_directory, legacy_hash_for_destination, managed_hook_state_path,
         managed_transaction_path, merge_managed_config, merge_managed_config_with_root,
-        migrate_managed_config_from_template, preflight_config_state,
-        preflight_managed_binary_destination, preflight_operation_transaction,
-        preflight_refresh_transaction, preflight_setup_transaction, preflight_shared_symlink,
-        publish_regular_file_exclusive, reject_cargo_configuration, sha256,
-        trusted_user_executable, valid_release_binary_magic, validate_managed_feature_value_types,
-        validate_setup_home, verify_managed_symlink, write_file_exclusive,
+        migrate_managed_config_from_template, migrate_managed_config_from_template_with_root,
+        preflight_config_state, preflight_managed_binary_destination,
+        preflight_operation_transaction, preflight_refresh_transaction,
+        preflight_setup_transaction, preflight_shared_symlink, publish_regular_file_exclusive,
+        reject_cargo_configuration, sha256, trusted_user_executable, valid_release_binary_magic,
+        validate_managed_feature_value_types, validate_setup_home, verify_managed_symlink,
+        write_file_exclusive,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4565,6 +4665,8 @@ features.rollout_budget.limit_tokens = 99999
     #[test]
     fn rollout_budget_hard_stop_is_disabled_and_limits_are_retired() {
         let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("rollout-budget-schema");
+        let managed_root = directory.path().join("codex").join("worktrees");
         let existing = r#"[features]
 hooks = false
 goals = false
@@ -4588,7 +4690,9 @@ timeout = 10
 statusMessage = "Git/GitHub操作を確認中"
 "#;
 
-        let migrated = merge_managed_config(template, existing);
+        let migrated =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate a valid legacy rollout budget schema");
         let document = migrated
             .parse::<toml_edit::DocumentMut>()
             .expect("disabled rollout budget migration must remain valid TOML");
@@ -4610,13 +4714,133 @@ statusMessage = "Git/GitHub操作を確認中"
             rollout_budget["local_budget_note"].as_str(),
             Some("preserved")
         );
-        assert_eq!(merge_managed_config(template, &migrated), migrated);
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat valid rollout budget migration"),
+            migrated
+        );
+
+        let inline_existing = r#"features = { hooks = false, goals = false, local_feature = "preserved", rollout_budget = { enabled = true, limit_tokens = 1, reminder_interval_tokens = 1, reminder_at_remaining_tokens = [], prefill_token_weight = 0, sampling_token_weight = 0.5, local_budget_note = "preserved" } }
+"#;
+        let inline_migrated = merge_managed_config_with_root(
+            template,
+            inline_existing,
+            &managed_root,
+            directory.path(),
+        )
+        .expect("migrate a valid inline legacy rollout budget schema");
+        let inline_document = inline_migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("inline migration must remain valid TOML");
+        assert_eq!(inline_document["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(
+            inline_document["features"]["local_feature"].as_str(),
+            Some("preserved")
+        );
+        assert_eq!(
+            inline_document["features"]["rollout_budget"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            inline_document["features"]["rollout_budget"]["local_budget_note"].as_str(),
+            Some("preserved")
+        );
+
+        for equivalent_existing in [
+            "[features.\"rollout_budget\"]\n\"enabled\" = true\n\"limit_tokens\" = 200000\nlocal_budget_note = \"preserved\"\n",
+            "[features]\nrollout_budget.\"reminder_interval_tokens\" = 20000\nrollout_budget.\"local_budget_note\" = \"preserved\"\n",
+            "[features]\n\"rollout_budget.limit_tokens\" = 200000\nlocal_feature = \"preserved\"\n",
+            "features.local_feature = \"preserved\"\nfeatures.rollout_budget.enabled = true\nfeatures.rollout_budget.limit_tokens = 200000\n",
+        ] {
+            let equivalent_migrated = merge_managed_config_with_root(
+                template,
+                equivalent_existing,
+                &managed_root,
+                directory.path(),
+            )
+            .expect("migrate an equivalent valid rollout budget representation");
+            equivalent_migrated
+                .parse::<toml_edit::DocumentMut>()
+                .expect("equivalent migration must remain valid TOML");
+            assert_eq!(
+                merge_managed_config_with_root(
+                    template,
+                    &equivalent_migrated,
+                    &managed_root,
+                    directory.path(),
+                )
+                .expect("repeat equivalent rollout budget migration"),
+                equivalent_migrated
+            );
+        }
 
         let nested_local_data = r#"[features.rollout_budget]
 [features.rollout_budget.limit_tokens]
 local_note = "preserve"
 "#;
         assert!(validate_managed_feature_value_types(nested_local_data).is_err());
+    }
+
+    #[test]
+    fn invalid_managed_feature_schema_fails_closed_before_backup_or_write() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("invalid-rollout-budget-schema");
+        let managed_root = directory.path().join("codex").join("worktrees");
+
+        for existing in [
+            "[features.rollout_budget]\nlimit_tokens = { local_note = \"preserve\" }\n",
+            "[features.rollout_budget]\nlimit_tokens = [200000]\n",
+            "[features.rollout_budget]\nlimit_tokens = \"200000\"\n",
+            "[features.rollout_budget]\nreminder_at_remaining_tokens = [180000, { local_note = \"preserve\" }]\n",
+            "[features.rollout_budget]\nprefill_token_weight = nan\n",
+            "[features]\nhooks = []\n",
+            "features = { rollout_budget = { limit_tokens = { local_note = \"preserve\" } } }\n",
+            "features = { \"rollout_budget.limit_tokens\" = [200000] }\n",
+            "[features]\n\"rollout_budget.limit_tokens\" = { local_note = \"preserve\" }\n",
+        ] {
+            assert!(
+                merge_managed_config_with_root(
+                    template,
+                    existing,
+                    &managed_root,
+                    directory.path(),
+                )
+                .is_err(),
+                "invalid managed feature value must fail closed: {existing}"
+            );
+        }
+
+        let codex_dir = directory.path().join("actual-codex");
+        fs::create_dir(&codex_dir).expect("create isolated Codex directory");
+        let template_path = directory.path().join("config.base.toml");
+        fs::write(&template_path, template).expect("write isolated config template");
+        let config_path = codex_dir.join("config.toml");
+        let original = "[features.rollout_budget]\nlimit_tokens = { local_note = \"preserve\" }\n";
+        fs::write(&config_path, original).expect("write isolated invalid config");
+
+        assert!(
+            migrate_managed_config_from_template_with_root(
+                &codex_dir,
+                &template_path,
+                &managed_root,
+                directory.path(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read unchanged invalid config"),
+            original
+        );
+        let entries = fs::read_dir(&codex_dir)
+            .expect("read isolated Codex directory")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("collect isolated Codex directory entries");
+        assert_eq!(
+            entries.len(),
+            1,
+            "migration must not create a backup or temp file"
+        );
+        assert_eq!(entries[0].file_name(), "config.toml");
     }
 
     #[test]
