@@ -186,7 +186,7 @@ review、CI、Ruleset、risk確認は[Codex delivery運用ガイド](codex-deliv
 ## deliveryとの境界
 
 Draft PR後のdeliveryは、専用`codex-delivery` helperの次の経路だけを使います。
-各commandでは`--task-id`、`--pr`、`--head`、`--plan-id`を明示します。review記録では
+各commandでは`--task-id`、`--pr`、`--head`、`--plan-id`、`--plan-version`を明示します。review記録では
 `--risk`、`--tests-passed`、`--independent-review-passed`を必須とし、high/criticalだけ
 `--specialist-review-passed`も必須です。
 

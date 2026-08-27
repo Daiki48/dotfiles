@@ -25,7 +25,7 @@
 - Draft PRの作成は実装の中間点であり、完了条件ではありません。Draft作成後は専用の
   `codex-delivery` helperを唯一の`record-review`、`approve-review`、`deliver`、`finish`経路として使い、
   review receipt、Ready化・merge、main同期、managed cleanupを一続きで検証します。すべての
-  commandで`--task-id`、`--pr`、`--head`、`--plan-id`を明示し、review記録時はrisk、test、標準review、
+  commandで`--task-id`、`--pr`、`--head`、`--plan-id`、`--plan-version`を明示し、review記録時はrisk、test、標準review、
   high/criticalだけ変更固有の専門reviewの完了証拠も固定します。
 - risk分類とDaikiの意思決定要否を分離します。low/medium/high/criticalのいずれでも、仕様、既存権限、
   rollback、検証をCodexが根拠付きで確定できる場合は`record-review`で自律deliveryします。製品判断、

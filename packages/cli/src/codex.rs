@@ -98,14 +98,20 @@ const RETIRED_CONFIG_KEYS: &[&str] = &["sandbox_mode", "sandbox_workspace_write"
 const RETIRED_SANDBOX_TABLE: &str = "[sandbox_workspace_write]";
 const MANAGED_PERMISSION_PROFILE: &str = "codex-autonomous";
 const MANAGED_PERMISSION_PROFILE_HEADER: &str = "[permissions.codex-autonomous]";
-const MANAGED_FEATURE_KEYS: &[&str] = &[
-    "hooks",
-    "goals",
+const MANAGED_FEATURE_KEYS: &[&str] = &["hooks", "goals"];
+const LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS: &[&str] = &[
     "rollout_budget.enabled",
     "rollout_budget.limit_tokens",
     "rollout_budget.reminder_interval_tokens",
     "rollout_budget.prefill_token_weight",
     "rollout_budget.sampling_token_weight",
+];
+const MANAGED_ROLLOUT_BUDGET_KEYS: &[&str] = &[
+    "enabled",
+    "limit_tokens",
+    "reminder_interval_tokens",
+    "prefill_token_weight",
+    "sampling_token_weight",
 ];
 const MANAGED_AGENT_KEYS: &[&str] = &[
     "enabled",
@@ -1077,6 +1083,11 @@ fn is_retired_managed_hook_command(line: &str) -> bool {
 fn merge_managed_config(template: &str, existing: &str) -> String {
     let managed = managed_assignments(template, None, MANAGED_CONFIG_KEYS).join("\n");
     let managed_features = managed_assignments(template, Some("[features]"), MANAGED_FEATURE_KEYS);
+    let managed_rollout_budget = managed_assignments(
+        template,
+        Some("[features.rollout_budget]"),
+        MANAGED_ROLLOUT_BUDGET_KEYS,
+    );
     let managed_agents = managed_assignments(template, Some("[agents]"), MANAGED_AGENT_KEYS);
     let managed_permissions = managed_permission_profile_sections(template);
 
@@ -1086,8 +1097,10 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     let mut in_retired_sandbox_table = false;
     let mut in_managed_permission_profile = false;
     let mut in_features = false;
+    let mut in_rollout_budget = false;
     let mut agents_found = false;
     let mut features_found = false;
+    let mut rollout_budget_found = false;
     let mut preserved_lines = Vec::new();
     for line in existing.lines() {
         let header = table_header(line);
@@ -1097,9 +1110,13 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
             in_retired_sandbox_table = header == RETIRED_SANDBOX_TABLE;
             in_managed_permission_profile = is_managed_permission_profile_header(header);
             in_features = header == "[features]";
+            in_rollout_budget = header == "[features.rollout_budget]";
             in_agents = header == "[agents]";
             if in_features {
                 features_found = true;
+            }
+            if in_rollout_budget {
+                rollout_budget_found = true;
             }
             if in_agents {
                 agents_found = true;
@@ -1120,12 +1137,21 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         if in_agents && is_assignment_for(line, MANAGED_AGENT_KEYS) {
             continue;
         }
-        if in_features && is_assignment_for(line, MANAGED_FEATURE_KEYS) {
+        if in_features
+            && (is_assignment_for(line, MANAGED_FEATURE_KEYS)
+                || is_assignment_for(line, LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS))
+        {
+            continue;
+        }
+        if in_rollout_budget && is_assignment_for(line, MANAGED_ROLLOUT_BUDGET_KEYS) {
             continue;
         }
         preserved_lines.push(line);
         if in_features && header == Some("[features]") {
             preserved_lines.extend(managed_features.iter().map(String::as_str));
+        }
+        if in_rollout_budget && header == Some("[features.rollout_budget]") {
+            preserved_lines.extend(managed_rollout_budget.iter().map(String::as_str));
         }
         if in_agents && header == Some("[agents]") {
             preserved_lines.extend(managed_agents.iter().map(String::as_str));
@@ -1135,6 +1161,11 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         preserved_lines.push("");
         preserved_lines.push("[features]");
         preserved_lines.extend(managed_features.iter().map(String::as_str));
+    }
+    if !rollout_budget_found && !managed_rollout_budget.is_empty() {
+        preserved_lines.push("");
+        preserved_lines.push("[features.rollout_budget]");
+        preserved_lines.extend(managed_rollout_budget.iter().map(String::as_str));
     }
     if !agents_found && !managed_agents.is_empty() {
         preserved_lines.push("");
@@ -4139,11 +4170,13 @@ commit_attribution = ""
 [features]
 hooks = true
 goals = true
-rollout_budget.enabled = true
-rollout_budget.limit_tokens = 200000
-rollout_budget.reminder_interval_tokens = 20000
-rollout_budget.prefill_token_weight = 1.0
-rollout_budget.sampling_token_weight = 1.0
+
+[features.rollout_budget]
+enabled = true
+limit_tokens = 200000
+reminder_interval_tokens = 20000
+prefill_token_weight = 1.0
+sampling_token_weight = 1.0
 
 [permissions.codex-autonomous]
 extends = ":workspace"
@@ -4170,9 +4203,12 @@ exclude_tmpdir_env_var = true
 [features]
 hooks = false
 goals = false
-rollout_budget.enabled = false
-rollout_budget.limit_tokens = 999999
 network_proxy = true
+
+[features.rollout_budget]
+enabled = false
+limit_tokens = 999999
+local_budget_note = "preserved"
 
 [permissions.codex-autonomous]
 extends = ":read-only"
@@ -4204,9 +4240,11 @@ description = "local"
         assert!(actual.contains("default_permissions = \"codex-autonomous\""));
         assert!(actual.contains("approvals_reviewer = \"auto_review\""));
         assert!(actual.contains("commit_attribution = \"\""));
+        assert!(actual.contains("[features]\nhooks = true\ngoals = true\nnetwork_proxy = true"));
         assert!(actual.contains(
-            "[features]\nhooks = true\ngoals = true\nrollout_budget.enabled = true\nrollout_budget.limit_tokens = 200000\nrollout_budget.reminder_interval_tokens = 20000\nrollout_budget.prefill_token_weight = 1.0\nrollout_budget.sampling_token_weight = 1.0\nnetwork_proxy = true"
+            "[features.rollout_budget]\nenabled = true\nlimit_tokens = 200000\nreminder_interval_tokens = 20000\nprefill_token_weight = 1.0\nsampling_token_weight = 1.0\nlocal_budget_note = \"preserved\""
         ));
+        assert!(actual.parse::<toml_edit::DocumentMut>().is_ok());
         assert!(actual.contains("[permissions.codex-autonomous]\nextends = \":workspace\""));
         assert!(actual.contains("\".git\" = \"write\""));
         assert!(actual.contains("[permissions.codex-autonomous.network]\nenabled = true"));
@@ -4227,6 +4265,18 @@ description = "local"
         assert!(!actual.contains("max_concurrent_threads_per_session = 12"));
         assert!(!actual.contains("default_subagent_model = \"old\""));
         assert_eq!(merge_managed_config(template, &actual), actual);
+
+        let legacy_dotted = r#"[features]
+hooks = false
+rollout_budget.enabled = false
+rollout_budget.limit_tokens = 999999
+network_proxy = true
+"#;
+        let migrated = merge_managed_config(template, legacy_dotted);
+        assert!(migrated.contains("[features]\nhooks = true\ngoals = true\nnetwork_proxy = true"));
+        assert!(migrated.contains("[features.rollout_budget]\nenabled = true"));
+        assert!(!migrated.contains("rollout_budget.enabled"));
+        assert!(migrated.parse::<toml_edit::DocumentMut>().is_ok());
     }
 
     #[test]

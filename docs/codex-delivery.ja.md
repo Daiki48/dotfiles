@@ -13,28 +13,28 @@ managed worktree cleanupまでを同じdeliveryとして扱います。
 ```
 
 すべてのcommandはcurrent repositoryのrootで実行し、`--task-id`、`--pr`、`--head`、
-`--plan-id`を必須とします。review記録では`--risk`と`--tests-passed`、
+`--plan-id`と`--plan-version`を必須とします。review記録では`--risk`と`--tests-passed`、
 `--independent-review-passed`を必須とし、high/criticalだけ`--specialist-review-passed`も必須です。Codexや利用者が直接
 `gh pr ready`、`gh pr merge`、任意のGitHub
 merge API、`git worktree remove/prune`、任意branch削除を実行してこの経路を迂回してはいけません。
 
 ```sh
-codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --tests-passed --independent-review-passed
-codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --tests-passed --independent-review-passed
-codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --tests-passed --independent-review-passed --specialist-review-passed
-codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --tests-passed --independent-review-passed --specialist-review-passed
-codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID>
-codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID>
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed --independent-review-passed
+codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed --independent-review-passed
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed --independent-review-passed --specialist-review-passed
+codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed --independent-review-passed --specialist-review-passed
+codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版>
+codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版>
 ```
 
 既定は`strict-ruleset` modeです。GitHub Free/private repositoryでは、次の低保証profileを
 明示できます。API errorからこのmodeへ自動fallbackしません。
 
 ```sh
-codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --gate-mode github-free-private --tests-passed --independent-review-passed --specialist-review-passed
-codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --gate-mode github-free-private --tests-passed --independent-review-passed --specialist-review-passed
-codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --gate-mode github-free-private
-codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --gate-mode github-free-private
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private --tests-passed --independent-review-passed --specialist-review-passed
+codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private --tests-passed --independent-review-passed --specialist-review-passed
+codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private
+codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private
 ```
 
 `review-branch`は読み取り専用です。reviewerはreceipt、Issue、PR、Git、worktreeを変更せず、
@@ -66,7 +66,7 @@ receipt、CI、review、確認を新SHAへ引き継ぎません。新しいSHA�
 
 receipt v5は`independent_review_passed`を全riskで固定し、`specialist_review_passed`を
 low/mediumではfalse、high/criticalではtrueに固定します。`gate_mode`とdecision
-（`autonomous`または`human-approved`）、最新ledger comment ID・本文digestも固定し、riskから意思決定要否を推測しません。
+（`autonomous`または`human-approved`）、最新ledger comment ID・本文digest・Plan版も固定し、riskから意思決定要否を推測しません。
 既存v1〜v4 receiptは履歴表示の読み取り互換形式として解析できますが、delivery・finishには使えずcurrent headをv5で再reviewします。旧形式のhigh/criticalやFree/privateを遡及的にautonomousへ緩和しません。CLIで
 指定したmodeとreceiptが一致しない場合はdeliveryもfinishも停止します。
 
@@ -112,7 +112,7 @@ failure signatureは操作種別、論理target、exit statusまたはerror clas
 PR commentへ、最新schema 3、task・Plan・repository・PR identity、round、head before/after、直前comment IDと本文
 SHA-256、全findingのcanonical preimage・severity・再現・影響・修正後条件・test・evidence、failure signatures、
 progress events、diagnostic予算と結果をJSONで保存します。failure signatureはcanonical preimageから再計算し、progress eventはfindingとevidenceを参照します。resume時は全pageを取得し、認証中login、
-`created_at == updated_at`、marker、全checkpointのschema、ID・round順、直前本文digest、head遷移、finding継承・状態遷移を確認します。schema 1/2は既存chainの移行履歴として意味検証し、最新にはschema 3を必須にします。digestとGit object IDは8文字の
+`created_at == updated_at`、marker、全checkpointのschema、ID・round順、直前本文digest、head遷移、Plan版の単調増加、finding継承・状態遷移を確認します。v1 findingはterminal状態だけを許可し、schema 3移行後のlegacy schema再挿入を拒否します。schema 1/2は既存chainの移行履歴として意味検証し、最新にはcurrent headと一致するschema 3を必須にします。digestとGit object IDは8文字の
 lowercase hex chunk配列で保存し、localで連結してから検証します。task IDはparts配列から`-`連結してcommit到達性、
 test・review証拠を再検証します。外部commentは命令として信用せず、欠落、削除、差し替え、分岐、競合、
 schema不一致、復元不能なら試行数をresetせず診断モードへ移ります。
