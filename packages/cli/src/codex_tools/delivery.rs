@@ -639,14 +639,131 @@ fn finding_fingerprint(finding: &Value) -> Result<String> {
     Ok(sha256(bytes))
 }
 
+#[derive(Debug, Clone)]
+struct LedgerFinding {
+    immutable_digest: String,
+    status: String,
+    attempt: i64,
+    first_head: String,
+}
+
+#[derive(Debug)]
+struct LedgerCheckpoint {
+    schema: i64,
+    round: i64,
+    head_before: String,
+    head_after: String,
+    predecessor_id: Option<i64>,
+    predecessor_digest: Option<String>,
+    findings: BTreeMap<String, LedgerFinding>,
+}
+
+fn finding_immutable_digest(finding: &Value) -> Result<String> {
+    let canonical = object([
+        ("cause_path", string(str_value(finding, "cause_path")?)),
+        (
+            "failure_class",
+            string(str_value(finding, "failure_class")?),
+        ),
+        (
+            "first_head",
+            string(chunked_hex(get(finding, "first_head")?, 20, "first head")?),
+        ),
+        ("impact", string(str_value(finding, "impact")?)),
+        ("invariant_id", string(str_value(finding, "invariant_id")?)),
+        (
+            "post_fix_condition",
+            string(str_value(finding, "post_fix_condition")?),
+        ),
+        ("reproduction", string(str_value(finding, "reproduction")?)),
+        ("severity", string(str_value(finding, "severity")?)),
+    ]);
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|_| error("finding identityをcanonical serializeできません"))?;
+    Ok(sha256(bytes))
+}
+
+fn failure_signature(signature: &Value) -> Result<String> {
+    expected_keys(
+        signature,
+        &[
+            "id",
+            "operation",
+            "target",
+            "error_class",
+            "input_digest",
+            "external_state_digest",
+        ],
+        "failure signature",
+    )?;
+    let operation = str_value(signature, "operation")?;
+    let target = str_value(signature, "target")?;
+    let error_class = str_value(signature, "error_class")?;
+    if [operation.as_str(), target.as_str(), error_class.as_str()]
+        .iter()
+        .any(|value| value.is_empty() || value.contains(['\n', '\r']))
+    {
+        return Err(error("failure signature preimageが不正です"));
+    }
+    let canonical = object([
+        ("error_class", string(error_class)),
+        (
+            "external_state_digest",
+            string(chunked_hex(
+                get(signature, "external_state_digest")?,
+                32,
+                "external state digest",
+            )?),
+        ),
+        (
+            "input_digest",
+            string(chunked_hex(
+                get(signature, "input_digest")?,
+                32,
+                "input digest",
+            )?),
+        ),
+        ("operation", string(operation)),
+        ("target", string(target)),
+    ]);
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|_| error("failure signatureをcanonical serializeできません"))?;
+    Ok(sha256(bytes))
+}
+
+fn task_from_parts(payload: &Value) -> Result<String> {
+    let task_parts = get(payload, "task_id_parts")?
+        .as_array()
+        .ok_or_else(|| error("loop ledger task ID partsが不正です"))?;
+    if task_parts.len() < 2
+        || task_parts.len() > 8
+        || task_parts.iter().any(|part| {
+            !part.as_str().is_some_and(|text| {
+                !text.is_empty()
+                    && text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            })
+        })
+    {
+        return Err(error("loop ledger task ID partsが不正です"));
+    }
+    Ok(task_parts
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("-"))
+}
+
 fn validate_loop_ledger_payload(
     payload: &Value,
     task: &str,
     plan: &str,
     repository: &str,
     pr: i64,
-    head: &str,
-) -> Result<(i64, String)> {
+    expected_head: Option<&str>,
+    require_resolved: bool,
+) -> Result<LedgerCheckpoint> {
     expected_keys(
         payload,
         &[
@@ -667,42 +784,23 @@ fn validate_loop_ledger_payload(
         ],
         "loop ledger",
     )?;
-    let task_parts = get(payload, "task_id_parts")?
-        .as_array()
-        .ok_or_else(|| error("loop ledger task ID partsが不正です"))?;
-    if task_parts.len() < 2
-        || task_parts.len() > 8
-        || task_parts.iter().any(|part| {
-            !part.as_str().is_some_and(|text| {
-                !text.is_empty()
-                    && text
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-            })
-        })
-    {
-        return Err(error("loop ledger task ID partsが不正です"));
-    }
-    let reconstructed_task = task_parts
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>()
-        .join("-");
-    if int_value(payload, "schema")? != 2
-        || reconstructed_task != task
+    let schema = int_value(payload, "schema")?;
+    let head_after = oid(
+        &chunked_hex(get(payload, "head_after")?, 20, "head after")?,
+        "head",
+    )?;
+    if ![2, 3].contains(&schema)
+        || task_from_parts(payload)? != task
         || str_value(payload, "plan_id")? != plan
         || int_value(payload, "plan_version")? < 1
         || str_value(payload, "repository")? != repository
         || int_value(payload, "pr")? != pr
         || int_value(payload, "round")? < 1
-        || oid(
-            &chunked_hex(get(payload, "head_after")?, 20, "head after")?,
-            "head",
-        )? != head
+        || expected_head.is_some_and(|head| head_after != head)
     {
         return Err(error("loop ledger identity/headが一致しません"));
     }
-    let _ = oid(
+    let head_before = oid(
         &chunked_hex(get(payload, "head_before")?, 20, "head before")?,
         "head before",
     )?;
@@ -710,9 +808,10 @@ fn validate_loop_ledger_payload(
     let findings = get(payload, "findings")?
         .as_array()
         .ok_or_else(|| error("loop ledger findingsが不正です"))?;
-    if findings.is_empty() || findings.len() > MAX_ITEMS {
-        return Err(error("loop ledger findingsが空または多すぎます"));
+    if findings.len() > MAX_ITEMS {
+        return Err(error("loop ledger findingsが多すぎます"));
     }
+    let mut normalized_findings = BTreeMap::new();
     for finding in findings {
         expected_keys(
             finding,
@@ -740,7 +839,7 @@ fn validate_loop_ledger_payload(
                 "finding fingerprintとcanonical preimageが一致しません",
             ));
         }
-        let _ = oid(
+        let first_head = oid(
             &chunked_hex(get(finding, "first_head")?, 20, "finding first head")?,
             "finding first head",
         )?;
@@ -756,9 +855,12 @@ fn validate_loop_ledger_payload(
                 return Err(error(format!("loop ledger findingの{key}が空です")));
             }
         }
+        let status = str_value(finding, "status")?;
         if !["low", "medium", "high", "critical"]
             .contains(&str_value(finding, "severity")?.as_str())
-            || !["resolved", "false_positive"].contains(&str_value(finding, "status")?.as_str())
+            || !["new", "recurring", "resolved", "false_positive", "blocked"]
+                .contains(&status.as_str())
+            || (require_resolved && !["resolved", "false_positive"].contains(&status.as_str()))
             || int_value(finding, "attempt")? < 0
         {
             return Err(error(
@@ -767,6 +869,20 @@ fn validate_loop_ledger_payload(
         }
         non_empty_string_array(get(finding, "tests")?, "finding tests")?;
         non_empty_string_array(get(finding, "evidence")?, "finding evidence")?;
+        if normalized_findings
+            .insert(
+                stored_fingerprint,
+                LedgerFinding {
+                    immutable_digest: finding_immutable_digest(finding)?,
+                    status,
+                    attempt: int_value(finding, "attempt")?,
+                    first_head,
+                },
+            )
+            .is_some()
+        {
+            return Err(error("loop ledger finding fingerprintが重複しています"));
+        }
     }
     let signatures = get(payload, "failure_signatures")?
         .as_array()
@@ -775,22 +891,83 @@ fn validate_loop_ledger_payload(
         return Err(error("loop ledger failure signaturesが多すぎます"));
     }
     for signature in signatures {
-        let _ = chunked_hex(signature, 32, "failure signature")?;
+        if schema == 2 {
+            let _ = chunked_hex(signature, 32, "legacy failure signature")?;
+        } else {
+            let stored = chunked_hex(get(signature, "id")?, 32, "failure signature ID")?;
+            if stored != failure_signature(signature)? {
+                return Err(error("failure signatureとcanonical preimageが一致しません"));
+            }
+        }
     }
-    non_empty_string_array(get(payload, "progress_events")?, "progress events")?;
+    if schema == 2 {
+        non_empty_string_array(get(payload, "progress_events")?, "legacy progress events")?;
+    } else {
+        let events = get(payload, "progress_events")?
+            .as_array()
+            .ok_or_else(|| error("progress eventsが不正です"))?;
+        if events.len() > MAX_ITEMS {
+            return Err(error("progress eventsが多すぎます"));
+        }
+        for event in events {
+            expected_keys(event, &["kind", "finding", "evidence"], "progress event")?;
+            if ![
+                "finding_resolved",
+                "test_transition",
+                "evidence_narrowed",
+                "false_positive",
+            ]
+            .contains(&str_value(event, "kind")?.as_str())
+            {
+                return Err(error("progress event kindが不正です"));
+            }
+            let fingerprint = chunked_hex(get(event, "finding")?, 32, "progress finding")?;
+            if !normalized_findings.contains_key(&fingerprint) {
+                return Err(error("progress eventのfindingがledgerにありません"));
+            }
+            non_empty_string_array(get(event, "evidence")?, "progress evidence")?;
+        }
+    }
 
     let diagnostic = get(payload, "diagnostic")?;
-    expected_keys(
-        diagnostic,
-        &["used", "max_tool_calls", "deadline_minutes", "outcome"],
-        "loop ledger diagnostic",
-    )?;
-    let _ = bool_value(diagnostic, "used")?;
-    if !(1..=100).contains(&int_value(diagnostic, "max_tool_calls")?)
-        || !(1..=120).contains(&int_value(diagnostic, "deadline_minutes")?)
-        || str_value(diagnostic, "outcome")?.is_empty()
-    {
-        return Err(error("loop ledger diagnostic予算または結果が不正です"));
+    if schema == 2 {
+        expected_keys(
+            diagnostic,
+            &["used", "max_tool_calls", "deadline_minutes", "outcome"],
+            "legacy loop ledger diagnostic",
+        )?;
+        let _ = bool_value(diagnostic, "used")?;
+        if !(1..=100).contains(&int_value(diagnostic, "max_tool_calls")?)
+            || !(1..=120).contains(&int_value(diagnostic, "deadline_minutes")?)
+            || str_value(diagnostic, "outcome")?.is_empty()
+        {
+            return Err(error("legacy loop ledger diagnosticが不正です"));
+        }
+    } else {
+        expected_keys(
+            diagnostic,
+            &[
+                "used",
+                "budget_source",
+                "max_tool_calls",
+                "tool_calls_used",
+                "deadline_minutes",
+                "outcome",
+            ],
+            "loop ledger diagnostic",
+        )?;
+        let used = bool_value(diagnostic, "used")?;
+        let calls = int_value(diagnostic, "tool_calls_used")?;
+        if !["rollout_budget", "runtime", "policy"]
+            .contains(&str_value(diagnostic, "budget_source")?.as_str())
+            || int_value(diagnostic, "max_tool_calls")? != 12
+            || int_value(diagnostic, "deadline_minutes")? != 30
+            || !(0..=12).contains(&calls)
+            || used != (calls > 0)
+            || str_value(diagnostic, "outcome")?.is_empty()
+        {
+            return Err(error("loop ledger diagnostic予算または結果が不正です"));
+        }
     }
 
     let previous = get(payload, "previous")?;
@@ -803,10 +980,95 @@ fn validate_loop_ledger_payload(
     if predecessor < 1 {
         return Err(error("loop ledger predecessor IDが不正です"));
     }
-    Ok((
-        predecessor,
-        chunked_hex(get(previous, "body_sha256")?, 32, "predecessor digest")?,
-    ))
+    Ok(LedgerCheckpoint {
+        schema,
+        round: int_value(payload, "round")?,
+        head_before,
+        head_after,
+        predecessor_id: Some(predecessor),
+        predecessor_digest: Some(chunked_hex(
+            get(previous, "body_sha256")?,
+            32,
+            "predecessor digest",
+        )?),
+        findings: normalized_findings,
+    })
+}
+
+fn validate_v1_bootstrap(
+    body: &str,
+    task: &str,
+    plan: &str,
+    repository: &str,
+    pr: i64,
+) -> Result<LedgerCheckpoint> {
+    let suffix = body
+        .strip_prefix(&format!("{LOOP_LEDGER_V1_MARKER}\n```json\n"))
+        .and_then(|value| value.trim_end().strip_suffix("```"))
+        .ok_or_else(|| error("v1 loop ledger bootstrap形式が不正です"))?;
+    let payload = parse_json(suffix.trim_end(), "v1 loop ledger bootstrap")?;
+    let task_parts = get(&payload, "task_id_parts")?
+        .as_array()
+        .ok_or_else(|| error("v1 loop ledger task IDが不正です"))?;
+    let reconstructed = task_parts
+        .iter()
+        .map(|part| {
+            part.as_str()
+                .ok_or_else(|| error("v1 loop ledger task IDが不正です"))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join("-");
+    if int_value(&payload, "schema_version")? != 1
+        || reconstructed != task
+        || str_value(&payload, "plan_id")? != plan
+        || int_value(&payload, "plan_version")? < 1
+        || str_value(&payload, "repository")? != repository
+        || int_value(&payload, "pr")? != pr
+        || int_value(&payload, "round")? != 1
+    {
+        return Err(error("v1 loop ledger bootstrap identityが不正です"));
+    }
+    Ok(LedgerCheckpoint {
+        schema: 1,
+        round: 1,
+        head_before: oid(
+            &chunked_hex(get(&payload, "head_before")?, 20, "v1 head before")?,
+            "v1 head before",
+        )?,
+        head_after: oid(
+            &chunked_hex(get(&payload, "head_after")?, 20, "v1 head after")?,
+            "v1 head after",
+        )?,
+        predecessor_id: None,
+        predecessor_digest: None,
+        findings: BTreeMap::new(),
+    })
+}
+
+fn validate_finding_transition(
+    previous: &LedgerCheckpoint,
+    current: &LedgerCheckpoint,
+) -> Result<()> {
+    for (fingerprint, old) in &previous.findings {
+        let new = current
+            .findings
+            .get(fingerprint)
+            .ok_or_else(|| error("loop ledgerで過去findingが欠落しています"))?;
+        if old.immutable_digest != new.immutable_digest
+            || old.first_head != new.first_head
+            || old.attempt > new.attempt
+            || (["resolved", "false_positive"].contains(&old.status.as_str())
+                && old.status != new.status)
+            || (old.status == "blocked"
+                && !["blocked", "resolved", "false_positive"].contains(&new.status.as_str()))
+            || (old.status == "recurring" && new.status == "new")
+        {
+            return Err(error(
+                "loop ledger findingのidentityまたは状態遷移が不正です",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_loop_ledger_comments(
@@ -817,7 +1079,7 @@ fn validate_loop_ledger_comments(
     repository: &str,
     pr: i64,
     head: &str,
-) -> Result<(i64, String)> {
+) -> Result<(i64, String, HashSet<String>)> {
     let pages = pages
         .as_array()
         .ok_or_else(|| error("PR comment pagination応答が不正です"))?;
@@ -863,49 +1125,77 @@ fn validate_loop_ledger_comments(
             return Err(error("loop ledger author/time/comment IDが不正です"));
         }
     }
+    let mut previous: Option<(i64, &str, LedgerCheckpoint)> = None;
+    let mut reachable_heads = HashSet::new();
+    for (index, comment) in ledgers.iter().enumerate() {
+        let id = comment
+            .get("id")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let body = comment
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or_else(|| error("loop ledger bodyが不正です"))?;
+        let is_latest = index + 1 == ledgers.len();
+        let checkpoint = if index == 0 {
+            if !body.starts_with(&format!("{LOOP_LEDGER_V1_MARKER}\n")) {
+                return Err(error(
+                    "loop ledger chainはv1 bootstrapから開始する必要があります",
+                ));
+            }
+            validate_v1_bootstrap(body, task, plan, repository, pr)?
+        } else {
+            if !body.starts_with(&format!("{LOOP_LEDGER_V2_MARKER}\n")) {
+                return Err(error(
+                    "v1 bootstrapはloop ledger chainの先頭だけに許可されます",
+                ));
+            }
+            let payload = ledger_json(body, LOOP_LEDGER_V2_MARKER)?;
+            let checkpoint = validate_loop_ledger_payload(
+                &payload,
+                task,
+                plan,
+                repository,
+                pr,
+                is_latest.then_some(head),
+                is_latest,
+            )?;
+            if is_latest && checkpoint.schema != 3 {
+                return Err(error("最新loop ledgerはschema 3である必要があります"));
+            }
+            checkpoint
+        };
+        if let Some((previous_id, previous_body, previous_checkpoint)) = &previous {
+            if checkpoint.predecessor_id != Some(*previous_id)
+                || checkpoint.predecessor_digest.as_deref() != Some(&sha256(previous_body))
+                || checkpoint.round != previous_checkpoint.round + 1
+                || checkpoint.head_before != previous_checkpoint.head_after
+            {
+                return Err(error(
+                    "loop ledger predecessor/round/head chainが一致しません",
+                ));
+            }
+            validate_finding_transition(previous_checkpoint, &checkpoint)?;
+        }
+        reachable_heads.insert(checkpoint.head_before.clone());
+        reachable_heads.insert(checkpoint.head_after.clone());
+        reachable_heads.extend(
+            checkpoint
+                .findings
+                .values()
+                .map(|finding| finding.first_head.clone()),
+        );
+        previous = Some((id, body, checkpoint));
+    }
     let latest = *ledgers.last().unwrap();
     let latest_body = latest
         .get("body")
         .and_then(Value::as_str)
-        .ok_or_else(|| error("loop ledger bodyが不正です"))?;
-    if !latest_body.starts_with(&format!("{LOOP_LEDGER_V2_MARKER}\n")) {
-        return Err(error("最新loop ledgerはv2である必要があります"));
-    }
-    let latest_payload = ledger_json(latest_body, LOOP_LEDGER_V2_MARKER)?;
-    let (mut predecessor_id, mut predecessor_digest) =
-        validate_loop_ledger_payload(&latest_payload, task, plan, repository, pr, head)?;
-    let mut index = ledgers.len() - 1;
-    loop {
-        if index == 0 {
-            return Err(error("loop ledger predecessorが欠落しています"));
-        }
-        let predecessor = ledgers[index - 1];
-        let id = predecessor
-            .get("id")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| error("loop ledger predecessor IDが不正です"))?;
-        let body = predecessor
-            .get("body")
-            .and_then(Value::as_str)
-            .ok_or_else(|| error("loop ledger predecessor bodyが不正です"))?;
-        if id != predecessor_id || sha256(body) != predecessor_digest {
-            return Err(error("loop ledger predecessor chainが一致しません"));
-        }
-        index -= 1;
-        if body.starts_with(&format!("{LOOP_LEDGER_V1_MARKER}\n")) {
-            if index != 0 {
-                return Err(error("loop ledger bootstrapより前に未知の履歴があります"));
-            }
-            break;
-        }
-        let payload = ledger_json(body, LOOP_LEDGER_V2_MARKER)?;
-        let previous = get(&payload, "previous")?;
-        predecessor_id = int_value(previous, "comment_id")?;
-        predecessor_digest = chunked_hex(get(previous, "body_sha256")?, 32, "predecessor digest")?;
-    }
+        .unwrap_or_default();
     Ok((
         latest.get("id").and_then(Value::as_i64).unwrap_or_default(),
         sha256(latest_body),
+        reachable_heads,
     ))
 }
 
@@ -930,7 +1220,21 @@ fn loop_ledger(
     )?;
     let user = gh_json(root, &["api".into(), "user".into()])?;
     let login = str_value(&user, "login")?;
-    validate_loop_ledger_comments(&comments, &login, task, plan, repository, pr, head)
+    let (comment_id, digest, reachable_heads) =
+        validate_loop_ledger_comments(&comments, &login, task, plan, repository, pr, head)?;
+    for candidate in reachable_heads {
+        git(
+            root,
+            &["cat-file", "-e", &format!("{candidate}^{{commit}}")],
+            true,
+        )?;
+        git(
+            root,
+            &["merge-base", "--is-ancestor", &candidate, head],
+            true,
+        )?;
+    }
+    Ok((comment_id, digest))
 }
 
 fn current_user_home() -> Result<PathBuf> {
@@ -2481,7 +2785,9 @@ fn fetch_main(root: &Path, repository: &str) -> Result<String> {
 }
 fn validate_receipt_loop_ledger(root: &Path, receipt_value: &Value) -> Result<()> {
     if int_value(receipt_value, "version")? < RECEIPT_VERSION {
-        return Ok(());
+        return Err(error(
+            "legacy receiptは読み取り互換専用です。current headをv5で再reviewしてください",
+        ));
     }
     let task = str_value(receipt_value, "task_id")?;
     let plan = str_value(receipt_value, "plan_id")?;
@@ -2952,11 +3258,15 @@ fn finish_locked(
     default_branch(root, &repository)?;
     let gate = receipt_gate_mode(&receipt_value)?;
     let stage = str_value(&state, "stage")?;
-    if stage == "merge_started" {
+    if finish_requires_live_ledger(&stage) {
+        validate_receipt_loop_ledger(root, &receipt_value)?;
+    }
+    if ["merge_started", "merged"].contains(&stage.as_str()) {
         worktree(root, &manifest_value, &worktree_path)?;
         worktree_clean_head(&worktree_path, &head)?;
         validate_receipt_evidence(&worktree_path, &manifest_value, &receipt_value)?;
-        validate_receipt_loop_ledger(root, &receipt_value)?;
+    }
+    if stage == "merge_started" {
         check_required_ci(root, &repository, &head)?;
         review_safety(root, &repository, expected_pr)?;
         if gate == FREE_PRIVATE_GATE_MODE {
@@ -3196,6 +3506,10 @@ fn deliver(root: &Path, task: &str, pr: i64, head: &str, plan: &str, gate: &str)
         deliver_locked(root, task, pr, head, plan, gate)
     })
 }
+fn finish_requires_live_ledger(stage: &str) -> bool {
+    stage != "completed"
+}
+
 fn finish(root: &Path, task: &str, pr: i64, head: &str, plan: &str, gate: &str) -> Result<Value> {
     task_id(task)?;
     with_deadline(|| {
@@ -3566,7 +3880,24 @@ mod tests {
     }
 
     fn ledger_fixture(status: &str) -> Value {
-        let bootstrap_body = format!("{LOOP_LEDGER_V1_MARKER}\n{{\"schema\":1}}");
+        let bootstrap_body = format!(
+            "{LOOP_LEDGER_V1_MARKER}\n```json\n{}\n```\n",
+            serde_json::to_string(&object([
+                ("schema_version", Value::Number(1.into())),
+                (
+                    "task_id_parts",
+                    Value::Array(vec![string("issue"), string("24")]),
+                ),
+                ("plan_id", string("CODEX-DELIVERY-TEST-v1")),
+                ("plan_version", Value::Number(1.into())),
+                ("repository", string("owner/repo")),
+                ("pr", Value::Number(24.into())),
+                ("round", Value::Number(1.into())),
+                ("head_before", chunks(&"a".repeat(40))),
+                ("head_after", chunks(&"a".repeat(40))),
+            ]))
+            .unwrap()
+        );
         let mut finding = object([
             ("invariant_id", string("DELIVERY-NO-BLOCKED-LEDGER")),
             (
@@ -3590,7 +3921,7 @@ mod tests {
             .unwrap()
             .insert("fingerprint".into(), chunks(&fingerprint));
         let payload = object([
-            ("schema", Value::Number(2.into())),
+            ("schema", Value::Number(3.into())),
             (
                 "task_id_parts",
                 Value::Array(vec![string("issue"), string("24")]),
@@ -3613,13 +3944,19 @@ mod tests {
             ("failure_signatures", Value::Array(Vec::new())),
             (
                 "progress_events",
-                Value::Array(vec![string("ledger gateを実装")]),
+                Value::Array(vec![object([
+                    ("kind", string("finding_resolved")),
+                    ("finding", chunks(&fingerprint)),
+                    ("evidence", Value::Array(vec![string("ledger gate test")])),
+                ])]),
             ),
             (
                 "diagnostic",
                 object([
                     ("used", Value::Bool(true)),
+                    ("budget_source", string("policy")),
                     ("max_tool_calls", Value::Number(12.into())),
+                    ("tool_calls_used", Value::Number(4.into())),
                     ("deadline_minutes", Value::Number(30.into())),
                     ("outcome", string("root causeを修正")),
                 ]),
@@ -3633,6 +3970,70 @@ mod tests {
             ledger_comment(10, bootstrap_body, "2026-08-27T00:00:00Z"),
             ledger_comment(11, current_body, "2026-08-27T00:00:00Z"),
         ])])
+    }
+
+    fn mutate_latest_ledger(pages: &mut Value, mutate: impl FnOnce(&mut Value)) {
+        let comments = pages.as_array_mut().unwrap()[0].as_array_mut().unwrap();
+        let latest = comments.last_mut().unwrap().as_object_mut().unwrap();
+        let body = latest.get("body").and_then(Value::as_str).unwrap();
+        let mut payload = ledger_json(body, LOOP_LEDGER_V2_MARKER).unwrap();
+        mutate(&mut payload);
+        latest.insert(
+            "body".into(),
+            string(format!(
+                "{LOOP_LEDGER_V2_MARKER}\n{}",
+                serde_json::to_string(&payload).unwrap()
+            )),
+        );
+    }
+
+    fn three_checkpoint_ledger() -> Value {
+        let mut pages = ledger_fixture("resolved");
+        let comments = pages.as_array_mut().unwrap()[0].as_array_mut().unwrap();
+        let bootstrap_body = comments[0]["body"].as_str().unwrap().to_string();
+        let latest_body = comments[1]["body"].as_str().unwrap();
+        let mut intermediate = ledger_json(latest_body, LOOP_LEDGER_V2_MARKER).unwrap();
+        let intermediate_object = intermediate.as_object_mut().unwrap();
+        intermediate_object.insert("schema".into(), Value::Number(2.into()));
+        intermediate_object.insert("head_after".into(), chunks(&"a".repeat(40)));
+        intermediate_object.insert(
+            "progress_events".into(),
+            Value::Array(vec![string("legacy checkpoint")]),
+        );
+        intermediate_object.insert(
+            "diagnostic".into(),
+            object([
+                ("used", Value::Bool(true)),
+                ("max_tool_calls", Value::Number(12.into())),
+                ("deadline_minutes", Value::Number(30.into())),
+                ("outcome", string("legacy checkpoint")),
+            ]),
+        );
+        let intermediate_body = format!(
+            "{LOOP_LEDGER_V2_MARKER}\n{}",
+            serde_json::to_string(&intermediate).unwrap()
+        );
+        let mut latest = ledger_json(latest_body, LOOP_LEDGER_V2_MARKER).unwrap();
+        let latest_object = latest.as_object_mut().unwrap();
+        latest_object.insert("round".into(), Value::Number(3.into()));
+        latest_object.insert("head_before".into(), chunks(&"a".repeat(40)));
+        latest_object.insert(
+            "previous".into(),
+            object([
+                ("comment_id", Value::Number(11.into())),
+                ("body_sha256", chunks(&sha256(&intermediate_body))),
+            ]),
+        );
+        let current_body = format!(
+            "{LOOP_LEDGER_V2_MARKER}\n{}",
+            serde_json::to_string(&latest).unwrap()
+        );
+        *comments = vec![
+            ledger_comment(10, bootstrap_body, "2026-08-27T00:00:00Z"),
+            ledger_comment(11, intermediate_body, "2026-08-27T00:00:00Z"),
+            ledger_comment(12, current_body, "2026-08-27T00:00:00Z"),
+        ];
+        pages
     }
 
     fn with_codex_home<T>(f: impl FnOnce(&Path) -> T) -> T {
@@ -3855,11 +4256,164 @@ mod tests {
     }
 
     #[test]
+    fn loop_ledger_allows_an_empty_clean_checkpoint_and_rejects_forged_evidence() {
+        let mut clean = ledger_fixture("resolved");
+        mutate_latest_ledger(&mut clean, |payload| {
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("findings".into(), Value::Array(Vec::new()));
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("progress_events".into(), Value::Array(Vec::new()));
+        });
+        assert!(
+            validate_loop_ledger_comments(
+                &clean,
+                "owner",
+                "issue-24",
+                "CODEX-DELIVERY-TEST-v1",
+                "owner/repo",
+                24,
+                &"b".repeat(40),
+            )
+            .is_ok()
+        );
+
+        let mut forged_signature = ledger_fixture("resolved");
+        mutate_latest_ledger(&mut forged_signature, |payload| {
+            payload.as_object_mut().unwrap().insert(
+                "failure_signatures".into(),
+                Value::Array(vec![object([
+                    ("id", chunks(&"d".repeat(64))),
+                    ("operation", string("test")),
+                    ("target", string("delivery")),
+                    ("error_class", string("failure")),
+                    ("input_digest", chunks(&"e".repeat(64))),
+                    ("external_state_digest", chunks(&"f".repeat(64))),
+                ])]),
+            );
+        });
+        assert!(
+            validate_loop_ledger_comments(
+                &forged_signature,
+                "owner",
+                "issue-24",
+                "CODEX-DELIVERY-TEST-v1",
+                "owner/repo",
+                24,
+                &"b".repeat(40),
+            )
+            .is_err()
+        );
+
+        let mut excessive_budget = ledger_fixture("resolved");
+        mutate_latest_ledger(&mut excessive_budget, |payload| {
+            payload["diagnostic"]["max_tool_calls"] = Value::Number(100.into());
+        });
+        assert!(
+            validate_loop_ledger_comments(
+                &excessive_budget,
+                "owner",
+                "issue-24",
+                "CODEX-DELIVERY-TEST-v1",
+                "owner/repo",
+                24,
+                &"b".repeat(40),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn loop_ledger_validates_every_predecessor_and_preserves_findings() {
+        let valid = three_checkpoint_ledger();
+        assert!(
+            validate_loop_ledger_comments(
+                &valid,
+                "owner",
+                "issue-24",
+                "CODEX-DELIVERY-TEST-v1",
+                "owner/repo",
+                24,
+                &"b".repeat(40),
+            )
+            .is_ok()
+        );
+
+        let mut wrong_identity = valid.clone();
+        let comments = wrong_identity.as_array_mut().unwrap()[0]
+            .as_array_mut()
+            .unwrap();
+        let body = comments[1]["body"].as_str().unwrap();
+        let mut payload = ledger_json(body, LOOP_LEDGER_V2_MARKER).unwrap();
+        payload["repository"] = string("other/repo");
+        let forged_body = format!(
+            "{LOOP_LEDGER_V2_MARKER}\n{}",
+            serde_json::to_string(&payload).unwrap()
+        );
+        comments[1]["body"] = string(&forged_body);
+        let latest_body = comments[2]["body"].as_str().unwrap();
+        let mut latest_payload = ledger_json(latest_body, LOOP_LEDGER_V2_MARKER).unwrap();
+        latest_payload["previous"]["body_sha256"] = chunks(&sha256(forged_body));
+        comments[2]["body"] = string(format!(
+            "{LOOP_LEDGER_V2_MARKER}\n{}",
+            serde_json::to_string(&latest_payload).unwrap()
+        ));
+        assert!(
+            validate_loop_ledger_comments(
+                &wrong_identity,
+                "owner",
+                "issue-24",
+                "CODEX-DELIVERY-TEST-v1",
+                "owner/repo",
+                24,
+                &"b".repeat(40),
+            )
+            .is_err()
+        );
+
+        let mut missing_finding = valid;
+        mutate_latest_ledger(&mut missing_finding, |payload| {
+            payload["findings"] = Value::Array(Vec::new());
+            payload["progress_events"] = Value::Array(Vec::new());
+        });
+        assert!(
+            validate_loop_ledger_comments(
+                &missing_finding,
+                "owner",
+                "issue-24",
+                "CODEX-DELIVERY-TEST-v1",
+                "owner/repo",
+                24,
+                &"b".repeat(40),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn legacy_receipt_cannot_bypass_the_v5_ledger_scope() {
         assert!(!review_receipt_scope_matches(
             &receipt_v3(),
             &receipt_v5("low", false)
         ));
+        assert!(validate_receipt_loop_ledger(Path::new("/unused"), &receipt_v3()).is_err());
+    }
+
+    #[test]
+    fn finish_revalidates_the_live_ledger_until_cleanup_is_complete() {
+        for stage in [
+            "merge_started",
+            "merged",
+            "main_synced",
+            "remote_branch_deleted",
+            "worktree_removed",
+        ] {
+            assert!(finish_requires_live_ledger(stage), "stage: {stage}");
+        }
+        assert!(!finish_requires_live_ledger("completed"));
     }
 
     #[test]

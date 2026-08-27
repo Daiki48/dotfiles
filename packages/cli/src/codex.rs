@@ -98,7 +98,15 @@ const RETIRED_CONFIG_KEYS: &[&str] = &["sandbox_mode", "sandbox_workspace_write"
 const RETIRED_SANDBOX_TABLE: &str = "[sandbox_workspace_write]";
 const MANAGED_PERMISSION_PROFILE: &str = "codex-autonomous";
 const MANAGED_PERMISSION_PROFILE_HEADER: &str = "[permissions.codex-autonomous]";
-const MANAGED_FEATURE_KEYS: &[&str] = &["hooks"];
+const MANAGED_FEATURE_KEYS: &[&str] = &[
+    "hooks",
+    "goals",
+    "rollout_budget.enabled",
+    "rollout_budget.limit_tokens",
+    "rollout_budget.reminder_interval_tokens",
+    "rollout_budget.prefill_token_weight",
+    "rollout_budget.sampling_token_weight",
+];
 const MANAGED_AGENT_KEYS: &[&str] = &[
     "enabled",
     "max_concurrent_threads_per_session",
@@ -3642,6 +3650,19 @@ mod tests {
         assert!(document.get("sandbox_mode").is_none());
         assert!(document.get("sandbox_workspace_write").is_none());
         assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(document["features"]["goals"].as_bool(), Some(true));
+        assert_eq!(
+            document["features"]["rollout_budget"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["limit_tokens"].as_integer(),
+            Some(200_000)
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["reminder_interval_tokens"].as_integer(),
+            Some(20_000)
+        );
         assert_eq!(
             document["permissions"][MANAGED_PERMISSION_PROFILE]["extends"].as_str(),
             Some(":workspace")
@@ -4117,6 +4138,12 @@ commit_attribution = ""
 
 [features]
 hooks = true
+goals = true
+rollout_budget.enabled = true
+rollout_budget.limit_tokens = 200000
+rollout_budget.reminder_interval_tokens = 20000
+rollout_budget.prefill_token_weight = 1.0
+rollout_budget.sampling_token_weight = 1.0
 
 [permissions.codex-autonomous]
 extends = ":workspace"
@@ -4142,6 +4169,9 @@ exclude_tmpdir_env_var = true
 
 [features]
 hooks = false
+goals = false
+rollout_budget.enabled = false
+rollout_budget.limit_tokens = 999999
 network_proxy = true
 
 [permissions.codex-autonomous]
@@ -4174,7 +4204,9 @@ description = "local"
         assert!(actual.contains("default_permissions = \"codex-autonomous\""));
         assert!(actual.contains("approvals_reviewer = \"auto_review\""));
         assert!(actual.contains("commit_attribution = \"\""));
-        assert!(actual.contains("[features]\nhooks = true\nnetwork_proxy = true"));
+        assert!(actual.contains(
+            "[features]\nhooks = true\ngoals = true\nrollout_budget.enabled = true\nrollout_budget.limit_tokens = 200000\nrollout_budget.reminder_interval_tokens = 20000\nrollout_budget.prefill_token_weight = 1.0\nrollout_budget.sampling_token_weight = 1.0\nnetwork_proxy = true"
+        ));
         assert!(actual.contains("[permissions.codex-autonomous]\nextends = \":workspace\""));
         assert!(actual.contains("\".git\" = \"write\""));
         assert!(actual.contains("[permissions.codex-autonomous.network]\nenabled = true"));

@@ -38,12 +38,13 @@
   reviewと検証をやり直します。修正round全体には固定上限を設けず、確定指摘を原因単位のfingerprintで
   追跡します。同じ指摘が修正後も再発するか、2round連続で受け入れ条件・test・既知指摘に証拠上の進展が
   ないか、入力・外部stateを正規化した同じfailure signatureが反復すればSol xhighの診断モードでroot causeと
-  計画を再検証します。診断は最大12 tool callまたは30分の早い方で終了し、token残量不明時はPlanの有限な
+  計画を再検証します。診断は最大12 tool callまたは30分の早い方で終了します。tool call数はSolがledgerへ
+  audit記録し、wall-clockとtoken消費はruntimeの経過時間・rollout budget reminderで監視します。token残量不明時はPlanの有限な
   受け入れ条件・実装単位・対象経路をtask work budgetにします。受け入れ条件は弱めず、Draft PR後は直前commentの
   IDとdigestで連鎖するappend-only ledger commentを次のbatch前に保存します。
   診断後の修正でも同じ指摘が再発する、または次のroundも進展がない場合はその項目をblockedとします。
   影響しない別原因の有効な指摘は自律修正できますが、task全体とdeliveryは全actionable解消までblockedです。
-  `codex-delivery`は最新ledgerのidentity・連鎖・未改変と全finding解消をreceiptへ固定し、deliver時にも再検証します。
+  `codex-delivery`は全ledger checkpointのidentity・round・head・finding状態遷移・未改変と全finding解消をreceiptへ固定し、deliver時とfinish再開時にも再検証します。
   条件成立後のReady、merge、mainのfetch後の`merge --ff-only`、
   managed cleanupまでをhelperに委ねます。
 - live Rulesetを既定のremote gateとします。GitHub Freeのprivate repositoryでは、

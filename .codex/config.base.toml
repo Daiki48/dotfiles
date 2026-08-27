@@ -17,11 +17,19 @@ approvals_reviewer = "auto_review"
 default_permissions = "codex-autonomous"
 
 # Codex/OpenAIのco-authorや生成表記をcommit messageへ追加しない。
-# Codex CLI 0.149.1でstrict config検証済み。
+# Codex CLI 0.150.0でstrict config検証済み。
 commit_attribution = ""
 
 [features]
 hooks = true
+goals = true
+# under-developmentの追跡機能。hard stopではなく20,000 tokenごとに残量を通知し、
+# AGENTSのsemantic circuit breakerと終了予算予約を補助する。
+rollout_budget.enabled = true
+rollout_budget.limit_tokens = 200000
+rollout_budget.reminder_interval_tokens = 20000
+rollout_budget.prefill_token_weight = 1.0
+rollout_budget.sampling_token_weight = 1.0
 
 [permissions.codex-autonomous]
 description = "Autonomous workspace access with operational Git policy checks."
