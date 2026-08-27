@@ -217,6 +217,8 @@ mergeがGitHubで完了した後、`finish`は次を順に検証します。
 取得済み`origin/main`のancestorであることを復旧前に確認します。そのうえでunstagedの通常fileだけを対象にし、
 各fileのbyteと実行bitが取得済み`origin/main`のblobと完全一致し、staged、未追跡、削除、rename、type変更、
 symlink parentがないことを証明できるときだけ、そのfileを元のHEADへ戻してff-onlyを再試行します。
+復旧対象を固定した後も各fileのrestore直前にHEAD、残りstatus、inode、mode、blobを再検証し、
+途中で1つでも変化した場合は未処理fileへ触れず停止します。
 固有のlocal変更や判定不能なpathは上書きしません。
 
 この限定復旧条件に合わないdirty checkout、mainのdiverge、remote到達性が判定不能な場合はreset、rebase、
