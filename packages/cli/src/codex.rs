@@ -1255,6 +1255,15 @@ fn preserve_removed_entry_comments(table: &mut Table, key: &Key, item: &Item) ->
             &mut comments,
             value.decor().suffix().and_then(|raw| raw.as_str()),
         );
+    } else if let Some(removed_table) = item.as_table() {
+        preserved |= append_comment_fragment(
+            &mut comments,
+            removed_table.decor().prefix().and_then(|raw| raw.as_str()),
+        );
+        preserved |= append_comment_fragment(
+            &mut comments,
+            removed_table.decor().suffix().and_then(|raw| raw.as_str()),
+        );
     }
     if preserved {
         table.decor_mut().set_suffix(comments);
@@ -1820,13 +1829,24 @@ fn remove_managed_permission_profile(contents: &str) -> Result<String> {
     } else {
         anyhow::bail!("permissions must be a TOML table");
     };
+    let normalized_has_comments = [normalized.decor().prefix(), normalized.decor().suffix()]
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| raw.as_str())
+        .any(|raw| raw.contains('#'));
     let removed_comments = normalized
         .remove_entry(MANAGED_PERMISSION_PROFILE)
         .is_some_and(|(key, item)| preserve_removed_entry_comments(&mut normalized, &key, &item));
-    if !normalized.is_empty() || root_has_comments || removed_comments {
+    if !normalized.is_empty() {
         document.insert_formatted(
             &key_for_table_header(permissions_key),
             Item::Table(normalized),
+        );
+    } else if root_has_comments || normalized_has_comments || removed_comments {
+        preserve_removed_entry_comments(
+            document.as_table_mut(),
+            &permissions_key,
+            &Item::Table(normalized),
         );
     }
     let mut rendered = document.to_string();
@@ -6740,6 +6760,41 @@ permissions = {
         assert_eq!(
             merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
                 .expect("repeat inline permission comment migration"),
+            migrated
+        );
+    }
+
+    #[test]
+    fn empty_inline_permissions_preserve_trailing_comments() {
+        let directory = TestDirectory::new("empty-inline-permission-comments");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"permissions = {
+  # keep-empty-permissions-comment
+}
+"#;
+
+        let migrated =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate empty inline permission comments");
+        assert!(migrated.contains("# keep-empty-permissions-comment"));
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("empty permission comment migration must remain valid TOML");
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]
+                [managed_root.to_str().expect("UTF-8 managed root")]
+            .as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat empty permission comment migration"),
             migrated
         );
     }
