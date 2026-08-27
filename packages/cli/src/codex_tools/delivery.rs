@@ -1952,7 +1952,7 @@ fn runtime_readonly_path(path: &str) -> bool {
     path.starts_with(".codex/") || path.starts_with(".agents/")
 }
 
-fn sandbox_readonly_sync_failure(stderr: &str, changed: &[String]) -> bool {
+fn protected_path_permission_failure(stderr: &str, changed: &[String]) -> bool {
     let protected = changed
         .iter()
         .filter(|path| runtime_readonly_path(path))
@@ -3692,7 +3692,7 @@ fn finish_locked(
                             .ok_or_else(|| error("receipt changed-filesが不正です"))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                if sandbox_readonly_sync_failure(&merge.stderr, &changed) {
+                if protected_path_permission_failure(&merge.stderr, &changed) {
                     save_stage(
                         &repository,
                         task,
@@ -3701,7 +3701,7 @@ fn finish_locked(
                         MAIN_SYNC_SANDBOX_RETRY_READY,
                     )?;
                     return Err(error(
-                        "runtimeのread-only拒否を確認しました。--sandbox-retry付きfinishをsandbox外で1回だけ再試行できます",
+                        "保護対象pathへのpermission拒否を確認しました。--sandbox-retry付きfinishを同一UIDのsandbox外で1回だけ再試行できます",
                     ));
                 }
             }
@@ -5692,21 +5692,21 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_retry_requires_a_readonly_error_on_a_changed_runtime_path() {
+    fn sandbox_retry_requires_a_permission_error_on_a_changed_runtime_path() {
         let changed = vec![".codex/AGENTS.md".to_string(), "README.md".to_string()];
-        assert!(sandbox_readonly_sync_failure(
+        assert!(protected_path_permission_failure(
             "error: unable to unlink old '.codex/AGENTS.md': Permission denied",
             &changed,
         ));
-        assert!(!sandbox_readonly_sync_failure(
+        assert!(!protected_path_permission_failure(
             "fatal: Not possible to fast-forward, aborting.",
             &changed,
         ));
-        assert!(!sandbox_readonly_sync_failure(
+        assert!(!protected_path_permission_failure(
             "error: unable to create file README.md: Permission denied",
             &changed,
         ));
-        assert!(!sandbox_readonly_sync_failure(
+        assert!(!protected_path_permission_failure(
             "error: .codex/AGENTS.md changed\nerror: index.lock: Permission denied",
             &changed,
         ));
