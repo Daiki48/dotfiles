@@ -1442,6 +1442,111 @@ enum ManagedFeatureValueKind {
     FiniteNonNegativeNumber,
 }
 
+#[derive(Clone, Copy)]
+enum ManagedScalarValueKind {
+    String,
+    Boolean,
+    PositiveInteger,
+}
+
+fn managed_root_value_kind(key: &str) -> Option<ManagedScalarValueKind> {
+    match key {
+        "model"
+        | "model_reasoning_effort"
+        | "plan_mode_reasoning_effort"
+        | "approval_policy"
+        | "approvals_reviewer"
+        | "default_permissions"
+        | "commit_attribution"
+        | "profile"
+        | "sandbox_mode" => Some(ManagedScalarValueKind::String),
+        _ => None,
+    }
+}
+
+fn managed_agent_value_kind(key: &str) -> Option<ManagedScalarValueKind> {
+    match key {
+        "enabled" => Some(ManagedScalarValueKind::Boolean),
+        "max_concurrent_threads_per_session" => Some(ManagedScalarValueKind::PositiveInteger),
+        "default_subagent_model" | "default_subagent_reasoning_effort" => {
+            Some(ManagedScalarValueKind::String)
+        }
+        _ => None,
+    }
+}
+
+fn validate_managed_scalar_value(
+    setting: &str,
+    value: &Value,
+    expected: ManagedScalarValueKind,
+) -> Result<()> {
+    let valid = match expected {
+        ManagedScalarValueKind::String => value.as_str().is_some(),
+        ManagedScalarValueKind::Boolean => value.as_bool().is_some(),
+        ManagedScalarValueKind::PositiveInteger => {
+            value.as_integer().is_some_and(|number| number > 0)
+        }
+    };
+    if !valid {
+        anyhow::bail!("Managed Codex setting has an invalid type or value: {setting}");
+    }
+    Ok(())
+}
+
+fn validate_managed_root_and_agent_value_types(existing: &str) -> Result<()> {
+    if existing.trim().is_empty() {
+        return Ok(());
+    }
+    let document = existing
+        .parse::<DocumentMut>()
+        .context("Existing Codex config must be valid TOML before migrating managed settings")?;
+
+    for key in MANAGED_CONFIG_KEYS
+        .iter()
+        .copied()
+        .chain(["profile", "sandbox_mode"])
+    {
+        let Some(item) = document.get(key) else {
+            continue;
+        };
+        let value = item
+            .as_value()
+            .with_context(|| format!("Managed Codex setting must be a TOML scalar: {key}"))?;
+        let kind = managed_root_value_kind(key)
+            .with_context(|| format!("Unknown managed Codex setting: {key}"))?;
+        validate_managed_scalar_value(key, value, kind)?;
+    }
+
+    let Some(agents) = document.get("agents") else {
+        return Ok(());
+    };
+    if let Some(table) = agents.as_table() {
+        for key in MANAGED_AGENT_KEYS {
+            let Some(item) = table.get(key) else {
+                continue;
+            };
+            let value = item.as_value().with_context(|| {
+                format!("Managed Codex agent setting must be a TOML scalar: agents.{key}")
+            })?;
+            let kind = managed_agent_value_kind(key)
+                .with_context(|| format!("Unknown managed Codex agent setting: {key}"))?;
+            validate_managed_scalar_value(&format!("agents.{key}"), value, kind)?;
+        }
+    } else if let Some(inline) = agents.as_inline_table() {
+        for key in MANAGED_AGENT_KEYS {
+            let Some(value) = inline.get(key) else {
+                continue;
+            };
+            let kind = managed_agent_value_kind(key)
+                .with_context(|| format!("Unknown managed Codex agent setting: {key}"))?;
+            validate_managed_scalar_value(&format!("agents.{key}"), value, kind)?;
+        }
+    } else {
+        anyhow::bail!("agents must be a TOML table");
+    }
+    Ok(())
+}
+
 fn rollout_budget_value_kind(key: &str) -> Option<ManagedFeatureValueKind> {
     match key {
         "enabled" => Some(ManagedFeatureValueKind::Boolean),
@@ -1677,6 +1782,7 @@ fn merge_managed_config_with_root(
     managed_root: &Path,
     home: &Path,
 ) -> Result<String> {
+    validate_managed_root_and_agent_value_types(existing)?;
     validate_managed_feature_value_types(existing)?;
     let legacy_roots = legacy_workspace_roots(existing, home)?;
     let profile_roots = managed_profile_workspace_roots(existing, home)?;
@@ -5298,6 +5404,98 @@ local_note = "preserve"
         fs::write(&template_path, template).expect("write isolated config template");
         let config_path = codex_dir.join("config.toml");
         let original = "[features.rollout_budget]\nlimit_tokens = { local_note = \"preserve\" }\n";
+        fs::write(&config_path, original).expect("write isolated invalid config");
+
+        assert!(
+            migrate_managed_config_from_template_with_root(
+                &codex_dir,
+                &template_path,
+                &managed_root,
+                directory.path(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read unchanged invalid config"),
+            original
+        );
+        let entries = fs::read_dir(&codex_dir)
+            .expect("read isolated Codex directory")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("collect isolated Codex directory entries");
+        assert_eq!(
+            entries.len(),
+            1,
+            "migration must not create a backup or temp file"
+        );
+        assert_eq!(entries[0].file_name(), "config.toml");
+    }
+
+    #[test]
+    fn invalid_managed_root_or_agent_schema_fails_closed_before_backup_or_write() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("invalid-managed-root-agent-schema");
+        let managed_root = directory.path().join("codex").join("worktrees");
+
+        for key in super::MANAGED_CONFIG_KEYS {
+            let existing = format!(r#"{key} = {{ local_note = "preserve" }}"#);
+            assert!(
+                merge_managed_config_with_root(
+                    template,
+                    &existing,
+                    &managed_root,
+                    directory.path(),
+                )
+                .is_err(),
+                "managed root container must fail closed: {key}"
+            );
+        }
+        for key in super::MANAGED_AGENT_KEYS {
+            let existing = format!(
+                r#"[agents]
+{key} = {{ local_note = "preserve" }}"#
+            );
+            assert!(
+                merge_managed_config_with_root(
+                    template,
+                    &existing,
+                    &managed_root,
+                    directory.path(),
+                )
+                .is_err(),
+                "managed agent container must fail closed: {key}"
+            );
+        }
+        for existing in [
+            "model = []\n",
+            "profile = { local_note = \"preserve\" }\n",
+            "sandbox_mode.local_note = \"preserve\"\n",
+            "[agents]\nenabled = \"true\"\n",
+            "[agents]\nmax_concurrent_threads_per_session = 0\n",
+            "[agents]\ndefault_subagent_model = false\n",
+        ] {
+            assert!(
+                merge_managed_config_with_root(
+                    template,
+                    existing,
+                    &managed_root,
+                    directory.path(),
+                )
+                .is_err(),
+                "invalid managed scalar must fail closed: {existing}"
+            );
+        }
+
+        let codex_dir = directory.path().join("actual-codex");
+        fs::create_dir(&codex_dir).expect("create isolated Codex directory");
+        let template_path = directory.path().join("config.base.toml");
+        fs::write(&template_path, template).expect("write isolated config template");
+        let config_path = codex_dir.join("config.toml");
+        let original = r#"model = { local_note = "preserve" }
+
+[agents]
+enabled = { local_note = "preserve" }
+"#;
         fs::write(&config_path, original).expect("write isolated invalid config");
 
         assert!(
