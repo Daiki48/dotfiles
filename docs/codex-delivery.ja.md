@@ -213,7 +213,8 @@ mergeがGitHubで完了した後、`finish`は次を順に検証します。
 4. fetch後に`git merge --ff-only origin/main`だけでlocal mainを更新できる。
 5. local mainと`origin/main`が一致する。
 
-`merged` stageのmain同期が中断してworking treeの一部だけ更新された場合、helperはunstagedの通常fileだけで、
+`merged` stageのmain同期が中断してworking treeの一部だけ更新された場合、helperは現在のmain HEADが
+取得済み`origin/main`のancestorであることを復旧前に確認します。そのうえでunstagedの通常fileだけを対象にし、
 各fileのbyteと実行bitが取得済み`origin/main`のblobと完全一致し、staged、未追跡、削除、rename、type変更、
 symlink parentがないことを証明できるときだけ、そのfileを元のHEADへ戻してff-onlyを再試行します。
 固有のlocal変更や判定不能なpathは上書きしません。

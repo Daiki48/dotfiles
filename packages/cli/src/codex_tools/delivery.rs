@@ -3244,6 +3244,27 @@ fn recover_interrupted_main_sync(root: &Path, target: &str) -> Result<()> {
     assert_main_clean(root)
 }
 
+fn prepare_main_sync(root: &Path, target: &str) -> Result<()> {
+    let before = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
+    let args = ["merge-base", "--is-ancestor", &before, target];
+    let av = args
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    if !run(
+        &git_command(&av)?,
+        root,
+        Duration::from_secs(COMMAND_TIMEOUT),
+        MAX_OUTPUT_BYTES,
+    )?
+    .status
+    .success()
+    {
+        return Err(error("人間用mainに未pushのlocal commitがあります"));
+    }
+    recover_interrupted_main_sync(root, target)
+}
+
 fn assert_main_synced(root: &Path, repository: &str) -> Result<()> {
     assert_main_clean(root)?;
     let remote = fetch_main(root, repository)?;
@@ -3497,22 +3518,8 @@ fn finish_locked(
         {
             return Err(error("origin/mainがmerged headへ到達していません"));
         }
-        recover_interrupted_main_sync(root, &remote_main)?;
+        prepare_main_sync(root, &remote_main)?;
         assert_main_clean(root)?;
-        let before = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
-        let args = ["merge-base", "--is-ancestor", &before, &remote_main];
-        let av = args.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
-        if !run(
-            &git_command(&av)?,
-            root,
-            Duration::from_secs(COMMAND_TIMEOUT),
-            MAX_OUTPUT_BYTES,
-        )?
-        .status
-        .success()
-        {
-            return Err(error("人間用mainに未pushのlocal commitがあります"));
-        }
         let args = ["merge", "--ff-only", "refs/remotes/origin/main"];
         let av = args.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
         if !run(
@@ -4898,7 +4905,7 @@ mod tests {
                 .success()
         );
         fs::write(root.join("a"), "new-a\n").unwrap();
-        recover_interrupted_main_sync(&root, target.trim()).expect("recover partial sync");
+        prepare_main_sync(&root, target.trim()).expect("recover partial sync");
         assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "old-a\n");
         let output = git_at(&root, &["merge", "--ff-only", target.trim()]);
         assert!(output.status.success());
@@ -4914,7 +4921,7 @@ mod tests {
                 .success()
         );
         fs::write(root.join("a"), "unique-local-change\n").unwrap();
-        assert!(recover_interrupted_main_sync(&root, target.trim()).is_err());
+        assert!(prepare_main_sync(&root, target.trim()).is_err());
         assert_eq!(
             fs::read_to_string(root.join("a")).unwrap(),
             "unique-local-change\n"
@@ -4927,7 +4934,7 @@ mod tests {
         );
         fs::write(root.join("a"), "new-a\n").unwrap();
         assert!(git_at(&root, &["add", "a"]).status.success());
-        assert!(recover_interrupted_main_sync(&root, target.trim()).is_err());
+        assert!(prepare_main_sync(&root, target.trim()).is_err());
         assert!(
             !git_at(&root, &["diff", "--cached", "--quiet"])
                 .status
@@ -4941,11 +4948,46 @@ mod tests {
         );
         fs::write(root.join("a"), "new-a\n").unwrap();
         fs::write(root.join("untracked"), "must survive\n").unwrap();
-        assert!(recover_interrupted_main_sync(&root, target.trim()).is_err());
+        assert!(prepare_main_sync(&root, target.trim()).is_err());
         assert_eq!(
             fs::read_to_string(root.join("untracked")).unwrap(),
             "must survive\n"
         );
+
+        fs::remove_file(root.join("untracked")).unwrap();
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        fs::write(root.join("local-only"), "local commit\n").unwrap();
+        assert!(git_at(&root, &["add", "local-only"]).status.success());
+        assert!(
+            git_at(
+                &root,
+                &[
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "diverged"
+                ]
+            )
+            .status
+            .success()
+        );
+        let diverged = git_at(&root, &["rev-parse", "HEAD"]).stdout;
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        let status_before = git_at(&root, &["status", "--porcelain=v1"]).stdout;
+        assert!(prepare_main_sync(&root, target.trim()).is_err());
+        assert_eq!(git_at(&root, &["rev-parse", "HEAD"]).stdout, diverged);
+        assert_eq!(
+            git_at(&root, &["status", "--porcelain=v1"]).stdout,
+            status_before
+        );
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
     }
 
     #[test]
