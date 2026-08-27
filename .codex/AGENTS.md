@@ -37,8 +37,10 @@
   成立する同一SHAだけをdeliver対象とし、修正可能な指摘は自律的に修正して新SHAで
   reviewと検証をやり直します。修正round全体には固定上限を設けず、確定指摘を原因単位のfingerprintで
   追跡します。同じ指摘が修正後も再発するか、2round連続で受け入れ条件・test・既知指摘に証拠上の進展が
-  なければSol xhighの診断モードでroot causeと計画を再検証します。診断後の修正でも同じ指摘が再発する、
-  または次のroundも進展がない場合だけblockedとし、別原因の新しい有効な指摘は自律修正を継続します。
+  ないか、入力・外部stateを正規化した同じfailure signatureが反復すればSol xhighの診断モードでroot causeと
+  計画を再検証します。受け入れ条件は弱めず、Draft PR後はappend-only ledger commentを次のbatch前に保存します。
+  診断後の修正でも同じ指摘が再発する、または次のroundも進展がない場合はその項目をblockedとします。
+  影響しない別原因の有効な指摘は自律修正できますが、task全体とdeliveryは全actionable解消までblockedです。
   条件成立後のReady、merge、mainのfetch後の`merge --ff-only`、
   managed cleanupまでをhelperに委ねます。
 - live Rulesetを既定のremote gateとします。GitHub Freeのprivate repositoryでは、

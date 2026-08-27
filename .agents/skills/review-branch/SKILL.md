@@ -20,19 +20,19 @@ commit、push、Ready化、merge、cleanupは呼び出し元が行う。レビ�
 
 ## riskに応じた独立reviewを行う
 
-すべてのriskで、実装を担当していない`reviewer` (`gpt-5.6-luna`, xhigh)を1つ使う。状態変更を明示的に禁止し、期待する結論や既知の懸念を渡さない。固定差分、影響する経路、受け入れ条件、後方互換性、高リスク境界、testで保証できない事項だけを確認し、再現可能で今回修正すべき指摘だけを返すよう依頼する。各指摘には重大度、fileとline、実行またはコード経路、期待結果と実際の結果、再現・確認方法、修正後の観測条件、および違反した不変条件と原因経路からなるfinding fingerprintを要求する。「問題なし」を有効な結論として扱い、指摘を作ること自体を目的にしない。将来改善、好み、具体的な影響根拠がない懸念はactionableにしない。網羅的な機械検証は共有済みのtest、lint、型検査、buildへ担わせ、reviewerへ同じ検証を繰り返させない。
+すべてのriskで、実装を担当していない`reviewer` (`gpt-5.6-luna`, xhigh)を1つ使う。状態変更を明示的に禁止し、期待する結論や既知の懸念を渡さない。固定差分、影響する経路、受け入れ条件、後方互換性、高リスク境界、testで保証できない事項だけを確認し、再現可能で今回修正すべき指摘を1回のpassでまとめて返すよう依頼する。各指摘には重大度、fileとlineまたは欠落した境界、実行またはコード経路、期待結果と実際の結果、再現・確認方法、修正後の観測条件、および固定した不変条件ID、repository-relativeな原因経路、正規化した失敗classからなるfinding fingerprintを要求する。「問題なし」を有効な結論として扱い、指摘を作ること自体を目的にしない。将来改善、好み、具体的な影響根拠がない懸念はactionableにしない。網羅的な機械検証は共有済みのtest、lint、型検査、buildへ担わせ、reviewerへ同じ検証を繰り返させない。
 
 high/criticalでは標準reviewに加え、変更で実際に触れる主要な高リスク境界を1つの専門reviewerへ割り当てる。authなら認証・認可、migrationならデータ損失・rollback、public APIなら後方互換性、concurrencyなら競合・timeout・retry、delivery安全境界ならgate・権限・fail-closed挙動のように、変更固有の観点だけを確認する。一般的な反論役、肯定役、複数の専門reviewerは追加しない。専門reviewerへ標準reviewerの所見を渡さず、同じ証拠集合から独立して判定させる。
 
-Sol highが固定した証拠集合とreview結果を再判定し、fingerprintが同じ重複、誤検知、根拠不足を除外してdelivery準備可否を決める。重大なセキュリティ・互換性・データ移行、同じfingerprintの修正後再発、2round連続の証拠上のstall、またはreview結論の衝突ではSol xhighの診断モードへ昇格する。診断後の修正でも同じfingerprintが再発するか、次のroundにも進展がない場合だけblockedとし、別原因の新しい有効な指摘はglobalなround上限なしで呼び出し元へ返す。Luna maxは、xhighで不足する具体的な根拠がある場合だけ使う。risk分類とdecision requirement（autonomous / human-required / blocked）を別々に判定し、receiptの記録は呼び出し元の`codex-delivery`へ返す。
+Sol highが固定した証拠集合とreview結果を再判定し、canonical fingerprintが同じ重複、誤検知、根拠不足を除外してdelivery準備可否を決める。新しいfingerprintは修正deltaまたは新たに利用可能になった一次証拠との因果を必須とし、同じ対象の言い換えを進展扱いしない。重大なセキュリティ・互換性・データ移行、同じfingerprintの修正後再発、2round連続の証拠上のstall、canonical failure signatureの反復、比較不能な入力・外部state、またはreview結論の衝突ではSol xhighの診断モードへ昇格する。診断後の修正でも同じfingerprintが再発するか、次のroundにも進展がない場合はその項目をblockedとし、独立した別原因の指摘は呼び出し元へ返せるがtask全体とdeliveryは全actionable解消までblockedとする。Luna maxは、xhighで不足する具体的な根拠がある場合だけ使う。risk分類とdecision requirement（autonomous / human-required / blocked）を別々に判定し、receiptの記録は呼び出し元の`codex-delivery`へ返す。
 
 subagentを利用できない場合はmain agentが同じ証拠集合で標準reviewを独立passとして行い、high/criticalだけ変更固有の専門passを追加する。その制約を結果へ明記する。
 
 ## 指摘を反証して統合する
 
 1. 各指摘をコード、test、履歴、一次情報で再現・確認し、誤検知と根拠不足を除外する。
-2. 違反した不変条件、原因経路、観測可能な失敗からfingerprintを確定する。line移動や表現差だけの指摘、同じroot causeの症状を重複fingerprintにしない。
-3. finding ledgerの既存項目と照合して新規、再発、解消、誤検知を判定し、重大度、根拠、影響範囲、fileとline、再現方法、修正後の観測条件を付ける。
+2. 固定した受け入れ条件または不変条件ID、repository-relativeな原因経路、正規化した失敗classの順序付きJSONをSHA-256 lowercase hexにしてfingerprintを確定する。timestamp、run ID、一時絶対path、line移動、表現差を除外し、同じroot causeの症状を重複fingerprintにしない。
+3. append-only finding ledgerを全page取得し、編集、欠落、競合、schema、task・Plan・repository・PR・head identity、commit到達性、test証拠を検証してから、新規、再発、解消、誤検知を判定する。復元不能なら試行数をresetせず診断対象として返す。
 4. 問題がない観点も、確認範囲と根拠を記録する。
 5. 変更に関係する内部仕様、外部仕様、docs・Issue・実装・testの横断整合性をmain agentが最終確認する。関係のない全コードを機械的にreviewしない。
 6. secret、AI帰属、不要なlocal情報、計画外ファイルが差分にないことを確認する。
