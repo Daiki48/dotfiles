@@ -113,8 +113,11 @@ review後にpushされた場合、以前のreceipt、review、CIを
 再利用せず、新しいSHAで最初からやり直します。`review-branch`は読み取り専用であり、receiptの記録と
 delivery判断は呼び出し元の専用`codex-delivery` helperが担当します。
 
-修正可能なactionable指摘はSolが反証して1つのbatchで自律修正し、review起因の修正roundを最大2回まで
-再pushします。その後の最終reviewで実欠陥が残る場合は新しい修正loopを始めずblockedとします。
+修正可能なactionable指摘はSolが反証し、原因単位のfinding fingerprintとledgerで新規、再発、解消、
+誤検知、修正試行を追跡して1つのbatchで自律修正します。修正round全体には固定上限を設けません。
+同じfingerprintが修正後も再発するか、2round連続で受け入れ条件・test・既知指摘に証拠上の進展が
+ない場合はSol xhighの診断モードでroot causeと計画を再検証します。診断後の修正でも同じ指摘が再発する、
+または次のroundも進展がない場合だけblockedとし、別原因の新しい有効な指摘は自律修正を継続します。
 次の条件が同一SHAで同時に成立した場合だけReady化・merge候補になります。
 
 - required-ciなどrequired checkがすべて文字通り`success`である（skipped、cancelled、timed out、

@@ -92,7 +92,18 @@ riskはreview深度と残存影響を決めますが、人間確認を自動決�
 1つだけ実行し、high/criticalは変更で実際に触れる主要な高リスク境界を対象とする専門reviewを1つ追加します。
 一般的な反論役や肯定役は使いません。actionableな指摘はSolが反証してから1つのbatchで修正、検証、
 commit、pushします。そのpushでSHAが変わるためreview、CI、receiptを最初からやり直しますが、
-review起因の修正roundは最大2回です。その後の最終reviewで実欠陥が残る場合はblockedとします。
+修正round全体には固定上限を設けません。違反した不変条件、原因経路、観測可能な失敗からfinding fingerprintを
+作り、新規、再発、解消、誤検知、修正試行、対応testをledgerで追跡します。同じfingerprintが1回目の
+修正後にも再発するか、2round連続で既知指摘、受け入れtest、原因を狭める一次証拠に進展がない場合は、
+Sol xhighの診断モードでroot causeと次の修正batchを再確定します。診断後の修正でも同じfingerprintが
+再発するか、次のroundにも進展がない場合だけblockedとします。別原因の新しいactionableを解消している間は
+自律loopを継続します。
+
+actionableは今回修正すべき具体的な欠陥に限り、fileとline、実行またはコード経路、期待結果と実際の結果、
+再現・確認方法、修正後の観測条件を必要とします。将来改善、好み、具体的な影響根拠のない懸念は含めません。
+共通root causeの指摘は1batchで修正し、可能なら修正前に失敗を再現する回帰testを追加します。
+明示されたtoken budgetまたはruntime残量がある場合は、test、最終review、CI、deliveryの終了予算を予約し、
+その予約を維持できない新しい修正roundは開始しません。round数をtoken上限の代用にはしません。
 
 次の条件が同じhead SHAで成立した場合だけ、`codex-delivery deliver`へ進みます。
 

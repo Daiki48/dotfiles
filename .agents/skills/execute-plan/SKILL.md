@@ -69,6 +69,38 @@ rootがSol highならroot自身がlead兼single writerとなり、監督のた�
 
 依頼スコープ内のテスト失敗や軽微な欠陥は同じ単位で修正する。実質的なスコープ変更、データ損失、重大な互換性・セキュリティ判断が必要なら作業を広げず停止する。
 
+## 自律loopを収束させる
+
+実装、test、CI、reviewの反復では、round数そのものではなく、原因と証拠の進展を追跡する。確定した問題ごとに
+finding fingerprintを付ける。fingerprintは違反した不変条件または期待挙動、原因経路、観測可能な失敗で構成し、
+line移動、表現差、同じroot causeから生じた重複指摘では別fingerprintを作らない。
+
+各roundで、fingerprint、初出head、重大度、根拠・再現方法、影響経路、状態（新規、再発、解消、誤検知）、
+修正試行数、対応test、検証結果をfinding ledgerへ記録する。review指摘は、今回修正すべき具体的な欠陥であり、
+fileとline、実行またはコード経路、期待結果と実際の結果、修正後の観測条件を示せる場合だけactionableとする。
+将来改善、好み、根拠のない懸念はactionableへ含めない。
+
+Solはactionableを反証してから、共通root causeごとに1つのbatchへまとめる。変更挙動をtestで観測できる場合は、
+修正前に失敗を再現する回帰testを追加し、修正後に同じtestが成功することを確認する。test化できない場合は、
+代替の検証方法とtestで保証できない理由をledgerへ残す。
+
+次のいずれかを満たす場合は通常のpatch反復を止め、Sol xhighの診断モードへ移る。
+
+- 同じfingerprintが1回目の修正後にも再発した
+- 2round連続で、既知fingerprintの解消、受け入れtestの失敗から成功への変化、または原因を狭める新しい一次証拠のいずれも得られなかった
+- 同じtest、CI、tool、networkのfailure signatureを、外部状態や入力の変化なしに2回連続で観測した
+
+診断モードではledger、固定差分、失敗log、関連する一次情報をまとめて見直し、症状への追加patchではなく
+root cause、誤った前提、修正境界、受け入れ条件、次の1batchを再確定する。依頼scope内で計画を改訂できるなら
+確認待ちにせず続行する。診断後の修正でも同じfingerprintが再発する、診断後の次roundにも証拠上の進展がない、
+または同じ外部failure signatureを状態変化なしに3回目も観測した場合は、同じ操作を繰り返さずblockedとする。
+別原因の新しいactionableが見つかり、各roundで証拠上の進展がある間は、修正round全体の固定上限を設けない。
+
+明示されたtask token budgetまたはruntimeの残量を利用できる場合は、test、固定SHA review、CI、deliveryに必要な
+終了予算を先に予約する。通常反復で予算警告へ達したら診断モードで残作業を再見積もりし、予約を維持したまま
+完了できない新しい修正roundを始めない。残量を取得できない場合に架空のtoken値を推定したり、round数を
+token上限の代用にしたりしない。停止時はledger、commit、失敗証拠、次の再開条件を安全なcheckpointとして残す。
+
 ## Draft PR前の統合確認を行う
 
 全単位完了後、rootのSol highが固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項を統合確認する。この段階では独立reviewerを起動せず、実装単位ごとのself-reviewと自動検証の不足、計画外差分、secret、AI帰属、不要なlocal情報だけを確認する。独立reviewはDraft PR作成後の固定SHAに対して1回だけ開始する。
@@ -97,8 +129,11 @@ high/criticalだけ`--specialist-review-passed`も指定する。明示認可さ
    差分、実装計画、test結果、既存仕様を確認し、actionable件数と未解決thread件数を返す。low/mediumは標準reviewerを1つだけ使い、high/criticalは変更で実際に触れる高リスク境界を確認する専門reviewerを1つ追加する。反論役、肯定役、変更と無関係な専門観点は追加しない。
 2. decisionが`autonomous`ならriskに関係なく、review結果とSHA、CI結果、risk分類を
    `codex-delivery record-review`でreceiptに記録する。
-   actionableな指摘があればSolがコード、test、履歴、一次情報で再現し、誤検知と根拠不足を除外する。確定した指摘を1つのbatchで修正、検証、commit、pushし、新しいhead SHAで手順1へ戻る。以前のreceipt、review、CIを新SHAの完了根拠として再利用しない。
-   review起因の修正roundは最大2回とし、その後の固定SHAで最終reviewを行う。最終reviewで確定したactionableが残る場合はSol xhighが反証し、誤検知なら根拠を記録して除外し、実欠陥なら新しい修正loopを始めずblockedとして具体的な残存事項を返す。
+   actionableな指摘があればSolがコード、test、履歴、一次情報で再現し、誤検知と根拠不足を除外する。
+   確定指摘をfinding ledgerへ統合し、前述の収束規則に従ってroot cause単位の1batchで修正、検証、commit、pushし、
+   新しいhead SHAで手順1へ戻る。以前のreceipt、review、CIを新SHAの完了根拠として再利用しない。
+   globalな修正round上限では停止せず、同一fingerprintの再発または証拠上のstallだけを診断モードと
+   circuit breakerの対象にする。
 3. decisionが`human-required`なら、必要な判断を具体化してDaikiの明示回答を得る。判断後だけ同じ証拠を
    `codex-delivery approve-review`へ渡す。自動approval reviewだけを回答とは扱わない。判断の前提を変える
    後続pushやscope変更があれば再判定する。blockedではreceiptを作らない。
