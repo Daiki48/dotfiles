@@ -611,6 +611,34 @@ fn ledger_json(body: &str, marker: &str) -> Result<Value> {
     parse_json(json, "loop ledger")
 }
 
+fn finding_fingerprint(finding: &Value) -> Result<String> {
+    let invariant = str_value(finding, "invariant_id")?;
+    let path = str_value(finding, "cause_path")?;
+    let failure_class = str_value(finding, "failure_class")?;
+    if invariant.is_empty()
+        || failure_class.is_empty()
+        || path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+        || [invariant.as_str(), failure_class.as_str(), path.as_str()]
+            .iter()
+            .any(|value| value.contains(['\n', '\r']))
+    {
+        return Err(error("finding fingerprint preimageが不正です"));
+    }
+    let canonical = object([
+        ("cause_path", string(path)),
+        ("failure_class", string(failure_class)),
+        ("invariant_id", string(invariant)),
+    ]);
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|_| error("finding fingerprintをcanonical serializeできません"))?;
+    Ok(sha256(bytes))
+}
+
 fn validate_loop_ledger_payload(
     payload: &Value,
     task: &str,
@@ -705,7 +733,13 @@ fn validate_loop_ledger_payload(
             ],
             "loop ledger finding",
         )?;
-        let _ = chunked_hex(get(finding, "fingerprint")?, 32, "finding fingerprint")?;
+        let stored_fingerprint =
+            chunked_hex(get(finding, "fingerprint")?, 32, "finding fingerprint")?;
+        if stored_fingerprint != finding_fingerprint(finding)? {
+            return Err(error(
+                "finding fingerprintとcanonical preimageが一致しません",
+            ));
+        }
         let _ = oid(
             &chunked_hex(get(finding, "first_head")?, 20, "finding first head")?,
             "finding first head",
@@ -3533,6 +3567,28 @@ mod tests {
 
     fn ledger_fixture(status: &str) -> Value {
         let bootstrap_body = format!("{LOOP_LEDGER_V1_MARKER}\n{{\"schema\":1}}");
+        let mut finding = object([
+            ("invariant_id", string("DELIVERY-NO-BLOCKED-LEDGER")),
+            (
+                "cause_path",
+                string("packages/cli/src/codex_tools/delivery.rs"),
+            ),
+            ("failure_class", string("blocked-ledger")),
+            ("first_head", chunks(&"a".repeat(40))),
+            ("severity", string("high")),
+            ("status", string(status)),
+            ("attempt", Value::Number(1.into())),
+            ("reproduction", string("blocked findingを記録する")),
+            ("impact", string("deliveryが通過し得る")),
+            ("post_fix_condition", string("helperが拒否する")),
+            ("tests", Value::Array(vec![string("ledger gate test")])),
+            ("evidence", Value::Array(vec![string("unit test passed")])),
+        ]);
+        let fingerprint = finding_fingerprint(&finding).unwrap();
+        finding
+            .as_object_mut()
+            .unwrap()
+            .insert("fingerprint".into(), chunks(&fingerprint));
         let payload = object([
             ("schema", Value::Number(2.into())),
             (
@@ -3553,27 +3609,7 @@ mod tests {
                     ("body_sha256", chunks(&sha256(&bootstrap_body))),
                 ]),
             ),
-            (
-                "findings",
-                Value::Array(vec![object([
-                    ("fingerprint", chunks(&"d".repeat(64))),
-                    ("invariant_id", string("DELIVERY-NO-BLOCKED-LEDGER")),
-                    (
-                        "cause_path",
-                        string("packages/cli/src/codex_tools/delivery.rs"),
-                    ),
-                    ("failure_class", string("blocked-ledger")),
-                    ("first_head", chunks(&"a".repeat(40))),
-                    ("severity", string("high")),
-                    ("status", string(status)),
-                    ("attempt", Value::Number(1.into())),
-                    ("reproduction", string("blocked findingを記録する")),
-                    ("impact", string("deliveryが通過し得る")),
-                    ("post_fix_condition", string("helperが拒否する")),
-                    ("tests", Value::Array(vec![string("ledger gate test")])),
-                    ("evidence", Value::Array(vec![string("unit test passed")])),
-                ])]),
-            ),
+            ("findings", Value::Array(vec![finding])),
             ("failure_signatures", Value::Array(Vec::new())),
             (
                 "progress_events",
