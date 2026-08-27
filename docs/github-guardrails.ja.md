@@ -121,7 +121,7 @@ delivery判断は呼び出し元の専用`codex-delivery` helperが担当しま�
 または次のroundも進展がない場合はその項目をblockedとします。影響しない別原因の新しい有効な指摘は
 自律修正できますが、task全体とdeliveryは全actionable解消までblockedです。各roundの証拠は次batch前に
 直前comment IDと本文digestで連鎖するv2 marker・schema 3 append-only PR ledger commentへ保存し、resume時にauthor、未編集、全checkpointのschema、
-chain、round・head遷移、Plan版の単調増加とreceiptへの最新版固定、finding状態遷移、commit、test、reviewと照合します。v1 findingはterminal状態だけを許可し、schema 3移行後のlegacy schema再挿入とcurrent head不一致のlatest checkpointを拒否します。診断は最大12 tool callまたは30分の早い方で終了し、tool call数をaudit記録、token消費をrollout budget reminderで監視します。token残量不明時は
+chain、round・head遷移、Plan版の単調増加とreceiptへの最新版固定、finding状態遷移、commit、test、reviewと照合します。v1 findingはterminal状態だけを許可し、schema 3移行後のlegacy schema再挿入とcurrent head不一致のlatest checkpointを拒否します。診断は最大12 tool callまたは30分の早い方で終了し、tool call数をaudit記録、token消費はruntimeが提示するtoken情報で監視します。token残量不明時は
 Planの有限な受け入れ条件・実装単位・対象経路をwork budgetとしてscope外へ増殖させません。`codex-delivery`は全findingの
 解消とledgerのcomment ID・digestをreceiptへ固定し、deliver時にも再検証します。
 次の条件が同一SHAで同時に成立した場合だけReady化・merge候補になります。
