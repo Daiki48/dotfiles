@@ -1216,6 +1216,52 @@ fn table_from_inline(inline: &InlineTable) -> Table {
     table
 }
 
+fn append_comment_fragment(comments: &mut String, raw: Option<&str>) -> bool {
+    let Some(raw) = raw.filter(|raw| raw.contains('#')) else {
+        return false;
+    };
+    if !comments.ends_with('\n') {
+        comments.push('\n');
+    }
+    comments.push_str(raw);
+    if !comments.ends_with('\n') {
+        comments.push('\n');
+    }
+    true
+}
+
+fn preserve_removed_entry_comments(table: &mut Table, key: &Key, item: &Item) -> bool {
+    let mut comments = table
+        .decor()
+        .suffix()
+        .and_then(|raw| raw.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let mut preserved = false;
+    preserved |= append_comment_fragment(
+        &mut comments,
+        key.leaf_decor().prefix().and_then(|raw| raw.as_str()),
+    );
+    preserved |= append_comment_fragment(
+        &mut comments,
+        key.leaf_decor().suffix().and_then(|raw| raw.as_str()),
+    );
+    if let Some(value) = item.as_value() {
+        preserved |= append_comment_fragment(
+            &mut comments,
+            value.decor().prefix().and_then(|raw| raw.as_str()),
+        );
+        preserved |= append_comment_fragment(
+            &mut comments,
+            value.decor().suffix().and_then(|raw| raw.as_str()),
+        );
+    }
+    if preserved {
+        table.decor_mut().set_suffix(comments);
+    }
+    preserved
+}
+
 fn key_for_table_header(key: Key) -> Key {
     let prefix = key
         .leaf_decor()
@@ -1248,10 +1294,14 @@ fn normalize_inline_feature_tables(existing: &str) -> String {
     features.set_implicit(false);
     features.set_dotted(false);
     for key in MANAGED_FEATURE_KEYS {
-        features.remove(key);
+        if let Some((formatted_key, item)) = features.remove_entry(key) {
+            preserve_removed_entry_comments(&mut features, &formatted_key, &item);
+        }
     }
     for key in LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS {
-        features.remove(key);
+        if let Some((formatted_key, item)) = features.remove_entry(key) {
+            preserve_removed_entry_comments(&mut features, &formatted_key, &item);
+        }
     }
     if let Some((rollout_budget_key, rollout_budget_item)) = features.remove_entry("rollout_budget")
     {
@@ -1267,7 +1317,9 @@ fn normalize_inline_feature_tables(existing: &str) -> String {
         rollout_budget.set_implicit(false);
         rollout_budget.set_dotted(false);
         for key in MANAGED_ROLLOUT_BUDGET_KEYS {
-            rollout_budget.remove(key);
+            if let Some((formatted_key, item)) = rollout_budget.remove_entry(key) {
+                preserve_removed_entry_comments(&mut rollout_budget, &formatted_key, &item);
+            }
         }
         features.insert_formatted(
             &key_for_table_header(rollout_budget_key),
@@ -1746,25 +1798,36 @@ fn remove_managed_permission_profile(contents: &str) -> Result<String> {
     let mut document = contents
         .parse::<DocumentMut>()
         .context("Existing Codex config must be valid TOML before normalizing permissions")?;
-    let Some(permissions) = document.get("permissions") else {
+    let Some((permissions_key, permissions_item)) = document.remove_entry("permissions") else {
         return Ok(contents.to_string());
     };
-    let mut normalized = if let Some(permissions) = permissions.as_table() {
+    let root_has_comments = permissions_key
+        .leaf_decor()
+        .prefix()
+        .and_then(|raw| raw.as_str())
+        .is_some_and(|raw| raw.contains('#'))
+        || permissions_item
+            .as_value()
+            .into_iter()
+            .flat_map(|value| [value.decor().prefix(), value.decor().suffix()])
+            .flatten()
+            .filter_map(|raw| raw.as_str())
+            .any(|raw| raw.contains('#'));
+    let mut normalized = if let Some(permissions) = permissions_item.as_table() {
         permissions.clone()
-    } else if let Some(permissions) = permissions.as_inline_table() {
-        let mut normalized = Table::new();
-        for (name, profile) in permissions.iter() {
-            normalized.insert(name, Item::Value(profile.clone()));
-        }
-        normalized
+    } else if let Some(permissions) = permissions_item.as_inline_table() {
+        table_from_inline(permissions)
     } else {
         anyhow::bail!("permissions must be a TOML table");
     };
-    normalized.remove(MANAGED_PERMISSION_PROFILE);
-    if normalized.is_empty() {
-        document.remove("permissions");
-    } else {
-        document.insert("permissions", Item::Table(normalized));
+    let removed_comments = normalized
+        .remove_entry(MANAGED_PERMISSION_PROFILE)
+        .is_some_and(|(key, item)| preserve_removed_entry_comments(&mut normalized, &key, &item));
+    if !normalized.is_empty() || root_has_comments || removed_comments {
+        document.insert_formatted(
+            &key_for_table_header(permissions_key),
+            Item::Table(normalized),
+        );
     }
     let mut rendered = document.to_string();
     if !rendered.ends_with('\n') {
@@ -5144,6 +5207,60 @@ rollout_budget = {
     }
 
     #[test]
+    fn feature_normalization_preserves_managed_key_comments() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("managed-feature-comments");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let fixtures = [
+            r#"[features]
+# keep-before-standard-hook
+hooks = false # keep-after-standard-hook
+local_feature = true
+"#,
+            r#"features = {
+  # keep-before-inline-hook
+  hooks = false, # keep-after-inline-hook
+  local_feature = true,
+}
+"#,
+            r#"# keep-before-dotted-hook
+features.hooks = false # keep-after-dotted-hook
+features.local_feature = true
+"#,
+        ];
+
+        for existing in fixtures {
+            let migrated =
+                merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                    .expect("migrate managed feature comments");
+            for comment in existing
+                .lines()
+                .filter_map(|line| line.split_once('#').map(|(_, comment)| comment.trim()))
+            {
+                assert!(
+                    migrated.contains(&format!("# {comment}")),
+                    "migration must preserve managed key comment: {comment}"
+                );
+            }
+            let document = migrated
+                .parse::<toml_edit::DocumentMut>()
+                .expect("managed key comment migration must remain valid TOML");
+            assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+            assert_eq!(document["features"]["local_feature"].as_bool(), Some(true));
+            assert_eq!(
+                merge_managed_config_with_root(
+                    template,
+                    &migrated,
+                    &managed_root,
+                    directory.path(),
+                )
+                .expect("repeat managed feature comment migration"),
+                migrated
+            );
+        }
+    }
+
+    #[test]
     fn exclusive_backup_does_not_overwrite_an_existing_path() {
         let directory = TestDirectory::new("exclusive-backup");
         let source = directory.path().join("source.toml");
@@ -6575,6 +6692,56 @@ workspace_roots = { "/srv/quoted" = true }
                 merged
             );
         }
+    }
+
+    #[test]
+    fn inline_permissions_preserve_local_comments() {
+        let directory = TestDirectory::new("inline-permission-comments");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"# keep-before-permissions
+permissions = {
+  # keep-local-profile
+  local = { workspace_roots = { "/srv/local" = true } },
+} # keep-after-permissions
+"#;
+
+        let migrated =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate inline permission comments");
+        for comment in [
+            "keep-before-permissions",
+            "keep-local-profile",
+            "keep-after-permissions",
+        ] {
+            assert!(
+                migrated.contains(&format!("# {comment}")),
+                "migration must preserve permission comment: {comment}"
+            );
+        }
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("permission comment migration must remain valid TOML");
+        assert_eq!(
+            document["permissions"]["local"]["workspace_roots"]["/srv/local"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]
+                [managed_root.to_str().expect("UTF-8 managed root")]
+            .as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat inline permission comment migration"),
+            migrated
+        );
     }
 
     #[test]
