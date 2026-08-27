@@ -4932,6 +4932,7 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         "--tests-passed",
         "--independent-review-passed",
         "--specialist-review-passed",
+        "--sandbox-retry",
     ];
     let mut values = HashMap::new();
     let mut seen = Vec::new();
@@ -4971,10 +4972,14 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
             || !seen.iter().any(|v| v == "--tests-passed")
             || !seen.iter().any(|v| v == "--independent-review-passed")
             || seen.iter().any(|v| v == "--specialist-review-passed") != specialist_required
+            || seen.iter().any(|v| v == "--sandbox-retry")
         {
             return Some("delivery helperのreview evidenceまたはriskが不正です".into());
         }
-    } else if values.contains_key("--risk") || !seen.is_empty() {
+    } else if values.contains_key("--risk")
+        || seen.iter().any(|flag| flag != "--sandbox-retry")
+        || (command == "deliver" && seen.iter().any(|flag| flag == "--sandbox-retry"))
+    {
         return Some("deliver/finishへreview evidenceまたはriskを指定できません".into());
     }
     if values
@@ -6779,6 +6784,26 @@ mod tests {
         let mut invalid_version = command("high", true);
         invalid_version[13] = "0".to_string();
         assert!(delivery_helper_invocation_reason(&invalid_version).is_some());
+
+        let finish_retry = vec![
+            "codex-delivery".to_string(),
+            "finish".to_string(),
+            "--task-id".to_string(),
+            "issue-24".to_string(),
+            "--pr".to_string(),
+            "24".to_string(),
+            "--head".to_string(),
+            "b".repeat(40),
+            "--plan-id".to_string(),
+            "loop-engineering-circuit-breaker-v1".to_string(),
+            "--plan-version".to_string(),
+            "3".to_string(),
+            "--sandbox-retry".to_string(),
+        ];
+        assert!(delivery_helper_invocation_reason(&finish_retry).is_none());
+        let mut deliver_retry = finish_retry;
+        deliver_retry[1] = "deliver".to_string();
+        assert!(delivery_helper_invocation_reason(&deliver_retry).is_some());
     }
 
     #[cfg(unix)]
