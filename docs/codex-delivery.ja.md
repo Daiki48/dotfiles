@@ -122,7 +122,7 @@ actionableは今回修正すべき具体的な欠陥に限り、fileとline、�
 共通root causeの指摘は1batchで修正し、可能なら修正前に失敗を再現する回帰testを追加します。
 診断モードは原因仮説、実装境界、検証手段だけを改訂でき、Planへ固定した期待挙動、security・互換性・
 データ損失の不変条件、risk、rollback条件を弱めません。変更が必要ならhuman-requiredまたはblockedです。
-診断モードは開始前に最大12 tool callまたは30分の早い方をledgerへ固定し、tool call使用数をaudit evidenceとして記録します。helperはCodex runtime内部のtool telemetryを直接観測しないため、件数だけを暗号学的なgateとは扱いません。wall-clock・token消費はruntime経過時間とrollout budget reminderで監視し、より小さい明示budgetを優先します。
+診断モードは開始前に最大12 tool callまたは30分の早い方をledgerへ固定し、tool call使用数をaudit evidenceとして記録します。helperはCodex runtime内部のtool telemetryを直接観測しないため、件数だけを暗号学的なgateとは扱いません。wall-clock・token消費はruntimeが提供する経過時間と利用量情報で監視し、より小さい明示budgetを優先します。
 超過時や残り予算で次batchと終了検証を完了できない場合はblockedかhuman-requiredへ移ります。明示されたtoken budget
 またはruntime残量がある場合は、test、最終review、CI、deliveryの終了予算を予約し、
 その予約を維持できない新しい修正roundは開始しません。round数をtoken上限の代用にはしません。budgetを
@@ -134,7 +134,7 @@ actionableは今回修正すべき具体的な欠陥に限り、fileとline、�
 comment IDと本文SHA-256をreceiptへ固定します。`deliver`とmerge後の`finish`は同じcomment、digest、chainを再取得して、
 blocked・未解消finding、編集、削除、差し替え、chain切れをfail closedで拒否します。`finish`をmerge後から再開する場合もcleanup前に再検証します。v1は移行時のbootstrap predecessor、schema 2は既存移行checkpointとしてだけ使え、新しいreceiptの最新ledgerには使えません。
 
-新規Codex sessionでは[公式Configuration Reference](https://developers.openai.com/codex/config-reference)のunder-developmentなrollout budget trackingを200,000 token、20,000 token間隔のreminderで有効にします。これはhard stopではなく、semantic circuit breakerと終了予算予約へ残量を通知する補助です。
+新規Codex sessionでは[公式Configuration Reference](https://developers.openai.com/codex/config-reference)でunder-developmentかつ既定無効のrollout budget trackingを無効のまま使います。共有token上限によるturn停止を避け、失敗loopはcanonical fingerprint、stall検出、最大12 tool callまたは30分の診断budget、有限なPlan scopeで制御します。
 
 次の条件が同じhead SHAで成立した場合だけ、`codex-delivery deliver`へ進みます。
 

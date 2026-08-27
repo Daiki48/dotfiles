@@ -14,7 +14,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, PermissionsExt},
 };
-use toml_edit::{DocumentMut, InlineTable, Item, Table, value};
+use toml_edit::{DocumentMut, InlineTable, Item, Key, Table, Value, value};
 
 use crate::codex_tools::{process, worktree};
 const CODEX_FILES: &[(&str, &str)] = &[
@@ -103,6 +103,7 @@ const LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS: &[&str] = &[
     "rollout_budget.enabled",
     "rollout_budget.limit_tokens",
     "rollout_budget.reminder_interval_tokens",
+    "rollout_budget.reminder_at_remaining_tokens",
     "rollout_budget.prefill_token_weight",
     "rollout_budget.sampling_token_weight",
 ];
@@ -110,6 +111,7 @@ const MANAGED_ROLLOUT_BUDGET_KEYS: &[&str] = &[
     "enabled",
     "limit_tokens",
     "reminder_interval_tokens",
+    "reminder_at_remaining_tokens",
     "prefill_token_weight",
     "sampling_token_weight",
 ];
@@ -974,6 +976,98 @@ fn table_header(line: &str) -> Option<&str> {
     header.starts_with('[').then_some(header)
 }
 
+#[derive(Clone, Copy)]
+enum TomlMultilineString {
+    Basic,
+    Literal,
+}
+
+fn multiline_delimiter_at(line: &[u8], index: usize, kind: TomlMultilineString) -> bool {
+    let quote = match kind {
+        TomlMultilineString::Basic => b'"',
+        TomlMultilineString::Literal => b'\'',
+    };
+    line.get(index..index + 3) == Some(&[quote, quote, quote])
+}
+
+fn basic_delimiter_is_escaped(line: &[u8], index: usize) -> bool {
+    let backslashes = line[..index]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    backslashes % 2 == 1
+}
+
+fn update_multiline_string_state(line: &str, state: &mut Option<TomlMultilineString>) {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(kind) = *state {
+            while index < bytes.len() {
+                if multiline_delimiter_at(bytes, index, kind)
+                    && (!matches!(kind, TomlMultilineString::Basic)
+                        || !basic_delimiter_is_escaped(bytes, index))
+                {
+                    *state = None;
+                    index += 3;
+                    break;
+                }
+                index += 1;
+            }
+            if state.is_some() {
+                return;
+            }
+            continue;
+        }
+
+        match bytes[index] {
+            b'#' => return,
+            b'"' if multiline_delimiter_at(bytes, index, TomlMultilineString::Basic) => {
+                *state = Some(TomlMultilineString::Basic);
+                index += 3;
+            }
+            b'\'' if multiline_delimiter_at(bytes, index, TomlMultilineString::Literal) => {
+                *state = Some(TomlMultilineString::Literal);
+                index += 3;
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'\'' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'\'' {
+                    index += 1;
+                }
+                index = (index + 1).min(bytes.len());
+            }
+            _ => index += 1,
+        }
+    }
+}
+
+fn toml_syntax_line_flags(contents: &str) -> Vec<bool> {
+    let mut state = None;
+    contents
+        .lines()
+        .map(|line| {
+            let is_syntax = state.is_none();
+            update_multiline_string_state(line, &mut state);
+            is_syntax
+        })
+        .collect()
+}
+
 fn managed_assignments(template: &str, section: Option<&str>, keys: &[&str]) -> Vec<String> {
     let mut current_section = None;
     template
@@ -1014,10 +1108,12 @@ fn managed_permission_profile_sections(template: &str) -> Vec<String> {
 
 fn remove_retired_managed_hook(existing: &str) -> String {
     let existing_lines = existing.lines().collect::<Vec<_>>();
+    let syntax_lines = toml_syntax_line_flags(existing);
     let mut merged = Vec::new();
     let mut index = 0;
     while index < existing_lines.len() {
-        if table_header(existing_lines[index]) != Some(PRE_TOOL_USE_HEADER) {
+        if !syntax_lines[index] || table_header(existing_lines[index]) != Some(PRE_TOOL_USE_HEADER)
+        {
             merged.push(existing_lines[index]);
             index += 1;
             continue;
@@ -1029,15 +1125,21 @@ fn remove_retired_managed_hook(existing: &str) -> String {
             .enumerate()
             .skip(index + 1)
             .find_map(|(next, line)| {
-                (table_header(line) == Some(PRE_TOOL_USE_HEADER)
-                    || (table_header(line).is_some()
-                        && table_header(line) != Some(PRE_TOOL_USE_HOOK_HEADER)))
-                .then_some(next)
+                syntax_lines[next]
+                    .then(|| table_header(line))
+                    .flatten()
+                    .is_some_and(|header| {
+                        header == PRE_TOOL_USE_HEADER || header != PRE_TOOL_USE_HOOK_HEADER
+                    })
+                    .then_some(next)
             })
             .unwrap_or(existing_lines.len());
         let has_managed_hook = existing_lines[section_start..section_end]
             .iter()
-            .any(|line| is_retired_managed_hook_command(line.trim()));
+            .enumerate()
+            .any(|(offset, line)| {
+                syntax_lines[section_start + offset] && is_retired_managed_hook_command(line.trim())
+            });
         if !has_managed_hook {
             merged.extend_from_slice(&existing_lines[section_start..section_end]);
             index = section_end;
@@ -1045,7 +1147,8 @@ fn remove_retired_managed_hook(existing: &str) -> String {
         }
 
         let first_hook = (section_start + 1..section_end).find(|position| {
-            table_header(existing_lines[*position]) == Some(PRE_TOOL_USE_HOOK_HEADER)
+            syntax_lines[*position]
+                && table_header(existing_lines[*position]) == Some(PRE_TOOL_USE_HOOK_HEADER)
         });
         let Some(first_hook) = first_hook else {
             index = section_end;
@@ -1056,12 +1159,17 @@ fn remove_retired_managed_hook(existing: &str) -> String {
         while hook_start < section_end {
             let hook_end = (hook_start + 1..section_end)
                 .find(|position| {
-                    table_header(existing_lines[*position]) == Some(PRE_TOOL_USE_HOOK_HEADER)
+                    syntax_lines[*position]
+                        && table_header(existing_lines[*position]) == Some(PRE_TOOL_USE_HOOK_HEADER)
                 })
                 .unwrap_or(section_end);
             if !existing_lines[hook_start..hook_end]
                 .iter()
-                .any(|line| is_retired_managed_hook_command(line.trim()))
+                .enumerate()
+                .any(|(offset, line)| {
+                    syntax_lines[hook_start + offset]
+                        && is_retired_managed_hook_command(line.trim())
+                })
             {
                 retained_hooks.extend_from_slice(&existing_lines[hook_start..hook_end]);
             }
@@ -1081,42 +1189,293 @@ fn is_retired_managed_hook_command(line: &str) -> bool {
 }
 
 fn table_from_inline(inline: &InlineTable) -> Table {
+    let mut source = inline.clone();
+    let keys = source
+        .iter()
+        .map(|(key, _)| key.to_owned())
+        .collect::<Vec<_>>();
     let mut table = Table::new();
-    for (key, value) in inline.iter() {
-        table.insert(key, Item::Value(value.clone()));
+    for key in keys {
+        if let Some((formatted_key, value)) = source.remove_entry(&key) {
+            table.insert_formatted(&formatted_key, Item::Value(value));
+        }
+    }
+
+    let mut comments = String::new();
+    for raw in [Some(inline.trailing()), inline.decor().suffix()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(raw) = raw.as_str() {
+            comments.push_str(raw);
+        }
+    }
+    if comments.contains('#') {
+        table.decor_mut().set_suffix(comments);
     }
     table
+}
+
+fn append_comment_fragment(comments: &mut String, raw: Option<&str>) -> bool {
+    let Some(raw) = raw.filter(|raw| raw.contains('#')) else {
+        return false;
+    };
+    if !comments.ends_with('\n') {
+        comments.push('\n');
+    }
+    comments.push_str(raw);
+    if !comments.ends_with('\n') {
+        comments.push('\n');
+    }
+    true
+}
+
+fn preserve_removed_entry_comments(table: &mut Table, key: &Key, item: &Item) -> bool {
+    let mut comments = table
+        .decor()
+        .suffix()
+        .and_then(|raw| raw.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let mut preserved = false;
+    preserved |= append_comment_fragment(
+        &mut comments,
+        key.leaf_decor().prefix().and_then(|raw| raw.as_str()),
+    );
+    preserved |= append_comment_fragment(
+        &mut comments,
+        key.leaf_decor().suffix().and_then(|raw| raw.as_str()),
+    );
+    if let Some(value) = item.as_value() {
+        preserved |= append_comment_fragment(
+            &mut comments,
+            value.decor().prefix().and_then(|raw| raw.as_str()),
+        );
+        preserved |= append_comment_fragment(
+            &mut comments,
+            value.decor().suffix().and_then(|raw| raw.as_str()),
+        );
+    } else if let Some(removed_table) = item.as_table() {
+        preserved |= append_comment_fragment(
+            &mut comments,
+            removed_table.decor().prefix().and_then(|raw| raw.as_str()),
+        );
+        preserved |= append_comment_fragment(
+            &mut comments,
+            removed_table.decor().suffix().and_then(|raw| raw.as_str()),
+        );
+    }
+    if preserved {
+        table.decor_mut().set_suffix(comments);
+    }
+    preserved
+}
+
+fn key_for_table_header(key: Key) -> Key {
+    let prefix = key
+        .leaf_decor()
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .filter(|prefix| prefix.contains('#'))
+        .map(str::to_owned);
+    let mut formatted = Key::new(key.get());
+    if let Some(prefix) = prefix {
+        formatted.leaf_decor_mut().set_prefix(prefix);
+    }
+    formatted
 }
 
 fn normalize_inline_feature_tables(existing: &str) -> String {
     let Ok(mut document) = existing.parse::<DocumentMut>() else {
         return existing.to_owned();
     };
-    let mut changed = false;
-    if let Some(inline) = document
-        .get("features")
-        .and_then(Item::as_inline_table)
-        .cloned()
-    {
-        document.insert("features", Item::Table(table_from_inline(&inline)));
-        changed = true;
-    }
-    let Some(features) = document.get_mut("features").and_then(Item::as_table_mut) else {
+    let Some((features_key, features_item)) = document.remove_entry("features") else {
         return existing.to_owned();
     };
-    if let Some(inline) = features
-        .get("rollout_budget")
-        .and_then(Item::as_inline_table)
-        .cloned()
-    {
-        features.insert("rollout_budget", Item::Table(table_from_inline(&inline)));
-        changed = true;
-    }
-    if changed {
-        document.to_string()
+    let mut features = if let Some(table) = features_item.as_table() {
+        table.clone()
+    } else if let Some(inline) = features_item.as_inline_table() {
+        table_from_inline(inline)
     } else {
-        existing.to_owned()
+        document.insert_formatted(&features_key, features_item);
+        return existing.to_owned();
+    };
+    features.set_implicit(false);
+    features.set_dotted(false);
+    for key in MANAGED_FEATURE_KEYS {
+        if let Some((formatted_key, item)) = features.remove_entry(key) {
+            preserve_removed_entry_comments(&mut features, &formatted_key, &item);
+        }
     }
+    for key in LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS {
+        if let Some((formatted_key, item)) = features.remove_entry(key) {
+            preserve_removed_entry_comments(&mut features, &formatted_key, &item);
+        }
+    }
+    if let Some((rollout_budget_key, rollout_budget_item)) = features.remove_entry("rollout_budget")
+    {
+        let mut rollout_budget = if let Some(table) = rollout_budget_item.as_table() {
+            table.clone()
+        } else if let Some(inline) = rollout_budget_item.as_inline_table() {
+            table_from_inline(inline)
+        } else {
+            features.insert_formatted(&rollout_budget_key, rollout_budget_item);
+            document.insert_formatted(&key_for_table_header(features_key), Item::Table(features));
+            return document.to_string();
+        };
+        rollout_budget.set_implicit(false);
+        rollout_budget.set_dotted(false);
+        for key in MANAGED_ROLLOUT_BUDGET_KEYS {
+            if let Some((formatted_key, item)) = rollout_budget.remove_entry(key) {
+                preserve_removed_entry_comments(&mut rollout_budget, &formatted_key, &item);
+            }
+        }
+        features.insert_formatted(
+            &key_for_table_header(rollout_budget_key),
+            Item::Table(rollout_budget),
+        );
+    }
+    document.insert_formatted(&key_for_table_header(features_key), Item::Table(features));
+    document.to_string()
+}
+
+#[derive(Clone, Copy)]
+enum ManagedFeatureValueKind {
+    Boolean,
+    PositiveInteger,
+    PositiveIntegerArray,
+    FiniteNonNegativeNumber,
+}
+
+fn rollout_budget_value_kind(key: &str) -> Option<ManagedFeatureValueKind> {
+    match key {
+        "enabled" => Some(ManagedFeatureValueKind::Boolean),
+        "limit_tokens" | "reminder_interval_tokens" => {
+            Some(ManagedFeatureValueKind::PositiveInteger)
+        }
+        "reminder_at_remaining_tokens" => Some(ManagedFeatureValueKind::PositiveIntegerArray),
+        "prefill_token_weight" | "sampling_token_weight" => {
+            Some(ManagedFeatureValueKind::FiniteNonNegativeNumber)
+        }
+        _ => None,
+    }
+}
+
+fn validate_managed_feature_value(
+    setting: &str,
+    value: &Value,
+    expected: ManagedFeatureValueKind,
+) -> Result<()> {
+    let valid = match expected {
+        ManagedFeatureValueKind::Boolean => value.as_bool().is_some(),
+        ManagedFeatureValueKind::PositiveInteger => {
+            value.as_integer().is_some_and(|number| number > 0)
+        }
+        ManagedFeatureValueKind::PositiveIntegerArray => value.as_array().is_some_and(|values| {
+            values
+                .iter()
+                .all(|value| value.as_integer().is_some_and(|number| number > 0))
+        }),
+        ManagedFeatureValueKind::FiniteNonNegativeNumber => {
+            value.as_integer().is_some_and(|number| number >= 0)
+                || value
+                    .as_float()
+                    .is_some_and(|number| number.is_finite() && number >= 0.0)
+        }
+    };
+    if !valid {
+        anyhow::bail!("Managed Codex feature setting has an invalid type or value: {setting}");
+    }
+    Ok(())
+}
+
+fn validate_managed_rollout_budget_item(setting: &str, item: &Item) -> Result<()> {
+    let value = item.as_value().with_context(|| {
+        format!("Managed rollout budget setting must be a TOML value: {setting}")
+    })?;
+    let kind = rollout_budget_value_kind(setting)
+        .with_context(|| format!("Unknown managed rollout budget setting: {setting}"))?;
+    validate_managed_feature_value(setting, value, kind)
+}
+
+fn validate_managed_rollout_budget_inline(inline: &InlineTable) -> Result<()> {
+    for key in MANAGED_ROLLOUT_BUDGET_KEYS {
+        if let Some(value) = inline.get(key) {
+            let kind = rollout_budget_value_kind(key)
+                .with_context(|| format!("Unknown managed rollout budget setting: {key}"))?;
+            validate_managed_feature_value(key, value, kind)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_feature_value_types(existing: &str) -> Result<()> {
+    if existing.trim().is_empty() {
+        return Ok(());
+    }
+    let document = existing
+        .parse::<DocumentMut>()
+        .context("Existing Codex config must be valid TOML before migrating features")?;
+    let Some(features) = document.get("features") else {
+        return Ok(());
+    };
+    if let Some(table) = features.as_table() {
+        for key in MANAGED_FEATURE_KEYS {
+            if let Some(item) = table.get(key) {
+                let value = item.as_value().with_context(|| {
+                    format!("Managed feature setting must be a TOML value: {key}")
+                })?;
+                validate_managed_feature_value(key, value, ManagedFeatureValueKind::Boolean)?;
+            }
+        }
+        for legacy_key in LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS {
+            if let Some(item) = table.get(legacy_key) {
+                let key = legacy_key
+                    .strip_prefix("rollout_budget.")
+                    .context("Managed rollout budget key must have the expected prefix")?;
+                validate_managed_rollout_budget_item(key, item)?;
+            }
+        }
+        if let Some(rollout_budget) = table.get("rollout_budget") {
+            if let Some(table) = rollout_budget.as_table() {
+                for key in MANAGED_ROLLOUT_BUDGET_KEYS {
+                    if let Some(item) = table.get(key) {
+                        validate_managed_rollout_budget_item(key, item)?;
+                    }
+                }
+            } else if let Some(inline) = rollout_budget.as_inline_table() {
+                validate_managed_rollout_budget_inline(inline)?;
+            } else {
+                anyhow::bail!("features.rollout_budget must be a TOML table");
+            }
+        }
+    } else if let Some(inline) = features.as_inline_table() {
+        for key in MANAGED_FEATURE_KEYS {
+            if let Some(value) = inline.get(key) {
+                validate_managed_feature_value(key, value, ManagedFeatureValueKind::Boolean)?;
+            }
+        }
+        for legacy_key in LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS {
+            if let Some(value) = inline.get(legacy_key) {
+                let key = legacy_key
+                    .strip_prefix("rollout_budget.")
+                    .context("Managed rollout budget key must have the expected prefix")?;
+                let kind = rollout_budget_value_kind(key)
+                    .with_context(|| format!("Unknown managed rollout budget setting: {key}"))?;
+                validate_managed_feature_value(key, value, kind)?;
+            }
+        }
+        if let Some(rollout_budget) = inline.get("rollout_budget") {
+            if let Some(rollout_budget) = rollout_budget.as_inline_table() {
+                validate_managed_rollout_budget_inline(rollout_budget)?;
+            } else {
+                anyhow::bail!("features.rollout_budget must be a TOML table");
+            }
+        }
+    } else {
+        anyhow::bail!("features must be a TOML table");
+    }
+    Ok(())
 }
 
 fn merge_managed_config(template: &str, existing: &str) -> String {
@@ -1131,6 +1490,10 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     let managed_permissions = managed_permission_profile_sections(template);
 
     let existing = normalize_inline_feature_tables(existing);
+    // Add the managed hook before rebuilding managed permission sections so a
+    // config that did not already contain the hook reaches its stable section
+    // order in a single migration.
+    let existing = sync_managed_hook(template, &existing);
     let mut in_top_level = true;
     let mut in_agents = false;
     let mut in_legacy_profile_table = false;
@@ -1142,8 +1505,10 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     let mut features_found = false;
     let mut rollout_budget_found = false;
     let mut preserved_lines = Vec::new();
-    for line in existing.lines() {
-        let header = table_header(line);
+    let syntax_lines = toml_syntax_line_flags(&existing);
+    for (index, line) in existing.lines().enumerate() {
+        let is_syntax = syntax_lines[index];
+        let header = is_syntax.then(|| table_header(line)).flatten();
         if let Some(header) = header {
             in_top_level = false;
             in_legacy_profile_table = header == "[profiles]" || header.starts_with("[profiles.");
@@ -1165,26 +1530,28 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         if in_legacy_profile_table || in_retired_sandbox_table || in_managed_permission_profile {
             continue;
         }
-        if in_top_level && is_assignment_for(line, &["profile"]) {
+        if is_syntax && in_top_level && is_assignment_for(line, &["profile"]) {
             continue;
         }
-        if in_top_level
+        if is_syntax
+            && in_top_level
             && (is_assignment_for(line, MANAGED_CONFIG_KEYS)
                 || is_assignment_for(line, RETIRED_CONFIG_KEYS))
         {
             continue;
         }
-        if in_agents && is_assignment_for(line, MANAGED_AGENT_KEYS) {
+        if is_syntax && in_agents && is_assignment_for(line, MANAGED_AGENT_KEYS) {
             continue;
         }
-        if in_features
+        if is_syntax
+            && in_features
             && (is_assignment_for(line, MANAGED_FEATURE_KEYS)
                 || is_assignment_for(line, LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS)
                 || is_assignment_for(line, &["rollout_budget"]))
         {
             continue;
         }
-        if in_rollout_budget && is_assignment_for(line, MANAGED_ROLLOUT_BUDGET_KEYS) {
+        if is_syntax && in_rollout_budget && is_assignment_for(line, MANAGED_ROLLOUT_BUDGET_KEYS) {
             continue;
         }
         preserved_lines.push(line);
@@ -1227,12 +1594,11 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         .trim_start_matches('\n')
         .to_string();
 
-    let merged = if preserved.is_empty() {
+    if preserved.is_empty() {
         format!("{managed}\n")
     } else {
         format!("{managed}\n\n{preserved}\n")
-    };
-    sync_managed_hook(template, &merged)
+    }
 }
 
 fn merge_managed_config_with_root(
@@ -1241,6 +1607,7 @@ fn merge_managed_config_with_root(
     managed_root: &Path,
     home: &Path,
 ) -> Result<String> {
+    validate_managed_feature_value_types(existing)?;
     let legacy_roots = legacy_workspace_roots(existing, home)?;
     let profile_roots = managed_profile_workspace_roots(existing, home)?;
     let existing = remove_managed_permission_profile(existing)?;
@@ -1440,25 +1807,47 @@ fn remove_managed_permission_profile(contents: &str) -> Result<String> {
     let mut document = contents
         .parse::<DocumentMut>()
         .context("Existing Codex config must be valid TOML before normalizing permissions")?;
-    let Some(permissions) = document.get("permissions") else {
+    let Some((permissions_key, permissions_item)) = document.remove_entry("permissions") else {
         return Ok(contents.to_string());
     };
-    let mut normalized = if let Some(permissions) = permissions.as_table() {
+    let root_has_comments = permissions_key
+        .leaf_decor()
+        .prefix()
+        .and_then(|raw| raw.as_str())
+        .is_some_and(|raw| raw.contains('#'))
+        || permissions_item
+            .as_value()
+            .into_iter()
+            .flat_map(|value| [value.decor().prefix(), value.decor().suffix()])
+            .flatten()
+            .filter_map(|raw| raw.as_str())
+            .any(|raw| raw.contains('#'));
+    let mut normalized = if let Some(permissions) = permissions_item.as_table() {
         permissions.clone()
-    } else if let Some(permissions) = permissions.as_inline_table() {
-        let mut normalized = Table::new();
-        for (name, profile) in permissions.iter() {
-            normalized.insert(name, Item::Value(profile.clone()));
-        }
-        normalized
+    } else if let Some(permissions) = permissions_item.as_inline_table() {
+        table_from_inline(permissions)
     } else {
         anyhow::bail!("permissions must be a TOML table");
     };
-    normalized.remove(MANAGED_PERMISSION_PROFILE);
-    if normalized.is_empty() {
-        document.remove("permissions");
-    } else {
-        document.insert("permissions", Item::Table(normalized));
+    let normalized_has_comments = [normalized.decor().prefix(), normalized.decor().suffix()]
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| raw.as_str())
+        .any(|raw| raw.contains('#'));
+    let removed_comments = normalized
+        .remove_entry(MANAGED_PERMISSION_PROFILE)
+        .is_some_and(|(key, item)| preserve_removed_entry_comments(&mut normalized, &key, &item));
+    if !normalized.is_empty() {
+        document.insert_formatted(
+            &key_for_table_header(permissions_key),
+            Item::Table(normalized),
+        );
+    } else if root_has_comments || normalized_has_comments || removed_comments {
+        preserve_removed_entry_comments(
+            document.as_table_mut(),
+            &permissions_key,
+            &Item::Table(normalized),
+        );
     }
     let mut rendered = document.to_string();
     if !rendered.ends_with('\n') {
@@ -3626,12 +4015,13 @@ mod tests {
         ensure_managed_hook_with_legacy_hash, ensure_managed_workspace_root,
         ensure_private_directory, legacy_hash_for_destination, managed_hook_state_path,
         managed_transaction_path, merge_managed_config, merge_managed_config_with_root,
-        migrate_managed_config_from_template, preflight_config_state,
-        preflight_managed_binary_destination, preflight_operation_transaction,
-        preflight_refresh_transaction, preflight_setup_transaction, preflight_shared_symlink,
-        publish_regular_file_exclusive, reject_cargo_configuration, sha256,
-        trusted_user_executable, valid_release_binary_magic, validate_setup_home,
-        verify_managed_symlink, write_file_exclusive,
+        migrate_managed_config_from_template, migrate_managed_config_from_template_with_root,
+        preflight_config_state, preflight_managed_binary_destination,
+        preflight_operation_transaction, preflight_refresh_transaction,
+        preflight_setup_transaction, preflight_shared_symlink, publish_regular_file_exclusive,
+        reject_cargo_configuration, sha256, trusted_user_executable, valid_release_binary_magic,
+        validate_managed_feature_value_types, validate_setup_home, verify_managed_symlink,
+        write_file_exclusive,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3725,16 +4115,20 @@ mod tests {
         assert_eq!(document["features"]["goals"].as_bool(), Some(true));
         assert_eq!(
             document["features"]["rollout_budget"]["enabled"].as_bool(),
-            Some(true)
+            Some(false)
         );
-        assert_eq!(
-            document["features"]["rollout_budget"]["limit_tokens"].as_integer(),
-            Some(200_000)
-        );
-        assert_eq!(
-            document["features"]["rollout_budget"]["reminder_interval_tokens"].as_integer(),
-            Some(20_000)
-        );
+        for key in [
+            "limit_tokens",
+            "reminder_interval_tokens",
+            "reminder_at_remaining_tokens",
+            "prefill_token_weight",
+            "sampling_token_weight",
+        ] {
+            assert!(
+                document["features"]["rollout_budget"].get(key).is_none(),
+                "rollout budget hard-stop setting must be absent: {key}"
+            );
+        }
         assert_eq!(
             document["permissions"][MANAGED_PERMISSION_PROFILE]["extends"].as_str(),
             Some(":workspace")
@@ -4207,6 +4601,7 @@ approval_policy = "on-request"
 approvals_reviewer = "auto_review"
 default_permissions = "codex-autonomous"
 commit_attribution = ""
+suppress_unstable_features_warning = true
 
 [features]
 hooks = true
@@ -4215,7 +4610,7 @@ goals = true
 [features.rollout_budget]
 enabled = true
 limit_tokens = 200000
-reminder_interval_tokens = 20000
+reminder_at_remaining_tokens = [180000, 160000, 140000, 120000, 100000, 80000, 60000, 40000, 20000]
 prefill_token_weight = 1.0
 sampling_token_weight = 1.0
 
@@ -4236,6 +4631,7 @@ default_subagent_reasoning_effort = "medium"
 "#;
         let existing = r#"model = "old"
 sandbox_mode = "read-only"
+suppress_unstable_features_warning = false
 
 [sandbox_workspace_write]
 network_access = false
@@ -4249,6 +4645,7 @@ network_proxy = true
 [features.rollout_budget]
 enabled = false
 limit_tokens = 999999
+reminder_interval_tokens = 99999
 local_budget_note = "preserved"
 
 [permissions.codex-autonomous]
@@ -4281,10 +4678,12 @@ description = "local"
         assert!(actual.contains("default_permissions = \"codex-autonomous\""));
         assert!(actual.contains("approvals_reviewer = \"auto_review\""));
         assert!(actual.contains("commit_attribution = \"\""));
+        assert!(actual.contains("suppress_unstable_features_warning = false"));
         assert!(actual.contains("[features]\nhooks = true\ngoals = true\nnetwork_proxy = true"));
         assert!(actual.contains(
-            "[features.rollout_budget]\nenabled = true\nlimit_tokens = 200000\nreminder_interval_tokens = 20000\nprefill_token_weight = 1.0\nsampling_token_weight = 1.0\nlocal_budget_note = \"preserved\""
+            "[features.rollout_budget]\nenabled = true\nlimit_tokens = 200000\nreminder_at_remaining_tokens = [180000, 160000, 140000, 120000, 100000, 80000, 60000, 40000, 20000]\nprefill_token_weight = 1.0\nsampling_token_weight = 1.0\nlocal_budget_note = \"preserved\""
         ));
+        assert!(!actual.contains("reminder_interval_tokens"));
         assert!(actual.parse::<toml_edit::DocumentMut>().is_ok());
         assert!(actual.contains("[permissions.codex-autonomous]\nextends = \":workspace\""));
         assert!(actual.contains("\".git\" = \"write\""));
@@ -4311,12 +4710,14 @@ description = "local"
 hooks = false
 rollout_budget.enabled = false
 rollout_budget.limit_tokens = 999999
+rollout_budget.reminder_interval_tokens = 99999
 network_proxy = true
 "#;
         let migrated = merge_managed_config(template, legacy_dotted);
         assert!(migrated.contains("[features]\nhooks = true\ngoals = true\nnetwork_proxy = true"));
         assert!(migrated.contains("[features.rollout_budget]\nenabled = true"));
         assert!(!migrated.contains("rollout_budget.enabled"));
+        assert!(!migrated.contains("rollout_budget.reminder_interval_tokens"));
         assert!(migrated.parse::<toml_edit::DocumentMut>().is_ok());
 
         let legacy_inline = r#"[features]
@@ -4369,6 +4770,62 @@ network_proxy = true
         );
         assert_eq!(merge_managed_config(template, &migrated), migrated);
 
+        let quoted = r#"[features]
+"hooks" = false
+
+[features.rollout_budget]
+"enabled" = false
+"reminder_at_remaining_tokens" = [
+  99999,
+  77777,
+]
+"sampling_token_weight" = 9.0
+"local_quoted_note" = "preserved"
+"#;
+        let migrated = merge_managed_config(template, quoted);
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("quoted rollout budget migration must remain valid TOML");
+        assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(
+            document["features"]["rollout_budget"]["reminder_at_remaining_tokens"]
+                .as_array()
+                .expect("managed rollout budget reminders")
+                .len(),
+            9
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["local_quoted_note"].as_str(),
+            Some("preserved")
+        );
+        assert!(!migrated.contains("reminder_interval_tokens"));
+        assert!(!migrated.contains("99999"));
+        assert!(!migrated.contains("77777"));
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
+
+        let dotted = r#"[features]
+rollout_budget."reminder_interval_tokens" = 99999
+rollout_budget."local_budget_note" = "preserved"
+"#;
+        let migrated = merge_managed_config(template, dotted);
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("dotted rollout budget migration must remain valid TOML");
+        assert_eq!(
+            document["features"]["rollout_budget"]["reminder_at_remaining_tokens"]
+                .as_array()
+                .expect("managed rollout budget reminders")
+                .len(),
+            9
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["local_budget_note"].as_str(),
+            Some("preserved")
+        );
+        assert!(!migrated.contains("reminder_interval_tokens"));
+        assert!(!migrated.contains("99999"));
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
+
         let root_inline_without_budget = r#"features = { hooks = false, local_feature = "preserved" }
 "#;
         let migrated = merge_managed_config(template, root_inline_without_budget);
@@ -4385,6 +4842,442 @@ network_proxy = true
             Some(200000)
         );
         assert_eq!(merge_managed_config(template, &migrated), migrated);
+
+        let quoted_header = r#"[features."rollout_budget"]
+"enabled" = true
+"limit_tokens" = 200000
+local_budget_note = "preserved"
+"#;
+        let migrated = merge_managed_config(template, quoted_header);
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("quoted rollout budget header migration must remain valid TOML");
+        assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(
+            document["features"]["rollout_budget"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["local_budget_note"].as_str(),
+            Some("preserved")
+        );
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
+
+        let quoted_dotted_key = r#"[features]
+"rollout_budget.limit_tokens" = 99999
+network_proxy = true
+"#;
+        let migrated = merge_managed_config(template, quoted_dotted_key);
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("quoted dotted rollout budget key migration must remain valid TOML");
+        assert!(
+            document["features"]
+                .get("rollout_budget.limit_tokens")
+                .is_none()
+        );
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
+
+        let root_dotted = r#"features.local_feature = "preserved"
+features.rollout_budget.enabled = false
+features.rollout_budget.limit_tokens = 99999
+"#;
+        let migrated = merge_managed_config(template, root_dotted);
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("root dotted features migration must remain valid TOML");
+        assert_eq!(
+            document["features"]["local_feature"].as_str(),
+            Some("preserved")
+        );
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
+    }
+
+    #[test]
+    fn rollout_budget_hard_stop_is_disabled_and_limits_are_retired() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("rollout-budget-schema");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let existing = r#"[features]
+hooks = false
+goals = false
+
+[features.rollout_budget]
+enabled = true
+limit_tokens = 200000
+reminder_interval_tokens = 20000
+reminder_at_remaining_tokens = [180000, 160000]
+prefill_token_weight = 1.0
+sampling_token_weight = 1.0
+local_budget_note = "preserved"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '"$HOME/.codex/hooks/block-git-write"'
+timeout = 10
+statusMessage = "Git/GitHub操作を確認中"
+"#;
+
+        let migrated =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate a valid legacy rollout budget schema");
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("disabled rollout budget migration must remain valid TOML");
+        let rollout_budget = &document["features"]["rollout_budget"];
+        assert_eq!(rollout_budget["enabled"].as_bool(), Some(false));
+        for key in [
+            "limit_tokens",
+            "reminder_interval_tokens",
+            "reminder_at_remaining_tokens",
+            "prefill_token_weight",
+            "sampling_token_weight",
+        ] {
+            assert!(
+                rollout_budget.get(key).is_none(),
+                "rollout budget hard-stop setting must be retired: {key}"
+            );
+        }
+        assert_eq!(
+            rollout_budget["local_budget_note"].as_str(),
+            Some("preserved")
+        );
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat valid rollout budget migration"),
+            migrated
+        );
+
+        let inline_existing = r#"features = { hooks = false, goals = false, local_feature = "preserved", rollout_budget = { enabled = true, limit_tokens = 1, reminder_interval_tokens = 1, reminder_at_remaining_tokens = [], prefill_token_weight = 0, sampling_token_weight = 0.5, local_budget_note = "preserved" } }
+"#;
+        let inline_migrated = merge_managed_config_with_root(
+            template,
+            inline_existing,
+            &managed_root,
+            directory.path(),
+        )
+        .expect("migrate a valid inline legacy rollout budget schema");
+        let inline_document = inline_migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("inline migration must remain valid TOML");
+        assert_eq!(inline_document["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(
+            inline_document["features"]["local_feature"].as_str(),
+            Some("preserved")
+        );
+        assert_eq!(
+            inline_document["features"]["rollout_budget"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            inline_document["features"]["rollout_budget"]["local_budget_note"].as_str(),
+            Some("preserved")
+        );
+
+        for equivalent_existing in [
+            "[features.\"rollout_budget\"]\n\"enabled\" = true\n\"limit_tokens\" = 200000\nlocal_budget_note = \"preserved\"\n",
+            "[features]\nrollout_budget.\"reminder_interval_tokens\" = 20000\nrollout_budget.\"local_budget_note\" = \"preserved\"\n",
+            "[features]\n\"rollout_budget.limit_tokens\" = 200000\nlocal_feature = \"preserved\"\n",
+            "features.local_feature = \"preserved\"\nfeatures.rollout_budget.enabled = true\nfeatures.rollout_budget.limit_tokens = 200000\n",
+        ] {
+            let equivalent_migrated = merge_managed_config_with_root(
+                template,
+                equivalent_existing,
+                &managed_root,
+                directory.path(),
+            )
+            .expect("migrate an equivalent valid rollout budget representation");
+            equivalent_migrated
+                .parse::<toml_edit::DocumentMut>()
+                .expect("equivalent migration must remain valid TOML");
+            assert_eq!(
+                merge_managed_config_with_root(
+                    template,
+                    &equivalent_migrated,
+                    &managed_root,
+                    directory.path(),
+                )
+                .expect("repeat equivalent rollout budget migration"),
+                equivalent_migrated
+            );
+        }
+
+        let nested_local_data = r#"[features.rollout_budget]
+[features.rollout_budget.limit_tokens]
+local_note = "preserve"
+"#;
+        assert!(validate_managed_feature_value_types(nested_local_data).is_err());
+    }
+
+    #[test]
+    fn invalid_managed_feature_schema_fails_closed_before_backup_or_write() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("invalid-rollout-budget-schema");
+        let managed_root = directory.path().join("codex").join("worktrees");
+
+        for existing in [
+            "[features.rollout_budget]\nlimit_tokens = { local_note = \"preserve\" }\n",
+            "[features.rollout_budget]\nlimit_tokens = [200000]\n",
+            "[features.rollout_budget]\nlimit_tokens = \"200000\"\n",
+            "[features.rollout_budget]\nreminder_at_remaining_tokens = [180000, { local_note = \"preserve\" }]\n",
+            "[features.rollout_budget]\nprefill_token_weight = nan\n",
+            "[features]\nhooks = []\n",
+            "features = { rollout_budget = { limit_tokens = { local_note = \"preserve\" } } }\n",
+            "features = { \"rollout_budget.limit_tokens\" = [200000] }\n",
+            "[features]\n\"rollout_budget.limit_tokens\" = { local_note = \"preserve\" }\n",
+        ] {
+            assert!(
+                merge_managed_config_with_root(
+                    template,
+                    existing,
+                    &managed_root,
+                    directory.path(),
+                )
+                .is_err(),
+                "invalid managed feature value must fail closed: {existing}"
+            );
+        }
+
+        let codex_dir = directory.path().join("actual-codex");
+        fs::create_dir(&codex_dir).expect("create isolated Codex directory");
+        let template_path = directory.path().join("config.base.toml");
+        fs::write(&template_path, template).expect("write isolated config template");
+        let config_path = codex_dir.join("config.toml");
+        let original = "[features.rollout_budget]\nlimit_tokens = { local_note = \"preserve\" }\n";
+        fs::write(&config_path, original).expect("write isolated invalid config");
+
+        assert!(
+            migrate_managed_config_from_template_with_root(
+                &codex_dir,
+                &template_path,
+                &managed_root,
+                directory.path(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read unchanged invalid config"),
+            original
+        );
+        let entries = fs::read_dir(&codex_dir)
+            .expect("read isolated Codex directory")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("collect isolated Codex directory entries");
+        assert_eq!(
+            entries.len(),
+            1,
+            "migration must not create a backup or temp file"
+        );
+        assert_eq!(entries[0].file_name(), "config.toml");
+    }
+
+    #[test]
+    fn managed_multiline_values_do_not_inject_table_headers() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("multiline-feature-value");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let existing = r#"[features]
+local_basic = """
+[features.rollout_budget]
+preserve-basic
+"""
+local_literal = '''
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+command = 'python3 "$HOME/.codex/hooks/prevent_irreversible_git.py"'
+'''
+"#;
+        let before = existing
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse existing multiline values");
+
+        let migrated =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate multiline local feature values");
+        let after = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("multiline migration must remain valid TOML");
+        assert_eq!(
+            after["features"]["local_basic"].as_str(),
+            before["features"]["local_basic"].as_str()
+        );
+        assert_eq!(
+            after["features"]["local_literal"].as_str(),
+            before["features"]["local_literal"].as_str()
+        );
+        assert_eq!(
+            after["features"]["rollout_budget"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat multiline feature migration"),
+            migrated
+        );
+    }
+
+    #[test]
+    fn feature_normalization_preserves_outer_comments() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("feature-comment-decor");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let fixtures = [
+            "# keep-before-root-inline\nfeatures = { hooks = false, local_feature = \"preserved\" } # keep-after-root-inline\n",
+            "# keep-before-root-dotted\nfeatures.local_feature = \"preserved\" # keep-after-root-dotted\n",
+            "[features]\n# keep-before-budget-inline\nrollout_budget = { enabled = true, local_budget_note = \"preserved\" } # keep-after-budget-inline\n",
+        ];
+
+        for existing in fixtures {
+            let migrated =
+                merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                    .expect("migrate a feature representation with outer comments");
+            for comment in existing
+                .lines()
+                .filter_map(|line| line.split_once('#').map(|(_, comment)| comment.trim()))
+            {
+                assert!(
+                    migrated.contains(&format!("# {comment}")),
+                    "migration must preserve local comment: {comment}"
+                );
+            }
+            let document = migrated
+                .parse::<toml_edit::DocumentMut>()
+                .expect("comment-preserving migration must remain valid TOML");
+            assert_eq!(
+                document["features"]["rollout_budget"]["enabled"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(
+                merge_managed_config_with_root(
+                    template,
+                    &migrated,
+                    &managed_root,
+                    directory.path(),
+                )
+                .expect("repeat comment-preserving migration"),
+                migrated
+            );
+        }
+    }
+
+    #[test]
+    fn feature_normalization_preserves_inline_comments() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("inline-feature-comments");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let fixtures = [
+            r#"features = {
+  hooks = false,
+  # keep-root-local-annotation
+  local_feature = "preserved",
+  # keep-root-trailing-annotation
+}
+"#,
+            r#"[features]
+rollout_budget = {
+  enabled = true,
+  # keep-budget-local-annotation
+  local_budget_note = "preserved",
+  # keep-budget-trailing-annotation
+}
+"#,
+        ];
+
+        for existing in fixtures {
+            let migrated =
+                merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                    .expect("migrate multiline inline feature comments");
+            for comment in existing
+                .lines()
+                .filter_map(|line| line.split_once('#').map(|(_, comment)| comment.trim()))
+            {
+                assert!(
+                    migrated.contains(&format!("# {comment}")),
+                    "migration must preserve inline comment: {comment}"
+                );
+            }
+            let document = migrated
+                .parse::<toml_edit::DocumentMut>()
+                .expect("inline comment migration must remain valid TOML");
+            assert_eq!(
+                document["features"]["rollout_budget"]["enabled"].as_bool(),
+                Some(false)
+            );
+            let local_feature = document["features"]
+                .get("local_feature")
+                .and_then(|item| item.as_str());
+            let local_budget_note = document["features"]["rollout_budget"]
+                .get("local_budget_note")
+                .and_then(|item| item.as_str());
+            assert!(local_feature == Some("preserved") || local_budget_note == Some("preserved"));
+            assert_eq!(
+                merge_managed_config_with_root(
+                    template,
+                    &migrated,
+                    &managed_root,
+                    directory.path(),
+                )
+                .expect("repeat inline comment migration"),
+                migrated
+            );
+        }
+    }
+
+    #[test]
+    fn feature_normalization_preserves_managed_key_comments() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("managed-feature-comments");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let fixtures = [
+            r#"[features]
+# keep-before-standard-hook
+hooks = false # keep-after-standard-hook
+local_feature = true
+"#,
+            r#"features = {
+  # keep-before-inline-hook
+  hooks = false, # keep-after-inline-hook
+  local_feature = true,
+}
+"#,
+            r#"# keep-before-dotted-hook
+features.hooks = false # keep-after-dotted-hook
+features.local_feature = true
+"#,
+        ];
+
+        for existing in fixtures {
+            let migrated =
+                merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                    .expect("migrate managed feature comments");
+            for comment in existing
+                .lines()
+                .filter_map(|line| line.split_once('#').map(|(_, comment)| comment.trim()))
+            {
+                assert!(
+                    migrated.contains(&format!("# {comment}")),
+                    "migration must preserve managed key comment: {comment}"
+                );
+            }
+            let document = migrated
+                .parse::<toml_edit::DocumentMut>()
+                .expect("managed key comment migration must remain valid TOML");
+            assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+            assert_eq!(document["features"]["local_feature"].as_bool(), Some(true));
+            assert_eq!(
+                merge_managed_config_with_root(
+                    template,
+                    &migrated,
+                    &managed_root,
+                    directory.path(),
+                )
+                .expect("repeat managed feature comment migration"),
+                migrated
+            );
+        }
     }
 
     #[test]
@@ -5819,6 +6712,91 @@ workspace_roots = { "/srv/quoted" = true }
                 merged
             );
         }
+    }
+
+    #[test]
+    fn inline_permissions_preserve_local_comments() {
+        let directory = TestDirectory::new("inline-permission-comments");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"# keep-before-permissions
+permissions = {
+  # keep-local-profile
+  local = { workspace_roots = { "/srv/local" = true } },
+} # keep-after-permissions
+"#;
+
+        let migrated =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate inline permission comments");
+        for comment in [
+            "keep-before-permissions",
+            "keep-local-profile",
+            "keep-after-permissions",
+        ] {
+            assert!(
+                migrated.contains(&format!("# {comment}")),
+                "migration must preserve permission comment: {comment}"
+            );
+        }
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("permission comment migration must remain valid TOML");
+        assert_eq!(
+            document["permissions"]["local"]["workspace_roots"]["/srv/local"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]
+                [managed_root.to_str().expect("UTF-8 managed root")]
+            .as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat inline permission comment migration"),
+            migrated
+        );
+    }
+
+    #[test]
+    fn empty_inline_permissions_preserve_trailing_comments() {
+        let directory = TestDirectory::new("empty-inline-permission-comments");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        let template = r#"default_permissions = "codex-autonomous"
+
+[permissions.codex-autonomous]
+extends = ":workspace"
+"#;
+        let existing = r#"permissions = {
+  # keep-empty-permissions-comment
+}
+"#;
+
+        let migrated =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate empty inline permission comments");
+        assert!(migrated.contains("# keep-empty-permissions-comment"));
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("empty permission comment migration must remain valid TOML");
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]
+                [managed_root.to_str().expect("UTF-8 managed root")]
+            .as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat empty permission comment migration"),
+            migrated
+        );
     }
 
     #[test]
