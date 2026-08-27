@@ -1080,27 +1080,43 @@ fn is_retired_managed_hook_command(line: &str) -> bool {
     line == RETIRED_HOOK_COMMAND || line == PYTHON_MANAGED_HOOK_COMMAND
 }
 
-fn normalize_inline_rollout_budget(existing: &str) -> String {
-    let Ok(mut document) = existing.parse::<DocumentMut>() else {
-        return existing.to_owned();
-    };
-    let Some(features) = document.get_mut("features").and_then(Item::as_table_mut) else {
-        return existing.to_owned();
-    };
-    let Some(inline) = features
-        .get("rollout_budget")
-        .and_then(Item::as_inline_table)
-        .cloned()
-    else {
-        return existing.to_owned();
-    };
-
+fn table_from_inline(inline: &InlineTable) -> Table {
     let mut table = Table::new();
     for (key, value) in inline.iter() {
         table.insert(key, Item::Value(value.clone()));
     }
-    features.insert("rollout_budget", Item::Table(table));
-    document.to_string()
+    table
+}
+
+fn normalize_inline_feature_tables(existing: &str) -> String {
+    let Ok(mut document) = existing.parse::<DocumentMut>() else {
+        return existing.to_owned();
+    };
+    let mut changed = false;
+    if let Some(inline) = document
+        .get("features")
+        .and_then(Item::as_inline_table)
+        .cloned()
+    {
+        document.insert("features", Item::Table(table_from_inline(&inline)));
+        changed = true;
+    }
+    let Some(features) = document.get_mut("features").and_then(Item::as_table_mut) else {
+        return existing.to_owned();
+    };
+    if let Some(inline) = features
+        .get("rollout_budget")
+        .and_then(Item::as_inline_table)
+        .cloned()
+    {
+        features.insert("rollout_budget", Item::Table(table_from_inline(&inline)));
+        changed = true;
+    }
+    if changed {
+        document.to_string()
+    } else {
+        existing.to_owned()
+    }
 }
 
 fn merge_managed_config(template: &str, existing: &str) -> String {
@@ -1114,7 +1130,7 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     let managed_agents = managed_assignments(template, Some("[agents]"), MANAGED_AGENT_KEYS);
     let managed_permissions = managed_permission_profile_sections(template);
 
-    let existing = normalize_inline_rollout_budget(existing);
+    let existing = normalize_inline_feature_tables(existing);
     let mut in_top_level = true;
     let mut in_agents = false;
     let mut in_legacy_profile_table = false;
@@ -1163,7 +1179,8 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         }
         if in_features
             && (is_assignment_for(line, MANAGED_FEATURE_KEYS)
-                || is_assignment_for(line, LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS))
+                || is_assignment_for(line, LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS)
+                || is_assignment_for(line, &["rollout_budget"]))
         {
             continue;
         }
@@ -4322,6 +4339,50 @@ network_proxy = true
         assert_eq!(
             document["features"]["rollout_budget"]["local_budget_note"].as_str(),
             Some("preserved")
+        );
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
+
+        let root_inline = r#"features = { hooks = false, goals = false, network_proxy = true, local_feature = "preserved", rollout_budget = { enabled = false, limit_tokens = 999999, local_budget_note = "preserved" } }
+"#;
+        let migrated = merge_managed_config(template, root_inline);
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("root inline features migration must remain valid TOML");
+        assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(document["features"]["goals"].as_bool(), Some(true));
+        assert_eq!(document["features"]["network_proxy"].as_bool(), Some(true));
+        assert_eq!(
+            document["features"]["local_feature"].as_str(),
+            Some("preserved")
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["limit_tokens"].as_integer(),
+            Some(200000)
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["local_budget_note"].as_str(),
+            Some("preserved")
+        );
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
+
+        let root_inline_without_budget = r#"features = { hooks = false, local_feature = "preserved" }
+"#;
+        let migrated = merge_managed_config(template, root_inline_without_budget);
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("root inline features without a budget must remain valid TOML");
+        assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(
+            document["features"]["local_feature"].as_str(),
+            Some("preserved")
+        );
+        assert_eq!(
+            document["features"]["rollout_budget"]["limit_tokens"].as_integer(),
+            Some(200000)
         );
         assert_eq!(merge_managed_config(template, &migrated), migrated);
     }
