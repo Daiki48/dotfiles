@@ -103,6 +103,7 @@ const LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS: &[&str] = &[
     "rollout_budget.enabled",
     "rollout_budget.limit_tokens",
     "rollout_budget.reminder_interval_tokens",
+    "rollout_budget.reminder_at_remaining_tokens",
     "rollout_budget.prefill_token_weight",
     "rollout_budget.sampling_token_weight",
 ];
@@ -110,6 +111,7 @@ const MANAGED_ROLLOUT_BUDGET_KEYS: &[&str] = &[
     "enabled",
     "limit_tokens",
     "reminder_interval_tokens",
+    "reminder_at_remaining_tokens",
     "prefill_token_weight",
     "sampling_token_weight",
 ];
@@ -3732,8 +3734,15 @@ mod tests {
             Some(200_000)
         );
         assert_eq!(
-            document["features"]["rollout_budget"]["reminder_interval_tokens"].as_integer(),
-            Some(20_000)
+            document["features"]["rollout_budget"]["reminder_at_remaining_tokens"]
+                .as_array()
+                .expect("rollout budget reminders")
+                .iter()
+                .filter_map(|value| value.as_integer())
+                .collect::<Vec<_>>(),
+            vec![
+                180_000, 160_000, 140_000, 120_000, 100_000, 80_000, 60_000, 40_000, 20_000
+            ]
         );
         assert_eq!(
             document["permissions"][MANAGED_PERMISSION_PROFILE]["extends"].as_str(),
@@ -4215,7 +4224,7 @@ goals = true
 [features.rollout_budget]
 enabled = true
 limit_tokens = 200000
-reminder_interval_tokens = 20000
+reminder_at_remaining_tokens = [180000, 160000, 140000, 120000, 100000, 80000, 60000, 40000, 20000]
 prefill_token_weight = 1.0
 sampling_token_weight = 1.0
 
@@ -4249,6 +4258,7 @@ network_proxy = true
 [features.rollout_budget]
 enabled = false
 limit_tokens = 999999
+reminder_interval_tokens = 99999
 local_budget_note = "preserved"
 
 [permissions.codex-autonomous]
@@ -4283,8 +4293,9 @@ description = "local"
         assert!(actual.contains("commit_attribution = \"\""));
         assert!(actual.contains("[features]\nhooks = true\ngoals = true\nnetwork_proxy = true"));
         assert!(actual.contains(
-            "[features.rollout_budget]\nenabled = true\nlimit_tokens = 200000\nreminder_interval_tokens = 20000\nprefill_token_weight = 1.0\nsampling_token_weight = 1.0\nlocal_budget_note = \"preserved\""
+            "[features.rollout_budget]\nenabled = true\nlimit_tokens = 200000\nreminder_at_remaining_tokens = [180000, 160000, 140000, 120000, 100000, 80000, 60000, 40000, 20000]\nprefill_token_weight = 1.0\nsampling_token_weight = 1.0\nlocal_budget_note = \"preserved\""
         ));
+        assert!(!actual.contains("reminder_interval_tokens"));
         assert!(actual.parse::<toml_edit::DocumentMut>().is_ok());
         assert!(actual.contains("[permissions.codex-autonomous]\nextends = \":workspace\""));
         assert!(actual.contains("\".git\" = \"write\""));
@@ -4311,12 +4322,14 @@ description = "local"
 hooks = false
 rollout_budget.enabled = false
 rollout_budget.limit_tokens = 999999
+rollout_budget.reminder_interval_tokens = 99999
 network_proxy = true
 "#;
         let migrated = merge_managed_config(template, legacy_dotted);
         assert!(migrated.contains("[features]\nhooks = true\ngoals = true\nnetwork_proxy = true"));
         assert!(migrated.contains("[features.rollout_budget]\nenabled = true"));
         assert!(!migrated.contains("rollout_budget.enabled"));
+        assert!(!migrated.contains("rollout_budget.reminder_interval_tokens"));
         assert!(migrated.parse::<toml_edit::DocumentMut>().is_ok());
 
         let legacy_inline = r#"[features]

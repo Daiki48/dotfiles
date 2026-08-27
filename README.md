@@ -90,7 +90,8 @@ updates are allowlisted so the workflow does not pause for approval. The hook va
 current repository, explicit target IDs, canonical arguments, metadata, and detected secrets.
 
 Codex setup explicitly enables persisted goals/automatic continuation and the under-development rollout budget tracker at 200,000 tokens with
-20,000-token reminders. It is an accounting/reminder signal rather than a hard stop; AGENTS.md uses
+20,000-token reminders. Codex CLI 0.150.1 expresses these as explicit remaining-token checkpoints.
+It is an accounting/reminder signal rather than a hard stop; AGENTS.md uses
 it together with per-fingerprint circuit breakers, finite Plan scope, and reserved closure work.
 It continues to reject protected-branch or force/delete/tag pushes, destructive cleanup,
 arbitrary GitHub API mutations, and repository mismatches. Draft PR後のreview receipt、Ready化、
