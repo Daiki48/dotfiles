@@ -1023,21 +1023,6 @@ fn is_assignment_for(line: &str, keys: &[&str]) -> bool {
         .any(|key| path.iter().map(String::as_str).eq(key.split('.')))
 }
 
-fn is_nested_assignment_for(line: &str, table: &str, keys: &[&str]) -> bool {
-    let Some(path) = assignment_key_path(line) else {
-        return false;
-    };
-    path.first().is_some_and(|segment| segment == table)
-        && keys
-            .iter()
-            .any(|key| path.iter().skip(1).map(String::as_str).eq(key.split('.')))
-}
-
-fn is_assignment_below(line: &str, table: &str) -> bool {
-    assignment_key_path(line)
-        .is_some_and(|path| path.len() > 1 && path.first().is_some_and(|key| key == table))
-}
-
 fn table_header(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     let header = trimmed
@@ -1356,6 +1341,45 @@ fn key_for_table_header(key: Key) -> Key {
     formatted
 }
 
+fn normalize_managed_root_and_agent_tables(existing: &str) -> String {
+    let Ok(mut document) = existing.parse::<DocumentMut>() else {
+        return existing.to_owned();
+    };
+
+    for key in ["profile"]
+        .into_iter()
+        .chain(MANAGED_CONFIG_KEYS.iter().copied())
+    {
+        if let Some((formatted_key, item)) = document.remove_entry(key) {
+            preserve_removed_entry_comments(document.as_table_mut(), &formatted_key, &item);
+        }
+    }
+    for key in RETIRED_CONFIG_KEYS {
+        let _ = document.remove(key);
+    }
+
+    let Some((agents_key, agents_item)) = document.remove_entry("agents") else {
+        return document.to_string();
+    };
+    let mut agents = if let Some(table) = agents_item.as_table() {
+        table.clone()
+    } else if let Some(inline) = agents_item.as_inline_table() {
+        table_from_inline(inline)
+    } else {
+        document.insert_formatted(&agents_key, agents_item);
+        return document.to_string();
+    };
+    agents.set_implicit(false);
+    agents.set_dotted(false);
+    for key in MANAGED_AGENT_KEYS {
+        if let Some((formatted_key, item)) = agents.remove_entry(key) {
+            preserve_removed_entry_comments(&mut agents, &formatted_key, &item);
+        }
+    }
+    document.insert_formatted(&key_for_table_header(agents_key), Item::Table(agents));
+    document.to_string()
+}
+
 fn normalize_inline_feature_tables(existing: &str) -> String {
     let Ok(mut document) = existing.parse::<DocumentMut>() else {
         return existing.to_owned();
@@ -1560,12 +1584,12 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     let managed_agents = managed_assignments(template, Some("[agents]"), MANAGED_AGENT_KEYS);
     let managed_permissions = managed_permission_profile_sections(template);
 
-    let existing = normalize_inline_feature_tables(existing);
+    let existing = normalize_managed_root_and_agent_tables(existing);
+    let existing = normalize_inline_feature_tables(&existing);
     // Add the managed hook before rebuilding managed permission sections so a
     // config that did not already contain the hook reaches its stable section
     // order in a single migration.
     let existing = sync_managed_hook(template, &existing);
-    let mut in_top_level = true;
     let mut in_agents = false;
     let mut in_legacy_profile_table = false;
     let mut in_retired_sandbox_table = false;
@@ -1581,7 +1605,6 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         let is_syntax = syntax_lines[index];
         let header = is_syntax.then(|| table_header(line)).flatten();
         if let Some(header) = header {
-            in_top_level = false;
             in_legacy_profile_table = header == "[profiles]" || header.starts_with("[profiles.");
             in_retired_sandbox_table = header == RETIRED_SANDBOX_TABLE;
             in_managed_permission_profile = is_managed_permission_profile_header(header);
@@ -1599,32 +1622,6 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
             }
         }
         if in_legacy_profile_table || in_retired_sandbox_table || in_managed_permission_profile {
-            continue;
-        }
-        if is_syntax && in_top_level && is_assignment_for(line, &["profile"]) {
-            continue;
-        }
-        if is_syntax
-            && in_top_level
-            && (is_assignment_for(line, MANAGED_CONFIG_KEYS)
-                || is_assignment_for(line, RETIRED_CONFIG_KEYS)
-                || is_assignment_below(line, "sandbox_workspace_write")
-                || is_nested_assignment_for(line, "agents", MANAGED_AGENT_KEYS))
-        {
-            continue;
-        }
-        if is_syntax && in_agents && is_assignment_for(line, MANAGED_AGENT_KEYS) {
-            continue;
-        }
-        if is_syntax
-            && in_features
-            && (is_assignment_for(line, MANAGED_FEATURE_KEYS)
-                || is_assignment_for(line, LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS)
-                || is_assignment_for(line, &["rollout_budget"]))
-        {
-            continue;
-        }
-        if is_syntax && in_rollout_budget && is_assignment_for(line, MANAGED_ROLLOUT_BUDGET_KEYS) {
             continue;
         }
         preserved_lines.push(line);
@@ -5037,6 +5034,114 @@ agents.max_concurrent_threads_per_session = 99
                 .expect("repeat root-dotted agent migration"),
             migrated
         );
+    }
+
+    #[test]
+    fn managed_root_and_agents_preserve_multiline_local_data_and_comments() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("managed-config-multiline-local-data");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let existing = r#""model" = "old" # keep-model-note
+sandbox_workspace_write = {
+  writable_roots = ["/srv/legacy-multiline"],
+}
+
+[agents]
+"enabled" = false # keep-enabled-note
+local_profile = {
+  enabled = false,
+  note = "keep",
+}
+
+[features]
+local_profile = {
+  hooks = false,
+  note = "keep-feature",
+}
+"#;
+
+        let migrated =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate multiline managed and local values");
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("multiline managed config migration must remain valid TOML");
+        assert_eq!(document["model"].as_str(), Some("gpt-5.6-sol"));
+        assert_eq!(document["agents"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            document["agents"]["local_profile"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            document["agents"]["local_profile"]["note"].as_str(),
+            Some("keep")
+        );
+        assert_eq!(
+            document["features"]["local_profile"]["hooks"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            document["features"]["local_profile"]["note"].as_str(),
+            Some("keep-feature")
+        );
+        assert!(document.get("sandbox_workspace_write").is_none());
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]
+                ["/srv/legacy-multiline"]
+                .as_bool(),
+            Some(true)
+        );
+        assert!(migrated.contains("# keep-model-note"));
+        assert!(migrated.contains("# keep-enabled-note"));
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat multiline managed config migration"),
+            migrated
+        );
+    }
+
+    #[test]
+    fn local_only_agent_forms_are_normalized_without_reopening_the_parent() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("local-only-agent-forms");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let fixtures = [
+            r#"agents = { local_setting = "inline" }"#,
+            r#"agents.local_setting = "dotted""#,
+            r#"[agents.local_reviewer]
+description = "child-table""#,
+        ];
+
+        for existing in fixtures {
+            let migrated =
+                merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                    .expect("migrate local-only agent form");
+            let document = migrated
+                .parse::<toml_edit::DocumentMut>()
+                .expect("local-only agent migration must remain valid TOML");
+            assert_eq!(document["agents"]["enabled"].as_bool(), Some(true));
+            if existing.contains("local_setting") {
+                assert!(matches!(
+                    document["agents"]["local_setting"].as_str(),
+                    Some("inline" | "dotted")
+                ));
+            } else {
+                assert_eq!(
+                    document["agents"]["local_reviewer"]["description"].as_str(),
+                    Some("child-table")
+                );
+            }
+            assert_eq!(
+                merge_managed_config_with_root(
+                    template,
+                    &migrated,
+                    &managed_root,
+                    directory.path(),
+                )
+                .expect("repeat local-only agent migration"),
+                migrated
+            );
+        }
     }
 
     #[test]
