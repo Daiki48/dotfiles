@@ -32,6 +32,8 @@ const MAX_MAIN_SYNC_RECOVERY_PATHS: usize = 512;
 const MAX_RULESETS: usize = 20;
 const COMMAND_TIMEOUT: u64 = 45;
 const OPERATION_TIMEOUT: u64 = 300;
+const MAIN_SYNC_SANDBOX_RETRY_READY: &str = "main-sync-sandbox-retry-ready";
+const MAIN_SYNC_SANDBOX_RETRY_CONSUMED: &str = "main-sync-sandbox-retry-consumed";
 const SYSTEM_PATH: &str = "/usr/bin:/bin";
 const GIT_BINARY: &str = "/usr/bin/git";
 const GH_BINARY: &str = "/usr/bin/gh";
@@ -401,6 +403,7 @@ fn git_command(args: &[String]) -> Result<Vec<String>> {
 struct Captured {
     status: std::process::ExitStatus,
     stdout: String,
+    stderr: String,
 }
 fn run(command: &[String], cwd: &Path, timeout: Duration, max_output: usize) -> Result<Captured> {
     run_with_config(command, cwd, timeout, max_output, None)
@@ -437,6 +440,8 @@ fn run_with_config(
         status: output.status,
         stdout: String::from_utf8(output.stdout)
             .map_err(|_| error("外部commandの応答がUTF-8ではありません"))?,
+        stderr: String::from_utf8(output.stderr)
+            .map_err(|_| error("外部commandのerror応答がUTF-8ではありません"))?,
     })
 }
 fn git(cwd: &Path, args: &[&str], check: bool) -> Result<String> {
@@ -1941,6 +1946,68 @@ fn safety_path(path: &str) -> bool {
             .iter()
             .any(|prefix| path.starts_with(prefix))
         || [".codex/config.base.toml", "packages/cli/src/codex.rs"].contains(&path)
+}
+
+fn runtime_readonly_path(path: &str) -> bool {
+    path.starts_with(".codex/") || path.starts_with(".agents/")
+}
+
+fn protected_path_permission_failure(stderr: &str, changed: &[String]) -> bool {
+    let protected = changed
+        .iter()
+        .filter(|path| runtime_readonly_path(path))
+        .collect::<Vec<_>>();
+    !protected.is_empty()
+        && stderr.lines().any(|line| {
+            let permission_denied = [
+                "Permission denied",
+                "Read-only file system",
+                "Operation not permitted",
+            ]
+            .iter()
+            .any(|message| line.contains(message));
+            permission_denied && protected.iter().any(|path| line.contains(path.as_str()))
+        })
+}
+
+fn validate_main_sync_retry(stage: &str, last_error: &str, sandbox_retry: bool) -> Result<()> {
+    if sandbox_retry {
+        if stage != "merged" || last_error != MAIN_SYNC_SANDBOX_RETRY_READY {
+            return Err(error(
+                "sandbox外のfinish再試行は検証済みのmain同期拒否に1回だけ使用できます",
+            ));
+        }
+    } else if stage == "merged"
+        && [
+            MAIN_SYNC_SANDBOX_RETRY_READY,
+            MAIN_SYNC_SANDBOX_RETRY_CONSUMED,
+        ]
+        .contains(&last_error)
+    {
+        return Err(error(
+            "main同期のsandbox拒否は検証済みです。finishを直接再実行できません",
+        ));
+    }
+    Ok(())
+}
+
+fn consume_main_sync_retry(
+    repository: &str,
+    task: &str,
+    state: &Value,
+    sandbox_retry: bool,
+) -> Result<Value> {
+    if sandbox_retry {
+        save_stage(
+            repository,
+            task,
+            state,
+            "merged",
+            MAIN_SYNC_SANDBOX_RETRY_CONSUMED,
+        )
+    } else {
+        Ok(state.clone())
+    }
 }
 
 fn receipt_decision(value: &Value) -> Result<String> {
@@ -3499,6 +3566,7 @@ fn deliver_locked(
     }
     save_stage(&repository, task, &state, "merged", "")
 }
+#[allow(clippy::too_many_arguments)]
 fn finish_locked(
     root: &Path,
     task: &str,
@@ -3507,6 +3575,7 @@ fn finish_locked(
     expected_plan: &str,
     expected_plan_version: i64,
     expected_gate: &str,
+    sandbox_retry: bool,
 ) -> Result<Value> {
     let repository = repository(root)?;
     let (manifest_value, worktree_path) = manifest(root, task, &repository)?;
@@ -3527,6 +3596,10 @@ fn finish_locked(
         &str_value(&manifest_value, "branch")?,
     )?;
     let _lock = task_lock(&repository, task)?;
+    let initial_stage = str_value(&state, "stage")?;
+    let initial_error = str_value(&state, "last_error")?;
+    validate_main_sync_retry(&initial_stage, &initial_error, sandbox_retry)?;
+    state = consume_main_sync_retry(&repository, task, &state, sandbox_retry)?;
     let view = pr_view(root, &repository, expected_pr)?;
     if str_value(&view, "state")? != "MERGED"
         || oid(&str_value(&view, "headRefOid")?, "merged PR head")? != head
@@ -3600,15 +3673,38 @@ fn finish_locked(
         assert_main_clean(root)?;
         let args = ["merge", "--ff-only", "refs/remotes/origin/main"];
         let av = args.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
-        if !run(
+        let merge = run(
             &git_command(&av)?,
             root,
             Duration::from_secs(COMMAND_TIMEOUT),
             MAX_OUTPUT_BYTES,
-        )?
-        .status
-        .success()
-        {
+        )?;
+        if !merge.status.success() {
+            if !sandbox_retry {
+                let changed = get(&receipt_value, "changed_files")?
+                    .as_array()
+                    .ok_or_else(|| error("receipt changed-filesが不正です"))?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(ToOwned::to_owned)
+                            .ok_or_else(|| error("receipt changed-filesが不正です"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if protected_path_permission_failure(&merge.stderr, &changed) {
+                    save_stage(
+                        &repository,
+                        task,
+                        &state,
+                        "merged",
+                        MAIN_SYNC_SANDBOX_RETRY_READY,
+                    )?;
+                    return Err(error(
+                        "保護対象pathへのpermission拒否を確認しました。--sandbox-retry付きfinishを同一UIDのsandbox外で1回だけ再試行できます",
+                    ));
+                }
+            }
             return Err(error("人間用mainをff-only syncできません"));
         }
         assert_main_synced(root, &repository)?;
@@ -3792,6 +3888,7 @@ fn finish_requires_live_ledger(stage: &str) -> bool {
     stage != "completed"
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish(
     root: &Path,
     task: &str,
@@ -3800,12 +3897,22 @@ fn finish(
     plan: &str,
     plan_version: i64,
     gate: &str,
+    sandbox_retry: bool,
 ) -> Result<Value> {
     task_id(task)?;
     with_deadline(|| {
         let repository = repository(root)?;
         let _lock = task_lock(&repository, task)?;
-        finish_locked(root, task, pr, head, plan, plan_version, gate)
+        finish_locked(
+            root,
+            task,
+            pr,
+            head,
+            plan,
+            plan_version,
+            gate,
+            sandbox_retry,
+        )
     })
 }
 
@@ -3901,6 +4008,7 @@ struct CliArgs {
     tests: bool,
     independent: bool,
     specialist: bool,
+    sandbox_retry: bool,
     gate: String,
 }
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
@@ -3928,6 +4036,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             "tests-passed",
             "independent-review-passed",
             "specialist-review-passed",
+            "sandbox-retry",
         ];
         let value_options = [
             "task-id",
@@ -4003,6 +4112,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
         ));
     }
     if command == "record-review" || command == "approve-review" {
+        if flags.contains("sandbox-retry") {
+            return Err(error("review記録へsandbox再試行を指定できません"));
+        }
         let risk_value = values
             .get("risk")
             .ok_or_else(|| error("--riskが必要です"))?
@@ -4023,10 +4135,15 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             tests,
             independent,
             specialist,
+            sandbox_retry: false,
             gate,
         })
     } else {
-        if values.contains_key("risk") || !flags.is_empty() {
+        let sandbox_retry = flags.remove("sandbox-retry");
+        if values.contains_key("risk")
+            || !flags.is_empty()
+            || (command == "deliver" && sandbox_retry)
+        {
             return Err(error("deliver/finishのargumentが不正です"));
         }
         Ok(CliArgs {
@@ -4040,6 +4157,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             tests: false,
             independent: false,
             specialist: false,
+            sandbox_retry,
             gate,
         })
     }
@@ -4100,6 +4218,7 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 &parsed.plan,
                 parsed.plan_version,
                 &parsed.gate,
+                parsed.sandbox_retry,
             ),
             _ => Err(error("不明なcommandです")),
         }
@@ -5515,6 +5634,82 @@ mod tests {
         ];
         duplicate.push(OsString::from("--independent-review-passed"));
         assert!(parse_args(duplicate).is_err());
+    }
+
+    #[test]
+    fn sandbox_retry_is_finish_only_and_bound_to_a_single_ready_state() {
+        let arguments = |command: &str| {
+            vec![
+                OsString::from(command),
+                OsString::from("--task-id"),
+                OsString::from("issue-24"),
+                OsString::from("--pr"),
+                OsString::from("24"),
+                OsString::from("--head"),
+                OsString::from("b".repeat(40)),
+                OsString::from("--plan-id"),
+                OsString::from("CODEX-DELIVERY-TEST-v1"),
+                OsString::from("--plan-version"),
+                OsString::from("2"),
+                OsString::from("--sandbox-retry"),
+            ]
+        };
+        assert!(parse_args(arguments("finish")).unwrap().sandbox_retry);
+        assert!(parse_args(arguments("deliver")).is_err());
+        assert!(validate_main_sync_retry("merged", MAIN_SYNC_SANDBOX_RETRY_READY, true).is_ok());
+        assert!(
+            validate_main_sync_retry("merged", MAIN_SYNC_SANDBOX_RETRY_CONSUMED, true).is_err()
+        );
+        assert!(validate_main_sync_retry("merged", MAIN_SYNC_SANDBOX_RETRY_READY, false).is_err());
+        assert!(validate_main_sync_retry("main_synced", "", false).is_ok());
+
+        with_codex_home(|_| {
+            let state = object([
+                ("stage", string("merged")),
+                ("last_error", string(MAIN_SYNC_SANDBOX_RETRY_READY)),
+            ]);
+            let consumed = consume_main_sync_retry("owner/repo", "issue-24", &state, true)
+                .expect("consume retry before external checks");
+            assert_eq!(
+                str_value(&consumed, "last_error").unwrap(),
+                MAIN_SYNC_SANDBOX_RETRY_CONSUMED
+            );
+            let persisted = read_json_file(
+                &state_path("owner/repo", "issue-24").unwrap(),
+                "delivery state",
+            )
+            .unwrap();
+            assert_eq!(persisted, consumed);
+            assert!(
+                validate_main_sync_retry(
+                    &str_value(&persisted, "stage").unwrap(),
+                    &str_value(&persisted, "last_error").unwrap(),
+                    true,
+                )
+                .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn sandbox_retry_requires_a_permission_error_on_a_changed_runtime_path() {
+        let changed = vec![".codex/AGENTS.md".to_string(), "README.md".to_string()];
+        assert!(protected_path_permission_failure(
+            "error: unable to unlink old '.codex/AGENTS.md': Permission denied",
+            &changed,
+        ));
+        assert!(!protected_path_permission_failure(
+            "fatal: Not possible to fast-forward, aborting.",
+            &changed,
+        ));
+        assert!(!protected_path_permission_failure(
+            "error: unable to create file README.md: Permission denied",
+            &changed,
+        ));
+        assert!(!protected_path_permission_failure(
+            "error: .codex/AGENTS.md changed\nerror: index.lock: Permission denied",
+            &changed,
+        ));
     }
 
     #[test]
