@@ -31,8 +31,8 @@ subagentを利用できない場合はmain agentが同じ証拠集合で標準re
 ## 指摘を反証して統合する
 
 1. 各指摘をコード、test、履歴、一次情報で再現・確認し、誤検知と根拠不足を除外する。
-2. 固定した受け入れ条件または不変条件ID、repository-relativeな原因経路、正規化した失敗classの順序付きJSONをSHA-256 lowercase hexにし、外部記録では8文字ごとに`-`で区切ってfingerprintを確定する。timestamp、run ID、一時絶対path、line移動、表現差を除外し、同じroot causeの症状を重複fingerprintにしない。
-3. append-only finding ledgerを全page取得し、編集、欠落、競合、schema、task・Plan・repository・PR・head identity、commit到達性、test証拠を検証してから、新規、再発、解消、誤検知を判定する。復元不能なら試行数をresetせず診断対象として返す。
+2. 固定した受け入れ条件または不変条件ID、repository-relativeな原因経路、正規化した失敗classの順序付きJSONをSHA-256 lowercase hexにし、外部記録では8文字のchunk配列にしてfingerprintを確定する。timestamp、run ID、一時絶対path、line移動、表現差を除外し、同じroot causeの症状を重複fingerprintにしない。
+3. append-only finding ledgerを全page取得し、8文字chunk配列のdigestとGit object IDをlocalで連結してから、編集、欠落、競合、schema、task・Plan・repository・PR・head identity、commit到達性、test証拠を検証し、新規、再発、解消、誤検知を判定する。復元不能なら試行数をresetせず診断対象として返す。
 4. 問題がない観点も、確認範囲と根拠を記録する。
 5. 変更に関係する内部仕様、外部仕様、docs・Issue・実装・testの横断整合性をmain agentが最終確認する。関係のない全コードを機械的にreviewしない。
 6. secret、AI帰属、不要なlocal情報、計画外ファイルが差分にないことを確認する。
