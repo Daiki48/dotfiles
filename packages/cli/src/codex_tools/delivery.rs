@@ -28,6 +28,7 @@ const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PAGES: usize = 20;
 const MAX_ITEMS: usize = 10_000;
+const MAX_MAIN_SYNC_RECOVERY_PATHS: usize = 512;
 const MAX_RULESETS: usize = 20;
 const COMMAND_TIMEOUT: u64 = 45;
 const OPERATION_TIMEOUT: u64 = 300;
@@ -3139,6 +3140,209 @@ fn assert_main_clean(root: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+struct MainSyncCandidate {
+    path: String,
+    target_blob: String,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+fn recover_interrupted_main_sync_with_hook(
+    root: &Path,
+    target: &str,
+    expected_head: &str,
+    before_restore: impl FnOnce(),
+) -> Result<()> {
+    let status = git(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        true,
+    )?;
+    if status.is_empty() {
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    return Err(error(
+        "main同期の中断復旧はatomicなinode検証がないplatformでは実行できません",
+    ));
+    if git(root, &["symbolic-ref", "--short", "HEAD"], true)?.trim() != "main" {
+        return Err(error("main同期の中断状態をmain以外では復旧できません"));
+    }
+    let paths = status
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let bytes = entry.as_bytes();
+            if bytes.len() < 4 || bytes[0] != b' ' || bytes[1] != b'M' || bytes[2] != b' ' {
+                return Err(error(
+                    "main同期の中断状態に未追跡、staged、削除、renameまたはtype変更があります",
+                ));
+            }
+            let path = &entry[3..];
+            let candidate = Path::new(path);
+            if path.is_empty()
+                || candidate.is_absolute()
+                || candidate
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(error("main同期の中断pathが安全ではありません"));
+            }
+            Ok(path.to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if paths.is_empty() || paths.len() > MAX_MAIN_SYNC_RECOVERY_PATHS {
+        return Err(error("main同期の中断path数が許可範囲外です"));
+    }
+
+    let mut candidates = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let mut current = root.to_path_buf();
+        let components = Path::new(path).components().collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            let std::path::Component::Normal(part) = component else {
+                return Err(error("main同期の中断pathが安全ではありません"));
+            };
+            current.push(part);
+            let metadata = fs::symlink_metadata(&current)
+                .map_err(|_| error("main同期の中断pathを確認できません"))?;
+            if index + 1 < components.len() {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(error("main同期の中断pathにsymlink parentがあります"));
+                }
+            } else if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(error("main同期の中断pathがregular fileではありません"));
+            }
+        }
+
+        let listing = git(root, &["ls-tree", "-z", target, "--", path], true)?;
+        let listing = listing
+            .strip_suffix('\0')
+            .filter(|value| !value.contains('\0'))
+            .ok_or_else(|| error("main同期target treeを一意に確認できません"))?;
+        let (header, listed_path) = listing
+            .split_once('\t')
+            .ok_or_else(|| error("main同期target treeを解析できません"))?;
+        let fields = header.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3
+            || !["100644", "100755"].contains(&fields[0])
+            || fields[1] != "blob"
+            || oid(fields[2], "main同期target blob").is_err()
+            || listed_path != path
+        {
+            return Err(error("main同期target entryが安全ではありません"));
+        }
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|_| error("main同期の中断path modeを確認できません"))?;
+        #[cfg(unix)]
+        if (metadata.mode() & 0o111 != 0) != (fields[0] == "100755") {
+            return Err(error("main同期の中断path modeがtargetと一致しません"));
+        }
+        let working_blob = git(root, &["hash-object", "--no-filters", "--", path], true)?;
+        if working_blob.trim() != fields[2] {
+            return Err(error(
+                "main同期の中断pathにtargetと異なるlocal変更があります",
+            ));
+        }
+        candidates.push(MainSyncCandidate {
+            path: path.clone(),
+            target_blob: fields[2].to_string(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+        });
+    }
+
+    before_restore();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if git(root, &["symbolic-ref", "--short", "HEAD"], true)?.trim() != "main" {
+            return Err(error("main同期の復旧前にcheckout branchが変化しました"));
+        }
+        if git(root, &["rev-parse", "HEAD"], true)?.trim() != expected_head {
+            return Err(error("main同期の復旧前にHEADが変化しました"));
+        }
+        let expected_status = candidates[index..]
+            .iter()
+            .map(|entry| format!(" M {}\0", entry.path))
+            .collect::<String>();
+        if git(
+            root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            true,
+        )? != expected_status
+        {
+            return Err(error("main同期の復旧前にworking tree状態が変化しました"));
+        }
+        let current = root.join(&candidate.path);
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|_| error("main同期の復旧前にpathが変化しました"))?;
+        #[cfg(unix)]
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.dev() != candidate.device
+            || metadata.ino() != candidate.inode
+            || metadata.mode() != candidate.mode
+        {
+            return Err(error("main同期の復旧前にinodeまたはmodeが変化しました"));
+        }
+        if git(
+            root,
+            &["hash-object", "--no-filters", "--", &candidate.path],
+            true,
+        )?
+        .trim()
+            != candidate.target_blob
+        {
+            return Err(error("main同期の復旧前にfile内容が変化しました"));
+        }
+        git(
+            root,
+            &[
+                "restore",
+                "--source=HEAD",
+                "--worktree",
+                "--",
+                &candidate.path,
+            ],
+            true,
+        )?;
+    }
+    assert_main_clean(root)
+}
+
+fn recover_interrupted_main_sync(root: &Path, target: &str, expected_head: &str) -> Result<()> {
+    recover_interrupted_main_sync_with_hook(root, target, expected_head, || {})
+}
+
+fn prepare_main_sync(root: &Path, target: &str) -> Result<()> {
+    let before = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
+    let args = ["merge-base", "--is-ancestor", &before, target];
+    let av = args
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    if !run(
+        &git_command(&av)?,
+        root,
+        Duration::from_secs(COMMAND_TIMEOUT),
+        MAX_OUTPUT_BYTES,
+    )?
+    .status
+    .success()
+    {
+        return Err(error("人間用mainに未pushのlocal commitがあります"));
+    }
+    recover_interrupted_main_sync(root, target, &before)
+}
+
 fn assert_main_synced(root: &Path, repository: &str) -> Result<()> {
     assert_main_clean(root)?;
     let remote = fetch_main(root, repository)?;
@@ -3359,8 +3563,10 @@ fn finish_locked(
     } else if gate == FREE_PRIVATE_GATE_MODE && stage != "completed" {
         free_private_repository(root, &repository)?;
     }
-    assert_main_clean(root)?;
     let stage = str_value(&state, "stage")?;
+    if stage != "merged" {
+        assert_main_clean(root)?;
+    }
     if stage == "completed" {
         if remote_branch(root, &repository, &str_value(&manifest_value, "branch")?)?.is_some()
             || worktree_path.exists()
@@ -3390,21 +3596,8 @@ fn finish_locked(
         {
             return Err(error("origin/mainがmerged headへ到達していません"));
         }
+        prepare_main_sync(root, &remote_main)?;
         assert_main_clean(root)?;
-        let before = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
-        let args = ["merge-base", "--is-ancestor", &before, &remote_main];
-        let av = args.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
-        if !run(
-            &git_command(&av)?,
-            root,
-            Duration::from_secs(COMMAND_TIMEOUT),
-            MAX_OUTPUT_BYTES,
-        )?
-        .status
-        .success()
-        {
-            return Err(error("人間用mainに未pushのlocal commitがあります"));
-        }
         let args = ["merge", "--ff-only", "refs/remotes/origin/main"];
         let av = args.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
         if !run(
@@ -4713,6 +4906,245 @@ mod tests {
             assert!(finish_requires_live_ledger(stage), "stage: {stage}");
         }
         assert!(!finish_requires_live_ledger("completed"));
+    }
+
+    #[test]
+    fn main_sync_recovers_only_target_matching_partial_files() {
+        fn git_at(root: &Path, args: &[&str]) -> std::process::Output {
+            std::process::Command::new("/usr/bin/git")
+                .args(["-c", "core.hooksPath=/dev/null", "-c", "diff.external="])
+                .args(args)
+                .current_dir(root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .expect("run git")
+        }
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("codex-delivery-ff-{suffix}"));
+        fs::create_dir(&root).unwrap();
+        assert!(
+            git_at(&root, &["init", "-q", "-b", "main"])
+                .status
+                .success()
+        );
+        fs::write(root.join("a"), "old-a\n").unwrap();
+        fs::write(root.join("b"), "old-b\n").unwrap();
+        assert!(git_at(&root, &["add", "a", "b"]).status.success());
+        assert!(
+            git_at(
+                &root,
+                &[
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "base"
+                ]
+            )
+            .status
+            .success()
+        );
+        let base = String::from_utf8(git_at(&root, &["rev-parse", "HEAD"]).stdout).unwrap();
+        assert!(
+            git_at(&root, &["checkout", "-qb", "target"])
+                .status
+                .success()
+        );
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        fs::write(root.join("b"), "new-b\n").unwrap();
+        assert!(git_at(&root, &["add", "a", "b"]).status.success());
+        assert!(
+            git_at(
+                &root,
+                &[
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "target"
+                ]
+            )
+            .status
+            .success()
+        );
+        let target = String::from_utf8(git_at(&root, &["rev-parse", "HEAD"]).stdout).unwrap();
+        assert!(git_at(&root, &["checkout", "-q", "main"]).status.success());
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        prepare_main_sync(&root, target.trim()).expect("recover partial sync");
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "old-a\n");
+        let output = git_at(&root, &["merge", "--ff-only", target.trim()]);
+        assert!(output.status.success());
+        assert!(
+            git_at(&root, &["status", "--porcelain=v1"])
+                .stdout
+                .is_empty()
+        );
+
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        assert!(
+            recover_interrupted_main_sync_with_hook(&root, target.trim(), base.trim(), || {
+                fs::write(root.join("a"), "changed-after-validation\n").unwrap()
+            },)
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("a")).unwrap(),
+            "changed-after-validation\n"
+        );
+
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        assert!(
+            recover_interrupted_main_sync_with_hook(&root, target.trim(), base.trim(), || {
+                fs::write(root.join("racing-commit"), "new HEAD\n").unwrap();
+                assert!(git_at(&root, &["add", "racing-commit"]).status.success());
+                assert!(
+                    git_at(
+                        &root,
+                        &[
+                            "-c",
+                            "user.name=test",
+                            "-c",
+                            "user.email=test@example.com",
+                            "commit",
+                            "-qm",
+                            "racing HEAD"
+                        ]
+                    )
+                    .status
+                    .success()
+                );
+            },)
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
+
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        assert!(
+            git_at(&root, &["checkout", "-qb", "feature-race"])
+                .status
+                .success()
+        );
+        assert!(git_at(&root, &["checkout", "-q", "main"]).status.success());
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        assert!(
+            recover_interrupted_main_sync_with_hook(&root, target.trim(), base.trim(), || {
+                assert!(
+                    git_at(&root, &["checkout", "-q", "feature-race"])
+                        .status
+                        .success()
+                );
+            },)
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
+        assert_eq!(
+            String::from_utf8(git_at(&root, &["symbolic-ref", "--short", "HEAD"]).stdout)
+                .unwrap()
+                .trim(),
+            "feature-race"
+        );
+        assert!(git_at(&root, &["checkout", "-q", "main"]).status.success());
+
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        fs::write(root.join("a"), "unique-local-change\n").unwrap();
+        assert!(prepare_main_sync(&root, target.trim()).is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("a")).unwrap(),
+            "unique-local-change\n"
+        );
+
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        assert!(git_at(&root, &["add", "a"]).status.success());
+        assert!(prepare_main_sync(&root, target.trim()).is_err());
+        assert!(
+            !git_at(&root, &["diff", "--cached", "--quiet"])
+                .status
+                .success()
+        );
+
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        fs::write(root.join("untracked"), "must survive\n").unwrap();
+        assert!(prepare_main_sync(&root, target.trim()).is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("untracked")).unwrap(),
+            "must survive\n"
+        );
+
+        fs::remove_file(root.join("untracked")).unwrap();
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        fs::write(root.join("local-only"), "local commit\n").unwrap();
+        assert!(git_at(&root, &["add", "local-only"]).status.success());
+        assert!(
+            git_at(
+                &root,
+                &[
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "diverged"
+                ]
+            )
+            .status
+            .success()
+        );
+        let diverged = git_at(&root, &["rev-parse", "HEAD"]).stdout;
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        let status_before = git_at(&root, &["status", "--porcelain=v1"]).stdout;
+        assert!(prepare_main_sync(&root, target.trim()).is_err());
+        assert_eq!(git_at(&root, &["rev-parse", "HEAD"]).stdout, diverged);
+        assert_eq!(
+            git_at(&root, &["status", "--porcelain=v1"]).stdout,
+            status_before
+        );
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
     }
 
     #[test]
