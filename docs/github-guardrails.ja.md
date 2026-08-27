@@ -91,8 +91,8 @@ review済みhead SHAの固定とrisk-based reviewは`codex-delivery`による完
 
 Rulesetを利用できないGitHub Free/private repositoryは、既定のstrict gateを暗黙に緩和しません。
 `--gate-mode github-free-private`を明示したcurrent private repositoryだけが低保証profileを使用できます。
-receipt v4へmode、risk、decision、標準review、専門reviewの完了証拠を別々に保存し、
-既存v1〜v3 receiptの意味を遡及的に緩和しません。
+receipt v5へmode、risk、decision、標準review、専門review、ledger comment ID・digestを別々に保存します。
+既存v1〜v4 receiptは履歴の読み取り互換に限定し、delivery時はcurrent headのv5再reviewを要求します。
 
 Free/private profileでも唯一の`required-ci`、GitHub Actions App ID `15368`、文字どおりの
 `success`、PR identity、最新mainのancestor、review thread、mergeabilityを検証します。
@@ -113,8 +113,17 @@ review後にpushされた場合、以前のreceipt、review、CIを
 再利用せず、新しいSHAで最初からやり直します。`review-branch`は読み取り専用であり、receiptの記録と
 delivery判断は呼び出し元の専用`codex-delivery` helperが担当します。
 
-修正可能なactionable指摘はSolが反証して1つのbatchで自律修正し、review起因の修正roundを最大2回まで
-再pushします。その後の最終reviewで実欠陥が残る場合は新しい修正loopを始めずblockedとします。
+修正可能なactionable指摘はSolが反証し、原因単位のfinding fingerprintとledgerで新規、再発、解消、
+誤検知、修正試行を追跡して1つのbatchで自律修正します。修正round全体には固定上限を設けません。
+同じfingerprintが修正後も再発するか、2round連続で受け入れ条件・test・既知指摘に証拠上の進展が
+ないか、入力・外部stateを正規化した同じfailure signatureが反復する場合はSol xhighの診断モードでroot causeと
+計画を再検証します。fingerprintとsignatureの比較不能も診断対象です。診断後の修正でも同じ指摘が再発する、
+または次のroundも進展がない場合はその項目をblockedとします。影響しない別原因の新しい有効な指摘は
+自律修正できますが、task全体とdeliveryは全actionable解消までblockedです。各roundの証拠は次batch前に
+直前comment IDと本文digestで連鎖するv2 marker・schema 3 append-only PR ledger commentへ保存し、resume時にauthor、未編集、全checkpointのschema、
+chain、round・head遷移、Plan版の単調増加とreceiptへの最新版固定、finding状態遷移、commit、test、reviewと照合します。v1 findingはterminal状態だけを許可し、schema 3移行後のlegacy schema再挿入とcurrent head不一致のlatest checkpointを拒否します。診断は最大12 tool callまたは30分の早い方で終了し、tool call数をaudit記録、token消費をrollout budget reminderで監視します。token残量不明時は
+Planの有限な受け入れ条件・実装単位・対象経路をwork budgetとしてscope外へ増殖させません。`codex-delivery`は全findingの
+解消とledgerのcomment ID・digestをreceiptへ固定し、deliver時にも再検証します。
 次の条件が同一SHAで同時に成立した場合だけReady化・merge候補になります。
 
 - required-ciなどrequired checkがすべて文字通り`success`である（skipped、cancelled、timed out、

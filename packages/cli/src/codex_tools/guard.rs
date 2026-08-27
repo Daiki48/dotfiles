@@ -2185,13 +2185,19 @@ fn valid_plan_id(value: &str) -> bool {
         && prefix
             .as_bytes()
             .first()
-            .is_some_and(|c| c.is_ascii_uppercase())
+            .is_some_and(|c| c.is_ascii_alphanumeric())
         && prefix
             .bytes()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'-')
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
         && !version.is_empty()
         && !version.starts_with('0')
         && version.bytes().all(|c| c.is_ascii_digit())
+}
+
+fn valid_plan_version(value: &str) -> bool {
+    value
+        .parse::<i64>()
+        .is_ok_and(|version| (1..=999_999).contains(&version))
 }
 
 fn valid_oid(value: &str) -> bool {
@@ -4918,6 +4924,7 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         "--pr",
         "--head",
         "--plan-id",
+        "--plan-version",
         "--gate-mode",
         "--risk",
     ];
@@ -4949,7 +4956,7 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         values.insert(rest[i].clone(), rest[i + 1].clone());
         i += 2;
     }
-    for key in ["--task-id", "--pr", "--head", "--plan-id"] {
+    for key in ["--task-id", "--pr", "--head", "--plan-id", "--plan-version"] {
         if !values.contains_key(key) {
             return Some(
                 "delivery helperのtask、PR、head、plan、review evidenceをすべて明示してください"
@@ -4977,6 +4984,7 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         || !values.get("--pr")?.bytes().all(|c| c.is_ascii_digit())
         || !valid_oid(values.get("--head")?)
         || !valid_plan_id(values.get("--plan-id")?)
+        || !valid_plan_version(values.get("--plan-version")?)
     {
         return Some("delivery helperの値が許可形式ではありません".into());
     }
@@ -6284,7 +6292,7 @@ mod tests {
         assert!(blocked_reason("codex-worktree list", None, 0).is_none());
         assert!(blocked_reason("codex-worktree create --task-id task-example", None, 0).is_none());
         assert!(blocked_reason("codex-worktree create --issue 0", None, 0).is_some());
-        assert!(blocked_reason("codex-delivery deliver --task-id task-example --pr 1 --head 0123456789012345678901234567890123456789 --plan-id PLAN-TEST-v1", None, 0).is_none());
+        assert!(blocked_reason("codex-delivery deliver --task-id task-example --pr 1 --head 0123456789012345678901234567890123456789 --plan-id PLAN-TEST-v1 --plan-version 1", None, 0).is_none());
     }
 
     #[test]
@@ -6323,7 +6331,7 @@ mod tests {
         assert!(
             write_context_reason("codex-worktree create --task-id task-example", None).is_some()
         );
-        assert!(write_context_reason("codex-delivery deliver --task-id task-example --pr 1 --head 0123456789012345678901234567890123456789 --plan-id PLAN-TEST-v1", None).is_some());
+        assert!(write_context_reason("codex-delivery deliver --task-id task-example --pr 1 --head 0123456789012345678901234567890123456789 --plan-id PLAN-TEST-v1 --plan-version 1", None).is_some());
     }
 
     #[test]
@@ -6748,7 +6756,9 @@ mod tests {
                 "--risk".to_string(),
                 risk.to_string(),
                 "--plan-id".to_string(),
-                "CODEX-DELIVERY-TEST-v1".to_string(),
+                "loop-engineering-circuit-breaker-v1".to_string(),
+                "--plan-version".to_string(),
+                "3".to_string(),
                 "--tests-passed".to_string(),
                 "--independent-review-passed".to_string(),
             ];
@@ -6761,6 +6771,14 @@ mod tests {
         assert!(delivery_helper_invocation_reason(&command("low", true)).is_some());
         assert!(delivery_helper_invocation_reason(&command("high", false)).is_some());
         assert!(delivery_helper_invocation_reason(&command("high", true)).is_none());
+
+        let mut missing_version = command("high", true);
+        missing_version.drain(12..14);
+        assert!(delivery_helper_invocation_reason(&missing_version).is_some());
+
+        let mut invalid_version = command("high", true);
+        invalid_version[13] = "0".to_string();
+        assert!(delivery_helper_invocation_reason(&invalid_version).is_some());
     }
 
     #[cfg(unix)]

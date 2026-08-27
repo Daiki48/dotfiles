@@ -25,7 +25,7 @@
 - Draft PRの作成は実装の中間点であり、完了条件ではありません。Draft作成後は専用の
   `codex-delivery` helperを唯一の`record-review`、`approve-review`、`deliver`、`finish`経路として使い、
   review receipt、Ready化・merge、main同期、managed cleanupを一続きで検証します。すべての
-  commandで`--task-id`、`--pr`、`--head`、`--plan-id`を明示し、review記録時はrisk、test、標準review、
+  commandで`--task-id`、`--pr`、`--head`、`--plan-id`、`--plan-version`を明示し、review記録時はrisk、test、標準review、
   high/criticalだけ変更固有の専門reviewの完了証拠も固定します。
 - risk分類とDaikiの意思決定要否を分離します。low/medium/high/criticalのいずれでも、仕様、既存権限、
   rollback、検証をCodexが根拠付きで確定できる場合は`record-review`で自律deliveryします。製品判断、
@@ -35,8 +35,17 @@
   変更で実際に触れる主要な高リスク境界を対象とする専門reviewを1つ追加します。一般的な反論役や肯定役は使いません。
   `actionable=0`、未解決thread=0、required checkが文字通り`success`、選択したremote gateが
   成立する同一SHAだけをdeliver対象とし、修正可能な指摘は自律的に修正して新SHAで
-  reviewと検証をやり直します。review起因の修正roundは最大2回とし、それでも実欠陥が残る場合は
-  新しい修正loopを始めずblockedとします。条件成立後のReady、merge、mainのfetch後の`merge --ff-only`、
+  reviewと検証をやり直します。修正round全体には固定上限を設けず、確定指摘を原因単位のfingerprintで
+  追跡します。同じ指摘が修正後も再発するか、2round連続で受け入れ条件・test・既知指摘に証拠上の進展が
+  ないか、入力・外部stateを正規化した同じfailure signatureが反復すればSol xhighの診断モードでroot causeと
+  計画を再検証します。診断は最大12 tool callまたは30分の早い方で終了します。tool call数はSolがledgerへ
+  audit記録し、wall-clockとtoken消費はruntimeの経過時間・rollout budget reminderで監視します。token残量不明時はPlanの有限な
+  受け入れ条件・実装単位・対象経路をtask work budgetにします。受け入れ条件は弱めず、Draft PR後は直前commentの
+  IDとdigestで連鎖するappend-only ledger commentを次のbatch前に保存します。
+  診断後の修正でも同じ指摘が再発する、または次のroundも進展がない場合はその項目をblockedとします。
+  影響しない別原因の有効な指摘は自律修正できますが、task全体とdeliveryは全actionable解消までblockedです。
+  `codex-delivery`は全ledger checkpointのidentity・round・head・finding状態遷移・未改変と全finding解消をreceiptへ固定し、deliver時とfinish再開時にも再検証します。
+  条件成立後のReady、merge、mainのfetch後の`merge --ff-only`、
   managed cleanupまでをhelperに委ねます。
 - live Rulesetを既定のremote gateとします。GitHub Freeのprivate repositoryでは、
   `--gate-mode github-free-private`をreview receipt、deliver、finishで明示できます。このmodeでは
