@@ -3263,6 +3263,9 @@ fn recover_interrupted_main_sync_with_hook(
 
     before_restore();
     for (index, candidate) in candidates.iter().enumerate() {
+        if git(root, &["symbolic-ref", "--short", "HEAD"], true)?.trim() != "main" {
+            return Err(error("main同期の復旧前にcheckout branchが変化しました"));
+        }
         if git(root, &["rev-parse", "HEAD"], true)?.trim() != expected_head {
             return Err(error("main同期の復旧前にHEADが変化しました"));
         }
@@ -5037,6 +5040,37 @@ mod tests {
             .is_err()
         );
         assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
+
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        assert!(
+            git_at(&root, &["checkout", "-qb", "feature-race"])
+                .status
+                .success()
+        );
+        assert!(git_at(&root, &["checkout", "-q", "main"]).status.success());
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        assert!(
+            recover_interrupted_main_sync_with_hook(&root, target.trim(), base.trim(), || {
+                assert!(
+                    git_at(&root, &["checkout", "-q", "feature-race"])
+                        .status
+                        .success()
+                );
+            },)
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
+        assert_eq!(
+            String::from_utf8(git_at(&root, &["symbolic-ref", "--short", "HEAD"]).stdout)
+                .unwrap()
+                .trim(),
+            "feature-race"
+        );
+        assert!(git_at(&root, &["checkout", "-q", "main"]).status.success());
 
         assert!(
             git_at(&root, &["reset", "--hard", base.trim()])
