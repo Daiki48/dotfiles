@@ -1189,16 +1189,29 @@ fn is_retired_managed_hook_command(line: &str) -> bool {
 }
 
 fn table_from_inline(inline: &InlineTable) -> Table {
-    let suffix = inline
-        .decor()
-        .suffix()
-        .and_then(|suffix| suffix.as_str())
-        .filter(|suffix| suffix.contains('#'))
-        .map(str::to_owned);
-    let mut table = inline.clone().into_table();
-    table.decor_mut().clear();
-    if let Some(suffix) = suffix {
-        table.decor_mut().set_suffix(suffix);
+    let mut source = inline.clone();
+    let keys = source
+        .iter()
+        .map(|(key, _)| key.to_owned())
+        .collect::<Vec<_>>();
+    let mut table = Table::new();
+    for key in keys {
+        if let Some((formatted_key, value)) = source.remove_entry(&key) {
+            table.insert_formatted(&formatted_key, Item::Value(value));
+        }
+    }
+
+    let mut comments = String::new();
+    for raw in [Some(inline.trailing()), inline.decor().suffix()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(raw) = raw.as_str() {
+            comments.push_str(raw);
+        }
+    }
+    if comments.contains('#') {
+        table.decor_mut().set_suffix(comments);
     }
     table
 }
@@ -1208,6 +1221,7 @@ fn key_for_table_header(key: Key) -> Key {
         .leaf_decor()
         .prefix()
         .and_then(|prefix| prefix.as_str())
+        .filter(|prefix| prefix.contains('#'))
         .map(str::to_owned);
     let mut formatted = Key::new(key.get());
     if let Some(prefix) = prefix {
@@ -5061,6 +5075,69 @@ command = 'python3 "$HOME/.codex/hooks/prevent_irreversible_git.py"'
                     directory.path(),
                 )
                 .expect("repeat comment-preserving migration"),
+                migrated
+            );
+        }
+    }
+
+    #[test]
+    fn feature_normalization_preserves_inline_comments() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("inline-feature-comments");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let fixtures = [
+            r#"features = {
+  hooks = false,
+  # keep-root-local-annotation
+  local_feature = "preserved",
+  # keep-root-trailing-annotation
+}
+"#,
+            r#"[features]
+rollout_budget = {
+  enabled = true,
+  # keep-budget-local-annotation
+  local_budget_note = "preserved",
+  # keep-budget-trailing-annotation
+}
+"#,
+        ];
+
+        for existing in fixtures {
+            let migrated =
+                merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                    .expect("migrate multiline inline feature comments");
+            for comment in existing
+                .lines()
+                .filter_map(|line| line.split_once('#').map(|(_, comment)| comment.trim()))
+            {
+                assert!(
+                    migrated.contains(&format!("# {comment}")),
+                    "migration must preserve inline comment: {comment}"
+                );
+            }
+            let document = migrated
+                .parse::<toml_edit::DocumentMut>()
+                .expect("inline comment migration must remain valid TOML");
+            assert_eq!(
+                document["features"]["rollout_budget"]["enabled"].as_bool(),
+                Some(false)
+            );
+            let local_feature = document["features"]
+                .get("local_feature")
+                .and_then(|item| item.as_str());
+            let local_budget_note = document["features"]["rollout_budget"]
+                .get("local_budget_note")
+                .and_then(|item| item.as_str());
+            assert!(local_feature == Some("preserved") || local_budget_note == Some("preserved"));
+            assert_eq!(
+                merge_managed_config_with_root(
+                    template,
+                    &migrated,
+                    &managed_root,
+                    directory.path(),
+                )
+                .expect("repeat inline comment migration"),
                 migrated
             );
         }
