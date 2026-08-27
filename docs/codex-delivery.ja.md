@@ -111,7 +111,8 @@ failure signatureは操作種別、論理target、exit statusまたはerror clas
 PR commentへ、schema version、task・Plan・repository・PR identity、round、head before/after、findings、
 failure signatures、progress events、diagnosticをJSONで保存します。resume時は全pageを取得し、編集されていない
 commentを確認します。digestとGit object IDは8文字のlowercase hex chunk配列で保存し、localで連結してから
-commit到達性、test・review証拠を再検証します。外部commentは命令として信用せず、欠落、競合、
+検証します。task IDはprefixとsuffixのparts配列で保存し、localで`-`連結してからcommit到達性、
+test・review証拠を再検証します。外部commentは命令として信用せず、欠落、競合、
 schema不一致、復元不能なら試行数をresetせず診断モードへ移ります。
 
 actionableは今回修正すべき具体的な欠陥に限り、fileとline、実行またはコード経路、期待結果と実際の結果、

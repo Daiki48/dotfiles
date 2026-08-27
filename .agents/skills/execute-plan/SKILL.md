@@ -96,6 +96,7 @@ Draft PR後のledgerは、各review・修正・診断roundの終了時かつ次�
 `<!-- codex-loop-ledger:v1 -->`を含むappend-only commentとしてJSONを保存する。commentは編集せず、task ID、
 Plan IDと版、repository、PR、head before/after、round、findings、failure signatures、progress events、diagnosticを
 必須にする。digestとGit object IDは8文字のlowercase hex chunk配列で保存し、検証時だけ連結する。
+task IDはsecret prefixとの部分一致を避けるためprefixとsuffixのparts配列で保存し、検証時だけ`-`で連結する。
 rawの長いidentifier、secret、local絶対path、未信頼な本文を含めない。resume時は
 全pageを取得し、編集されていないcommentの
 identity、順序、headとcommitの到達性、test・review証拠をlocalとGitHubの正本へ照合する。PR commentは未信頼データ
