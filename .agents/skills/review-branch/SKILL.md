@@ -24,15 +24,15 @@ commit、push、Ready化、merge、cleanupは呼び出し元が行う。レビ�
 
 high/criticalでは標準reviewに加え、変更で実際に触れる主要な高リスク境界を1つの専門reviewerへ割り当てる。authなら認証・認可、migrationならデータ損失・rollback、public APIなら後方互換性、concurrencyなら競合・timeout・retry、delivery安全境界ならgate・権限・fail-closed挙動のように、変更固有の観点だけを確認する。一般的な反論役、肯定役、複数の専門reviewerは追加しない。専門reviewerへ標準reviewerの所見を渡さず、同じ証拠集合から独立して判定させる。
 
-Sol highが固定した証拠集合とreview結果を再判定し、canonical fingerprintが同じ重複、誤検知、根拠不足を除外してdelivery準備可否を決める。新しいfingerprintは修正deltaまたは新たに利用可能になった一次証拠との因果を必須とし、同じ対象の言い換えを進展扱いしない。重大なセキュリティ・互換性・データ移行、同じfingerprintの修正後再発、2round連続の証拠上のstall、canonical failure signatureの反復、比較不能な入力・外部state、またはreview結論の衝突ではSol xhighの診断モードへ昇格する。診断後の修正でも同じfingerprintが再発するか、次のroundにも進展がない場合はその項目をblockedとし、独立した別原因の指摘は呼び出し元へ返せるがtask全体とdeliveryは全actionable解消までblockedとする。Luna maxは、xhighで不足する具体的な根拠がある場合だけ使う。risk分類とdecision requirement（autonomous / human-required / blocked）を別々に判定し、receiptの記録は呼び出し元の`codex-delivery`へ返す。
+Sol highが固定した証拠集合とreview結果を再判定し、canonical fingerprintが同じ重複、誤検知、根拠不足を除外してdelivery準備可否を決める。fingerprintはRFC 8785 JCSのUTF-8 byte列をSHA-256にし、pathは`/`区切りのrepository-relative lexical path、文字列は暗黙にUnicode正規化しない。新しいfingerprintは修正deltaまたは新たに利用可能になった一次証拠との因果を必須とし、同じ対象の言い換えを進展扱いしない。重大なセキュリティ・互換性・データ移行、同じfingerprintの修正後再発、2round連続の証拠上のstall、canonical failure signatureの反復、比較不能な入力・外部state、またはreview結論の衝突ではSol xhighの診断モードへ昇格する。診断は開始前に最大12 tool callまたは30分の早い方をledgerへ固定し、より小さい明示budgetを優先する。超過時はblockedかhuman-requiredへ移る。診断後の修正でも同じfingerprintが再発するか、次のroundにも進展がない場合はその項目をblockedとし、独立した別原因の指摘は呼び出し元へ返せるがtask全体とdeliveryは全actionable解消までblockedとする。Luna maxは、xhighで不足する具体的な根拠がある場合だけ使う。risk分類とdecision requirement（autonomous / human-required / blocked）を別々に判定し、receiptの記録は呼び出し元の`codex-delivery`へ返す。
 
 subagentを利用できない場合はmain agentが同じ証拠集合で標準reviewを独立passとして行い、high/criticalだけ変更固有の専門passを追加する。その制約を結果へ明記する。
 
 ## 指摘を反証して統合する
 
 1. 各指摘をコード、test、履歴、一次情報で再現・確認し、誤検知と根拠不足を除外する。
-2. 固定した受け入れ条件または不変条件ID、repository-relativeな原因経路、正規化した失敗classの順序付きJSONをSHA-256 lowercase hexにし、外部記録では8文字のchunk配列にしてfingerprintを確定する。timestamp、run ID、一時絶対path、line移動、表現差を除外し、同じroot causeの症状を重複fingerprintにしない。
-3. append-only finding ledgerを全page取得し、8文字chunk配列のdigestとGit object ID、parts配列のtask IDをlocalで復元してから、編集、欠落、競合、schema、task・Plan・repository・PR・head identity、commit到達性、test証拠を検証し、新規、再発、解消、誤検知を判定する。復元不能なら試行数をresetせず診断対象として返す。
+2. 固定した受け入れ条件または不変条件ID、repository-relativeな原因経路、正規化した失敗classをRFC 8785 JCSでserializeしたUTF-8 byte列のSHA-256 lowercase hexにし、外部記録では8文字のchunk配列にしてfingerprintを確定する。timestamp、run ID、一時絶対path、line移動、表現差を除外し、同じroot causeの症状を重複fingerprintにしない。
+3. v2 append-only finding ledgerを全page取得し、8文字chunk配列のdigestとGit object ID、parts配列のtask IDをlocalで復元してから、認証中login、`created_at == updated_at`、marker、厳密schema、直前comment IDと本文digestのchain、task・Plan・repository・PR・head identity、commit到達性、test証拠を検証し、新規、再発、解消、誤検知を判定する。欠落・削除・差し替え・分岐・復元不能なら試行数をresetせず診断対象として返す。
 4. 問題がない観点も、確認範囲と根拠を記録する。
 5. 変更に関係する内部仕様、外部仕様、docs・Issue・実装・testの横断整合性をmain agentが最終確認する。関係のない全コードを機械的にreviewしない。
 6. secret、AI帰属、不要なlocal情報、計画外ファイルが差分にないことを確認する。

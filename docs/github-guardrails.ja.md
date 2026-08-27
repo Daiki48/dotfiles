@@ -120,7 +120,10 @@ delivery判断は呼び出し元の専用`codex-delivery` helperが担当しま�
 計画を再検証します。fingerprintとsignatureの比較不能も診断対象です。診断後の修正でも同じ指摘が再発する、
 または次のroundも進展がない場合はその項目をblockedとします。影響しない別原因の新しい有効な指摘は
 自律修正できますが、task全体とdeliveryは全actionable解消までblockedです。各roundの証拠は次batch前に
-append-onlyのPR ledger commentへ保存し、resume時にhead、commit、test、reviewと照合します。
+直前comment IDと本文digestで連鎖するv2 append-only PR ledger commentへ保存し、resume時にauthor、未編集、schema、
+chain、head、commit、test、reviewと照合します。診断は最大12 tool callまたは30分の早い方で終了し、token残量不明時は
+Planの有限な受け入れ条件・実装単位・対象経路をwork budgetとしてscope外へ増殖させません。`codex-delivery`は全findingの
+解消とledgerのcomment ID・digestをreceiptへ固定し、deliver時にも再検証します。
 次の条件が同一SHAで同時に成立した場合だけReady化・merge候補になります。
 
 - required-ciなどrequired checkがすべて文字通り`success`である（skipped、cancelled、timed out、
