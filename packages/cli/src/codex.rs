@@ -93,7 +93,6 @@ const MANAGED_CONFIG_KEYS: &[&str] = &[
     "approvals_reviewer",
     "default_permissions",
     "commit_attribution",
-    "suppress_unstable_features_warning",
 ];
 const RETIRED_CONFIG_KEYS: &[&str] = &["sandbox_mode", "sandbox_workspace_write"];
 const RETIRED_SANDBOX_TABLE: &str = "[sandbox_workspace_write]";
@@ -3741,28 +3740,21 @@ mod tests {
         assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
         assert_eq!(document["features"]["goals"].as_bool(), Some(true));
         assert_eq!(
-            document["suppress_unstable_features_warning"].as_bool(),
-            Some(true)
-        );
-        assert_eq!(
             document["features"]["rollout_budget"]["enabled"].as_bool(),
-            Some(true)
+            Some(false)
         );
-        assert_eq!(
-            document["features"]["rollout_budget"]["limit_tokens"].as_integer(),
-            Some(200_000)
-        );
-        assert_eq!(
-            document["features"]["rollout_budget"]["reminder_at_remaining_tokens"]
-                .as_array()
-                .expect("rollout budget reminders")
-                .iter()
-                .filter_map(|value| value.as_integer())
-                .collect::<Vec<_>>(),
-            vec![
-                180_000, 160_000, 140_000, 120_000, 100_000, 80_000, 60_000, 40_000, 20_000
-            ]
-        );
+        for key in [
+            "limit_tokens",
+            "reminder_interval_tokens",
+            "reminder_at_remaining_tokens",
+            "prefill_token_weight",
+            "sampling_token_weight",
+        ] {
+            assert!(
+                document["features"]["rollout_budget"].get(key).is_none(),
+                "rollout budget hard-stop setting must be absent: {key}"
+            );
+        }
         assert_eq!(
             document["permissions"][MANAGED_PERMISSION_PROFILE]["extends"].as_str(),
             Some(":workspace")
@@ -4312,7 +4304,7 @@ description = "local"
         assert!(actual.contains("default_permissions = \"codex-autonomous\""));
         assert!(actual.contains("approvals_reviewer = \"auto_review\""));
         assert!(actual.contains("commit_attribution = \"\""));
-        assert!(actual.contains("suppress_unstable_features_warning = true"));
+        assert!(actual.contains("suppress_unstable_features_warning = false"));
         assert!(actual.contains("[features]\nhooks = true\ngoals = true\nnetwork_proxy = true"));
         assert!(actual.contains(
             "[features.rollout_budget]\nenabled = true\nlimit_tokens = 200000\nreminder_at_remaining_tokens = [180000, 160000, 140000, 120000, 100000, 80000, 60000, 40000, 20000]\nprefill_token_weight = 1.0\nsampling_token_weight = 1.0\nlocal_budget_note = \"preserved\""
@@ -4474,6 +4466,57 @@ rollout_budget."local_budget_note" = "preserved"
         assert_eq!(
             document["features"]["rollout_budget"]["limit_tokens"].as_integer(),
             Some(200000)
+        );
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
+    }
+
+    #[test]
+    fn rollout_budget_hard_stop_is_disabled_and_limits_are_retired() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let existing = r#"[features]
+hooks = false
+goals = false
+
+[features.rollout_budget]
+enabled = true
+limit_tokens = 200000
+reminder_interval_tokens = 20000
+reminder_at_remaining_tokens = [180000, 160000]
+prefill_token_weight = 1.0
+sampling_token_weight = 1.0
+local_budget_note = "preserved"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '"$HOME/.codex/hooks/block-git-write"'
+timeout = 10
+statusMessage = "Git/GitHub操作を確認中"
+"#;
+
+        let migrated = merge_managed_config(template, existing);
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("disabled rollout budget migration must remain valid TOML");
+        let rollout_budget = &document["features"]["rollout_budget"];
+        assert_eq!(rollout_budget["enabled"].as_bool(), Some(false));
+        for key in [
+            "limit_tokens",
+            "reminder_interval_tokens",
+            "reminder_at_remaining_tokens",
+            "prefill_token_weight",
+            "sampling_token_weight",
+        ] {
+            assert!(
+                rollout_budget.get(key).is_none(),
+                "rollout budget hard-stop setting must be retired: {key}"
+            );
+        }
+        assert_eq!(
+            rollout_budget["local_budget_note"].as_str(),
+            Some("preserved")
         );
         assert_eq!(merge_managed_config(template, &migrated), migrated);
     }

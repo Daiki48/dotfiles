@@ -89,11 +89,10 @@ the current non-protected work branch, Draft PR creation, and reversible Issue/P
 updates are allowlisted so the workflow does not pause for approval. The hook validates the
 current repository, explicit target IDs, canonical arguments, metadata, and detected secrets.
 
-Codex setup explicitly enables persisted goals/automatic continuation and the under-development rollout budget tracker at 200,000 tokens with
-20,000-token reminders. Codex CLI 0.150.1 expresses these as explicit remaining-token checkpoints.
-Because the tracker is intentionally enabled, setup also suppresses only its under-development
-startup warning; tracking remains enabled. It is an accounting/reminder signal rather than a hard stop; AGENTS.md uses
-it together with per-fingerprint circuit breakers, finite Plan scope, and reserved closure work.
+Codex setup explicitly enables persisted goals/automatic continuation. It disables the
+under-development rollout budget tracker because its shared token limit stops turns at exhaustion.
+AGENTS.md instead uses per-fingerprint circuit breakers, evidence-based progress checks, finite
+diagnostic budgets, finite Plan scope, and reserved closure work.
 It continues to reject protected-branch or force/delete/tag pushes, destructive cleanup,
 arbitrary GitHub API mutations, and repository mismatches. Draft PR後のreview receipt、Ready化、
 merge、main同期、managed cleanupは専用[`codex-delivery` helper](docs/codex-delivery.ja.md)だけを
