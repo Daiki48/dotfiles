@@ -955,16 +955,87 @@ fn preflight_shared_symlink(
     Ok(())
 }
 
-fn is_assignment_for(line: &str, keys: &[&str]) -> bool {
+fn assignment_key_path(line: &str) -> Option<Vec<String>> {
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') || trimmed.starts_with('[') {
-        return false;
+        return None;
     }
-    keys.iter().any(|key| {
-        trimmed
-            .strip_prefix(key)
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    })
+    let mut basic = false;
+    let mut literal = false;
+    let mut escaped = false;
+    let equals = trimmed.char_indices().find_map(|(index, character)| {
+        if basic {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                basic = false;
+            }
+            return None;
+        }
+        if literal {
+            if character == '\'' {
+                literal = false;
+            }
+            return None;
+        }
+        match character {
+            '"' => basic = true,
+            '\'' => literal = true,
+            '=' => return Some(index),
+            _ => {}
+        }
+        None
+    })?;
+    if basic || literal {
+        return None;
+    }
+    let key = trimmed[..equals].trim();
+    if key.is_empty() {
+        return None;
+    }
+    let probe = format!("{key} = true\n").parse::<DocumentMut>().ok()?;
+    let mut table = probe.as_table();
+    let mut path = Vec::new();
+    loop {
+        if table.len() != 1 {
+            return None;
+        }
+        let (key, item) = table.iter().next()?;
+        path.push(key.to_owned());
+        if item.is_value() {
+            return Some(path);
+        }
+        let next = item.as_table()?;
+        if !next.is_implicit() {
+            return None;
+        }
+        table = next;
+    }
+}
+
+fn is_assignment_for(line: &str, keys: &[&str]) -> bool {
+    let Some(path) = assignment_key_path(line) else {
+        return false;
+    };
+    keys.iter()
+        .any(|key| path.iter().map(String::as_str).eq(key.split('.')))
+}
+
+fn is_nested_assignment_for(line: &str, table: &str, keys: &[&str]) -> bool {
+    let Some(path) = assignment_key_path(line) else {
+        return false;
+    };
+    path.first().is_some_and(|segment| segment == table)
+        && keys
+            .iter()
+            .any(|key| path.iter().skip(1).map(String::as_str).eq(key.split('.')))
+}
+
+fn is_assignment_below(line: &str, table: &str) -> bool {
+    assignment_key_path(line)
+        .is_some_and(|path| path.len() > 1 && path.first().is_some_and(|key| key == table))
 }
 
 fn table_header(line: &str) -> Option<&str> {
@@ -1536,7 +1607,9 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         if is_syntax
             && in_top_level
             && (is_assignment_for(line, MANAGED_CONFIG_KEYS)
-                || is_assignment_for(line, RETIRED_CONFIG_KEYS))
+                || is_assignment_for(line, RETIRED_CONFIG_KEYS)
+                || is_assignment_below(line, "sandbox_workspace_write")
+                || is_nested_assignment_for(line, "agents", MANAGED_AGENT_KEYS))
         {
             continue;
         }
@@ -4891,6 +4964,79 @@ features.rollout_budget.limit_tokens = 99999
             Some("preserved")
         );
         assert_eq!(merge_managed_config(template, &migrated), migrated);
+    }
+
+    #[test]
+    fn managed_config_keys_are_normalized_across_toml_spellings() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("managed-config-key-spellings");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let existing = r#""model" = "old"
+'approval_policy' = "never"
+"profile" = "legacy"
+'sandbox_mode' = "workspace-write"
+sandbox_workspace_write.writable_roots = ["/srv/legacy"]
+
+[agents]
+"enabled" = false
+'default_subagent_model' = "old"
+local_agent_setting = "preserved"
+"#;
+
+        let migrated =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate quoted and dotted managed config keys");
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("managed config spelling migration must remain valid TOML");
+        assert_eq!(document["model"].as_str(), Some("gpt-5.6-sol"));
+        assert_eq!(document["approval_policy"].as_str(), Some("on-request"));
+        assert!(document.get("profile").is_none());
+        assert!(document.get("sandbox_mode").is_none());
+        assert!(document.get("sandbox_workspace_write").is_none());
+        assert_eq!(document["agents"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            document["agents"]["default_subagent_model"].as_str(),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            document["agents"]["local_agent_setting"].as_str(),
+            Some("preserved")
+        );
+        assert_eq!(
+            document["permissions"][MANAGED_PERMISSION_PROFILE]["workspace_roots"]["/srv/legacy"]
+                .as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat managed config spelling migration"),
+            migrated
+        );
+
+        let dotted_agents = r#"agents.enabled = false
+agents.max_concurrent_threads_per_session = 99
+"#;
+        let migrated = merge_managed_config_with_root(
+            template,
+            dotted_agents,
+            &managed_root,
+            directory.path(),
+        )
+        .expect("migrate root-dotted managed agent keys");
+        let document = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("root-dotted agent migration must remain valid TOML");
+        assert_eq!(document["agents"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            document["agents"]["max_concurrent_threads_per_session"].as_integer(),
+            Some(3)
+        );
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat root-dotted agent migration"),
+            migrated
+        );
     }
 
     #[test]
