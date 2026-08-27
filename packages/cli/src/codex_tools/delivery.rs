@@ -1991,6 +1991,25 @@ fn validate_main_sync_retry(stage: &str, last_error: &str, sandbox_retry: bool) 
     Ok(())
 }
 
+fn consume_main_sync_retry(
+    repository: &str,
+    task: &str,
+    state: &Value,
+    sandbox_retry: bool,
+) -> Result<Value> {
+    if sandbox_retry {
+        save_stage(
+            repository,
+            task,
+            state,
+            "merged",
+            MAIN_SYNC_SANDBOX_RETRY_CONSUMED,
+        )
+    } else {
+        Ok(state.clone())
+    }
+}
+
 fn receipt_decision(value: &Value) -> Result<String> {
     if let Some(raw) = value.get("decision") {
         return decision(
@@ -3580,6 +3599,7 @@ fn finish_locked(
     let initial_stage = str_value(&state, "stage")?;
     let initial_error = str_value(&state, "last_error")?;
     validate_main_sync_retry(&initial_stage, &initial_error, sandbox_retry)?;
+    state = consume_main_sync_retry(&repository, task, &state, sandbox_retry)?;
     let view = pr_view(root, &repository, expected_pr)?;
     if str_value(&view, "state")? != "MERGED"
         || oid(&str_value(&view, "headRefOid")?, "merged PR head")? != head
@@ -3651,15 +3671,6 @@ fn finish_locked(
         }
         prepare_main_sync(root, &remote_main)?;
         assert_main_clean(root)?;
-        if sandbox_retry {
-            state = save_stage(
-                &repository,
-                task,
-                &state,
-                "merged",
-                MAIN_SYNC_SANDBOX_RETRY_CONSUMED,
-            )?;
-        }
         let args = ["merge", "--ff-only", "refs/remotes/origin/main"];
         let av = args.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
         let merge = run(
@@ -5651,6 +5662,33 @@ mod tests {
         );
         assert!(validate_main_sync_retry("merged", MAIN_SYNC_SANDBOX_RETRY_READY, false).is_err());
         assert!(validate_main_sync_retry("main_synced", "", false).is_ok());
+
+        with_codex_home(|_| {
+            let state = object([
+                ("stage", string("merged")),
+                ("last_error", string(MAIN_SYNC_SANDBOX_RETRY_READY)),
+            ]);
+            let consumed = consume_main_sync_retry("owner/repo", "issue-24", &state, true)
+                .expect("consume retry before external checks");
+            assert_eq!(
+                str_value(&consumed, "last_error").unwrap(),
+                MAIN_SYNC_SANDBOX_RETRY_CONSUMED
+            );
+            let persisted = read_json_file(
+                &state_path("owner/repo", "issue-24").unwrap(),
+                "delivery state",
+            )
+            .unwrap();
+            assert_eq!(persisted, consumed);
+            assert!(
+                validate_main_sync_retry(
+                    &str_value(&persisted, "stage").unwrap(),
+                    &str_value(&persisted, "last_error").unwrap(),
+                    true,
+                )
+                .is_err()
+            );
+        });
     }
 
     #[test]
