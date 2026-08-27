@@ -62,6 +62,7 @@
 - `gh pr ready`、`gh pr merge`などのdelivery操作や`git worktree remove`などの直接cleanupを
   実行せず、`codex-delivery`へ集約します。失敗、timeout、pending、dirty、stale、conflict、
   判定不能時はPR・branch・worktreeを保持して再開点を報告します。
+- merge済みPRの`finish`が`人間用mainをff-only syncできません`だけで停止し、mainがcleanかつ`origin/main`のancestor、receipt headが`origin/main`へ到達済みで、変更にruntimeがread-onlyにする`.codex/`または`.agents/`を含む場合は、同じ引数の`codex-delivery finish`だけをsandbox外権限で1回再試行します。条件不成立や再失敗では権限昇格せず、直接`git merge`やcleanupへ迂回しません。
 - managed root内で、merge済み・head到達性・clean・未pushなしなどをhelperが厳格に証明した
   cleanupだけが自律削除の例外です。任意の削除は従来どおり確認を得て`.codex-trash/`へ
   退避し、直接削除しません。managed cleanupでremote task branchを削除するときだけ、競合更新を

@@ -198,6 +198,7 @@ high/criticalだけ`--specialist-review-passed`も指定する。明示認可さ
    branch、PR、merged状態、head到達性、ignored artifactを含むclean、未pushなしを厳格に証明できた場合だけmanaged cleanupを行う。
    remote task branch削除だけはreview済みSHAをexpected leaseに固定し、競合更新時は停止する。内容を上書きする
    force push、`rm`、`prune`、`branch -D`は行わない。
+7. merge済みPRの`finish`が`人間用mainをff-only syncできません`だけで停止し、mainがcleanかつ`origin/main`のancestor、receipt headが`origin/main`へ到達済みで、変更にruntimeがread-onlyにする`.codex/`または`.agents/`を含む場合は、同じ引数の`codex-delivery finish`だけをsandbox外権限で1回再試行する。条件不成立や再失敗では権限昇格せず、直接`git merge`やcleanupへ迂回しない。
 
 失敗、timeout、pending、dirty、stale、conflict、network障害、判定不能ではdeliver/finishを中断し、PR、branch、
 worktreeを保持する。再開時はreceipt、head SHA、CI/review状態を再取得し、直接cleanupや直接mergeで復旧しない。
