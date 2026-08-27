@@ -14,7 +14,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, PermissionsExt},
 };
-use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
+use toml_edit::{DocumentMut, InlineTable, Item, Key, Table, Value, value};
 
 use crate::codex_tools::{process, worktree};
 const CODEX_FILES: &[(&str, &str)] = &[
@@ -976,6 +976,98 @@ fn table_header(line: &str) -> Option<&str> {
     header.starts_with('[').then_some(header)
 }
 
+#[derive(Clone, Copy)]
+enum TomlMultilineString {
+    Basic,
+    Literal,
+}
+
+fn multiline_delimiter_at(line: &[u8], index: usize, kind: TomlMultilineString) -> bool {
+    let quote = match kind {
+        TomlMultilineString::Basic => b'"',
+        TomlMultilineString::Literal => b'\'',
+    };
+    line.get(index..index + 3) == Some(&[quote, quote, quote])
+}
+
+fn basic_delimiter_is_escaped(line: &[u8], index: usize) -> bool {
+    let backslashes = line[..index]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    backslashes % 2 == 1
+}
+
+fn update_multiline_string_state(line: &str, state: &mut Option<TomlMultilineString>) {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(kind) = *state {
+            while index < bytes.len() {
+                if multiline_delimiter_at(bytes, index, kind)
+                    && (!matches!(kind, TomlMultilineString::Basic)
+                        || !basic_delimiter_is_escaped(bytes, index))
+                {
+                    *state = None;
+                    index += 3;
+                    break;
+                }
+                index += 1;
+            }
+            if state.is_some() {
+                return;
+            }
+            continue;
+        }
+
+        match bytes[index] {
+            b'#' => return,
+            b'"' if multiline_delimiter_at(bytes, index, TomlMultilineString::Basic) => {
+                *state = Some(TomlMultilineString::Basic);
+                index += 3;
+            }
+            b'\'' if multiline_delimiter_at(bytes, index, TomlMultilineString::Literal) => {
+                *state = Some(TomlMultilineString::Literal);
+                index += 3;
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'\'' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'\'' {
+                    index += 1;
+                }
+                index = (index + 1).min(bytes.len());
+            }
+            _ => index += 1,
+        }
+    }
+}
+
+fn toml_syntax_line_flags(contents: &str) -> Vec<bool> {
+    let mut state = None;
+    contents
+        .lines()
+        .map(|line| {
+            let is_syntax = state.is_none();
+            update_multiline_string_state(line, &mut state);
+            is_syntax
+        })
+        .collect()
+}
+
 fn managed_assignments(template: &str, section: Option<&str>, keys: &[&str]) -> Vec<String> {
     let mut current_section = None;
     template
@@ -1016,10 +1108,12 @@ fn managed_permission_profile_sections(template: &str) -> Vec<String> {
 
 fn remove_retired_managed_hook(existing: &str) -> String {
     let existing_lines = existing.lines().collect::<Vec<_>>();
+    let syntax_lines = toml_syntax_line_flags(existing);
     let mut merged = Vec::new();
     let mut index = 0;
     while index < existing_lines.len() {
-        if table_header(existing_lines[index]) != Some(PRE_TOOL_USE_HEADER) {
+        if !syntax_lines[index] || table_header(existing_lines[index]) != Some(PRE_TOOL_USE_HEADER)
+        {
             merged.push(existing_lines[index]);
             index += 1;
             continue;
@@ -1031,15 +1125,21 @@ fn remove_retired_managed_hook(existing: &str) -> String {
             .enumerate()
             .skip(index + 1)
             .find_map(|(next, line)| {
-                (table_header(line) == Some(PRE_TOOL_USE_HEADER)
-                    || (table_header(line).is_some()
-                        && table_header(line) != Some(PRE_TOOL_USE_HOOK_HEADER)))
-                .then_some(next)
+                syntax_lines[next]
+                    .then(|| table_header(line))
+                    .flatten()
+                    .is_some_and(|header| {
+                        header == PRE_TOOL_USE_HEADER || header != PRE_TOOL_USE_HOOK_HEADER
+                    })
+                    .then_some(next)
             })
             .unwrap_or(existing_lines.len());
         let has_managed_hook = existing_lines[section_start..section_end]
             .iter()
-            .any(|line| is_retired_managed_hook_command(line.trim()));
+            .enumerate()
+            .any(|(offset, line)| {
+                syntax_lines[section_start + offset] && is_retired_managed_hook_command(line.trim())
+            });
         if !has_managed_hook {
             merged.extend_from_slice(&existing_lines[section_start..section_end]);
             index = section_end;
@@ -1047,7 +1147,8 @@ fn remove_retired_managed_hook(existing: &str) -> String {
         }
 
         let first_hook = (section_start + 1..section_end).find(|position| {
-            table_header(existing_lines[*position]) == Some(PRE_TOOL_USE_HOOK_HEADER)
+            syntax_lines[*position]
+                && table_header(existing_lines[*position]) == Some(PRE_TOOL_USE_HOOK_HEADER)
         });
         let Some(first_hook) = first_hook else {
             index = section_end;
@@ -1058,12 +1159,17 @@ fn remove_retired_managed_hook(existing: &str) -> String {
         while hook_start < section_end {
             let hook_end = (hook_start + 1..section_end)
                 .find(|position| {
-                    table_header(existing_lines[*position]) == Some(PRE_TOOL_USE_HOOK_HEADER)
+                    syntax_lines[*position]
+                        && table_header(existing_lines[*position]) == Some(PRE_TOOL_USE_HOOK_HEADER)
                 })
                 .unwrap_or(section_end);
             if !existing_lines[hook_start..hook_end]
                 .iter()
-                .any(|line| is_retired_managed_hook_command(line.trim()))
+                .enumerate()
+                .any(|(offset, line)| {
+                    syntax_lines[hook_start + offset]
+                        && is_retired_managed_hook_command(line.trim())
+                })
             {
                 retained_hooks.extend_from_slice(&existing_lines[hook_start..hook_end]);
             }
@@ -1083,18 +1189,38 @@ fn is_retired_managed_hook_command(line: &str) -> bool {
 }
 
 fn table_from_inline(inline: &InlineTable) -> Table {
-    let mut table = Table::new();
-    for (key, value) in inline.iter() {
-        table.insert(key, Item::Value(value.clone()));
+    let suffix = inline
+        .decor()
+        .suffix()
+        .and_then(|suffix| suffix.as_str())
+        .filter(|suffix| suffix.contains('#'))
+        .map(str::to_owned);
+    let mut table = inline.clone().into_table();
+    table.decor_mut().clear();
+    if let Some(suffix) = suffix {
+        table.decor_mut().set_suffix(suffix);
     }
     table
+}
+
+fn key_for_table_header(key: Key) -> Key {
+    let prefix = key
+        .leaf_decor()
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .map(str::to_owned);
+    let mut formatted = Key::new(key.get());
+    if let Some(prefix) = prefix {
+        formatted.leaf_decor_mut().set_prefix(prefix);
+    }
+    formatted
 }
 
 fn normalize_inline_feature_tables(existing: &str) -> String {
     let Ok(mut document) = existing.parse::<DocumentMut>() else {
         return existing.to_owned();
     };
-    let Some(features_item) = document.remove("features") else {
+    let Some((features_key, features_item)) = document.remove_entry("features") else {
         return existing.to_owned();
     };
     let mut features = if let Some(table) = features_item.as_table() {
@@ -1102,7 +1228,7 @@ fn normalize_inline_feature_tables(existing: &str) -> String {
     } else if let Some(inline) = features_item.as_inline_table() {
         table_from_inline(inline)
     } else {
-        document.insert("features", features_item);
+        document.insert_formatted(&features_key, features_item);
         return existing.to_owned();
     };
     features.set_implicit(false);
@@ -1113,14 +1239,15 @@ fn normalize_inline_feature_tables(existing: &str) -> String {
     for key in LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS {
         features.remove(key);
     }
-    if let Some(rollout_budget_item) = features.remove("rollout_budget") {
+    if let Some((rollout_budget_key, rollout_budget_item)) = features.remove_entry("rollout_budget")
+    {
         let mut rollout_budget = if let Some(table) = rollout_budget_item.as_table() {
             table.clone()
         } else if let Some(inline) = rollout_budget_item.as_inline_table() {
             table_from_inline(inline)
         } else {
-            features.insert("rollout_budget", rollout_budget_item);
-            document.insert("features", Item::Table(features));
+            features.insert_formatted(&rollout_budget_key, rollout_budget_item);
+            document.insert_formatted(&key_for_table_header(features_key), Item::Table(features));
             return document.to_string();
         };
         rollout_budget.set_implicit(false);
@@ -1128,9 +1255,12 @@ fn normalize_inline_feature_tables(existing: &str) -> String {
         for key in MANAGED_ROLLOUT_BUDGET_KEYS {
             rollout_budget.remove(key);
         }
-        features.insert("rollout_budget", Item::Table(rollout_budget));
+        features.insert_formatted(
+            &key_for_table_header(rollout_budget_key),
+            Item::Table(rollout_budget),
+        );
     }
-    document.insert("features", Item::Table(features));
+    document.insert_formatted(&key_for_table_header(features_key), Item::Table(features));
     document.to_string()
 }
 
@@ -1300,8 +1430,10 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
     let mut features_found = false;
     let mut rollout_budget_found = false;
     let mut preserved_lines = Vec::new();
-    for line in existing.lines() {
-        let header = table_header(line);
+    let syntax_lines = toml_syntax_line_flags(&existing);
+    for (index, line) in existing.lines().enumerate() {
+        let is_syntax = syntax_lines[index];
+        let header = is_syntax.then(|| table_header(line)).flatten();
         if let Some(header) = header {
             in_top_level = false;
             in_legacy_profile_table = header == "[profiles]" || header.starts_with("[profiles.");
@@ -1323,26 +1455,28 @@ fn merge_managed_config(template: &str, existing: &str) -> String {
         if in_legacy_profile_table || in_retired_sandbox_table || in_managed_permission_profile {
             continue;
         }
-        if in_top_level && is_assignment_for(line, &["profile"]) {
+        if is_syntax && in_top_level && is_assignment_for(line, &["profile"]) {
             continue;
         }
-        if in_top_level
+        if is_syntax
+            && in_top_level
             && (is_assignment_for(line, MANAGED_CONFIG_KEYS)
                 || is_assignment_for(line, RETIRED_CONFIG_KEYS))
         {
             continue;
         }
-        if in_agents && is_assignment_for(line, MANAGED_AGENT_KEYS) {
+        if is_syntax && in_agents && is_assignment_for(line, MANAGED_AGENT_KEYS) {
             continue;
         }
-        if in_features
+        if is_syntax
+            && in_features
             && (is_assignment_for(line, MANAGED_FEATURE_KEYS)
                 || is_assignment_for(line, LEGACY_MANAGED_ROLLOUT_BUDGET_KEYS)
                 || is_assignment_for(line, &["rollout_budget"]))
         {
             continue;
         }
-        if in_rollout_budget && is_assignment_for(line, MANAGED_ROLLOUT_BUDGET_KEYS) {
+        if is_syntax && in_rollout_budget && is_assignment_for(line, MANAGED_ROLLOUT_BUDGET_KEYS) {
             continue;
         }
         preserved_lines.push(line);
@@ -4841,6 +4975,95 @@ local_note = "preserve"
             "migration must not create a backup or temp file"
         );
         assert_eq!(entries[0].file_name(), "config.toml");
+    }
+
+    #[test]
+    fn managed_multiline_values_do_not_inject_table_headers() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("multiline-feature-value");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let existing = r#"[features]
+local_basic = """
+[features.rollout_budget]
+preserve-basic
+"""
+local_literal = '''
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+command = 'python3 "$HOME/.codex/hooks/prevent_irreversible_git.py"'
+'''
+"#;
+        let before = existing
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse existing multiline values");
+
+        let migrated =
+            merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                .expect("migrate multiline local feature values");
+        let after = migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("multiline migration must remain valid TOML");
+        assert_eq!(
+            after["features"]["local_basic"].as_str(),
+            before["features"]["local_basic"].as_str()
+        );
+        assert_eq!(
+            after["features"]["local_literal"].as_str(),
+            before["features"]["local_literal"].as_str()
+        );
+        assert_eq!(
+            after["features"]["rollout_budget"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            merge_managed_config_with_root(template, &migrated, &managed_root, directory.path(),)
+                .expect("repeat multiline feature migration"),
+            migrated
+        );
+    }
+
+    #[test]
+    fn feature_normalization_preserves_outer_comments() {
+        let template = include_str!("../../../.codex/config.base.toml");
+        let directory = TestDirectory::new("feature-comment-decor");
+        let managed_root = directory.path().join("codex").join("worktrees");
+        let fixtures = [
+            "# keep-before-root-inline\nfeatures = { hooks = false, local_feature = \"preserved\" } # keep-after-root-inline\n",
+            "# keep-before-root-dotted\nfeatures.local_feature = \"preserved\" # keep-after-root-dotted\n",
+            "[features]\n# keep-before-budget-inline\nrollout_budget = { enabled = true, local_budget_note = \"preserved\" } # keep-after-budget-inline\n",
+        ];
+
+        for existing in fixtures {
+            let migrated =
+                merge_managed_config_with_root(template, existing, &managed_root, directory.path())
+                    .expect("migrate a feature representation with outer comments");
+            for comment in existing
+                .lines()
+                .filter_map(|line| line.split_once('#').map(|(_, comment)| comment.trim()))
+            {
+                assert!(
+                    migrated.contains(&format!("# {comment}")),
+                    "migration must preserve local comment: {comment}"
+                );
+            }
+            let document = migrated
+                .parse::<toml_edit::DocumentMut>()
+                .expect("comment-preserving migration must remain valid TOML");
+            assert_eq!(
+                document["features"]["rollout_budget"]["enabled"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(
+                merge_managed_config_with_root(
+                    template,
+                    &migrated,
+                    &managed_root,
+                    directory.path(),
+                )
+                .expect("repeat comment-preserving migration"),
+                migrated
+            );
+        }
     }
 
     #[test]
