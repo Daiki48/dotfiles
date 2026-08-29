@@ -4982,11 +4982,17 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
     {
         return Some("deliver/finishへreview evidenceまたはriskを指定できません".into());
     }
+    let local_gate = values
+        .get("--gate-mode")
+        .is_some_and(|v| v == "github-free-private-local");
     if values.get("--gate-mode").is_some_and(|v| {
         !["github-free-private", "github-free-private-local"].contains(&v.as_str())
     }) || values
         .get("--gate-mode")
         .is_some_and(|v| v == "github-free-private-local" && command == "record-review")
+        || local_gate
+            && !["high", "critical"]
+                .contains(&values.get("--risk").map(String::as_str).unwrap_or(""))
         || !valid_task_id(values.get("--task-id")?)
         || !values.get("--pr")?.bytes().all(|c| c.is_ascii_digit())
         || !valid_oid(values.get("--head")?)
@@ -6787,6 +6793,14 @@ mod tests {
         assert!(delivery_helper_invocation_reason(&local_record).is_some());
         local_record[1] = "approve-review".to_string();
         assert!(delivery_helper_invocation_reason(&local_record).is_none());
+
+        let mut local_low = command("low", false);
+        local_low[1] = "approve-review".to_string();
+        local_low.extend([
+            "--gate-mode".to_string(),
+            "github-free-private-local".to_string(),
+        ]);
+        assert!(delivery_helper_invocation_reason(&local_low).is_some());
 
         let mut missing_version = command("high", true);
         missing_version.drain(12..14);

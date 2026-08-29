@@ -2347,13 +2347,17 @@ fn review_request_is_idempotent(
     requested_risk: &str,
     existing_decision: &str,
     approved: bool,
+    existing_gate: &str,
+    requested_gate: &str,
 ) -> bool {
     let requested_decision = if approved {
         "human-approved"
     } else {
         "autonomous"
     };
-    existing_risk == requested_risk && existing_decision == requested_decision
+    existing_risk == requested_risk
+        && existing_decision == requested_decision
+        && existing_gate == requested_gate
 }
 #[allow(clippy::too_many_arguments)]
 fn write_review_locked(
@@ -2443,13 +2447,21 @@ fn write_review_locked(
         }
         let old_risk = str_value(&existing, "risk")?;
         let old_decision = receipt_decision(&existing)?;
+        let old_gate = receipt_gate_mode(&existing)?;
         if risk_level(risk_value) < risk_level(&old_risk)
             || (!approved && old_decision == "human-approved")
         {
             return Err(error("同じheadのreceiptをdowngradeできません"));
         }
         if receipt_has_current_plan_version(&existing)
-            && review_request_is_idempotent(&old_risk, risk_value, &old_decision, approved)
+            && review_request_is_idempotent(
+                &old_risk,
+                risk_value,
+                &old_decision,
+                approved,
+                &old_gate,
+                gate,
+            )
         {
             return Ok(existing);
         }
@@ -4187,6 +4199,15 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
                 "github-free-private-localはapprove-reviewでのみ記録できます",
             ));
         }
+        validate_gate_review_profile(
+            &gate,
+            &risk_value,
+            if command == "approve-review" {
+                "human-approved"
+            } else {
+                "autonomous"
+            },
+        )?;
         Ok(CliArgs {
             command,
             task,
@@ -5373,30 +5394,46 @@ mod tests {
     }
 
     #[test]
-    fn review_request_only_reuses_the_same_decision_and_risk() {
+    fn review_request_only_reuses_the_same_decision_risk_and_gate() {
         assert!(review_request_is_idempotent(
             "low",
             "low",
             "autonomous",
-            false
+            false,
+            STRICT_GATE_MODE,
+            STRICT_GATE_MODE,
         ));
         assert!(review_request_is_idempotent(
             "high",
             "high",
             "human-approved",
-            true
+            true,
+            FREE_PRIVATE_LOCAL_GATE_MODE,
+            FREE_PRIVATE_LOCAL_GATE_MODE,
         ));
         assert!(!review_request_is_idempotent(
             "low",
             "low",
             "autonomous",
-            true
+            true,
+            STRICT_GATE_MODE,
+            STRICT_GATE_MODE,
         ));
         assert!(!review_request_is_idempotent(
             "low",
             "high",
             "autonomous",
-            false
+            false,
+            STRICT_GATE_MODE,
+            STRICT_GATE_MODE,
+        ));
+        assert!(!review_request_is_idempotent(
+            "high",
+            "high",
+            "human-approved",
+            true,
+            FREE_PRIVATE_GATE_MODE,
+            FREE_PRIVATE_LOCAL_GATE_MODE,
         ));
     }
 
@@ -5703,6 +5740,29 @@ mod tests {
             parse_args(local_approve).unwrap().gate,
             FREE_PRIVATE_LOCAL_GATE_MODE
         );
+
+        let mut local_low = vec![
+            OsString::from("approve-review"),
+            OsString::from("--task-id"),
+            OsString::from("issue-24"),
+            OsString::from("--pr"),
+            OsString::from("24"),
+            OsString::from("--head"),
+            OsString::from("b".repeat(40)),
+            OsString::from("--risk"),
+            OsString::from("low"),
+            OsString::from("--plan-id"),
+            OsString::from("CODEX-DELIVERY-TEST-v1"),
+            OsString::from("--plan-version"),
+            OsString::from("2"),
+            OsString::from("--tests-passed"),
+            OsString::from("--independent-review-passed"),
+        ];
+        local_low.extend([
+            OsString::from("--gate-mode"),
+            OsString::from(FREE_PRIVATE_LOCAL_GATE_MODE),
+        ]);
+        assert!(parse_args(local_low).is_err());
     }
 
     #[test]
