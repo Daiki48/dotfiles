@@ -4985,12 +4985,14 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
     let local_gate = values
         .get("--gate-mode")
         .is_some_and(|v| v == "github-free-private-local");
+    let review_command = command == "record-review" || command == "approve-review";
     if values.get("--gate-mode").is_some_and(|v| {
         !["github-free-private", "github-free-private-local"].contains(&v.as_str())
     }) || values
         .get("--gate-mode")
         .is_some_and(|v| v == "github-free-private-local" && command == "record-review")
         || local_gate
+            && review_command
             && !["high", "critical"]
                 .contains(&values.get("--risk").map(String::as_str).unwrap_or(""))
         || !valid_task_id(values.get("--task-id")?)
@@ -6801,6 +6803,27 @@ mod tests {
             "github-free-private-local".to_string(),
         ]);
         assert!(delivery_helper_invocation_reason(&local_low).is_some());
+
+        let local_delivery = |command: &str| {
+            vec![
+                "codex-delivery".to_string(),
+                command.to_string(),
+                "--task-id".to_string(),
+                "issue-24".to_string(),
+                "--pr".to_string(),
+                "24".to_string(),
+                "--head".to_string(),
+                "b".repeat(40),
+                "--plan-id".to_string(),
+                "loop-engineering-circuit-breaker-v1".to_string(),
+                "--plan-version".to_string(),
+                "3".to_string(),
+                "--gate-mode".to_string(),
+                "github-free-private-local".to_string(),
+            ]
+        };
+        assert!(delivery_helper_invocation_reason(&local_delivery("deliver")).is_none());
+        assert!(delivery_helper_invocation_reason(&local_delivery("finish")).is_none());
 
         let mut missing_version = command("high", true);
         missing_version.drain(12..14);
