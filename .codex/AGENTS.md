@@ -32,9 +32,11 @@
   rollback、検証をCodexが根拠付きで確定できる場合は`record-review`で自律deliveryします。製品判断、
   追加権限、費用、不可逆性、重大な残存リスクの受容などDaikiだけが決められる事項がある場合だけ、
   明示判断後に`approve-review`を使います。技術gateの失敗や不明状態はapprovalで迂回せずblockedとします。
-- すべてのタスクで、固定したPR head SHAに対するCIと1つの標準独立reviewを行います。high/criticalだけ、
+- すべてのタスクで、固定したPR head SHAに対するCI（明示承認済みlocal-only modeでは同一SHAのlocal test）と
+  1つの標準独立reviewを行います。high/criticalだけ、
   変更で実際に触れる主要な高リスク境界を対象とする専門reviewを1つ追加します。一般的な反論役や肯定役は使いません。
-  `actionable=0`、未解決thread=0、required checkが文字通り`success`、選択したremote gateが
+  `actionable=0`、未解決thread=0、required checkが文字通り`success`（明示承認済みlocal-only modeでは
+  固定SHAのlocal testが成功）、選択したremote gateが
   成立する同一SHAだけをdeliver対象とし、修正可能な指摘は自律的に修正して新SHAで
   reviewと検証をやり直します。修正round全体には固定上限を設けず、確定指摘を原因単位のfingerprintで
   追跡します。同じ指摘が修正後も再発するか、2round連続で受け入れ条件・test・既知指摘に証拠上の進展が
@@ -54,6 +56,11 @@
   検証し、server-side強制がないためriskをhigh/criticalとして扱います。ただし意思決定要否はriskと
   分離し、根拠を確定できる場合は自律deliveryできます。GitHub側が直接push、helper外merge、force push、branch削除を
   強制拒否しない残存リスクをRulesetと同等とは扱いません。
+- hosted/self-hosted CIを意図的に使わないGitHub Free/private repositoryでは、Daikiがserver-side CI不在の
+  残存リスクを明示承認した場合だけ`--gate-mode github-free-private-local`を`approve-review`、`deliver`、
+  `finish`へ明示できます。このmodeはhigh/critical、固定SHAのlocal test、標準・専門review、ledger、live
+  repository/PR/review検証を必須とし、`required-ci`だけを要求しません。CI失敗から自動fallbackせず、
+  `record-review`では作成できません。
 - CI/workflow、Ruleset、hook、rules、AGENTS、Skills、helper、installerなどdelivery安全境界を
   変更する作業、auth/secrets、billing、production、不可逆migration、breaking changeは
   highです。criticalを含め、riskの高さだけでは確認待ちへ移行しません。影響範囲、仕様、rollback、

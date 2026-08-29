@@ -117,12 +117,19 @@ repository identity, one successful exact-SHA `required-ci`, review state, and a
 receipt. GitHub does not enforce direct-push, force-push, deletion, or helper-only merge constraints
 server-side.
 
+When a GitHub Free private repository intentionally operates without hosted or self-hosted CI,
+`--gate-mode github-free-private-local` is available only after explicit human approval. It keeps
+the fixed-SHA local test and review receipt, ledger, live repository/PR/review checks, and
+high/critical risk requirement, while omitting only the `required-ci` check run. It is never an
+automatic fallback for a failed or pending CI run.
+
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, Draft PRs, and the delivery
 loop are used when the task or an explicit request warrants them. risk分類とDaikiの意思決定要否は
 別々に判定します。全riskで固定head SHAの標準独立reviewを1つ行い、high/criticalだけ変更固有の
-専門reviewを1つ追加します。actionable=0、未解決thread=0、required
-checkの文字どおりの`success`、選択したremote gateを満たし、仕様・既存権限・rollback・検証を
+専門reviewを1つ追加します。actionable=0、未解決thread=0、required checkの文字どおりの`success`
+（明示承認済みlocal-only modeでは固定SHAのlocal test成功）、選択したremote gateを満たし、
+仕様・既存権限・rollback・検証を
 Codexが確定できる場合に`codex-delivery`がReady、merge、mainのfetch後の`merge --ff-only`、
 managed cleanupまで進めます。delivery安全境界、auth/secrets、production、不可逆migration、
 breaking changeはhigh/criticalとしてreviewを強化しますが、riskだけで確認待ちにしません。

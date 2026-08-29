@@ -99,6 +99,11 @@ Free/private profileでも唯一の`required-ci`、GitHub Actions App ID `15368`
 Rulesetの代替としてprivate/default branch/archive/disable/merge/auto-merge設定をlive readbackし、
 設定driftや取得不能を拒否します。Ruleset APIの403、404、timeoutはfallback条件ではありません。
 
+hosted/self-hosted CIを意図的に運用しない場合は、Daikiが残存リスクを明示承認したときだけ
+`--gate-mode github-free-private-local`を選べます。これはhigh/criticalの`approve-review`専用で、
+固定SHAのlocal test・標準review・専門review、ledger、上記のrepository/PR/review検証を維持し、
+`required-ci` check runだけを要求しません。CI failureやpendingから自動fallbackしません。
+
 このprofileではGitHubサーバーが直接push、helper外merge、force push、branch削除を拒否しません。
 そのため実装内容にかかわらずdelivery riskをhigh/criticalへ引き上げます。ただしdecision requirementは
 riskと分離し、根拠を確定できる場合は`record-review`、Daikiだけが決められる事項がある場合だけ
