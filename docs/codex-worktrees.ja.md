@@ -199,8 +199,8 @@ high/criticalでは変更固有の専門reviewの完了証拠を
 receiptとして記録します。riskとは別にdecision requirementを判定し、仕様・既存権限・rollback・検証を
 確定できる場合は全riskで`record-review`を使います。Daikiだけが決められる事項がある場合は明示回答後に
 `approve-review`を使い、技術gateが不明または失敗ならblockedとしてreceiptを作りません。receiptと
-現在のSHAが一致し、delivery直前に
-再取得したCIが文字通り`success`、actionable=0、未解決thread=0、選択したremote gateが成立した
+現在のSHAが一致し、delivery直前に再取得したCIが文字通り`success`（明示承認済みlocal-only
+modeでは固定SHAのlocal test完了）、actionable=0、未解決thread=0、選択したremote gateが成立した
 場合だけ`deliver`へ進みます。
 
 既定はlive Rulesetを要求するstrict modeです。GitHub Free/private repositoryでは、`record-review`
@@ -208,6 +208,12 @@ receiptとして記録します。riskとは別にdecision requirementを判定�
 このmodeは保証差によりriskをhigh/criticalとし、Rulesetの代わりにlive private repository identityと
 decision receiptを検証します。403やnetwork
 errorから自動fallbackせず、modeを省略した既存commandとv1 receiptはstrictとして扱います。
+
+hosted/self-hosted CIを使わない方針をDaikiが明示承認した場合だけ、high/criticalの
+`approve-review`、`deliver`、`finish`へ`--gate-mode github-free-private-local`を明示できます。
+このmodeは固定headにworkflow YAMLがないこと、private repositoryとPR/reviewのlive検証を要求し、
+`required-ci`だけをlocal testのreceiptへ置き換えます。workflow YAMLがあれば`runs-on`のrunner種別に
+従って通常CIを使い、`record-review`やCI failureからの自動fallbackには使えません。
 
 確認待ち、blocked、delivery途中の異常で、PR、branch、worktreeを自動cleanupしません。
 

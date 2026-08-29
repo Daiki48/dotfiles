@@ -37,6 +37,17 @@ codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --p
 codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private
 ```
 
+hosted/self-hosted CIを意図的に使わないGitHub Free/private repositoryでは、Daikiが残存リスクを
+明示承認し、固定headに`.github/workflows/*.yml|*.yaml`がない場合に限り、次のlocal-only profileを
+使用できます。workflow YAMLがあれば`runs-on`のrunner種別に従って通常CIを使います。
+`record-review`では記録できません。
+
+```sh
+codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private-local --tests-passed --independent-review-passed --specialist-review-passed
+codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private-local
+codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private-local
+```
+
 `review-branch`は読み取り専用です。reviewerはreceipt、Issue、PR、Git、worktreeを変更せず、
 呼び出し元がdecision assessmentに応じてreview結果を`record-review`または`approve-review`へ渡します。
 
@@ -141,7 +152,7 @@ blocked・未解消finding、編集、削除、差し替え、chain切れをfail
 1. PRがopenで、baseがrepositoryのdefault branchである。
 2. 現在のhead SHAがreceiptのreview済みSHAと一致する。
 3. required CIがすべて文字通り`success`で、失敗、skip、cancel、timeout、neutral、pending、
-   取得不能がない。
+   取得不能がない。明示承認済みlocal-only modeでは、代わりに固定SHAのlocal testが成功している。
 4. actionableな指摘が0件で、GitHub review conversationの全pageに未解決threadがなく、reviewerごとの
    現在有効な個別reviewに`CHANGES_REQUESTED`がなく、`reviewDecision`も`CHANGES_REQUESTED`、
    `REVIEW_REQUIRED`、不明値ではない。
@@ -183,12 +194,24 @@ GitHub側ではmainへの直接push、helper外merge、force push、branch削除
 同等の保証とは説明しません。identity不一致、public化、repository設定drift、mode省略・不一致、
 API取得不能ではfail closedにします。
 
+### GitHub Free/private local-only
+
+`github-free-private-local`は`github-free-private`と同じlive repository identity、固定head、最新mainの
+ancestor、mergeability、review thread、`CHANGES_REQUESTED`、ledgerを検証しますが、唯一
+`required-ci` check runを要求しません。代わりに固定SHAで完了したlocal test・標準review・専門reviewを
+receiptへ固定し、workflow YAML不在、high/critical、`human-approved`を必須にします。同一headの既存
+`github-free-private` receiptは、同じPlan・evidenceのまま明示承認されたこのmodeへだけ更新できます。
+
+このmodeの`tests-passed`はlocal実行結果の構造的な申告であり、GitHubが実行・強制するCI証明では
+ありません。CI失敗・pendingを迂回するfallbackとしては使わず、CI自体を運用しない方針への明示承認が
+ある場合だけ選択します。GitHub側で直接push等を拒否できない残存リスクも引き続き存在します。
+
 ## deliver
 
 `deliver`はreceiptとlive状態をもう一度読み取り、上記の全条件を満たした同一SHAだけを対象にします。
 `autonomous`または`human-approved` decisionを持つreceiptだけをReady化し、
 選択したremote gateが許可するmerge methodでmergeします。Ready化やmergeの前後でhead SHA、
-PR状態、remote gate、CIを取り直し、
+PR状態、remote gate、CI（local-only modeでは固定済みlocal test証拠）を取り直し、
 raceやstale状態を検出したら停止します。
 
 merge直前にはrepository、PR番号、open/Ready、base=`main`、head branch、head SHA、同一repository、

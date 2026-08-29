@@ -40,6 +40,7 @@ const GH_BINARY: &str = "/usr/bin/gh";
 const SSH_BINARY: &str = "/usr/bin/ssh";
 const STRICT_GATE_MODE: &str = "strict-ruleset";
 const FREE_PRIVATE_GATE_MODE: &str = "github-free-private";
+const FREE_PRIVATE_LOCAL_GATE_MODE: &str = "github-free-private-local";
 const LOOP_LEDGER_V1_MARKER: &str = "<!-- codex-loop-ledger:v1 -->";
 const LOOP_LEDGER_V2_MARKER: &str = "<!-- codex-loop-ledger:v2 -->";
 const THREAD_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{isResolved}pageInfo{hasNextPage,endCursor}}}}}";
@@ -232,8 +233,21 @@ fn gate_mode(value: &str) -> Result<&'static str> {
     match value {
         STRICT_GATE_MODE => Ok(STRICT_GATE_MODE),
         FREE_PRIVATE_GATE_MODE => Ok(FREE_PRIVATE_GATE_MODE),
+        FREE_PRIVATE_LOCAL_GATE_MODE => Ok(FREE_PRIVATE_LOCAL_GATE_MODE),
         _ => Err(error("gate modeが不正です")),
     }
+}
+fn free_private_gate(value: &str) -> bool {
+    [FREE_PRIVATE_GATE_MODE, FREE_PRIVATE_LOCAL_GATE_MODE].contains(&value)
+}
+fn remote_ci_required(value: &str) -> bool {
+    value != FREE_PRIVATE_LOCAL_GATE_MODE
+}
+fn workflow_yaml_path(value: &str) -> bool {
+    let Some(name) = value.strip_prefix(".github/workflows/") else {
+        return false;
+    };
+    !name.is_empty() && !name.contains('/') && (name.ends_with(".yml") || name.ends_with(".yaml"))
 }
 fn risk(value: &str) -> Result<&'static str> {
     match value {
@@ -2070,6 +2084,45 @@ fn validate_gate_repository(repository: &str, gate: &str) -> Result<()> {
     }
     Ok(())
 }
+fn validate_gate_review_profile(gate: &str, risk_value: &str, decision_value: &str) -> Result<()> {
+    gate_mode(gate)?;
+    risk(risk_value)?;
+    decision(decision_value)?;
+    if free_private_gate(gate) && !["high", "critical"].contains(&risk_value) {
+        return Err(error(
+            "GitHub Free/private receiptにはhigh/critical riskが必要です",
+        ));
+    }
+    if gate == FREE_PRIVATE_LOCAL_GATE_MODE && decision_value != "human-approved" {
+        return Err(error(
+            "github-free-private-local receiptには明示的なhuman approvalが必要です",
+        ));
+    }
+    Ok(())
+}
+fn validate_local_gate_workflow_policy(worktree: &Path, head: &str, gate: &str) -> Result<()> {
+    if gate != FREE_PRIVATE_LOCAL_GATE_MODE {
+        return Ok(());
+    }
+    let files = git(
+        worktree,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            head,
+            "--",
+            ".github/workflows",
+        ],
+        true,
+    )?;
+    if files.lines().any(workflow_yaml_path) {
+        return Err(error(
+            "github-free-private-localはworkflow YAMLが存在しない固定headでのみ使用できます",
+        ));
+    }
+    Ok(())
+}
 fn receipt_has_current_plan_version(payload: &Value) -> bool {
     payload.get("version").and_then(Value::as_i64) == Some(RECEIPT_VERSION)
         && payload.get("plan_version").is_some()
@@ -2193,11 +2246,7 @@ fn receipt(
     }
     let risk_value = risk(&str_value(&normalized, "risk")?)?.to_string();
     let decision_value = receipt_decision(&normalized)?;
-    if gate == FREE_PRIVATE_GATE_MODE && !["high", "critical"].contains(&risk_value.as_str()) {
-        return Err(error(
-            "github-free-private receiptにはhigh/critical riskが必要です",
-        ));
-    }
+    validate_gate_review_profile(&gate, &risk_value, &decision_value)?;
     if !plan_id(&str_value(&normalized, "plan_id")?) {
         return Err(error("receipt Plan IDが不正です"));
     }
@@ -2276,26 +2325,39 @@ fn review_receipt_scope_matches(existing: &Value, proposed: &Value) -> bool {
         "actionable",
         "tests_passed",
         "changed_files",
-        "gate_mode",
     ];
     if receipt_has_current_plan_version(existing) {
         keys.extend(["ledger_comment_id", "ledger_body_sha256", "plan_version"]);
     }
-    keys.iter()
-        .all(|key| existing.get(*key) == proposed.get(*key))
+    let common_scope_matches = keys
+        .iter()
+        .all(|key| existing.get(*key) == proposed.get(*key));
+    if !common_scope_matches {
+        return false;
+    }
+    let existing_gate = existing.get("gate_mode").and_then(Value::as_str);
+    let proposed_gate = proposed.get("gate_mode").and_then(Value::as_str);
+    existing_gate == proposed_gate
+        || existing_gate == Some(FREE_PRIVATE_GATE_MODE)
+            && proposed_gate == Some(FREE_PRIVATE_LOCAL_GATE_MODE)
+            && receipt_decision(proposed).as_deref() == Ok("human-approved")
 }
 fn review_request_is_idempotent(
     existing_risk: &str,
     requested_risk: &str,
     existing_decision: &str,
     approved: bool,
+    existing_gate: &str,
+    requested_gate: &str,
 ) -> bool {
     let requested_decision = if approved {
         "human-approved"
     } else {
         "autonomous"
     };
-    existing_risk == requested_risk && existing_decision == requested_decision
+    existing_risk == requested_risk
+        && existing_decision == requested_decision
+        && existing_gate == requested_gate
 }
 #[allow(clippy::too_many_arguments)]
 fn write_review_locked(
@@ -2334,6 +2396,7 @@ fn write_review_locked(
         return Err(error("指定headがworktreeのcurrent HEADと一致しません"));
     }
     worktree_clean_head(&worktree_path, &head)?;
+    validate_local_gate_workflow_policy(&worktree_path, &head, gate)?;
     let changed = changed_files(
         &worktree_path,
         &str_value(&manifest_value, "base_oid")?,
@@ -2342,11 +2405,12 @@ fn write_review_locked(
     if changed.iter().any(|v| safety_path(v)) && !["high", "critical"].contains(&risk_value) {
         return Err(error("安全境界差分にはhigh/critical riskが必要です"));
     }
-    if gate == FREE_PRIVATE_GATE_MODE && !["high", "critical"].contains(&risk_value) {
-        return Err(error(
-            "github-free-private receiptにはhigh/critical riskが必要です",
-        ));
-    }
+    let decision_value = if approved {
+        "human-approved"
+    } else {
+        "autonomous"
+    };
+    validate_gate_review_profile(gate, risk_value, decision_value)?;
     let (ledger_comment_id, ledger_body_sha256, plan_version) =
         loop_ledger(root, task, plan, &repository, pr, &head, plan_version)?;
     let payload = object([
@@ -2359,14 +2423,7 @@ fn write_review_locked(
         ("risk", string(risk_value)),
         ("plan_id", string(plan)),
         ("actionable", Value::Number(0.into())),
-        (
-            "decision",
-            string(if approved {
-                "human-approved"
-            } else {
-                "autonomous"
-            }),
-        ),
+        ("decision", string(decision_value)),
         ("tests_passed", Value::Bool(true)),
         ("independent_review_passed", Value::Bool(true)),
         ("specialist_review_passed", Value::Bool(specialist)),
@@ -2390,13 +2447,21 @@ fn write_review_locked(
         }
         let old_risk = str_value(&existing, "risk")?;
         let old_decision = receipt_decision(&existing)?;
+        let old_gate = receipt_gate_mode(&existing)?;
         if risk_level(risk_value) < risk_level(&old_risk)
             || (!approved && old_decision == "human-approved")
         {
             return Err(error("同じheadのreceiptをdowngradeできません"));
         }
         if receipt_has_current_plan_version(&existing)
-            && review_request_is_idempotent(&old_risk, risk_value, &old_decision, approved)
+            && review_request_is_idempotent(
+                &old_risk,
+                risk_value,
+                &old_decision,
+                approved,
+                &old_gate,
+                gate,
+            )
         {
             return Ok(existing);
         }
@@ -3005,9 +3070,11 @@ fn validate_delivery(
             "live origin/mainがreceipt headのancestorではありません",
         ));
     }
-    check_required_ci(root, &repository, &head)?;
+    if remote_ci_required(&gate) {
+        check_required_ci(root, &repository, &head)?;
+    }
     review_safety(root, &repository, pr)?;
-    if gate == FREE_PRIVATE_GATE_MODE {
+    if free_private_gate(&gate) {
         free_private_repository(root, &repository)?;
     } else {
         ruleset(root, &repository)?;
@@ -3051,11 +3118,12 @@ fn validate_receipt_evidence(
     if version == 1 || version == 2 {
         validate_legacy_decision(version, risk_value, &decision_value, &gate)?;
     }
-    if gate == FREE_PRIVATE_GATE_MODE && !["high", "critical"].contains(&risk_value) {
-        return Err(error(
-            "github-free-private receiptにはhigh/critical riskが必要です",
-        ));
-    }
+    validate_gate_review_profile(&gate, risk_value, &decision_value)?;
+    validate_local_gate_workflow_policy(
+        worktree_path,
+        &str_value(receipt_value, "head_sha")?,
+        &gate,
+    )?;
     let changed = changed_files(
         worktree_path,
         &str_value(manifest_value, "base_oid")?,
@@ -3625,15 +3693,17 @@ fn finish_locked(
         validate_receipt_evidence(&worktree_path, &manifest_value, &receipt_value)?;
     }
     if stage == "merge_started" {
-        check_required_ci(root, &repository, &head)?;
+        if remote_ci_required(&gate) {
+            check_required_ci(root, &repository, &head)?;
+        }
         review_safety(root, &repository, expected_pr)?;
-        if gate == FREE_PRIVATE_GATE_MODE {
+        if free_private_gate(&gate) {
             free_private_repository(root, &repository)?;
         } else {
             ruleset(root, &repository)?;
         }
         state = save_stage(&repository, task, &state, "merged", "")?;
-    } else if gate == FREE_PRIVATE_GATE_MODE && stage != "completed" {
+    } else if free_private_gate(&gate) && stage != "completed" {
         free_private_repository(root, &repository)?;
     }
     let stage = str_value(&state, "stage")?;
@@ -4124,6 +4194,20 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
         let independent = flags.contains("independent-review-passed");
         let specialist = flags.contains("specialist-review-passed");
         validate_review_evidence_flags(&risk_value, tests, independent, specialist)?;
+        if gate == FREE_PRIVATE_LOCAL_GATE_MODE && command != "approve-review" {
+            return Err(error(
+                "github-free-private-localはapprove-reviewでのみ記録できます",
+            ));
+        }
+        validate_gate_review_profile(
+            &gate,
+            &risk_value,
+            if command == "approve-review" {
+                "human-approved"
+            } else {
+                "autonomous"
+            },
+        )?;
         Ok(CliArgs {
             command,
             task,
@@ -4628,6 +4712,31 @@ mod tests {
             )
             .is_err()
         );
+
+        let mut local = receipt_v5("high", true);
+        local["gate_mode"] = string(FREE_PRIVATE_LOCAL_GATE_MODE);
+        local["decision"] = string("human-approved");
+        assert!(
+            receipt(
+                &local,
+                Path::new("/unused"),
+                "issue-24",
+                &"b".repeat(40),
+                Some("owner/repo"),
+            )
+            .is_ok()
+        );
+        local["decision"] = string("autonomous");
+        assert!(
+            receipt(
+                &local,
+                Path::new("/unused"),
+                "issue-24",
+                &"b".repeat(40),
+                Some("owner/repo"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5014,6 +5123,24 @@ mod tests {
     }
 
     #[test]
+    fn same_head_receipt_only_allows_the_approved_local_gate_transition() {
+        let mut existing = receipt_v5("high", true);
+        existing["gate_mode"] = string(FREE_PRIVATE_GATE_MODE);
+        let mut approved_local = existing.clone();
+        approved_local["gate_mode"] = string(FREE_PRIVATE_LOCAL_GATE_MODE);
+        approved_local["decision"] = string("human-approved");
+        assert!(review_receipt_scope_matches(&existing, &approved_local));
+
+        let mut autonomous_local = approved_local.clone();
+        autonomous_local["decision"] = string("autonomous");
+        assert!(!review_receipt_scope_matches(&existing, &autonomous_local));
+
+        let mut strict = approved_local;
+        strict["gate_mode"] = string(STRICT_GATE_MODE);
+        assert!(!review_receipt_scope_matches(&existing, &strict));
+    }
+
+    #[test]
     fn finish_revalidates_the_live_ledger_until_cleanup_is_complete() {
         for stage in [
             "merge_started",
@@ -5267,30 +5394,46 @@ mod tests {
     }
 
     #[test]
-    fn review_request_only_reuses_the_same_decision_and_risk() {
+    fn review_request_only_reuses_the_same_decision_risk_and_gate() {
         assert!(review_request_is_idempotent(
             "low",
             "low",
             "autonomous",
-            false
+            false,
+            STRICT_GATE_MODE,
+            STRICT_GATE_MODE,
         ));
         assert!(review_request_is_idempotent(
             "high",
             "high",
             "human-approved",
-            true
+            true,
+            FREE_PRIVATE_LOCAL_GATE_MODE,
+            FREE_PRIVATE_LOCAL_GATE_MODE,
         ));
         assert!(!review_request_is_idempotent(
             "low",
             "low",
             "autonomous",
-            true
+            true,
+            STRICT_GATE_MODE,
+            STRICT_GATE_MODE,
         ));
         assert!(!review_request_is_idempotent(
             "low",
             "high",
             "autonomous",
-            false
+            false,
+            STRICT_GATE_MODE,
+            STRICT_GATE_MODE,
+        ));
+        assert!(!review_request_is_idempotent(
+            "high",
+            "high",
+            "human-approved",
+            true,
+            FREE_PRIVATE_GATE_MODE,
+            FREE_PRIVATE_LOCAL_GATE_MODE,
         ));
     }
 
@@ -5426,9 +5569,31 @@ mod tests {
         assert!(decision("approved").is_err());
         assert!(gate_mode(STRICT_GATE_MODE).is_ok());
         assert!(gate_mode(FREE_PRIVATE_GATE_MODE).is_ok());
+        assert!(gate_mode(FREE_PRIVATE_LOCAL_GATE_MODE).is_ok());
+        assert!(remote_ci_required(STRICT_GATE_MODE));
+        assert!(remote_ci_required(FREE_PRIVATE_GATE_MODE));
+        assert!(!remote_ci_required(FREE_PRIVATE_LOCAL_GATE_MODE));
+        assert!(workflow_yaml_path(".github/workflows/ci.yml"));
+        assert!(workflow_yaml_path(".github/workflows/ci.yaml"));
+        assert!(!workflow_yaml_path(".github/workflows/README.md"));
+        assert!(!workflow_yaml_path(".github/workflows/nested/ci.yml"));
+        assert!(!workflow_yaml_path("docs/ci.yml"));
         assert!(validate_gate_repository("owner/repo", STRICT_GATE_MODE).is_ok());
         assert!(validate_gate_repository("owner/repo", FREE_PRIVATE_GATE_MODE).is_ok());
+        assert!(validate_gate_repository("owner/repo", FREE_PRIVATE_LOCAL_GATE_MODE).is_ok());
         assert!(validate_gate_repository("owner/repo/extra", STRICT_GATE_MODE).is_err());
+        assert!(
+            validate_gate_review_profile(FREE_PRIVATE_LOCAL_GATE_MODE, "high", "human-approved")
+                .is_ok()
+        );
+        assert!(
+            validate_gate_review_profile(FREE_PRIVATE_LOCAL_GATE_MODE, "high", "autonomous")
+                .is_err()
+        );
+        assert!(
+            validate_gate_review_profile(FREE_PRIVATE_LOCAL_GATE_MODE, "medium", "human-approved")
+                .is_err()
+        );
         assert!(safety_path(".github/workflows/ci.yml"));
         assert!(safety_path(".codex/config.base.toml"));
         assert!(safety_path("packages/cli/src/main.rs"));
@@ -5526,7 +5691,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_explicit_strict_mode_and_accepts_free_private_only_explicitly() {
+    fn parser_rejects_explicit_strict_mode_and_restricts_the_local_gate_to_approval() {
         let common = vec![
             OsString::from("record-review"),
             OsString::from("--task-id"),
@@ -5551,12 +5716,53 @@ mod tests {
             OsString::from(STRICT_GATE_MODE),
         ]);
         assert!(parse_args(strict).is_err());
-        let mut free = common;
+        let mut free = common.clone();
         free.extend([
             OsString::from("--gate-mode"),
             OsString::from(FREE_PRIVATE_GATE_MODE),
         ]);
         assert_eq!(parse_args(free).unwrap().gate, FREE_PRIVATE_GATE_MODE);
+
+        let mut local_record = common.clone();
+        local_record.extend([
+            OsString::from("--gate-mode"),
+            OsString::from(FREE_PRIVATE_LOCAL_GATE_MODE),
+        ]);
+        assert!(parse_args(local_record).is_err());
+
+        let mut local_approve = common;
+        local_approve[0] = OsString::from("approve-review");
+        local_approve.extend([
+            OsString::from("--gate-mode"),
+            OsString::from(FREE_PRIVATE_LOCAL_GATE_MODE),
+        ]);
+        assert_eq!(
+            parse_args(local_approve).unwrap().gate,
+            FREE_PRIVATE_LOCAL_GATE_MODE
+        );
+
+        let mut local_low = vec![
+            OsString::from("approve-review"),
+            OsString::from("--task-id"),
+            OsString::from("issue-24"),
+            OsString::from("--pr"),
+            OsString::from("24"),
+            OsString::from("--head"),
+            OsString::from("b".repeat(40)),
+            OsString::from("--risk"),
+            OsString::from("low"),
+            OsString::from("--plan-id"),
+            OsString::from("CODEX-DELIVERY-TEST-v1"),
+            OsString::from("--plan-version"),
+            OsString::from("2"),
+            OsString::from("--tests-passed"),
+            OsString::from("--independent-review-passed"),
+        ];
+        local_low.extend([
+            OsString::from("--gate-mode"),
+            OsString::from(FREE_PRIVATE_LOCAL_GATE_MODE),
+        ]);
+        assert!(parse_args(local_low).is_err());
     }
 
     #[test]
