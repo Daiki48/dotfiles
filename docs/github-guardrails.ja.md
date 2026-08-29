@@ -102,7 +102,8 @@ Rulesetの代替としてprivate/default branch/archive/disable/merge/auto-merge
 hosted/self-hosted CIを意図的に運用しない場合は、Daikiが残存リスクを明示承認したときだけ
 `--gate-mode github-free-private-local`を選べます。これはhigh/criticalの`approve-review`専用で、
 固定SHAのlocal test・標準review・専門review、ledger、上記のrepository/PR/review検証を維持し、
-`required-ci` check runだけを要求しません。CI failureやpendingから自動fallbackしません。
+固定headにworkflow YAMLがない場合だけ`required-ci` check runを要求しません。workflow YAMLがあれば
+`runs-on`のrunner種別に従って通常CIを使い、CI failureやpendingから自動fallbackしません。
 
 このprofileではGitHubサーバーが直接push、helper外merge、force push、branch削除を拒否しません。
 そのため実装内容にかかわらずdelivery riskをhigh/criticalへ引き上げます。ただしdecision requirementは

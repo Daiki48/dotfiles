@@ -59,8 +59,9 @@
 - hosted/self-hosted CIを意図的に使わないGitHub Free/private repositoryでは、Daikiがserver-side CI不在の
   残存リスクを明示承認した場合だけ`--gate-mode github-free-private-local`を`approve-review`、`deliver`、
   `finish`へ明示できます。このmodeはhigh/critical、固定SHAのlocal test、標準・専門review、ledger、live
-  repository/PR/review検証を必須とし、`required-ci`だけを要求しません。CI失敗から自動fallbackせず、
-  `record-review`では作成できません。
+  repository/PR/review検証を必須とし、固定headに`.github/workflows/*.yml|*.yaml`がない場合だけ
+  `required-ci`を要求しません。workflow YAMLがあれば`runs-on`のrunner種別に従って通常CIを使います。
+  CI失敗から自動fallbackせず、`record-review`では作成できません。
 - CI/workflow、Ruleset、hook、rules、AGENTS、Skills、helper、installerなどdelivery安全境界を
   変更する作業、auth/secrets、billing、production、不可逆migration、breaking changeは
   highです。criticalを含め、riskの高さだけでは確認待ちへ移行しません。影響範囲、仕様、rollback、

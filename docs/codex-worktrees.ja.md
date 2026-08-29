@@ -211,8 +211,9 @@ errorから自動fallbackせず、modeを省略した既存commandとv1 receipt�
 
 hosted/self-hosted CIを使わない方針をDaikiが明示承認した場合だけ、high/criticalの
 `approve-review`、`deliver`、`finish`へ`--gate-mode github-free-private-local`を明示できます。
-このmodeはprivate repositoryとPR/reviewのlive検証を維持し、`required-ci`だけをlocal testのreceiptへ
-置き換えます。`record-review`やCI failureからの自動fallbackには使えません。
+このmodeは固定headにworkflow YAMLがないこと、private repositoryとPR/reviewのlive検証を要求し、
+`required-ci`だけをlocal testのreceiptへ置き換えます。workflow YAMLがあれば`runs-on`のrunner種別に
+従って通常CIを使い、`record-review`やCI failureからの自動fallbackには使えません。
 
 確認待ち、blocked、delivery途中の異常で、PR、branch、worktreeを自動cleanupしません。
 

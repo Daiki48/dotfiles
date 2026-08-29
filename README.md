@@ -120,8 +120,9 @@ server-side.
 When a GitHub Free private repository intentionally operates without hosted or self-hosted CI,
 `--gate-mode github-free-private-local` is available only after explicit human approval. It keeps
 the fixed-SHA local test and review receipt, ledger, live repository/PR/review checks, and
-high/critical risk requirement, while omitting only the `required-ci` check run. It is never an
-automatic fallback for a failed or pending CI run.
+high/critical risk requirement, while omitting only the `required-ci` check run when the fixed head
+has no workflow YAML. If workflow YAML exists, its `runs-on` setting selects the runner and normal
+CI remains required. The local mode is never an automatic fallback for a failed or pending CI run.
 
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, Draft PRs, and the delivery

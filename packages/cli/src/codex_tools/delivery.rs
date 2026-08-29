@@ -243,6 +243,12 @@ fn free_private_gate(value: &str) -> bool {
 fn remote_ci_required(value: &str) -> bool {
     value != FREE_PRIVATE_LOCAL_GATE_MODE
 }
+fn workflow_yaml_path(value: &str) -> bool {
+    let Some(name) = value.strip_prefix(".github/workflows/") else {
+        return false;
+    };
+    !name.is_empty() && !name.contains('/') && (name.ends_with(".yml") || name.ends_with(".yaml"))
+}
 fn risk(value: &str) -> Result<&'static str> {
     match value {
         "low" => Ok("low"),
@@ -2094,6 +2100,29 @@ fn validate_gate_review_profile(gate: &str, risk_value: &str, decision_value: &s
     }
     Ok(())
 }
+fn validate_local_gate_workflow_policy(worktree: &Path, head: &str, gate: &str) -> Result<()> {
+    if gate != FREE_PRIVATE_LOCAL_GATE_MODE {
+        return Ok(());
+    }
+    let files = git(
+        worktree,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            head,
+            "--",
+            ".github/workflows",
+        ],
+        true,
+    )?;
+    if files.lines().any(workflow_yaml_path) {
+        return Err(error(
+            "github-free-private-localはworkflow YAMLが存在しない固定headでのみ使用できます",
+        ));
+    }
+    Ok(())
+}
 fn receipt_has_current_plan_version(payload: &Value) -> bool {
     payload.get("version").and_then(Value::as_i64) == Some(RECEIPT_VERSION)
         && payload.get("plan_version").is_some()
@@ -2363,6 +2392,7 @@ fn write_review_locked(
         return Err(error("指定headがworktreeのcurrent HEADと一致しません"));
     }
     worktree_clean_head(&worktree_path, &head)?;
+    validate_local_gate_workflow_policy(&worktree_path, &head, gate)?;
     let changed = changed_files(
         &worktree_path,
         &str_value(&manifest_value, "base_oid")?,
@@ -3077,6 +3107,11 @@ fn validate_receipt_evidence(
         validate_legacy_decision(version, risk_value, &decision_value, &gate)?;
     }
     validate_gate_review_profile(&gate, risk_value, &decision_value)?;
+    validate_local_gate_workflow_policy(
+        worktree_path,
+        &str_value(receipt_value, "head_sha")?,
+        &gate,
+    )?;
     let changed = changed_files(
         worktree_path,
         &str_value(manifest_value, "base_oid")?,
@@ -5501,6 +5536,11 @@ mod tests {
         assert!(remote_ci_required(STRICT_GATE_MODE));
         assert!(remote_ci_required(FREE_PRIVATE_GATE_MODE));
         assert!(!remote_ci_required(FREE_PRIVATE_LOCAL_GATE_MODE));
+        assert!(workflow_yaml_path(".github/workflows/ci.yml"));
+        assert!(workflow_yaml_path(".github/workflows/ci.yaml"));
+        assert!(!workflow_yaml_path(".github/workflows/README.md"));
+        assert!(!workflow_yaml_path(".github/workflows/nested/ci.yml"));
+        assert!(!workflow_yaml_path("docs/ci.yml"));
         assert!(validate_gate_repository("owner/repo", STRICT_GATE_MODE).is_ok());
         assert!(validate_gate_repository("owner/repo", FREE_PRIVATE_GATE_MODE).is_ok());
         assert!(validate_gate_repository("owner/repo", FREE_PRIVATE_LOCAL_GATE_MODE).is_ok());
