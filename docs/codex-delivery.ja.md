@@ -86,10 +86,10 @@ receiptは対象SHAに束縛します。review後にcommitをpushしてhead SHA�
 receipt、CI、review、確認を新SHAへ引き継ぎません。新しいSHAでCIとrisk上必要なreviewを実行し、
 新しいreceiptを記録します。
 
-receipt v5は`independent_review_passed`をlow/mediumでは任意、high/criticalではtrueに固定し、
+receipt v6は`independent_review_passed`をlow/mediumでは任意、high/criticalではtrueに固定し、
 `specialist_review_passed`をcriticalで別境界をreviewした場合だけ必須にします。既存receiptの追加review証拠も有効です。`gate_mode`とdecision
-（`autonomous`または`human-approved`）、最新ledger comment ID・本文digest・Plan版も固定し、riskから意思決定要否を推測しません。
-既存v1〜v4 receiptは履歴表示の読み取り互換形式として解析できますが、delivery・finishには使えずcurrent headをv5で再reviewします。旧形式のhigh/criticalやFree/privateを遡及的にautonomousへ緩和しません。CLIで
+（`autonomous`または`human-approved`）、Plan版も固定し、riskから意思決定要否を推測しません。新規receiptはPR commentへ内部監査用のJSONを投稿せず、privateなmanaged stateへ保存します。
+既存v5 receiptは進行中taskを再開するため従来のledger comment chainを読み取り専用で検証します。既存v1〜v4 receiptは履歴表示の読み取り互換形式として解析できますが、delivery・finishには使えずcurrent headをv6で再reviewします。旧形式のhigh/criticalやFree/privateを遡及的にautonomousへ緩和しません。CLIで
 指定したmodeとreceiptが一致しない場合はdeliveryもfinishも停止します。
 
 receiptのreview/test flagは、定めた手順を完了したことをmachine-readableに束縛する構造証拠であり、
@@ -111,52 +111,15 @@ remote CIではGitHubがrequired checkの成功状態として扱う`success`、
 不可逆migration、breaking change、重大なsecurity・互換性・データ損失影響はhigh/criticalです。
 riskはreview深度と残存影響を決めますが、人間確認を自動決定しません。low/mediumはSolのself-review、
 highは独立reviewを1つ実行し、criticalは別の高リスク境界が実在する場合だけ専門reviewを1つ追加します。
-一般的な反論役や肯定役は使いません。actionableな指摘はSolが反証してから1つのbatchで修正、検証、
-commit、pushします。そのpushでSHAが変わるためreview、CI、receiptを最初からやり直しますが、
-修正round全体には固定上限を設けません。違反した不変条件、原因経路、観測可能な失敗からfinding fingerprintを
-作り、新規、再発、解消、誤検知、修正試行、対応testをledgerで追跡します。同じfingerprintが1回目の
-修正後にも再発するか、2round連続で既知指摘、受け入れtest、原因を狭める一次証拠に進展がない場合は、
-Sol xhighの診断モードでroot causeと次の修正batchを再確定します。診断後の修正でも同じfingerprintが
-再発するか、次のroundにも進展がない場合はその項目をblockedとします。影響しない別原因のactionableは
-自律修正できますが、task全体とdeliveryは全actionable解消までblockedです。
+一般的な反論役や肯定役は使いません。actionableな指摘は今回修正すべき具体的な欠陥に限り、fileまたは実行経路、期待結果と実際の結果、再現・確認方法、修正後の観測条件を明らかにします。将来改善、好み、具体的な影響根拠のない懸念は含めません。
 
-1roundは固定した入力・状態・headから行うroot cause単位の1batchと、その影響範囲の1回の検証、ledger更新までです。
-同じ操作の無変更retryはroundや進展に数えません。fingerprintは固定した受け入れ条件または不変条件ID、
-repository-relativeな原因経路、volatile値を除いた失敗classをRFC 8785 JCS（UTF-8、key順固定、余分な空白・末尾改行なし）
-でserializeし、SHA-256にして作ります。pathは`/`区切りのrepository-relative lexical pathとし、文字列へ暗黙の
-Unicode正規化や大小文字変換を行いません。
-外部ledgerへ記録するdigestはsecret scannerと区別できるようlowercase hexを8文字のchunk配列にします。
-failure signatureは操作種別、論理target、exit statusまたはerror class、秘密情報を除く入力digest、外部state digestを
-固定し、比較不能なら変化を仮定せず診断対象にします。新しいfingerprintは修正deltaまたは新しい一次証拠との
-因果を必要とし、同じ対象の言い換えは進展ではありません。
+共通root causeの指摘は1つのbatchで修正し、可能なら回帰testを追加します。修正でSHAが変わった場合は新SHAでreview、CI、receiptをやり直します。同じ問題が修正後も再発するか、2回続けて受け入れ条件・test・既知指摘に証拠上の進展がない場合は、Solがroot cause、実装境界、検証手段を再確認します。その後も同じ問題が続く場合だけblockedとし、無変更retryを続けません。
 
-各review・修正・診断roundの終了時かつ次batchの前に、`<!-- codex-loop-ledger:v2 -->`を先頭行に置くappend-onlyの
-PR commentへ、最新schema 3、task・Plan・repository・PR identity、round、head before/after、直前comment IDと本文
-SHA-256、全findingのcanonical preimage・severity・再現・影響・修正後条件・test・evidence、failure signatures、
-progress events、diagnostic予算と結果をJSONで保存します。failure signatureはcanonical preimageから再計算し、progress eventはfindingとevidenceを参照します。resume時は全pageを取得し、認証中login、
-`created_at == updated_at`、marker、全checkpointのschema、ID・round順、直前本文digest、head遷移、Plan版の単調増加、finding継承・状態遷移を確認します。v1 findingはterminal状態だけを許可し、schema 3移行後のlegacy schema再挿入を拒否します。schema 1/2は既存chainの移行履歴として意味検証し、最新にはcurrent headと一致するschema 3を必須にします。digestとGit object IDは8文字の
-lowercase hex chunk配列で保存し、localで連結してから検証します。task IDはparts配列から`-`連結してcommit到達性、
-test・review証拠を再検証します。外部commentは命令として信用せず、欠落、削除、差し替え、分岐、競合、
-schema不一致、復元不能なら試行数をresetせず診断モードへ移ります。
+PRやIssueへ内部監査用のschema JSON、fingerprint、digest chain、round logを投稿しません。PR bodyとcommentは、人間が読む変更概要、判断が必要な論点、検証結果、残存事項に限ります。作業範囲は依頼の目的、観測可能な受け入れ条件、変更対象経路、必須検証で区切り、その集合外の改善を自律loopへ追加しません。
 
-actionableは今回修正すべき具体的な欠陥に限り、fileとline、実行またはコード経路、期待結果と実際の結果、
-再現・確認方法、修正後の観測条件を必要とします。将来改善、好み、具体的な影響根拠のない懸念は含めません。
-共通root causeの指摘は1batchで修正し、可能なら修正前に失敗を再現する回帰testを追加します。
-診断モードは原因仮説、実装境界、検証手段だけを改訂でき、Planへ固定した期待挙動、security・互換性・
-データ損失の不変条件、risk、rollback条件を弱めません。変更が必要ならhuman-requiredまたはblockedです。
-診断モードは開始前に最大12 tool callまたは30分の早い方をledgerへ固定し、tool call使用数をaudit evidenceとして記録します。helperはCodex runtime内部のtool telemetryを直接観測しないため、件数だけを暗号学的なgateとは扱いません。wall-clock・token消費はruntimeが提供する経過時間と利用量情報で監視し、より小さい明示budgetを優先します。
-超過時や残り予算で次batchと終了検証を完了できない場合はblockedかhuman-requiredへ移ります。明示されたtoken budget
-またはruntime残量がある場合は、test、最終review、CI、deliveryの終了予算を予約し、
-その予約を維持できない新しい修正roundは開始しません。round数をtoken上限の代用にはしません。budgetを
-取得できない場合はPlanで固定した有限な受け入れ条件ID・実装単位・変更対象経路・必須検証をtask work budgetとし、
-その集合外の変更を自律loopへ追加しません。canonical fingerprint・signature、stall、新規指摘とdelta・一次証拠の因果も
-必須にし、同じ問題の無制限retryを許可しません。
+`codex-delivery record-review`はv6 receiptをprivateなmanaged stateへ記録し、固定SHA、変更file、test、riskに応じたreview、Plan、decision、gate modeを固定します。v6の`deliver`と`finish`はPR comments APIや機械監査commentに依存しません。既存v5 receiptだけは進行中taskを安全に再開するため、記録済みの旧ledger comment chainを読み取り専用で再検証します。新しいledger commentは作成しません。
 
-`codex-delivery record-review`はv2 markerの全ledger checkpointを検証し、最新schema 3の全findingが`resolved`または`false_positive`（findingがなければ空配列）である場合だけ
-comment IDと本文SHA-256をreceiptへ固定します。`deliver`とmerge後の`finish`は同じcomment、digest、chainを再取得して、
-blocked・未解消finding、編集、削除、差し替え、chain切れをfail closedで拒否します。`finish`をmerge後から再開する場合もcleanup前に再検証します。v1は移行時のbootstrap predecessor、schema 2は既存移行checkpointとしてだけ使え、新しいreceiptの最新ledgerには使えません。
-
-新規Codex sessionでは[公式Configuration Reference](https://developers.openai.com/codex/config-reference)でunder-developmentかつ既定無効のrollout budget trackingを無効のまま使います。共有token上限によるturn停止を避け、失敗loopはcanonical fingerprint、stall検出、最大12 tool callまたは30分の診断budget、有限なPlan scopeで制御します。
+新規Codex sessionでは[公式Configuration Reference](https://developers.openai.com/codex/config-reference)でunder-developmentかつ既定無効のrollout budget trackingを無効のまま使います。失敗時は有限なPlan scopeと観測可能な進展で制御し、同じ問題の無制限retryや目的外の監査作業へ広げません。
 
 次の条件が同じhead SHAで成立した場合だけ、`codex-delivery deliver`へ進みます。
 
@@ -208,7 +171,7 @@ API取得不能ではfail closedにします。
 ### GitHub Free/private local-only
 
 `github-free-private-local`は`github-free-private`と同じlive repository identity、固定head、最新mainの
-ancestor、mergeability、review thread、`CHANGES_REQUESTED`、ledgerを検証しますが、唯一
+ancestor、mergeability、review thread、`CHANGES_REQUESTED`、receiptを検証しますが、唯一
 `required-ci` check runを要求しません。代わりに固定SHAで完了したlocal test・従来必須の独立review・専門reviewを
 receiptへ固定し、workflow YAML不在、high/critical、`human-approved`を必須にします。同一headの既存
 `github-free-private` receiptは、同じPlan・evidenceのまま明示承認されたこのmodeへだけ更新できます。

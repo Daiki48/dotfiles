@@ -91,8 +91,8 @@ review済みhead SHAの固定とrisk-based reviewは`codex-delivery`による完
 
 Rulesetを利用できないGitHub Free/private repositoryは、既定のstrict gateを暗黙に緩和しません。
 `--gate-mode github-free-private`を明示したcurrent private repositoryだけが低保証profileを使用できます。
-receipt v5へmode、risk、decision、riskに応じたreview、ledger comment ID・digestを別々に保存します。
-既存v1〜v4 receiptは履歴の読み取り互換に限定し、delivery時はcurrent headのv5再reviewを要求します。
+receipt v6へmode、risk、decision、riskに応じたreview、Plan版を保存します。新規receiptはPR commentへ内部監査用JSONを投稿しません。
+既存v5 receiptは進行中taskの再開時だけ旧ledger comment chainを読み取り専用で検証します。既存v1〜v4 receiptは履歴の読み取り互換に限定し、delivery時はcurrent headのv6再reviewを要求します。
 
 Free/private profileでも固定headで実際に起動したGitHub Actions check、App ID `15368`、GitHubが成功と扱う
 `success`・`skipped`・`neutral`、PR identity、最新mainのancestor、review thread、mergeabilityを検証します。
@@ -101,7 +101,7 @@ Rulesetの代替としてprivate/default branch/archive/disable/merge/auto-merge
 
 hosted/self-hosted CIを意図的に運用しない場合は、Daikiが残存リスクを明示承認したときだけ
 `--gate-mode github-free-private-local`を選べます。これはhigh/criticalの`approve-review`専用で、
-固定SHAのlocal test・従来必須の独立review・専門review、ledger、上記のrepository/PR/review検証を維持し、
+固定SHAのlocal test・従来必須の独立review・専門review、receipt、上記のrepository/PR/review検証を維持し、
 PRのbaseと固定headの双方にworkflow YAMLがない場合だけ`required-ci` check runを要求しません。workflow YAMLがあれば
 local modeは選択せず、Rulesetの有無に応じてstrictまたは`github-free-private` modeを使い、YAMLの
 `runs-on`に従って通常CIを実行します。CI failureやpendingから自動fallbackしません。
@@ -125,17 +125,9 @@ review後にpushされた場合、以前のreceipt、review、CIを
 再利用せず、新しいSHAで最初からやり直します。`review-branch`は読み取り専用であり、receiptの記録と
 delivery判断は呼び出し元の専用`codex-delivery` helperが担当します。
 
-修正可能なactionable指摘はSolが反証し、原因単位のfinding fingerprintとledgerで新規、再発、解消、
-誤検知、修正試行を追跡して1つのbatchで自律修正します。修正round全体には固定上限を設けません。
-同じfingerprintが修正後も再発するか、2round連続で受け入れ条件・test・既知指摘に証拠上の進展が
-ないか、入力・外部stateを正規化した同じfailure signatureが反復する場合はSol xhighの診断モードでroot causeと
-計画を再検証します。fingerprintとsignatureの比較不能も診断対象です。診断後の修正でも同じ指摘が再発する、
-または次のroundも進展がない場合はその項目をblockedとします。影響しない別原因の新しい有効な指摘は
-自律修正できますが、task全体とdeliveryは全actionable解消までblockedです。各roundの証拠は次batch前に
-直前comment IDと本文digestで連鎖するv2 marker・schema 3 append-only PR ledger commentへ保存し、resume時にauthor、未編集、全checkpointのschema、
-chain、round・head遷移、Plan版の単調増加とreceiptへの最新版固定、finding状態遷移、commit、test、reviewと照合します。v1 findingはterminal状態だけを許可し、schema 3移行後のlegacy schema再挿入とcurrent head不一致のlatest checkpointを拒否します。診断は最大12 tool callまたは30分の早い方で終了し、tool call数をaudit記録、token消費はruntimeが提示するtoken情報で監視します。token残量不明時は
-Planの有限な受け入れ条件・実装単位・対象経路をwork budgetとしてscope外へ増殖させません。`codex-delivery`は全findingの
-解消とledgerのcomment ID・digestをreceiptへ固定し、deliver時にも再検証します。
+修正可能なactionable指摘はSolが根拠を確認し、共通root causeごとの1つのbatchで自律修正します。同じ問題が修正後も再発するか、2回続けて受け入れ条件・test・既知指摘に証拠上の進展がない場合は、root cause、実装境界、検証手段を再確認します。その後も同じ問題が続く場合だけblockedとし、無変更retryを続けません。
+
+PRやIssueへ内部監査用のschema JSON、fingerprint、digest chain、round logを投稿しません。PR bodyとcommentは、人間が読む変更概要、判断が必要な論点、検証結果、残存事項に限ります。作業はPlanの有限な受け入れ条件・実装単位・対象経路から目的外へ増殖させません。`codex-delivery`はv6 receiptをprivateなmanaged stateへ保存し、固定SHA、test、review、Plan、decision、gateを検証します。v6のdeliveryはPR comments APIに依存しません。既存v5 receiptだけは進行中taskの再開時に旧ledger comment chainを読み取り専用で検証します。
 次の条件が同一SHAで同時に成立した場合だけReady化・merge候補になります。
 
 - workflowで起動したGitHub Actions checkがすべて`success`、`skipped`、`neutral`である
