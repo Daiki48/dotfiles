@@ -3739,7 +3739,7 @@ fn finish_locked(
         worktree_clean_head(&worktree_path, &head)?;
         validate_receipt_evidence(&worktree_path, &manifest_value, &receipt_value)?;
     }
-    if stage == "merge_started" {
+    if finish_requires_live_delivery_gate(&stage) {
         let live = fetch_main(root, &repository)?;
         validate_local_gate_workflow_policy(root, &live, &head, &gate)?;
         if remote_ci_required(&gate) {
@@ -3755,9 +3755,9 @@ fn finish_locked(
         } else {
             ruleset(root, &repository)?;
         }
+    }
+    if stage == "merge_started" {
         state = save_stage(&repository, task, &state, "merged", "")?;
-    } else if free_private_gate(&gate) && stage != "completed" {
-        free_private_repository(root, &repository)?;
     }
     let stage = str_value(&state, "stage")?;
     if stage != "merged" {
@@ -4008,6 +4008,9 @@ fn deliver(
     })
 }
 fn finish_requires_live_ledger(stage: &str) -> bool {
+    stage != "completed"
+}
+fn finish_requires_live_delivery_gate(stage: &str) -> bool {
     stage != "completed"
 }
 
@@ -5239,6 +5242,20 @@ mod tests {
             assert!(finish_requires_live_ledger(stage), "stage: {stage}");
         }
         assert!(!finish_requires_live_ledger("completed"));
+    }
+
+    #[test]
+    fn finish_revalidates_the_live_delivery_gate_until_cleanup_is_complete() {
+        for stage in [
+            "merge_started",
+            "merged",
+            "main_synced",
+            "remote_branch_deleted",
+            "worktree_removed",
+        ] {
+            assert!(finish_requires_live_delivery_gate(stage), "stage: {stage}");
+        }
+        assert!(!finish_requires_live_delivery_gate("completed"));
     }
 
     #[test]
