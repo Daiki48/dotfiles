@@ -2420,12 +2420,8 @@ fn write_review_locked(
         return Err(error("指定headがworktreeのcurrent HEADと一致しません"));
     }
     worktree_clean_head(&worktree_path, &head)?;
-    validate_local_gate_workflow_policy(
-        &worktree_path,
-        &str_value(&manifest_value, "base_oid")?,
-        &head,
-        gate,
-    )?;
+    let live = fetch_main(root, &repository)?;
+    validate_local_gate_workflow_policy(&worktree_path, &live, &head, gate)?;
     let changed = changed_files(
         &worktree_path,
         &str_value(&manifest_value, "base_oid")?,
@@ -3175,12 +3171,6 @@ fn validate_receipt_evidence(
         validate_legacy_decision(version, risk_value, &decision_value, &gate)?;
     }
     validate_gate_review_profile(&gate, risk_value, &decision_value)?;
-    validate_local_gate_workflow_policy(
-        worktree_path,
-        &str_value(manifest_value, "base_oid")?,
-        &str_value(receipt_value, "head_sha")?,
-        &gate,
-    )?;
     let changed = changed_files(
         worktree_path,
         &str_value(manifest_value, "base_oid")?,
@@ -3750,6 +3740,8 @@ fn finish_locked(
         validate_receipt_evidence(&worktree_path, &manifest_value, &receipt_value)?;
     }
     if stage == "merge_started" {
+        let live = fetch_main(root, &repository)?;
+        validate_local_gate_workflow_policy(root, &live, &head, &gate)?;
         if remote_ci_required(&gate) {
             check_required_ci(root, &repository, &head)?;
         } else {
@@ -5759,6 +5751,15 @@ mod tests {
         assert!(
             validate_local_gate_workflow_policy(&root, &no_ci, &no_ci, LOCAL_VALIDATION_GATE_MODE)
                 .is_ok()
+        );
+        assert!(
+            validate_local_gate_workflow_policy(
+                &root,
+                &no_ci,
+                &removed_ci,
+                LOCAL_VALIDATION_GATE_MODE,
+            )
+            .is_ok()
         );
         assert!(
             validate_local_gate_workflow_policy(
