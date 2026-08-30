@@ -240,12 +240,14 @@ finishの最後に、管理root内の対象worktreeだけをcleanupできます�
 
 - manifestのrepository、task ID、worktree path、branchが対象PRと一致する。
 - PRがmergedで、receiptのhead commitがmainへ到達している。
-- worktreeがignored artifactも含めてcleanで、未push commitがなく、別taskのworktreeではない。
+- worktreeにtracked/untrackedの変更がなく、ignored artifactが既知の再生成可能なdirectoryだけで、
+  未push commitがなく、別taskのworktreeではない。`.codex-trash`と未知のignored artifactは保持して停止する。
 - cleanup対象が`$CODEX_HOME/worktrees`のmanaged root内にあり、pathやGit登録を再解決できる。
 
 この証明を満たしたmanaged cleanupだけが、自律的なworktree・対応branch削除の例外です。証明が
 一つでも不足する、対象がdirty、未merge、未push、別taskと競合する、または判定不能な場合は対象を
-保持します。管理root外や任意のファイル・directory・branchの削除は従来どおりDaikiの確認を得て、
+容量・件数・経過日数に関係なく保持し、activeなworktreeの作業を制限しません。管理root外や任意の
+ファイル・directory・branchの削除は従来どおりDaikiの確認を得て、
 プロジェクト直下の`.codex-trash/<timestamp>/`へ退避してから扱います。直接`rm`や直接GitHub API
 削除で代替してはいけません。
 

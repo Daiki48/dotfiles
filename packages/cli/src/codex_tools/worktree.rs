@@ -1713,7 +1713,12 @@ fn load_manifests(repository: &Repository) -> Result<Vec<(PathBuf, Manifest)>, W
         let path = entry
             .map_err(|cause| error(format!("manifest entryを読めません: {cause}")))?
             .path();
-        if path.extension().and_then(OsStr::to_str) == Some("json") {
+        if path.extension().and_then(OsStr::to_str) == Some("json")
+            && path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .is_some_and(valid_task_id)
+        {
             paths.push(path);
         }
     }
@@ -2729,6 +2734,38 @@ mod tests {
             diagnose(&fixture.repository, Some("task-doctor"), true).unwrap()[0].1,
             "missing"
         );
+    }
+
+    #[test]
+    fn manifest_listing_ignores_delivery_and_receipt_state() {
+        let fixture = TemporaryRepository::new();
+        let _target = create_worktree(
+            &fixture.repository,
+            "feat/list-filter",
+            "task-list-filter",
+            true,
+        )
+        .unwrap();
+        let state_root = fixture
+            .manifest("task-list-filter")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::write(
+            state_root.join("task-list-filter.delivery.json"),
+            "{\"stage\":\"completed\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            state_root.join("task-list-filter.receipt.abc.json"),
+            "{\"schema\":6}\n",
+        )
+        .unwrap();
+
+        let rows = diagnose(&fixture.repository, None, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "task-list-filter");
+        assert_eq!(rows[0].1, "ready");
     }
 
     #[test]

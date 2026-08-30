@@ -225,6 +225,10 @@ human approvalやrisk引き上げを要求せず、workflowが存在するbase/h
 - 作成・診断・再開・recoverのworktree lifecycle書き込みは `codex-worktree` に限定します。
   merge後のmanaged cleanupだけは`codex-delivery finish`が厳格な証明後に実行します。`git worktree
   add/remove/prune`などを直接実行して状態を合わせようとしないでください。
+- managed cleanupは既知の再生成可能なignored directoryをworktreeとともに破棄できます。
+  `.codex-trash`、未知のignored artifact、tracked/untrackedの変更があるworktreeは保持して停止します。
+- active、未merge、dirty、判定不能なworktreeには容量・件数・経過日数によるcleanupや作業制限を
+  適用しません。cleanup判定は、merge後の`codex-delivery finish`で終了条件を証明した対象だけに限定します。
 - 親checkoutのbranch切り替え、index、working treeを変更しないことを作成前後に検証します。
 - `origin` のfetch/push先とrepository identityを検証し、最新default branchのOIDを確認して
   からbranchを作成します。

@@ -1918,17 +1918,36 @@ fn worktree(root: &Path, manifest: &Value, expected: &Path) -> Result<()> {
 fn worktree_clean_head(worktree: &Path, expected: &str) -> Result<()> {
     if !git(
         worktree,
-        &[
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-            "--ignored=matching",
-        ],
+        &["status", "--porcelain=v1", "--untracked-files=all"],
         true,
     )?
     .is_empty()
     {
         return Err(error("managed worktreeがcleanではありません"));
+    }
+    let ignored = git(
+        worktree,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        true,
+    )?;
+    let mut ignored_count = 0usize;
+    for record in ignored.split('\0').filter(|item| !item.is_empty()) {
+        ignored_count += 1;
+        if ignored_count > MAX_ITEMS
+            || !record
+                .strip_prefix("!! ")
+                .is_some_and(reclaimable_ignored_path)
+        {
+            return Err(error(
+                "managed worktreeに保存対象または未知のignored artifactがあります",
+            ));
+        }
     }
     if oid(
         git(worktree, &["rev-parse", "HEAD"], true)?.trim(),
@@ -1938,6 +1957,39 @@ fn worktree_clean_head(worktree: &Path, expected: &str) -> Result<()> {
         return Err(error("managed worktree headがreceiptと一致しません"));
     }
     Ok(())
+}
+
+fn reclaimable_ignored_path(value: &str) -> bool {
+    if value.is_empty()
+        || !value.ends_with('/')
+        || value.starts_with('/')
+        || value.contains(['\\', '\n', '\r', '\0'])
+    {
+        return false;
+    }
+    let components: Vec<_> = value.trim_end_matches('/').split('/').collect();
+    if components
+        .iter()
+        .any(|item| item.is_empty() || matches!(*item, "." | ".." | ".codex-trash"))
+    {
+        return false;
+    }
+    components.iter().any(|item| {
+        matches!(
+            *item,
+            "target"
+                | "node_modules"
+                | ".pnpm-store"
+                | ".wrangler"
+                | "dist"
+                | "build"
+                | "playwright-report"
+                | "test-results"
+                | "__pycache__"
+                | ".pytest_cache"
+                | ".ruff_cache"
+        )
+    })
 }
 fn changed_files(worktree: &Path, base: &str, head: &str) -> Result<Vec<String>> {
     let output = git(
@@ -3960,9 +4012,13 @@ fn finish_locked(
                 worktree(root, &manifest_value, &worktree_path)?;
                 worktree_clean_head(&worktree_path, &head)?;
             }
+            assert_main_synced(root, &repository)?;
+            worktree(root, &manifest_value, &worktree_path)?;
+            worktree_clean_head(&worktree_path, &head)?;
             let args = [
                 "worktree",
                 "remove",
+                "--force",
                 "--",
                 &worktree_path.display().to_string(),
             ];
@@ -4404,6 +4460,34 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn cleanup_allows_only_known_rebuildable_ignored_paths() {
+        for path in [
+            "target/",
+            "web/node_modules/",
+            "packages/app/dist/",
+            "src/__pycache__/",
+            ".pytest_cache/",
+        ] {
+            assert!(reclaimable_ignored_path(path), "path: {path}");
+        }
+
+        for path in [
+            ".codex-trash/20260830/",
+            "nested/.codex-trash/artifact",
+            ".env",
+            "artifacts/",
+            "target",
+            "dist",
+            "build",
+            "../target/",
+            "/target/",
+            "target\\artifact",
+        ] {
+            assert!(!reclaimable_ignored_path(path), "path: {path}");
+        }
+    }
 
     fn receipt_v3() -> Value {
         object([
