@@ -26,7 +26,7 @@
 ## Verification and delivery policy
 
 - 検証は各productの設定を正本にする。`.github/workflows/*.yml|*.yaml`がある場合、GitHub-hostedかself-hostedかをCodex側で上書きせず、workflowの`runs-on`、trigger、job、matrix、Ruleset・branch protectionに従って固定headの該当checkを待つ。固定job名`required-ci`を全repositoryへ要求しない。
-- workflowがない場合はCI不在だけを理由に停止または確認待ちへ移行せず、`local-validation` modeを使う。README、CONTRIBUTING、package scripts、build manifestからformat、lint、型検査、test、buildのうち変更に該当するlocal commandを特定し、整形が必要なら適用後にcheck modeでも確認する。
+- PRのlive baseと固定headの双方にworkflowがない場合はCI不在だけを理由に停止または確認待ちへ移行せず、`local-validation` modeを使う。README、CONTRIBUTING、package scripts、build manifestからformat、lint、型検査、test、buildのうち変更に該当するlocal commandを特定し、整形が必要なら適用後にcheck modeでも確認する。固定headにGitHub Actions checkが存在する場合は、全件の完了と成功系conclusionも必須とする。
 - workflowが存在するのに失敗、pending、runner unavailableの場合はlocal検証へ自動fallbackして成功扱いにしない。原因を依頼scope内で修正できる場合は修正し、外部状態が必要なら安全な再開点を報告する。
 - CDはrepositoryに既に定義されたtriggerと権限境界へ従い、Codexが独自のdeploy手順を追加しない。mergeやpushで自動起動する既存CDは状態を確認して報告するが、manual dispatch、release、production deploy、新規environment approvalはDaikiの明示依頼なしに実行しない。
 - すべての変更でSolが固定差分、受け入れ条件、影響経路、testで保証できない事項をself-reviewする。low/mediumはこれを既定のreview完了条件とし、独立reviewを必須にしない。highは実装を担当していない独立reviewを1件、criticalは実際に存在する別の高リスク境界がある場合だけ専門reviewを1件追加する。

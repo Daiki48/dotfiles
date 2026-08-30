@@ -2104,26 +2104,33 @@ fn validate_gate_review_profile(gate: &str, risk_value: &str, decision_value: &s
     }
     Ok(())
 }
-fn validate_local_gate_workflow_policy(worktree: &Path, head: &str, gate: &str) -> Result<()> {
+fn validate_local_gate_workflow_policy(
+    worktree: &Path,
+    base: &str,
+    head: &str,
+    gate: &str,
+) -> Result<()> {
     if ![FREE_PRIVATE_LOCAL_GATE_MODE, LOCAL_VALIDATION_GATE_MODE].contains(&gate) {
         return Ok(());
     }
-    let files = git(
-        worktree,
-        &[
-            "ls-tree",
-            "-r",
-            "--name-only",
-            head,
-            "--",
-            ".github/workflows",
-        ],
-        true,
-    )?;
-    if files.lines().any(workflow_yaml_path) {
-        return Err(error(
-            "local validation gateはworkflow YAMLが存在しない固定headでのみ使用できます",
-        ));
+    for reference in [base, head] {
+        let files = git(
+            worktree,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                reference,
+                "--",
+                ".github/workflows",
+            ],
+            true,
+        )?;
+        if files.lines().any(workflow_yaml_path) {
+            return Err(error(
+                "local validation gateはbaseと固定headの双方にworkflow YAMLが存在しない場合のみ使用できます",
+            ));
+        }
     }
     Ok(())
 }
@@ -2413,7 +2420,12 @@ fn write_review_locked(
         return Err(error("指定headがworktreeのcurrent HEADと一致しません"));
     }
     worktree_clean_head(&worktree_path, &head)?;
-    validate_local_gate_workflow_policy(&worktree_path, &head, gate)?;
+    validate_local_gate_workflow_policy(
+        &worktree_path,
+        &str_value(&manifest_value, "base_oid")?,
+        &head,
+        gate,
+    )?;
     let changed = changed_files(
         &worktree_path,
         &str_value(&manifest_value, "base_oid")?,
@@ -2607,6 +2619,17 @@ fn same_head_repository(view: &Value, repository: &str) -> bool {
 }
 
 fn check_required_ci(root: &Path, repository: &str, head: &str) -> Result<()> {
+    check_actions_ci(root, repository, head, true)
+}
+fn check_local_validation_ci(root: &Path, repository: &str, head: &str) -> Result<()> {
+    check_actions_ci(root, repository, head, false)
+}
+fn check_actions_ci(
+    root: &Path,
+    repository: &str,
+    head: &str,
+    require_actions: bool,
+) -> Result<()> {
     let args = vec![
         "api".into(),
         format!("repos/{repository}/commits/{head}/check-runs?filter=latest&per_page=100"),
@@ -2616,9 +2639,17 @@ fn check_required_ci(root: &Path, repository: &str, head: &str) -> Result<()> {
         "Accept: application/vnd.github+json".into(),
     ];
     let value = gh_json(root, &args)?;
-    validate_check_runs(&value, head)
+    validate_action_check_runs(&value, head, require_actions)
 }
+#[cfg(test)]
 fn validate_check_runs(value: &Value, head: &str) -> Result<()> {
+    validate_action_check_runs(value, head, true)
+}
+#[cfg(test)]
+fn validate_local_check_runs(value: &Value, head: &str) -> Result<()> {
+    validate_action_check_runs(value, head, false)
+}
+fn validate_action_check_runs(value: &Value, head: &str, require_actions: bool) -> Result<()> {
     let pages = value
         .as_array()
         .ok_or_else(|| error("check-runs pagination応答が不正です"))?;
@@ -2645,7 +2676,7 @@ fn validate_check_runs(value: &Value, head: &str) -> Result<()> {
                 == Some(15368)
         })
         .collect();
-    if candidates.is_empty() {
+    if require_actions && candidates.is_empty() {
         return Err(error("固定headのGitHub Actions checkが存在しません"));
     }
     if candidates.iter().any(|run| {
@@ -3072,6 +3103,7 @@ fn validate_delivery(
     default_branch(root, &repository)?;
     validate_receipt_loop_ledger(root, receipt_value)?;
     let live = fetch_main(root, &repository)?;
+    validate_local_gate_workflow_policy(root, &live, &head, &gate)?;
     if let Some(base) = inspected_base {
         base.push(live.clone());
     }
@@ -3092,6 +3124,8 @@ fn validate_delivery(
     }
     if remote_ci_required(&gate) {
         check_required_ci(root, &repository, &head)?;
+    } else {
+        check_local_validation_ci(root, &repository, &head)?;
     }
     review_safety(root, &repository, pr)?;
     if gate == LOCAL_VALIDATION_GATE_MODE {
@@ -3143,6 +3177,7 @@ fn validate_receipt_evidence(
     validate_gate_review_profile(&gate, risk_value, &decision_value)?;
     validate_local_gate_workflow_policy(
         worktree_path,
+        &str_value(manifest_value, "base_oid")?,
         &str_value(receipt_value, "head_sha")?,
         &gate,
     )?;
@@ -3717,6 +3752,8 @@ fn finish_locked(
     if stage == "merge_started" {
         if remote_ci_required(&gate) {
             check_required_ci(root, &repository, &head)?;
+        } else {
+            check_local_validation_ci(root, &repository, &head)?;
         }
         review_safety(root, &repository, expected_pr)?;
         if gate == LOCAL_VALIDATION_GATE_MODE {
@@ -5665,6 +5702,90 @@ mod tests {
     }
 
     #[test]
+    fn local_validation_requires_workflow_free_base_and_head() {
+        fn git_at(root: &Path, args: &[&str]) -> std::process::Output {
+            std::process::Command::new("/usr/bin/git")
+                .args(["-c", "core.hooksPath=/dev/null", "-c", "diff.external="])
+                .args(args)
+                .current_dir(root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .expect("run git")
+        }
+        fn commit(root: &Path, message: &str) -> String {
+            assert!(git_at(root, &["add", "-A"]).status.success());
+            assert!(
+                git_at(
+                    root,
+                    &[
+                        "-c",
+                        "user.name=test",
+                        "-c",
+                        "user.email=test@example.com",
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        message,
+                    ],
+                )
+                .status
+                .success()
+            );
+            String::from_utf8(git_at(root, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_string()
+        }
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("codex-delivery-local-gate-{suffix}"));
+        fs::create_dir(&root).unwrap();
+        assert!(
+            git_at(&root, &["init", "-q", "-b", "main"])
+                .status
+                .success()
+        );
+        let no_ci = commit(&root, "no ci");
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::write(root.join(".github/workflows/ci.yml"), "name: CI\n").unwrap();
+        let with_ci = commit(&root, "add ci");
+        fs::remove_file(root.join(".github/workflows/ci.yml")).unwrap();
+        let removed_ci = commit(&root, "remove ci");
+
+        assert!(
+            validate_local_gate_workflow_policy(&root, &no_ci, &no_ci, LOCAL_VALIDATION_GATE_MODE)
+                .is_ok()
+        );
+        assert!(
+            validate_local_gate_workflow_policy(
+                &root,
+                &no_ci,
+                &with_ci,
+                LOCAL_VALIDATION_GATE_MODE,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_local_gate_workflow_policy(
+                &root,
+                &with_ci,
+                &removed_ci,
+                LOCAL_VALIDATION_GATE_MODE,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_local_gate_workflow_policy(&root, &with_ci, &removed_ci, STRICT_GATE_MODE)
+                .is_ok()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn configured_actions_validation_accepts_multiple_jobs_and_rejects_wrong_or_pending_runs() {
         let good_run = object([
             ("name", string("required-ci")),
@@ -5676,6 +5797,13 @@ mod tests {
         ]);
         let valid = object([("check_runs", Value::Array(vec![good_run.clone()]))]);
         assert!(validate_check_runs(&Value::Array(vec![valid]), &"b".repeat(40)).is_ok());
+        assert!(
+            validate_local_check_runs(
+                &Value::Array(vec![object([("check_runs", Value::Array(vec![]))])]),
+                &"b".repeat(40),
+            )
+            .is_ok()
+        );
         assert!(
             validate_check_runs(
                 &Value::Array(vec![object([(
@@ -5706,6 +5834,16 @@ mod tests {
             validate_check_runs(
                 &Value::Array(vec![object([(
                     "check_runs",
+                    Value::Array(vec![Value::Object(queued.clone())]),
+                )])]),
+                &"b".repeat(40),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_local_check_runs(
+                &Value::Array(vec![object([(
+                    "check_runs",
                     Value::Array(vec![Value::Object(queued)]),
                 )])]),
                 &"b".repeat(40),
@@ -5716,6 +5854,16 @@ mod tests {
         failed.insert("conclusion".into(), string("failure"));
         assert!(
             validate_check_runs(
+                &Value::Array(vec![object([(
+                    "check_runs",
+                    Value::Array(vec![Value::Object(failed.clone())]),
+                )])]),
+                &"b".repeat(40),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_local_check_runs(
                 &Value::Array(vec![object([(
                     "check_runs",
                     Value::Array(vec![Value::Object(failed)]),

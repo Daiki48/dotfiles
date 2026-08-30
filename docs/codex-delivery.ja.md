@@ -49,7 +49,7 @@ codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --p
 codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private-local
 ```
 
-公開・非公開を問わずworkflow YAMLが存在しないrepositoryでは、変更riskに応じたreview evidenceと
+公開・非公開を問わずPRのlive baseと固定headの双方にworkflow YAMLが存在しないrepositoryでは、変更riskに応じたreview evidenceと
 product固有のlocal検証を使って`local-validation`を自律的に選択できます。CI不在だけを理由に
 `approve-review`へ切り替えません。
 
@@ -163,7 +163,7 @@ blocked・未解消finding、編集、削除、差し替え、chain切れをfail
 1. PRがopenで、baseがrepositoryのdefault branchである。
 2. 現在のhead SHAがreceiptのreview済みSHAと一致する。
 3. workflowがある場合は固定headのGitHub Actions checkがすべて`success`、`skipped`、`neutral`で、
-   failure、cancel、timeout、pending、取得不能がない。workflow不在の`local-validation`では固定SHAのlocal検証が成功している。
+   failure、cancel、timeout、pending、取得不能がない。workflow不在の`local-validation`では固定SHAのlocal検証が成功し、固定headにGitHub Actions checkが存在する場合は同じ成功条件を満たしている。
 4. actionableな指摘が0件で、GitHub review conversationの全pageに未解決threadがなく、reviewerごとの
    現在有効な個別reviewに`CHANGES_REQUESTED`がなく、`reviewDecision`も`CHANGES_REQUESTED`、
    `REVIEW_REQUIRED`、不明値ではない。
@@ -219,12 +219,12 @@ receiptへ固定し、workflow YAML不在、high/critical、`human-approved`を�
 
 ### workflow不在のlocal validation
 
-固定headに`.github/workflows/*.yml|*.yaml`がない場合は`--gate-mode local-validation`を使います。
+PRのlive baseと固定headの双方に`.github/workflows/*.yml|*.yaml`がない場合は`--gate-mode local-validation`を使います。
 公開・非公開を問わず選択でき、CI不在だけを理由にhuman approvalやrisk引き上げを要求しません。
 README、CONTRIBUTING、package scripts、build manifestからformat、lint、型検査、test、buildのうち
 変更に該当するcommandを実行し、固定headの`tests-passed` evidenceへ記録します。
 
-workflow YAMLが1つでも存在するheadではこのmodeを拒否します。CI failure、pending、runner unavailableを
+workflow YAMLがbaseまたはheadに1つでも存在する場合はこのmodeを拒否します。固定headにGitHub Actions checkが存在する場合も全件の完了と成功系conclusionを要求し、CI failure、pending、runner unavailableを
 local検証で迂回せず、workflowのtrigger、`runs-on`、job、matrixとlive repository ruleを正本にします。
 mergeやpushで自動起動する既存CDはそのworkflowへ任せて状態を報告します。manual dispatch、release、
 production deploy、新しいenvironment approvalはdelivery helperのscopeに含めません。

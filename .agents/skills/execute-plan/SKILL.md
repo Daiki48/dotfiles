@@ -188,7 +188,7 @@ criticalで別の高リスク境界を専門reviewした場合は`--specialist-r
    `codex-delivery approve-review`へ渡す。自動approval reviewだけを回答とは扱わない。判断の前提を変える
    後続pushやscope変更があれば再判定する。blockedではreceiptを作らない。
 4. receiptのSHAと現在のPR head SHAが一致し、actionable=0、未解決thread=0、merge conflictなし、
-   branchが最新baseであることをhelperで再取得する。workflowがある場合は固定job名を仮定せず、workflowの`runs-on`とlive Ruleset・branch protectionに従って固定headのGitHub Actions checkを待ち、`success`、`skipped`、`neutral`だけを合格とする。workflowがない場合は`--gate-mode local-validation`で固定headのlocal検証を使う。workflowの失敗やpendingからlocalへfallbackしない。strict modeはlive Ruleset gateを必須とする。
+   branchが最新baseであることをhelperで再取得する。workflowがある場合は固定job名を仮定せず、workflowの`runs-on`とlive Ruleset・branch protectionに従って固定headのGitHub Actions checkを待ち、`success`、`skipped`、`neutral`だけを合格とする。PRのlive baseと固定headの双方にworkflowがない場合は`--gate-mode local-validation`で固定headのlocal検証を使い、固定headにGitHub Actions checkが存在すれば同じ成功条件を適用する。workflowの失敗やpendingからlocalへfallbackしない。strict modeはlive Ruleset gateを必須とする。
    明示したGitHub Free/private modeはlive private repository identityとhigh/critical receiptを
    必須とし、Rulesetが保証していたhelper外操作の拒否は残存リスクとして扱う。
 5. `autonomous`または`human-approved` decisionを持つreceiptだけ、`codex-delivery deliver`へ進む。

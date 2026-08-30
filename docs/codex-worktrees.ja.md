@@ -210,13 +210,13 @@ errorから自動fallbackせず、modeを省略した既存commandとv1 receipt�
 
 hosted/self-hosted CIを使わない方針をDaikiが明示承認した場合だけ、high/criticalの
 `approve-review`、`deliver`、`finish`へ`--gate-mode github-free-private-local`を明示できます。
-このmodeは固定headにworkflow YAMLがないこと、private repositoryとPR/reviewのlive検証を要求し、
+このmodeはPRのbaseと固定headの双方にworkflow YAMLがないこと、private repositoryとPR/reviewのlive検証を要求し、
 `required-ci`だけをlocal testのreceiptへ置き換えます。workflow YAMLがあれば`runs-on`のrunner種別に
 従って通常CIを使い、`record-review`やCI failureからの自動fallbackには使えません。
 
-workflow YAMLが存在しない通常のrepositoryでは`--gate-mode local-validation`を使い、product固有の
+PRのbaseと固定headの双方にworkflow YAMLが存在しない通常のrepositoryでは`--gate-mode local-validation`を使い、product固有の
 format、lint、型検査、test、buildから該当するlocal検証を固定headへ記録します。CI不在だけを理由に
-human approvalやrisk引き上げを要求せず、workflowが存在するheadやCI failureからは選択しません。
+human approvalやrisk引き上げを要求せず、workflowが存在するbase/headやCI failureからは選択しません。固定headにGitHub Actions checkが存在する場合は全件の完了と成功系conclusionも必須です。
 
 確認待ち、blocked、delivery途中の異常で、PR、branch、worktreeを自動cleanupしません。
 

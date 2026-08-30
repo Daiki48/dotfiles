@@ -117,11 +117,12 @@ job name. Each workflow's `runs-on` selects GitHub-hosted or self-hosted executi
 private repository may explicitly use `--gate-mode github-free-private` while retaining the live
 repository identity and fixed-head checks.
 
-When no `.github/workflows/*.yml|*.yaml` exists, `--gate-mode local-validation` uses the fixed-head
-local format, lint, type, test, and build evidence that applies to the product. Missing CI alone does
-not require human approval. This mode is unavailable when workflow YAML exists and is never a
-fallback for a failed, pending, or unavailable runner. The legacy `github-free-private-local` mode
-remains supported for existing receipts.
+When neither the live PR base nor the fixed head contains `.github/workflows/*.yml|*.yaml`,
+`--gate-mode local-validation` uses the fixed-head local format, lint, type, test, and build evidence
+that applies to the product. Missing CI alone does not require human approval. If GitHub Actions
+checks nevertheless exist for the fixed head, they must all be completed with a successful
+conclusion. This mode is never a fallback for a failed, pending, or unavailable runner. The legacy
+`github-free-private-local` mode remains supported for existing receipts.
 
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, Draft PRs, and the delivery

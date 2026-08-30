@@ -102,13 +102,13 @@ Rulesetの代替としてprivate/default branch/archive/disable/merge/auto-merge
 hosted/self-hosted CIを意図的に運用しない場合は、Daikiが残存リスクを明示承認したときだけ
 `--gate-mode github-free-private-local`を選べます。これはhigh/criticalの`approve-review`専用で、
 固定SHAのlocal test・従来必須の独立review・専門review、ledger、上記のrepository/PR/review検証を維持し、
-固定headにworkflow YAMLがない場合だけ`required-ci` check runを要求しません。workflow YAMLがあれば
+PRのbaseと固定headの双方にworkflow YAMLがない場合だけ`required-ci` check runを要求しません。workflow YAMLがあれば
 local modeは選択せず、Rulesetの有無に応じてstrictまたは`github-free-private` modeを使い、YAMLの
 `runs-on`に従って通常CIを実行します。CI failureやpendingから自動fallbackしません。
 
-workflow YAMLが存在しない通常のrepositoryでは`--gate-mode local-validation`を選び、公開・非公開を
+PRのbaseと固定headの双方にworkflow YAMLが存在しない通常のrepositoryでは`--gate-mode local-validation`を選び、公開・非公開を
 問わずproduct固有のformat、lint、型検査、test、buildを固定headで実行します。CI不在だけを理由に
-human approvalやrisk引き上げを要求しません。workflowが存在するheadではこのmodeを拒否し、
+human approvalやrisk引き上げを要求しません。workflowが存在するbase/headではこのmodeを拒否し、固定headにGitHub Actions checkが存在する場合は全件の完了と成功系conclusionを要求します。
 GitHub-hosted/self-hostedの選択は各jobの`runs-on`をそのまま尊重します。
 
 通常の`github-free-private` profileではGitHubサーバーが直接push、helper外merge、force push、branch削除を拒否しません。
