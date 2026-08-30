@@ -91,20 +91,25 @@ review済みhead SHAの固定とrisk-based reviewは`codex-delivery`による完
 
 Rulesetを利用できないGitHub Free/private repositoryは、既定のstrict gateを暗黙に緩和しません。
 `--gate-mode github-free-private`を明示したcurrent private repositoryだけが低保証profileを使用できます。
-receipt v5へmode、risk、decision、標準review、専門review、ledger comment ID・digestを別々に保存します。
+receipt v5へmode、risk、decision、riskに応じたreview、ledger comment ID・digestを別々に保存します。
 既存v1〜v4 receiptは履歴の読み取り互換に限定し、delivery時はcurrent headのv5再reviewを要求します。
 
-Free/private profileでも唯一の`required-ci`、GitHub Actions App ID `15368`、文字どおりの
-`success`、PR identity、最新mainのancestor、review thread、mergeabilityを検証します。
+Free/private profileでも固定headで実際に起動したGitHub Actions check、App ID `15368`、GitHubが成功と扱う
+`success`・`skipped`・`neutral`、PR identity、最新mainのancestor、review thread、mergeabilityを検証します。
 Rulesetの代替としてprivate/default branch/archive/disable/merge/auto-merge設定をlive readbackし、
 設定driftや取得不能を拒否します。Ruleset APIの403、404、timeoutはfallback条件ではありません。
 
 hosted/self-hosted CIを意図的に運用しない場合は、Daikiが残存リスクを明示承認したときだけ
 `--gate-mode github-free-private-local`を選べます。これはhigh/criticalの`approve-review`専用で、
-固定SHAのlocal test・標準review・専門review、ledger、上記のrepository/PR/review検証を維持し、
+固定SHAのlocal test・従来必須の独立review・専門review、ledger、上記のrepository/PR/review検証を維持し、
 固定headにworkflow YAMLがない場合だけ`required-ci` check runを要求しません。workflow YAMLがあれば
 local modeは選択せず、Rulesetの有無に応じてstrictまたは`github-free-private` modeを使い、YAMLの
 `runs-on`に従って通常CIを実行します。CI failureやpendingから自動fallbackしません。
+
+workflow YAMLが存在しない通常のrepositoryでは`--gate-mode local-validation`を選び、公開・非公開を
+問わずproduct固有のformat、lint、型検査、test、buildを固定headで実行します。CI不在だけを理由に
+human approvalやrisk引き上げを要求しません。workflowが存在するheadではこのmodeを拒否し、
+GitHub-hosted/self-hostedの選択は各jobの`runs-on`をそのまま尊重します。
 
 通常の`github-free-private` profileではGitHubサーバーが直接push、helper外merge、force push、branch削除を拒否しません。
 そのため実装内容にかかわらずdelivery riskをhigh/criticalへ引き上げます。ただしdecision requirementは
@@ -114,7 +119,7 @@ riskと分離し、根拠を確定できる場合は`record-review`、Daikiだ�
 ## Delivery gate（Issue #24）
 
 Draft PR作成後は、PRのrepository、base branch、head branch、head SHAを固定し、固定SHAに対する
-testと標準独立review、high/criticalでは変更固有の専門reviewの完了証拠をreceiptへ記録し、
+testとriskに応じたreview（low/mediumはSolのself-review、highは独立review、criticalは必要時の専門review）の完了証拠をreceiptへ記録し、
 CIとGitHub review状態はdelivery直前にも再取得します。
 review後にpushされた場合、以前のreceipt、review、CIを
 再利用せず、新しいSHAで最初からやり直します。`review-branch`は読み取り専用であり、receiptの記録と
@@ -133,8 +138,8 @@ Planの有限な受け入れ条件・実装単位・対象経路をwork budget�
 解消とledgerのcomment ID・digestをreceiptへ固定し、deliver時にも再検証します。
 次の条件が同一SHAで同時に成立した場合だけReady化・merge候補になります。
 
-- required-ciなどrequired checkがすべて文字通り`success`である（skipped、cancelled、timed out、
-  neutral、pending、判定不能は成功と扱わない）
+- workflowで起動したGitHub Actions checkがすべて`success`、`skipped`、`neutral`である
+  （cancelled、timed out、failure、pending、判定不能は成功と扱わない）
 - actionableな指摘が0件、GitHub review conversationの未解決件数が0件
 - PRがopen、baseがdefault branch、headがreceiptのSHAと一致し、merge conflictがない
 - branchが最新baseを満たし、strict modeでは実行時点のlive Ruleset gateがrequired CI、PR必須、

@@ -1,6 +1,6 @@
 ---
 name: review-branch
-description: 内部計画に基づく全実装とDraft PR作成後、固定SHAを1つの標準独立reviewで監査し、high/criticalだけ変更固有の専門reviewを追加してSolが最終判断する。「最終レビュー」「Draft PRレビュー」「リリース前確認」で使う。方針未確定の調査、個別実装、未commit変更がある状態には使わない。
+description: high/criticalの変更、またはDaikiが明示した最終監査で、Draft PRの固定SHAを1つの独立reviewで監査する。criticalで別の高リスク境界が実在する場合だけ専門reviewを追加する。low/mediumの通常実装、方針未確定の調査、未commit変更には使わない。
 ---
 
 # 作業branchを独立監査する
@@ -20,13 +20,13 @@ commit、push、Ready化、merge、cleanupは呼び出し元が行う。レビ�
 
 ## riskに応じた独立reviewを行う
 
-すべてのriskで、実装を担当していない`reviewer` (`gpt-5.6-luna`, xhigh)を1つ使う。状態変更を明示的に禁止し、期待する結論や既知の懸念を渡さない。固定差分、影響する経路、受け入れ条件、後方互換性、高リスク境界、testで保証できない事項だけを確認し、再現可能で今回修正すべき指摘を1回のpassでまとめて返すよう依頼する。各指摘には重大度、fileとlineまたは欠落した境界、実行またはコード経路、期待結果と実際の結果、再現・確認方法、修正後の観測条件、および固定した不変条件ID、repository-relativeな原因経路、正規化した失敗classからなるfinding fingerprintを要求する。「問題なし」を有効な結論として扱い、指摘を作ること自体を目的にしない。将来改善、好み、具体的な影響根拠がない懸念はactionableにしない。網羅的な機械検証は共有済みのtest、lint、型検査、buildへ担わせ、reviewerへ同じ検証を繰り返させない。
+high/criticalで、実装を担当していない`reviewer` (`gpt-5.6-luna`, xhigh)を1つ使う。状態変更を明示的に禁止し、期待する結論や既知の懸念を渡さない。固定差分、影響する経路、受け入れ条件、後方互換性、高リスク境界、testで保証できない事項だけを確認し、再現可能で今回修正すべき指摘を1回のpassでまとめて返すよう依頼する。各指摘には重大度、fileとlineまたは欠落した境界、実行またはコード経路、期待結果と実際の結果、再現・確認方法、修正後の観測条件、および固定した不変条件ID、repository-relativeな原因経路、正規化した失敗classからなるfinding fingerprintを要求する。「問題なし」を有効な結論として扱い、指摘を作ること自体を目的にしない。将来改善、好み、具体的な影響根拠がない懸念はactionableにしない。網羅的な機械検証は共有済みのtest、lint、型検査、buildへ担わせ、reviewerへ同じ検証を繰り返させない。
 
-high/criticalでは標準reviewに加え、変更で実際に触れる主要な高リスク境界を1つの専門reviewerへ割り当てる。authなら認証・認可、migrationならデータ損失・rollback、public APIなら後方互換性、concurrencyなら競合・timeout・retry、delivery安全境界ならgate・権限・fail-closed挙動のように、変更固有の観点だけを確認する。一般的な反論役、肯定役、複数の専門reviewerは追加しない。専門reviewerへ標準reviewerの所見を渡さず、同じ証拠集合から独立して判定させる。
+criticalで、標準reviewとは別に確認すべき高リスク境界が実際に存在する場合だけ、1つの専門reviewerへ割り当てる。authなら認証・認可、不可逆migrationならデータ損失・rollback、production deliveryなら誤配信防止のように、変更固有の観点だけを確認する。highでは標準reviewへ高リスク境界を含め、別reviewerを増やさない。一般的な反論役、肯定役、複数の専門reviewerは追加しない。
 
 Sol highが固定した証拠集合とreview結果を再判定し、canonical fingerprintが同じ重複、誤検知、根拠不足を除外してdelivery準備可否を決める。fingerprintはRFC 8785 JCSのUTF-8 byte列をSHA-256にし、pathは`/`区切りのrepository-relative lexical path、文字列は暗黙にUnicode正規化しない。新しいfingerprintは修正deltaまたは新たに利用可能になった一次証拠との因果を必須とし、同じ対象の言い換えを進展扱いしない。重大なセキュリティ・互換性・データ移行、同じfingerprintの修正後再発、2round連続の証拠上のstall、canonical failure signatureの反復、比較不能な入力・外部state、またはreview結論の衝突ではSol xhighの診断モードへ昇格する。診断は開始前に最大12 tool callまたは30分の早い方をledgerへ固定し、tool call使用数をaudit記録、wall-clock・token消費はruntimeが提示する経過時間・token情報で監視する。より小さい明示budgetを優先し、超過時はblockedかhuman-requiredへ移る。診断後の修正でも同じfingerprintが再発するか、次のroundにも進展がない場合はその項目をblockedとし、独立した別原因の指摘は呼び出し元へ返せるがtask全体とdeliveryは全actionable解消までblockedとする。Luna maxは、xhighで不足する具体的な根拠がある場合だけ使う。risk分類とdecision requirement（autonomous / human-required / blocked）を別々に判定し、receiptの記録は呼び出し元の`codex-delivery`へ返す。
 
-subagentを利用できない場合はmain agentが同じ証拠集合で標準reviewを独立passとして行い、high/criticalだけ変更固有の専門passを追加する。その制約を結果へ明記する。
+subagentを利用できない場合はmain agentが同じ証拠集合で独立passを行い、criticalで別境界がある場合だけ変更固有の専門passを追加する。その制約を結果へ明記する。
 
 ## 指摘を反証して統合する
 
@@ -40,7 +40,7 @@ subagentを利用できない場合はmain agentが同じ証拠集合で標準re
 ## 判定を返す
 
 - Plan IDと版、base、branch、HEAD、commit列
-- 標準reviewerの確認範囲と判定、high/criticalでは変更固有の専門reviewerの確認範囲と判定、およびSolの最終判断
+- 独立reviewerの確認範囲と判定、criticalで実施した場合だけ専門reviewerの確認範囲と判定、およびSolの最終判断
 - repository、PR、base/head ref、固定head SHA、required CI状態、actionable件数、未解決thread件数
 - 実行した自動検証と結果
 - 確定した指摘を重大度順に整理した一覧とfinding fingerprint、新規・再発・解消・誤検知の判定

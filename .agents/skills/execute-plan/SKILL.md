@@ -1,11 +1,11 @@
 ---
 name: execute-plan
-description: 実装依頼の全実装単位を自律的に実装・検証し、安全なcheckpointごとにcommitして、独立レビュー、修正、限定push、Draft PR後のdeliveryまで進める。Daikiから修正、追加、構築、「進めて」「最後まで自動で」と依頼されたときに使う。方針未確定の調査、単独レビュー、releaseには使わない。
+description: 内部計画が必要な複数経路・high/criticalの実装、またはDaikiが明示したPR deliveryを自律的に実装・検証して完了まで進める。小さく局所的で要件が明確なlow/medium risk変更、方針未確定の調査、単独レビュー、releaseには使わない。
 ---
 
 # 実装依頼を完了まで実行する
 
-実装依頼を人間の主要な許可として扱い、計画確認やcommitごとの確認待ちを挟まず、全実装単位、最終監査、Draft PR後のdeliveryまで進める。riskと意思決定要否を分離し、Daikiだけが決められる事項がある場合だけ確認を得る。
+対象となる実装依頼を人間の主要な許可として扱い、計画確認やcommitごとの確認待ちを挟まず、全実装単位と比例した検証を進める。PR deliveryが計画または依頼に含まれる場合だけcommit、push、Draft PR、deliveryへ進む。riskと意思決定要否を分離し、Daikiだけが決められる事項がある場合だけ確認を得る。
 
 ## 正本と実行権限を確定する
 
@@ -19,11 +19,11 @@ description: 実装依頼の全実装単位を自律的に実装・検証し、�
 実装単位を次の基準で分類し、分類結果をreview receiptと完了報告へ記録する。
 
 - **low/medium**: 通常の実装・修正で、delivery安全境界や高リスクデータ・権限に影響しないもの。
-  Draft PR後も自律してreview、修正、再検証、Ready、merge、main同期、managed cleanupまで進める。
+  Solのself-reviewと変更に近い自動検証を既定とし、独立reviewは必須にしない。PR deliveryがscopeにある場合だけReady、merge、main同期、managed cleanupまで進める。
 - **high/critical**: CI/workflow、Ruleset、hook、rules、AGENTS、Skills、helper、installerなどの
   delivery安全境界、auth/secrets、billing、production、不可逆migration、breaking changeを含むもの。
   security、互換性、データ損失の重大な懸念も含む。riskはreview深度と残存影響を決めるが、
-  それだけで人間確認を要求しない。
+  それだけで人間確認を要求しない。highは独立reviewを1件、criticalは実際に別の高リスク境界がある場合だけ専門reviewを1件追加する。
 - **GitHub Free/private delivery**: `--gate-mode github-free-private`を明示するprivate repositoryでは、
   Rulesetなしの保証差を反映してriskをhigh/criticalとして扱う。repository固有allowlistやAPI errorからの
   自動fallbackは使わず、live identityとCodex側gateを検証する。
@@ -60,7 +60,7 @@ rootがSol highならroot自身がlead兼single writerとなり、監督のた�
 
 1. 単位の目的、対象、観測可能な受け入れ条件、追加・更新する回帰test、依存する完了単位を確認する。
 2. 周辺実装とテストを読んでから、依頼スコープの最小変更を行う。無関係な整形や後続単位を混ぜない。
-3. 変更した挙動を可能な限り回帰testで固定する。変更箇所に近いtest、lint、型検査、buildから実行し、リスクに応じて範囲を広げる。
+3. 変更した挙動を可能な限り回帰testで固定する。repositoryのREADME、CONTRIBUTING、package scripts、build manifestを正本に、変更箇所に近いformat、lint、型検査、test、buildから実行し、リスクに応じて範囲を広げる。
 4. 固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項だけを正しさ、互換性、セキュリティ、堅牢性、性能、不要変更の観点でself-reviewする。全コードの機械的な網羅確認はtest、lint、型検査、buildへ担わせる。
 5. 変更ファイル名と追加行をsecret検査し、認証情報、local state、個人情報、AI帰属がないことを確認する。
 6. `git -C <専用worktree> add -- <明示パス...>`だけでstageし、同じ専用worktreeで`git diff --cached`とstage対象を再確認する。`SSH_ASKPASS`がある環境では前述の`env -u SSH_ASKPASS`を先頭に付ける。
@@ -150,13 +150,15 @@ wall-clock予算、canonical failure signature、stall、
 修正deltaまたは新しい一次証拠へ結び付かない新規指摘のbreakerを必須とし、budget不明を同一問題の無制限retryに
 使わない。停止時はledger、commit、失敗証拠、次の再開条件を安全なcheckpointとして残す。
 
-## Draft PR前の統合確認を行う
+## 完了境界とDraft PR前の統合確認を行う
 
-全単位完了後、rootのSol highが固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項を統合確認する。この段階では独立reviewerを起動せず、実装単位ごとのself-reviewと自動検証の不足、計画外差分、secret、AI帰属、不要なlocal情報だけを確認する。独立reviewはDraft PR作成後の固定SHAに対して1回だけ開始する。
+全単位完了後、rootのSol highが固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項を統合確認する。low/mediumはこのself-reviewを既定のreview完了条件とする。highはDraft PR後の固定SHAに対して独立reviewを1件、criticalは実際に別の高リスク境界がある場合だけ専門reviewを1件追加する。
 
 依頼スコープ内の欠陥はまとめて修正、検証、追加commitする。重大な問題や必須条件が残る間はpushしない。
 
-## push前監査とDraft PRを作成する
+## scopeに含まれる場合だけpush前監査とDraft PRを作成する
+
+Daikiの依頼、内部計画、repository運用のいずれにもPR deliveryが含まれない場合は、この節以降へ進まず、専用worktree上の変更、検証結果、未実施事項を最終報告する。commitも依頼または安全なcheckpointとして必要な場合だけ行う。
 
 1. 専用worktreeがclean、current branch、task manifest、remoteが計画どおりで、全実装単位とreview修正がcommit済みであることを確認する。人間用checkoutの事前snapshotも不変であることを再確認する。
 2. baseからHEADまでのcommit列、全差分、テスト、secret検査、AI帰属の不在、不要ファイルの不在を再確認する。
@@ -169,13 +171,12 @@ wall-clock予算、canonical failure signature、stall、
 
 Draft PR作成後は、専用`codex-delivery` helperだけをreceipt、delivery、finishの経路として使う。
 すべてのcommandで`--task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版>`を
-明示し、review記録では`--risk`と`--tests-passed`、`--independent-review-passed`を指定する。
-high/criticalだけ`--specialist-review-passed`も指定する。明示認可されたGitHub Free/private repositoryでは
+明示し、review記録では`--risk`と`--tests-passed`を指定する。high/criticalでは`--independent-review-passed`、
+criticalで別の高リスク境界を専門reviewした場合は`--specialist-review-passed`も指定する。明示認可されたGitHub Free/private repositoryでは
  `record-review`または`approve-review`、`deliver`、`finish`の各commandへ`--gate-mode github-free-private`も指定し、
  strict modeでは省略する。
 
-1. PRのbase、head、head SHAを固定し、`review-branch`を読み取り専用で実行する。reviewerは固定SHAの
-   差分、実装計画、test結果、既存仕様を確認し、actionable件数と未解決thread件数を返す。low/mediumは標準reviewerを1つだけ使い、high/criticalは変更で実際に触れる高リスク境界を確認する専門reviewerを1つ追加する。反論役、肯定役、変更と無関係な専門観点は追加しない。
+1. PRのbase、head、head SHAを固定する。low/mediumはSolのself-review結果を使い、独立reviewerを起動しない。high/criticalは`review-branch`を読み取り専用で1回実行し、固定SHAの差分、実装計画、test結果、既存仕様を確認する。criticalで実際に別の高リスク境界がある場合だけ専門reviewerを1つ追加する。反論役、肯定役、変更と無関係な専門観点は追加しない。
 2. decisionが`autonomous`ならriskに関係なく、review結果とSHA、CI結果、risk分類を
    `codex-delivery record-review`でreceiptに記録する。
    actionableな指摘があればSolがコード、test、履歴、一次情報で再現し、誤検知と根拠不足を除外する。
@@ -186,9 +187,8 @@ high/criticalだけ`--specialist-review-passed`も指定する。明示認可さ
 3. decisionが`human-required`なら、必要な判断を具体化してDaikiの明示回答を得る。判断後だけ同じ証拠を
    `codex-delivery approve-review`へ渡す。自動approval reviewだけを回答とは扱わない。判断の前提を変える
    後続pushやscope変更があれば再判定する。blockedではreceiptを作らない。
-4. receiptのSHAと現在のPR head SHAが一致し、actionable=0、未解決thread=0、required CIが文字通り
-   `success`（skipped、cancelled、timed out、neutral、pending、判定不能は不合格）、merge conflictなし、
-   branchが最新baseであることをhelperで再取得する。strict modeはlive Ruleset gateを必須とする。
+4. receiptのSHAと現在のPR head SHAが一致し、actionable=0、未解決thread=0、merge conflictなし、
+   branchが最新baseであることをhelperで再取得する。workflowがある場合は固定job名を仮定せず、workflowの`runs-on`とlive Ruleset・branch protectionに従って固定headのGitHub Actions checkを待ち、`success`、`skipped`、`neutral`だけを合格とする。workflowがない場合は`--gate-mode local-validation`で固定headのlocal検証を使う。workflowの失敗やpendingからlocalへfallbackしない。strict modeはlive Ruleset gateを必須とする。
    明示したGitHub Free/private modeはlive private repository identityとhigh/critical receiptを
    必須とし、Rulesetが保証していたhelper外操作の拒否は残存リスクとして扱う。
 5. `autonomous`または`human-approved` decisionを持つreceiptだけ、`codex-delivery deliver`へ進む。
@@ -211,7 +211,7 @@ PRが未mergeの間はworktreeを安全な再開点として保持する。`git 
 
 - Plan IDと版、task ID、worktree path、base、branch、HEAD、Draft PR URL、risk分類
 - 実装単位とcommit hashの対応
-- 自動検証、固定SHAごとの標準review、高リスク時の専門review、receipt、修正結果、delivery/finish結果
+- 自動検証、risk上必要な固定SHA review、receipt、修正結果、delivery/finish結果
 - 未実施の手動確認、残存リスク、計画との差異
 - push・PR作成・delivery・finishを実施できなかった場合は、PR、branch、worktreeを保持した安全な再開条件
 

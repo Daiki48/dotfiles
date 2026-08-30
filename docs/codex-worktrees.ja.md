@@ -187,20 +187,19 @@ review、CI、Ruleset、risk確認は[Codex delivery運用ガイド](codex-deliv
 
 Draft PR後のdeliveryは、専用`codex-delivery` helperの次の経路だけを使います。
 各commandでは`--task-id`、`--pr`、`--head`、`--plan-id`、`--plan-version`を明示します。review記録では
-`--risk`、`--tests-passed`、`--independent-review-passed`を必須とし、high/criticalだけ
-`--specialist-review-passed`も必須です。
+`--risk`、`--tests-passed`を必須とし、high/criticalは`--independent-review-passed`、criticalで
+別の高リスク境界をreviewした場合だけ`--specialist-review-passed`も指定します。
 
 ```text
 (autonomous: record-review | human-required: approve-review)  ->  deliver  ->  finish
 ```
 
-`record-review`は、repository、PR、固定head SHA、Plan ID、risk分類、testと標準独立review、
-high/criticalでは変更固有の専門reviewの完了証拠を
+`record-review`は、repository、PR、固定head SHA、Plan ID、risk分類、testとriskに応じたreviewの完了証拠を
 receiptとして記録します。riskとは別にdecision requirementを判定し、仕様・既存権限・rollback・検証を
 確定できる場合は全riskで`record-review`を使います。Daikiだけが決められる事項がある場合は明示回答後に
 `approve-review`を使い、技術gateが不明または失敗ならblockedとしてreceiptを作りません。receiptと
-現在のSHAが一致し、delivery直前に再取得したCIが文字通り`success`（明示承認済みlocal-only
-modeでは固定SHAのlocal test完了）、actionable=0、未解決thread=0、選択したremote gateが成立した
+現在のSHAが一致し、delivery直前に再取得したGitHub Actions checkが`success`・`skipped`・`neutral`
+（workflow不在の`local-validation`では固定SHAのlocal検証完了）、actionable=0、未解決thread=0、選択したremote gateが成立した
 場合だけ`deliver`へ進みます。
 
 既定はlive Rulesetを要求するstrict modeです。GitHub Free/private repositoryでは、`record-review`
@@ -214,6 +213,10 @@ hosted/self-hosted CIを使わない方針をDaikiが明示承認した場合だ
 このmodeは固定headにworkflow YAMLがないこと、private repositoryとPR/reviewのlive検証を要求し、
 `required-ci`だけをlocal testのreceiptへ置き換えます。workflow YAMLがあれば`runs-on`のrunner種別に
 従って通常CIを使い、`record-review`やCI failureからの自動fallbackには使えません。
+
+workflow YAMLが存在しない通常のrepositoryでは`--gate-mode local-validation`を使い、product固有の
+format、lint、型検査、test、buildから該当するlocal検証を固定headへ記録します。CI不在だけを理由に
+human approvalやrisk引き上げを要求せず、workflowが存在するheadやCI failureからは選択しません。
 
 確認待ち、blocked、delivery途中の異常で、PR、branch、worktreeを自動cleanupしません。
 

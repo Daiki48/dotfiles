@@ -1,4 +1,4 @@
 interface:
   display_name: "変更方針を策定"
-  short_description: "未確定の変更要求を調査し、内部実装計画を確定します"
-  default_prompt: "$plan-change を使い、変更要求を調査して内部実装計画を確定してください。実装依頼なら execute-plan へ引き継いでください。"
+  short_description: "未確定・複数経路・高リスクの変更計画を確定します"
+  default_prompt: "$plan-change を使い、計画が必要な変更要求を調査して内部実装計画を確定してください。実装依頼なら execute-plan へ引き継いでください。"
