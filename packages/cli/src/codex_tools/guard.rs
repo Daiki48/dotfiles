@@ -4967,11 +4967,16 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
     }
     if command == "record-review" || command == "approve-review" {
         let risk = values.get("--risk").map(String::as_str).unwrap_or("");
-        let specialist_required = ["high", "critical"].contains(&risk);
-        if !["low", "medium", "high", "critical"].contains(&risk)
+        let independent = seen.iter().any(|v| v == "--independent-review-passed");
+        let specialist = seen.iter().any(|v| v == "--specialist-review-passed");
+        let review_profile_valid = match risk {
+            "low" | "medium" => !specialist,
+            "high" => independent,
+            "critical" => independent,
+            _ => false,
+        };
+        if !review_profile_valid
             || !seen.iter().any(|v| v == "--tests-passed")
-            || !seen.iter().any(|v| v == "--independent-review-passed")
-            || seen.iter().any(|v| v == "--specialist-review-passed") != specialist_required
             || seen.iter().any(|v| v == "--sandbox-retry")
         {
             return Some("delivery helperのreview evidenceまたはriskが不正です".into());
@@ -4987,7 +4992,12 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         .is_some_and(|v| v == "github-free-private-local");
     let review_command = command == "record-review" || command == "approve-review";
     if values.get("--gate-mode").is_some_and(|v| {
-        !["github-free-private", "github-free-private-local"].contains(&v.as_str())
+        ![
+            "github-free-private",
+            "github-free-private-local",
+            "local-validation",
+        ]
+        .contains(&v.as_str())
     }) || values
         .get("--gate-mode")
         .is_some_and(|v| v == "github-free-private-local" && command == "record-review")
@@ -6758,7 +6768,7 @@ mod tests {
 
     #[test]
     fn delivery_helper_guard_enforces_the_risk_based_review_profile() {
-        let command = |risk: &str, specialist: bool| {
+        let command = |risk: &str, independent: bool, specialist: bool| {
             let mut tokens = vec![
                 "codex-delivery".to_string(),
                 "record-review".to_string(),
@@ -6775,19 +6785,24 @@ mod tests {
                 "--plan-version".to_string(),
                 "3".to_string(),
                 "--tests-passed".to_string(),
-                "--independent-review-passed".to_string(),
             ];
+            if independent {
+                tokens.push("--independent-review-passed".to_string());
+            }
             if specialist {
                 tokens.push("--specialist-review-passed".to_string());
             }
             tokens
         };
-        assert!(delivery_helper_invocation_reason(&command("low", false)).is_none());
-        assert!(delivery_helper_invocation_reason(&command("low", true)).is_some());
-        assert!(delivery_helper_invocation_reason(&command("high", false)).is_some());
-        assert!(delivery_helper_invocation_reason(&command("high", true)).is_none());
+        assert!(delivery_helper_invocation_reason(&command("low", false, false)).is_none());
+        assert!(delivery_helper_invocation_reason(&command("medium", false, false)).is_none());
+        assert!(delivery_helper_invocation_reason(&command("low", true, true)).is_some());
+        assert!(delivery_helper_invocation_reason(&command("high", false, false)).is_some());
+        assert!(delivery_helper_invocation_reason(&command("high", true, false)).is_none());
+        assert!(delivery_helper_invocation_reason(&command("critical", true, false)).is_none());
+        assert!(delivery_helper_invocation_reason(&command("critical", true, true)).is_none());
 
-        let mut local_record = command("high", true);
+        let mut local_record = command("high", true, true);
         local_record.extend([
             "--gate-mode".to_string(),
             "github-free-private-local".to_string(),
@@ -6796,13 +6811,17 @@ mod tests {
         local_record[1] = "approve-review".to_string();
         assert!(delivery_helper_invocation_reason(&local_record).is_none());
 
-        let mut local_low = command("low", false);
+        let mut local_low = command("low", false, false);
         local_low[1] = "approve-review".to_string();
         local_low.extend([
             "--gate-mode".to_string(),
             "github-free-private-local".to_string(),
         ]);
         assert!(delivery_helper_invocation_reason(&local_low).is_some());
+
+        let mut local_validation = command("low", false, false);
+        local_validation.extend(["--gate-mode".to_string(), "local-validation".to_string()]);
+        assert!(delivery_helper_invocation_reason(&local_validation).is_none());
 
         let local_delivery = |command: &str| {
             vec![
@@ -6825,11 +6844,11 @@ mod tests {
         assert!(delivery_helper_invocation_reason(&local_delivery("deliver")).is_none());
         assert!(delivery_helper_invocation_reason(&local_delivery("finish")).is_none());
 
-        let mut missing_version = command("high", true);
+        let mut missing_version = command("high", true, true);
         missing_version.drain(12..14);
         assert!(delivery_helper_invocation_reason(&missing_version).is_some());
 
-        let mut invalid_version = command("high", true);
+        let mut invalid_version = command("high", true, true);
         invalid_version[13] = "0".to_string();
         assert!(delivery_helper_invocation_reason(&invalid_version).is_some());
 

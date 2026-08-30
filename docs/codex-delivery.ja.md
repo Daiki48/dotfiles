@@ -13,16 +13,17 @@ managed worktree cleanupまでを同じdeliveryとして扱います。
 ```
 
 すべてのcommandはcurrent repositoryのrootで実行し、`--task-id`、`--pr`、`--head`、
-`--plan-id`と`--plan-version`を必須とします。review記録では`--risk`と`--tests-passed`、
-`--independent-review-passed`を必須とし、high/criticalだけ`--specialist-review-passed`も必須です。Codexや利用者が直接
+`--plan-id`と`--plan-version`を必須とします。review記録では`--risk`と`--tests-passed`を必須とし、
+high/criticalでは`--independent-review-passed`、criticalで別の高リスク境界を専門reviewした場合は
+`--specialist-review-passed`も指定します。Codexや利用者が直接
 `gh pr ready`、`gh pr merge`、任意のGitHub
 merge API、`git worktree remove/prune`、任意branch削除を実行してこの経路を迂回してはいけません。
 
 ```sh
-codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed --independent-review-passed
-codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed --independent-review-passed
-codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed --independent-review-passed --specialist-review-passed
-codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high|critical> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed --independent-review-passed --specialist-review-passed
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed
+codex-delivery approve-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <high> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed --independent-review-passed
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <critical> --plan-id <Plan ID> --plan-version <Plan版> --tests-passed --independent-review-passed --specialist-review-passed
 codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版>
 codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版>
 ```
@@ -48,6 +49,16 @@ codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --p
 codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private-local
 ```
 
+公開・非公開を問わずPRのlive baseと固定headの双方にworkflow YAMLが存在しないrepositoryでは、変更riskに応じたreview evidenceと
+product固有のlocal検証を使って`local-validation`を自律的に選択できます。CI不在だけを理由に
+`approve-review`へ切り替えません。
+
+```sh
+codex-delivery record-review --task-id <task-id> --pr <PR番号> --head <40桁SHA> --risk <low|medium> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode local-validation --tests-passed
+codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode local-validation
+codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode local-validation
+```
+
 `review-branch`は読み取り専用です。reviewerはreceipt、Issue、PR、Git、worktreeを変更せず、
 呼び出し元がdecision assessmentに応じてreview結果を`record-review`または`approve-review`へ渡します。
 
@@ -69,14 +80,14 @@ Draft PRを作成したら、receiptとmanaged manifestを合わせて次の対�
 - review対象のhead SHAとbase SHA
 - task ID、worktree path、risk分類
 - remote gate mode
-- 標準独立review、high/criticalでは変更固有の専門review、testの完了判定、actionable件数
+- riskに応じたreview（low/mediumはSolのself-review、highは独立review、criticalは必要時の専門review）、testの完了判定、actionable件数
 
 receiptは対象SHAに束縛します。review後にcommitをpushしてhead SHAが変わった場合、以前の
-receipt、CI、review、確認を新SHAへ引き継ぎません。新しいSHAでCIと独立reviewを実行し、
+receipt、CI、review、確認を新SHAへ引き継ぎません。新しいSHAでCIとrisk上必要なreviewを実行し、
 新しいreceiptを記録します。
 
-receipt v5は`independent_review_passed`を全riskで固定し、`specialist_review_passed`を
-low/mediumではfalse、high/criticalではtrueに固定します。`gate_mode`とdecision
+receipt v5は`independent_review_passed`をlow/mediumでは任意、high/criticalではtrueに固定し、
+`specialist_review_passed`をcriticalで別境界をreviewした場合だけ必須にします。既存receiptの追加review証拠も有効です。`gate_mode`とdecision
 （`autonomous`または`human-approved`）、最新ledger comment ID・本文digest・Plan版も固定し、riskから意思決定要否を推測しません。
 既存v1〜v4 receiptは履歴表示の読み取り互換形式として解析できますが、delivery・finishには使えずcurrent headをv5で再reviewします。旧形式のhigh/criticalやFree/privateを遡及的にautonomousへ緩和しません。CLIで
 指定したmodeとreceiptが一致しない場合はdeliveryもfinishも停止します。
@@ -86,10 +97,10 @@ review品質を暗号学的に証明するものではありません。helper�
 実差分を再計算し、receiptのchanged-filesと順序も含めて完全一致させます。安全境界pathを含む差分は
 low/mediumへ分類できません。
 
-required checkは文字通り`success`だけを成功とします。`skipped`、`cancelled`、`timed out`、
-`neutral`、`pending`、取得不能、判定不能は成功として扱いません。CI結果はreceiptの自己申告を
-信頼せず、`deliver`が固定head上のcheck runをlive取得し、名前、GitHub Actions app ID、head SHA、
-`completed`、`success`、完了時刻が一意に一致することを確認します。
+remote CIではGitHubがrequired checkの成功状態として扱う`success`、`skipped`、`neutral`を成功とします。
+`cancelled`、`timed out`、`failure`、`pending`、取得不能、判定不能は成功として扱いません。CI結果はreceiptの自己申告を
+信頼せず、`deliver`が固定head上のGitHub Actions check runをlive取得し、job名を固定せずapp ID、head SHA、
+`completed`、conclusion、完了時刻を確認します。
 
 ## DELIVERY-05: riskとdecision assessment
 
@@ -98,8 +109,8 @@ required checkは文字通り`success`だけを成功とします。`skipped`、
 通常の実装・修正で、delivery安全境界や高リスクデータ・権限に影響しないタスクをlow/mediumと
 します。CI/workflow、hook、rules、AGENTS、Skills、helper、installer、auth/secrets、production、
 不可逆migration、breaking change、重大なsecurity・互換性・データ損失影響はhigh/criticalです。
-riskはreview深度と残存影響を決めますが、人間確認を自動決定しません。low/mediumは標準独立reviewを
-1つだけ実行し、high/criticalは変更で実際に触れる主要な高リスク境界を対象とする専門reviewを1つ追加します。
+riskはreview深度と残存影響を決めますが、人間確認を自動決定しません。low/mediumはSolのself-review、
+highは独立reviewを1つ実行し、criticalは別の高リスク境界が実在する場合だけ専門reviewを1つ追加します。
 一般的な反論役や肯定役は使いません。actionableな指摘はSolが反証してから1つのbatchで修正、検証、
 commit、pushします。そのpushでSHAが変わるためreview、CI、receiptを最初からやり直しますが、
 修正round全体には固定上限を設けません。違反した不変条件、原因経路、観測可能な失敗からfinding fingerprintを
@@ -151,8 +162,8 @@ blocked・未解消finding、編集、削除、差し替え、chain切れをfail
 
 1. PRがopenで、baseがrepositoryのdefault branchである。
 2. 現在のhead SHAがreceiptのreview済みSHAと一致する。
-3. required CIがすべて文字通り`success`で、失敗、skip、cancel、timeout、neutral、pending、
-   取得不能がない。明示承認済みlocal-only modeでは、代わりに固定SHAのlocal testが成功している。
+3. workflowがある場合は固定headのGitHub Actions checkがすべて`success`、`skipped`、`neutral`で、
+   failure、cancel、timeout、pending、取得不能がない。workflow不在の`local-validation`では固定SHAのlocal検証が成功し、固定headにGitHub Actions checkが存在する場合は同じ成功条件を満たしている。
 4. actionableな指摘が0件で、GitHub review conversationの全pageに未解決threadがなく、reviewerごとの
    現在有効な個別reviewに`CHANGES_REQUESTED`がなく、`reviewDecision`も`CHANGES_REQUESTED`、
    `REVIEW_REQUIRED`、不明値ではない。
@@ -185,8 +196,8 @@ GitHub Freeのprivate repositoryではRulesetやprotected branchをserver-side�
 decision assessmentが`autonomous`なら`record-review`、Daikiの判断が必要な場合だけ`approve-review`を
 使います。live repository readbackはcurrent repositoryと完全一致するrepository identity、
 `private=true`、`default_branch=main`、`archived=false`、`disabled=false`、
-`allow_merge_commit=true`、`allow_auto_merge=false`を要求します。さらに唯一のGitHub Actions App
-由来`required-ci`成功、最新mainのancestor、全review thread解決、`CHANGES_REQUESTED`なし、
+`allow_merge_commit=true`、`allow_auto_merge=false`を要求します。さらに固定headで実際に起動したGitHub Actions App
+由来checkの完了、最新mainのancestor、全review thread解決、`CHANGES_REQUESTED`なし、
 same-repository PR、固定head、mergeable/CLEANをstrict modeと同じく検証します。
 
 GitHub側ではmainへの直接push、helper外merge、force push、branch削除、最新base CIを強制できません。
@@ -198,13 +209,25 @@ API取得不能ではfail closedにします。
 
 `github-free-private-local`は`github-free-private`と同じlive repository identity、固定head、最新mainの
 ancestor、mergeability、review thread、`CHANGES_REQUESTED`、ledgerを検証しますが、唯一
-`required-ci` check runを要求しません。代わりに固定SHAで完了したlocal test・標準review・専門reviewを
+`required-ci` check runを要求しません。代わりに固定SHAで完了したlocal test・従来必須の独立review・専門reviewを
 receiptへ固定し、workflow YAML不在、high/critical、`human-approved`を必須にします。同一headの既存
 `github-free-private` receiptは、同じPlan・evidenceのまま明示承認されたこのmodeへだけ更新できます。
 
 このmodeの`tests-passed`はlocal実行結果の構造的な申告であり、GitHubが実行・強制するCI証明では
 ありません。CI失敗・pendingを迂回するfallbackとしては使わず、CI自体を運用しない方針への明示承認が
 ある場合だけ選択します。GitHub側で直接push等を拒否できない残存リスクも引き続き存在します。
+
+### workflow不在のlocal validation
+
+PRのlive baseと固定headの双方に`.github/workflows/*.yml|*.yaml`がない場合は`--gate-mode local-validation`を使います。
+公開・非公開を問わず選択でき、CI不在だけを理由にhuman approvalやrisk引き上げを要求しません。
+README、CONTRIBUTING、package scripts、build manifestからformat、lint、型検査、test、buildのうち
+変更に該当するcommandを実行し、固定headの`tests-passed` evidenceへ記録します。
+
+workflow YAMLがbaseまたはheadに1つでも存在する場合はこのmodeを拒否します。固定headにGitHub Actions checkが存在する場合も全件の完了と成功系conclusionを要求し、CI failure、pending、runner unavailableを
+local検証で迂回せず、workflowのtrigger、`runs-on`、job、matrixとlive repository ruleを正本にします。
+mergeやpushで自動起動する既存CDはそのworkflowへ任せて状態を報告します。manual dispatch、release、
+production deploy、新しいenvironment approvalはdelivery helperのscopeに含めません。
 
 ## deliver
 

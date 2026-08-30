@@ -111,25 +111,25 @@ Ruleset is active; apply it with explicit approval and verify its readback. See
 [GitHub CI・Ruleset運用ガイド](docs/github-guardrails.ja.md) for the check mapping, application,
 verification, and rollback procedure.
 
-`codex-delivery` defaults to that strict Ruleset gate. A GitHub Free private repository may instead
-explicitly use `--gate-mode github-free-private`; this lower-assurance mode binds the live private
-repository identity, one successful exact-SHA `required-ci`, review state, and a high/critical
-receipt. GitHub does not enforce direct-push, force-push, deletion, or helper-only merge constraints
-server-side.
+`codex-delivery` defaults to the live Ruleset gate. When workflow YAML exists, it validates the
+GitHub Actions checks actually configured for the fixed head instead of imposing a repository-wide
+job name. Each workflow's `runs-on` selects GitHub-hosted or self-hosted execution. A GitHub Free
+private repository may explicitly use `--gate-mode github-free-private` while retaining the live
+repository identity and fixed-head checks.
 
-When a GitHub Free private repository intentionally operates without hosted or self-hosted CI,
-`--gate-mode github-free-private-local` is available only after explicit human approval. It keeps
-the fixed-SHA local test and review receipt, ledger, live repository/PR/review checks, and
-high/critical risk requirement, while omitting only the `required-ci` check run when the fixed head
-has no workflow YAML. If workflow YAML exists, its `runs-on` setting selects the runner and normal
-CI remains required. The local mode is never an automatic fallback for a failed or pending CI run.
+When neither the live PR base nor the fixed head contains `.github/workflows/*.yml|*.yaml`,
+`--gate-mode local-validation` uses the fixed-head local format, lint, type, test, and build evidence
+that applies to the product. Missing CI alone does not require human approval. If GitHub Actions
+checks nevertheless exist for the fixed head, they must all be completed with a successful
+conclusion. This mode is never a fallback for a failed, pending, or unavailable runner. The legacy
+`github-free-private-local` mode remains supported for existing receipts.
 
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, Draft PRs, and the delivery
-loop are used when the task or an explicit request warrants them. risk分類とDaikiの意思決定要否は
-別々に判定します。全riskで固定head SHAの標準独立reviewを1つ行い、high/criticalだけ変更固有の
-専門reviewを1つ追加します。actionable=0、未解決thread=0、required checkの文字どおりの`success`
-（明示承認済みlocal-only modeでは固定SHAのlocal test成功）、選択したremote gateを満たし、
+loop are used when the task or an explicit request warrants them. 小さく局所的なlow/medium変更は
+local検証とSolのself-reviewで完了し、commit、push、PR、独立reviewへ自動的に広げません。highは
+固定head SHAの独立reviewを1つ、criticalは別の高リスク境界が実在する場合だけ専門reviewを1つ追加します。
+actionable=0、未解決thread=0、GitHubが成功として扱う固定head check、またはworkflow不在時のlocal検証を満たし、
 仕様・既存権限・rollback・検証を
 Codexが確定できる場合に`codex-delivery`がReady、merge、mainのfetch後の`merge --ff-only`、
 managed cleanupまで進めます。delivery安全境界、auth/secrets、production、不可逆migration、
