@@ -626,6 +626,18 @@ pub(crate) fn run_with_limit(
     run_with_limit_config(command, timeout, capture_limit, namespace_available)
 }
 
+/// Run a trusted host adapter without a user/PID namespace while retaining
+/// bounded capture, deadline enforcement, process-group termination, and
+/// descendant reaping. This is reserved for adapters that must inspect host
+/// services or use an already-authorized non-interactive sudo credential.
+pub(crate) fn run_host_with_limit(
+    command: &mut Command,
+    timeout: Duration,
+    capture_limit: usize,
+) -> Result<Output, ProcessError> {
+    run_with_limit_config(command, timeout, capture_limit, false)
+}
+
 fn run_with_limit_config(
     command: &mut Command,
     timeout: Duration,
