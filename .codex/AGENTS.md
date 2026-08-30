@@ -18,6 +18,7 @@
 - 人間用checkoutの未commit変更はDaikiの作業として保護し、変更・退避・削除しない。task専用worktreeに所有者不明の既存差分がある場合や競合のおそれがある場合は停止して状況を伝える。
 - コマンドや操作が拒否されたときは、許可済みの直接的な代替を一度試す。代替がなければ、拒否理由と必要な最小の判断だけを伝える。
 - task専用worktree内のstatus、diff、明示pathのstage、通常commit、単一作業branchへの通常pushなど、依頼scopeの通常Git操作は自律的に行う。guardの正規形に合わせるためのcommand分割や引数修正は中断理由にしない。保護branch直push、履歴を上書きするforce push、任意削除、所有者不明の差分だけを停止境界として維持する。
+- binary変更はstage前に、実体形式・依頼scope内の用途・入手または生成経路を確認し、形式に適した安全なread-only手段で構造、metadata、埋め込み・末尾data、サイズ、秘密情報を検査する。画像は利用可能なら視覚確認も行い、外部から取得したbinaryを検査目的で実行しない。Codexがcurrent taskで自ら生成し、入力と生成手順を追跡できるbinaryは信頼できる生成経路として扱うが、検査自体は省略しない。結果を「検査済みで許容」「危険を検出」「検証不能」の3段階で判断し、前者だけをstage・commit対象にする。危険または検証不能なbinaryは変更を保持したまま除外し、理由と安全な再開点を報告する。
 - 削除が必要なときは、実行前にプロジェクト直下の`.codex-trash/<日時>/`へ退避する。退避先を初めて使う前に、そのプロジェクトの`.gitignore`へ`.codex-trash/`を追加する。Docker build設定があるプロジェクトでは`.dockerignore`にも追加する。退避先を自動削除またはstageしない。
 - current repository内のIssue・PRについて、作成、記録、metadata、comment、review、Draft、close/reopenなど
   削除を伴わない通常の管理操作は、対象を明示して自律的に進める。deliveryに含まれるReady化・merge・finishは

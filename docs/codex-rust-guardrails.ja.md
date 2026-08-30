@@ -38,8 +38,12 @@ Git実行時はsystem/global設定と環境変数を隔離し、repository-local
 停止します。平文HTTPのGitHub remoteと`file`/`git`/`ext` transportを拒否し、TLS検証を固定します。SSHは
 `-F /dev/null`でuser設定を隔離します。GitHub CLIは認証情報だけをprivateな一時設定へsnapshotし、
 proxyや`http_unix_socket`などの既存設定を引き継ぎません。browser・editorを起動するoptionも拒否します。
-`--body-file`は同じfile descriptorから検査した内容をprivate snapshotへ固定してから実行し、内容を安全に検査できない
-binary差分はcommit・push前に拒否します。
+`--body-file`は同じfile descriptorから検査した内容をprivate snapshotへ固定してから実行します。binary差分は
+拡張子やGitのbinary判定だけでは一律拒否せず、Codexがstage前に実体形式、依頼scope内の用途、入手・生成経路、
+構造、metadata、埋め込み・末尾data、サイズ、秘密情報を形式に適したread-only手段で検査します。画像は利用可能なら
+視覚確認も行います。Codex自身がcurrent taskで生成し、入力と生成手順を追跡できるbinaryも検査を省略しません。
+監査結果は「検査済みで許容」「危険を検出」「検証不能」の3段階とし、許容だけをcommit対象にします。hookによる
+秘密情報を保持し得るpathの拒否と、検査可能なtext差分の秘密情報・AI帰属検査はbinaryを許可する場合も維持します。
 
 `PreToolUse`のdenyは、stableな`codex-guard:<rule-id>`、直接理由、安全上の根拠、次に取る操作、未実行であることを
 `systemMessage`と`permissionDecisionReason`の両方へ返します。Codexは同じ構文で再試行せず、表示された正規形または

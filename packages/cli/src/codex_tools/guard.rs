@@ -2670,14 +2670,6 @@ fn changes_secret_reason(names: &str, patch: &str, label: &str) -> Option<String
     None
 }
 
-fn binary_numstat_reason(numstat: &str, label: &str) -> Option<String> {
-    let contains_binary = numstat.lines().any(|line| {
-        let mut fields = line.splitn(3, '\t');
-        matches!((fields.next(), fields.next()), (Some("-"), Some("-")))
-    });
-    contains_binary.then(|| format!("{label}に内容を安全に検査できないbinary変更が含まれています"))
-}
-
 fn staged_secret_reason(cwd: &str) -> Option<String> {
     let Some(names) = run_git(
         cwd,
@@ -2698,15 +2690,6 @@ fn staged_secret_reason(cwd: &str) -> Option<String> {
     ) else {
         return Some("staged changesを検査できないためcommitを拒否しました".into());
     };
-    let Some(numstat) = run_git(
-        cwd,
-        &["diff", "--cached", "--numstat", "--diff-filter=ACMR", "--"],
-    ) else {
-        return Some("staged binary changesを検査できないためcommitを拒否しました".into());
-    };
-    if let Some(reason) = binary_numstat_reason(&numstat, "staged changes") {
-        return Some(reason);
-    }
     changes_secret_reason(&names, &patch, "staged changes")
 }
 
@@ -2777,16 +2760,6 @@ fn push_preflight_reason(cwd: &str, branch: &str) -> Option<String> {
     ) else {
         return Some("未push commitを検査できません".into());
     };
-    let range = format!("{base}..HEAD");
-    let Some(numstat) = run_git(
-        cwd,
-        &["diff", "--numstat", "--diff-filter=ACMR", &range, "--"],
-    ) else {
-        return Some("未push binary変更を検査できません".into());
-    };
-    if let Some(reason) = binary_numstat_reason(&numstat, "未push commit") {
-        return Some(reason);
-    }
     changes_secret_reason(&names, &patch, "未push commit")
 }
 
@@ -6093,10 +6066,52 @@ mod tests {
     }
 
     #[test]
-    fn binary_numstat_is_rejected_before_secret_scan() {
-        assert!(binary_numstat_reason("-\t-\tpayload.bin\n", "changes").is_some());
-        assert!(binary_numstat_reason("1\t0\tREADME.md\n", "changes").is_none());
-        assert!(binary_numstat_reason("12\t3\tpath with spaces\n", "changes").is_none());
+    fn binary_patch_defers_to_agent_audit_without_bypassing_sensitive_paths() {
+        let binary_patch = "diff --git a/asset.png b/asset.png\nnew file mode 100644\nindex 0000000..1234567\nBinary files /dev/null and b/asset.png differ\n";
+        assert!(changes_secret_reason("asset.png\n", binary_patch, "changes").is_none());
+        assert!(changes_secret_reason("credentials.json\n", binary_patch, "changes").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_binary_is_not_blanket_rejected_but_sensitive_binary_path_is() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-guard-binary-audit-{suffix}"));
+        fs::create_dir(&root).expect("create binary audit fixture");
+        let git = |arguments: &[&str]| {
+            let status = Command::new(SYSTEM_GIT)
+                .current_dir(&root)
+                .args(arguments)
+                .status()
+                .expect("run Git for binary audit fixture");
+            assert!(status.success(), "Git fixture failed: {arguments:?}");
+        };
+        git(&["init", "-q"]);
+
+        fs::write(root.join("asset.png"), b"\x89PNG\r\n\x1a\n\0fixture")
+            .expect("write binary asset fixture");
+        git(&["add", "--", "asset.png"]);
+        assert!(
+            staged_secret_reason(root.to_str().expect("UTF-8 fixture path")).is_none(),
+            "ordinary binary content should defer to the agent audit"
+        );
+
+        fs::write(
+            root.join("credentials.json"),
+            b"\0opaque credentials fixture",
+        )
+        .expect("write sensitive binary fixture");
+        git(&["add", "--", "credentials.json"]);
+        assert!(
+            staged_secret_reason(root.to_str().expect("UTF-8 fixture path"))
+                .is_some_and(|reason| reason.contains("秘密情報を保持し得るファイル")),
+            "sensitive path policy must still reject binary content"
+        );
+
+        fs::remove_dir_all(root).expect("remove binary audit fixture");
     }
 
     #[test]
