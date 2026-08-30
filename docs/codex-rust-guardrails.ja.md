@@ -18,9 +18,9 @@ atomic installします。起動時は実行file名で処理を分岐します�
 - `~/.local/bin/codex-worktree`
 - `~/.local/bin/codex-delivery`
 
-hookのallow/deny、worktree manifest、delivery receipt v1〜v4の読み取り互換性と再開stateは従来の
-外部契約を維持します。receipt v5とhelper CLIはlow/mediumでSolのself-review、high/criticalで独立review、
-criticalで必要な場合だけ専門reviewを要求し、ledger comment ID・digestを固定します。旧receiptの追加review証拠は有効なままです。旧schemaは履歴解析専用でdeliveryには使えません。設定移行では旧Python hookの定義を取り除き、Rust binaryを直接実行する定義へ置き換えます。
+hookのallow/deny、worktree manifest、delivery receipt v1〜v5の読み取り互換性と再開stateは従来の
+外部契約を維持します。receipt v6とhelper CLIはlow/mediumでSolのself-review、high/criticalで独立review、
+criticalで必要な場合だけ専門reviewを要求します。v6 receiptはprivateなmanaged stateへ保存し、PR commentへ内部監査用JSONを投稿しません。既存v5 receiptのledger証拠は進行中taskの再開時だけ読み取り専用で検証します。設定移行では旧Python hookの定義を取り除き、Rust binaryを直接実行する定義へ置き換えます。
 
 ## エラー処理と停止
 

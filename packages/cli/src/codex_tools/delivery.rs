@@ -22,7 +22,8 @@ use super::{process, trust};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const MANIFEST_VERSION: i64 = 1;
-const RECEIPT_VERSION: i64 = 5;
+const LEGACY_LEDGER_RECEIPT_VERSION: i64 = 5;
+const RECEIPT_VERSION: i64 = 6;
 const STATE_VERSION: i64 = 1;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -2138,6 +2139,10 @@ fn receipt_has_current_plan_version(payload: &Value) -> bool {
     payload.get("version").and_then(Value::as_i64) == Some(RECEIPT_VERSION)
         && payload.get("plan_version").is_some()
 }
+fn receipt_has_legacy_ledger(payload: &Value) -> bool {
+    payload.get("version").and_then(Value::as_i64) == Some(LEGACY_LEDGER_RECEIPT_VERSION)
+        && payload.get("plan_version").is_some()
+}
 fn receipt(
     payload: &Value,
     root: &Path,
@@ -2220,7 +2225,7 @@ fn receipt(
             "specialist_review_passed",
         ]);
         expected_keys(payload, &keys, "legacy receipt")?;
-    } else if version == RECEIPT_VERSION {
+    } else if version == LEGACY_LEDGER_RECEIPT_VERSION {
         let mut keys = common.to_vec();
         keys.extend([
             "decision",
@@ -2230,12 +2235,22 @@ fn receipt(
             "ledger_comment_id",
             "ledger_body_sha256",
         ]);
-        if receipt_has_current_plan_version(payload) {
+        if receipt_has_legacy_ledger(payload) {
             keys.push("plan_version");
-            expected_keys(payload, &keys, "receipt")?;
+            expected_keys(payload, &keys, "legacy v5 receipt")?;
         } else {
             expected_keys(payload, &keys, "legacy v5 receipt")?;
         }
+    } else if version == RECEIPT_VERSION {
+        let mut keys = common.to_vec();
+        keys.extend([
+            "decision",
+            "gate_mode",
+            "independent_review_passed",
+            "specialist_review_passed",
+            "plan_version",
+        ]);
+        expected_keys(payload, &keys, "receipt")?;
     } else {
         return Err(error("receipt schemaが一致しません"));
     }
@@ -2277,9 +2292,9 @@ fn receipt(
     {
         return Err(error("receiptの必須検証flagが不足しています"));
     }
-    if version == RECEIPT_VERSION
+    if version == LEGACY_LEDGER_RECEIPT_VERSION
         && (int_value(&normalized, "ledger_comment_id")? < 1
-            || receipt_has_current_plan_version(&normalized)
+            || receipt_has_legacy_ledger(&normalized)
                 && int_value(&normalized, "plan_version")? < 1
             || oid(
                 &str_value(&normalized, "ledger_body_sha256")?,
@@ -2289,6 +2304,9 @@ fn receipt(
                 != 64)
     {
         return Err(error("receiptのloop ledger証拠が不正です"));
+    }
+    if version == RECEIPT_VERSION && int_value(&normalized, "plan_version")? < 1 {
+        return Err(error("receiptのPlan versionが不正です"));
     }
     let changed = get(&normalized, "changed_files")?
         .as_array()
@@ -2350,8 +2368,10 @@ fn review_receipt_scope_matches(existing: &Value, proposed: &Value) -> bool {
         "tests_passed",
         "changed_files",
     ];
-    if receipt_has_current_plan_version(existing) {
+    if receipt_has_legacy_ledger(existing) {
         keys.extend(["ledger_comment_id", "ledger_body_sha256", "plan_version"]);
+    } else if receipt_has_current_plan_version(existing) {
+        keys.push("plan_version");
     }
     let common_scope_matches = keys
         .iter()
@@ -2436,8 +2456,6 @@ fn write_review_locked(
         "autonomous"
     };
     validate_gate_review_profile(gate, risk_value, decision_value)?;
-    let (ledger_comment_id, ledger_body_sha256, plan_version) =
-        loop_ledger(root, task, plan, &repository, pr, &head, plan_version)?;
     let payload = object([
         ("version", Value::Number(RECEIPT_VERSION.into())),
         ("kind", string("review")),
@@ -2458,8 +2476,6 @@ fn write_review_locked(
         ),
         ("created_at", string(now())),
         ("gate_mode", string(gate)),
-        ("ledger_comment_id", Value::Number(ledger_comment_id.into())),
-        ("ledger_body_sha256", string(ledger_body_sha256)),
         ("plan_version", Value::Number(plan_version.into())),
     ]);
     let path = receipt_path(&repository, task, &head)?;
@@ -3023,12 +3039,14 @@ fn fetch_main(root: &Path, repository: &str) -> Result<String> {
         "origin/main",
     )
 }
-fn validate_receipt_loop_ledger(root: &Path, receipt_value: &Value) -> Result<()> {
-    if int_value(receipt_value, "version")? < RECEIPT_VERSION
-        || !receipt_has_current_plan_version(receipt_value)
-    {
+fn validate_receipt_review_history(root: &Path, receipt_value: &Value) -> Result<()> {
+    let version = int_value(receipt_value, "version")?;
+    if version == RECEIPT_VERSION {
+        return Ok(());
+    }
+    if version != LEGACY_LEDGER_RECEIPT_VERSION || !receipt_has_legacy_ledger(receipt_value) {
         return Err(error(
-            "legacy receiptは読み取り互換専用です。current headをv5で再reviewしてください",
+            "legacy receiptは読み取り互換専用です。current headをv6で再reviewしてください",
         ));
     }
     let task = str_value(receipt_value, "task_id")?;
@@ -3097,7 +3115,7 @@ fn validate_delivery(
         ));
     }
     default_branch(root, &repository)?;
-    validate_receipt_loop_ledger(root, receipt_value)?;
+    validate_receipt_review_history(root, receipt_value)?;
     let live = fetch_main(root, &repository)?;
     validate_local_gate_workflow_policy(root, &live, &head, &gate)?;
     if let Some(base) = inspected_base {
@@ -3731,8 +3749,8 @@ fn finish_locked(
     default_branch(root, &repository)?;
     let gate = receipt_gate_mode(&receipt_value)?;
     let stage = str_value(&state, "stage")?;
-    if finish_requires_live_ledger(&stage) {
-        validate_receipt_loop_ledger(root, &receipt_value)?;
+    if finish_requires_review_history_validation(&stage) {
+        validate_receipt_review_history(root, &receipt_value)?;
     }
     if ["merge_started", "merged"].contains(&stage.as_str()) {
         worktree(root, &manifest_value, &worktree_path)?;
@@ -4007,7 +4025,7 @@ fn deliver(
         deliver_locked(root, task, pr, head, plan, plan_version, gate)
     })
 }
-fn finish_requires_live_ledger(stage: &str) -> bool {
+fn finish_requires_review_history_validation(stage: &str) -> bool {
     stage != "completed"
 }
 fn finish_requires_live_delivery_gate(stage: &str) -> bool {
@@ -4408,11 +4426,11 @@ mod tests {
         ])
     }
 
-    fn receipt_v5(risk_value: &str, specialist: bool) -> Value {
-        receipt_v5_with_review(risk_value, true, specialist)
+    fn receipt_v6(risk_value: &str, specialist: bool) -> Value {
+        receipt_v6_with_review(risk_value, true, specialist)
     }
 
-    fn receipt_v5_with_review(risk_value: &str, independent: bool, specialist: bool) -> Value {
+    fn receipt_v6_with_review(risk_value: &str, independent: bool, specialist: bool) -> Value {
         object([
             ("version", Value::Number(RECEIPT_VERSION.into())),
             ("kind", string("review")),
@@ -4430,14 +4448,20 @@ mod tests {
             ("changed_files", Value::Array(vec![string("src/main.rs")])),
             ("created_at", string("now")),
             ("gate_mode", string(STRICT_GATE_MODE)),
-            ("ledger_comment_id", Value::Number(42.into())),
-            ("ledger_body_sha256", string("c".repeat(64))),
             ("plan_version", Value::Number(2.into())),
         ])
     }
 
+    fn receipt_v5_with_ledger(risk_value: &str, specialist: bool) -> Value {
+        let mut receipt = receipt_v6(risk_value, specialist);
+        receipt["version"] = Value::Number(LEGACY_LEDGER_RECEIPT_VERSION.into());
+        receipt["ledger_comment_id"] = Value::Number(42.into());
+        receipt["ledger_body_sha256"] = string("c".repeat(64));
+        receipt
+    }
+
     fn legacy_receipt_v5(risk_value: &str, specialist: bool) -> Value {
-        let mut receipt = receipt_v5(risk_value, specialist);
+        let mut receipt = receipt_v5_with_ledger(risk_value, specialist);
         receipt.as_object_mut().unwrap().remove("plan_version");
         receipt
     }
@@ -4734,7 +4758,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_v5_requires_only_risk_proportional_review_evidence() {
+    fn receipt_v6_requires_only_risk_proportional_review_evidence() {
         for (risk_value, specialist) in [
             ("low", false),
             ("medium", false),
@@ -4743,7 +4767,7 @@ mod tests {
         ] {
             assert!(
                 receipt(
-                    &receipt_v5(risk_value, specialist),
+                    &receipt_v6(risk_value, specialist),
                     Path::new("/unused"),
                     "issue-24",
                     &"b".repeat(40),
@@ -4754,7 +4778,7 @@ mod tests {
         }
         assert!(
             receipt(
-                &receipt_v5("low", true),
+                &receipt_v6("low", true),
                 Path::new("/unused"),
                 "issue-24",
                 &"b".repeat(40),
@@ -4764,7 +4788,7 @@ mod tests {
         );
         assert!(
             receipt(
-                &receipt_v5_with_review("low", false, false),
+                &receipt_v6_with_review("low", false, false),
                 Path::new("/unused"),
                 "issue-24",
                 &"b".repeat(40),
@@ -4774,7 +4798,7 @@ mod tests {
         );
         assert!(
             receipt(
-                &receipt_v5_with_review("high", false, false),
+                &receipt_v6_with_review("high", false, false),
                 Path::new("/unused"),
                 "issue-24",
                 &"b".repeat(40),
@@ -4784,7 +4808,7 @@ mod tests {
         );
         assert!(
             receipt(
-                &receipt_v5("high", false),
+                &receipt_v6("high", false),
                 Path::new("/unused"),
                 "issue-24",
                 &"b".repeat(40),
@@ -4794,7 +4818,7 @@ mod tests {
         );
         assert!(
             receipt(
-                &receipt_v5("critical", false),
+                &receipt_v6("critical", false),
                 Path::new("/unused"),
                 "issue-24",
                 &"b".repeat(40),
@@ -4803,7 +4827,7 @@ mod tests {
             .is_ok()
         );
 
-        let mut local = receipt_v5("high", true);
+        let mut local = receipt_v6("high", true);
         local["gate_mode"] = string(FREE_PRIVATE_LOCAL_GATE_MODE);
         local["decision"] = string("human-approved");
         assert!(
@@ -5183,18 +5207,22 @@ mod tests {
     }
 
     #[test]
-    fn legacy_receipt_cannot_bypass_the_v5_ledger_scope() {
+    fn v6_receipt_does_not_require_pr_comments_and_legacy_v5_stays_read_only() {
         assert!(review_receipt_scope_matches(
             &receipt_v3(),
-            &receipt_v5("low", false)
+            &receipt_v6("low", false)
         ));
-        let current = receipt_v5("low", false);
+        let current = receipt_v6("low", false);
         let mut different_plan_version = current.clone();
         different_plan_version["plan_version"] = Value::Number(3.into());
         assert!(!review_receipt_scope_matches(
             &current,
             &different_plan_version
         ));
+        assert!(validate_receipt_review_history(Path::new("/unused"), &current).is_ok());
+        let v5 = receipt_v5_with_ledger("low", false);
+        assert!(receipt_has_legacy_ledger(&v5));
+        assert!(validate_receipt_review_history(Path::new("/unused"), &v5).is_err());
         let legacy_v5 = legacy_receipt_v5("low", false);
         assert!(review_receipt_scope_matches(&legacy_v5, &current));
         assert!(!receipt_has_current_plan_version(&legacy_v5));
@@ -5208,13 +5236,13 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(validate_receipt_loop_ledger(Path::new("/unused"), &legacy_v5).is_err());
-        assert!(validate_receipt_loop_ledger(Path::new("/unused"), &receipt_v3()).is_err());
+        assert!(validate_receipt_review_history(Path::new("/unused"), &legacy_v5).is_err());
+        assert!(validate_receipt_review_history(Path::new("/unused"), &receipt_v3()).is_err());
     }
 
     #[test]
     fn same_head_receipt_only_allows_the_approved_local_gate_transition() {
-        let mut existing = receipt_v5("high", true);
+        let mut existing = receipt_v6("high", true);
         existing["gate_mode"] = string(FREE_PRIVATE_GATE_MODE);
         let mut approved_local = existing.clone();
         approved_local["gate_mode"] = string(FREE_PRIVATE_LOCAL_GATE_MODE);
@@ -5231,7 +5259,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_revalidates_the_live_ledger_until_cleanup_is_complete() {
+    fn finish_revalidates_legacy_review_history_until_cleanup_is_complete() {
         for stage in [
             "merge_started",
             "merged",
@@ -5239,9 +5267,12 @@ mod tests {
             "remote_branch_deleted",
             "worktree_removed",
         ] {
-            assert!(finish_requires_live_ledger(stage), "stage: {stage}");
+            assert!(
+                finish_requires_review_history_validation(stage),
+                "stage: {stage}"
+            );
         }
-        assert!(!finish_requires_live_ledger("completed"));
+        assert!(!finish_requires_review_history_validation("completed"));
     }
 
     #[test]
@@ -5610,7 +5641,7 @@ mod tests {
 
     #[test]
     fn receipt_schema_and_type_spoofing_fail_closed() {
-        let base = receipt_v5("low", false);
+        let base = receipt_v6("low", false);
         let mut bool_version = base.as_object().unwrap().clone();
         bool_version.insert("version".into(), Value::Bool(true));
         assert!(
@@ -5658,7 +5689,9 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(validate_receipt_loop_ledger(Path::new("/unused"), &missing_plan_version).is_err());
+        assert!(
+            validate_receipt_review_history(Path::new("/unused"), &missing_plan_version).is_err()
+        );
     }
 
     #[test]
@@ -6302,7 +6335,7 @@ mod tests {
         assert!(parse_args(vec![OsString::from("deliver")]).is_err());
         assert!(
             match_cli_receipt(
-                &receipt_v5("low", false),
+                &receipt_v6("low", false),
                 Some(24),
                 Some(&"b".repeat(40)),
                 Some("CODEX-DELIVERY-TEST-v1"),

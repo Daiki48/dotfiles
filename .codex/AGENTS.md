@@ -34,6 +34,7 @@
 - PR deliveryが明示されたか、変更規模・risk・repository運用上PRが必要な場合だけ、Draft PR後に`codex-delivery`を`record-review|approve-review -> deliver -> finish`の経路で使う。low/mediumの小規模作業を自動的にこの経路へ広げない。
 - remote CIでは固定headに紐づくGitHub Actionsの全checkが完了し、GitHubがrequired checkの成功状態として扱う`success`、`skipped`、`neutral`のいずれかであることを確認する。workflow不在時は固定headのlocal検証receiptを使う。いずれもactionable=0、未解決thread=0、最新base、conflictなしをdelivery条件とする。
 - delivery中の修正は確定した原因単位でまとめ、同じ失敗を状態変化なしに反復しない。修正後は影響する検証と、risk上必要なreviewだけを新しいheadで再実施する。
+- PRやIssueへ内部監査用のschema JSON、fingerprint、digest chain、round logを投稿しない。PR bodyとcommentは人間が読む概要、判断が必要な論点、検証結果、残存事項に限る。作業中の進捗は依頼の目的、受け入れ条件、既知の指摘、commit、test結果で簡潔に保持し、目的外の機械監査作業へ広げない。
 - Ready化、merge、main同期、managed cleanupは`codex-delivery`へ集約する。失敗、timeout、dirty、stale、conflict、判定不能時はPR・branch・worktreeを保持する。`finish --sandbox-retry`とmanaged cleanupの既存の限定条件、任意削除の退避条件は維持する。
 
 ## Safety boundaries

@@ -91,8 +91,8 @@ current repository, explicit target IDs, canonical arguments, metadata, and dete
 
 Codex setup explicitly enables persisted goals/automatic continuation. It disables the
 under-development rollout budget tracker because its shared token limit stops turns at exhaustion.
-AGENTS.md instead uses per-fingerprint circuit breakers, evidence-based progress checks, finite
-diagnostic budgets, finite Plan scope, and reserved closure work.
+AGENTS.md keeps work bounded by the requested outcome, observable acceptance conditions, and
+evidence-based stopping rules.
 It continues to reject protected-branch or force/delete/tag pushes, destructive cleanup,
 arbitrary GitHub API mutations, and repository mismatches. Draft PR後のreview receipt、Ready化、
 merge、main同期、managed cleanupは専用[`codex-delivery` helper](docs/codex-delivery.ja.md)だけを
@@ -104,6 +104,11 @@ managed root内でmerged、main到達性、clean、未pushなしを厳格に証�
 ignored artifactもdirtyとして停止し、stateをatomic保存して途中から再検証・再開します。
 The guard checks direct Bash invocations; arbitrary programs, privileged concurrent PR/repository
 mutations, and same-user races remain outside its security boundary.
+
+New delivery receipts do not require machine-audit comments on a PR. Codex must not post schema
+JSON, fingerprint chains, digests, or internal round logs to Issues or PRs; only human-readable
+summaries, decisions, verification results, and residual risks belong there. Legacy receipt v5 can
+still read its existing comment chain so an already-running task is not stranded.
 
 The repository declares a required `required-ci` GitHub Actions job and the intended remote
 `main` Ruleset in `.github/rulesets/main.json`. The declaration does not prove that the remote
