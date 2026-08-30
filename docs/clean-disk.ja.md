@@ -15,7 +15,7 @@ worktree rootを1回だけ走査します。daemon、常駐監視、controller�
 
 設定は`.config/clean-disk.json`です。`scan_roots`にはプロジェクトそのものではなく、将来のプロジェクトも
 配置される親directoryだけを指定します。Codex worktree rootは`CODEX_HOME`または`~/.codex`から自動で
-追加されます。
+追加されます。走査root同士、またはCodex worktree rootと包含・重複する設定は拒否します。
 
 ```bash
 cargo run -- clean-disk --dry-run
@@ -52,7 +52,8 @@ repository、storage pathをcommitしません。
 
 manifest directory、manifest、working directory、storage rootは現在user所有でgroup/world writableではない
 通常pathに限定します。programは安全な`/usr/bin`直下のsystem executableだけを許可します。IDとfilenameは
-一致が必要で、未知field、symlink、hard link、過大な入力を拒否します。
+一致が必要で、未知field、symlink、hard link、過大な入力を拒否します。安全なmanifest directoryが空の場合、
+`clean-disk`はrunner cleanupをskipします。
 
 adapterのstdoutは次のJSON契約です。監査は`applied=false`、適用は`applied=true`を返します。
 

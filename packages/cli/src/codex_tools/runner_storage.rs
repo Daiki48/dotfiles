@@ -316,7 +316,10 @@ fn validate_manifest(path: &Path, manifest: &TargetManifest) -> Result<(), Strin
     Ok(())
 }
 
-fn load_manifests(config_dir: &Path) -> Result<BTreeMap<String, TargetManifest>, String> {
+fn load_manifests(
+    config_dir: &Path,
+    require_registered_target: bool,
+) -> Result<BTreeMap<String, TargetManifest>, String> {
     validate_user_directory(config_dir, "configuration directory")?;
     let mut paths = Vec::new();
     for (index, entry) in fs::read_dir(config_dir)
@@ -338,7 +341,7 @@ fn load_manifests(config_dir: &Path) -> Result<BTreeMap<String, TargetManifest>,
         paths.push(path);
     }
     paths.sort();
-    if paths.is_empty() {
+    if require_registered_target && paths.is_empty() {
         return Err("no runner storage cleanup targets are registered".to_string());
     }
 
@@ -356,8 +359,22 @@ fn load_manifests(config_dir: &Path) -> Result<BTreeMap<String, TargetManifest>,
     Ok(manifests)
 }
 
+#[cfg(test)]
 pub(crate) fn audit_registered(config_dir: &Path) -> Result<Vec<(String, AdapterReport)>, String> {
-    let manifests = load_manifests(config_dir)?;
+    let manifests = load_manifests(config_dir, true)?;
+    audit_manifest_map(&manifests)
+}
+
+pub(crate) fn audit_registered_if_any(
+    config_dir: &Path,
+) -> Result<Vec<(String, AdapterReport)>, String> {
+    let manifests = load_manifests(config_dir, false)?;
+    audit_manifest_map(&manifests)
+}
+
+fn audit_manifest_map(
+    manifests: &BTreeMap<String, TargetManifest>,
+) -> Result<Vec<(String, AdapterReport)>, String> {
     manifests
         .iter()
         .map(|(id, manifest)| run_adapter(manifest, false).map(|report| (id.clone(), report)))
@@ -369,7 +386,7 @@ pub(crate) fn apply_registered(
     target: &str,
     expected: &AdapterReport,
 ) -> Result<(AdapterReport, AdapterReport, AdapterReport), String> {
-    let manifests = load_manifests(config_dir)?;
+    let manifests = load_manifests(config_dir, true)?;
     let manifest = manifests
         .get(target)
         .ok_or_else(|| format!("unknown target ID: {target}"))?;
@@ -535,7 +552,7 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let arguments = parse_args(args)?;
-    let manifests = load_manifests(&arguments.config_dir)?;
+    let manifests = load_manifests(&arguments.config_dir, true)?;
     match arguments.action {
         Action::Audit { target } => audit(&manifests, target.as_deref()),
         Action::Apply { target } => apply(&manifests, &target),
@@ -655,7 +672,7 @@ mod tests {
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         value["unexpected"] = serde_json::Value::Bool(true);
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(load_manifests(&fixture.config).is_err());
+        assert!(load_manifests(&fixture.config, true).is_err());
 
         fs::remove_file(&path).unwrap();
         fixture.manifest("beta", "/usr/bin/true", &[], &["--apply"]);
@@ -664,14 +681,14 @@ mod tests {
             fixture.config.join("other.json"),
         )
         .unwrap();
-        assert!(load_manifests(&fixture.config).is_err());
+        assert!(load_manifests(&fixture.config, true).is_err());
     }
 
     #[test]
     fn report_rejects_candidates_outside_the_registered_storage() {
         let fixture = Fixture::new("report-boundary");
         fixture.manifest("alpha", "/usr/bin/true", &[], &["--apply"]);
-        let manifests = load_manifests(&fixture.config).unwrap();
+        let manifests = load_manifests(&fixture.config, true).unwrap();
         let manifest = manifests.get("alpha").unwrap();
         let report = AdapterReport {
             applied: false,
@@ -691,7 +708,14 @@ mod tests {
         let fixture = Fixture::new("config-mode");
         fixture.manifest("alpha", "/usr/bin/true", &[], &["--apply"]);
         fs::set_permissions(&fixture.config, fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(load_manifests(&fixture.config).is_err());
+        assert!(load_manifests(&fixture.config, true).is_err());
+    }
+
+    #[test]
+    fn clean_disk_audit_accepts_an_empty_safe_configuration_directory() {
+        let fixture = Fixture::new("empty-config");
+        assert!(audit_registered_if_any(&fixture.config).unwrap().is_empty());
+        assert!(audit_registered(&fixture.config).is_err());
     }
 
     #[test]

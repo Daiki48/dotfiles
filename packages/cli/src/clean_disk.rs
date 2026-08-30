@@ -82,6 +82,10 @@ fn normalized_absolute(path: &Path) -> bool {
             .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
 }
 
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
 fn validate_scan_root(path: &Path) -> Result<()> {
     if !normalized_absolute(path) {
         anyhow::bail!(
@@ -155,6 +159,17 @@ fn read_config(path: &Path) -> Result<CleanDiskConfig> {
     }
     if config.scan_roots.is_empty() || config.scan_roots.len() > MAX_SCAN_ROOTS {
         anyhow::bail!("clean-disk scan root count is invalid");
+    }
+    for (index, left) in config.scan_roots.iter().enumerate() {
+        for right in &config.scan_roots[index + 1..] {
+            if paths_overlap(left, right) {
+                anyhow::bail!(
+                    "clean-disk scan roots must not overlap: {} and {}",
+                    left.display(),
+                    right.display()
+                );
+            }
+        }
     }
     if !(1..=3650).contains(&config.trash_retention_days)
         || !(1..=3650).contains(&config.build_cache_retention_days)
@@ -437,6 +452,18 @@ pub(crate) fn run(explicit_config: Option<&Path>, dry_run: bool) -> Result<()> {
     let config = read_config(&config_path)?;
     println!("clean-disk: {} を使用します", config_path.display());
 
+    let codex_root = codex_worktree_root();
+    if let Some(root) = &codex_root
+        && config
+            .scan_roots
+            .iter()
+            .any(|scan| paths_overlap(scan, root))
+    {
+        anyhow::bail!(
+            "configured scan roots must not overlap the Codex worktree root: {}",
+            root.display()
+        );
+    }
     let mut candidates = Vec::new();
     for root in &config.scan_roots {
         if !root.exists() {
@@ -445,9 +472,8 @@ pub(crate) fn run(explicit_config: Option<&Path>, dry_run: bool) -> Result<()> {
         }
         candidates.extend(discover_under(root, true)?);
     }
-    if let Some(root) = codex_worktree_root()
+    if let Some(root) = codex_root
         && root.exists()
-        && !config.scan_roots.iter().any(|scan| root.starts_with(scan))
     {
         candidates.extend(discover_under(&root, false)?);
     }
@@ -519,7 +545,7 @@ pub(crate) fn run(explicit_config: Option<&Path>, dry_run: bool) -> Result<()> {
         .unwrap_or(runner_storage::default_config_dir().map_err(anyhow::Error::msg)?);
     if manifest_dir.exists() {
         for (id, report) in
-            runner_storage::audit_registered(&manifest_dir).map_err(anyhow::Error::msg)?
+            runner_storage::audit_registered_if_any(&manifest_dir).map_err(anyhow::Error::msg)?
         {
             writeln!(
                 output,
@@ -640,6 +666,18 @@ mod tests {
         let mut output = Vec::new();
         assert!(!confirm(&mut empty, &mut output, "delete?").unwrap());
         assert!(confirm(&mut yes, &mut output, "delete?").unwrap());
+    }
+
+    #[test]
+    fn overlapping_scan_roots_are_detected_component_wise() {
+        assert!(paths_overlap(
+            Path::new("/tmp/products"),
+            Path::new("/tmp/products/project")
+        ));
+        assert!(!paths_overlap(
+            Path::new("/tmp/product"),
+            Path::new("/tmp/products")
+        ));
     }
 
     #[test]
