@@ -332,14 +332,90 @@ fn discover_under(root: &Path, include_build_cache: bool) -> Result<Vec<Candidat
     Ok(candidates)
 }
 
-fn observe_open_paths() -> Result<BTreeSet<PathBuf>> {
+fn validate_lsof_warnings(stderr: &[u8], protected_scopes: &BTreeSet<PathBuf>) -> Result<()> {
+    let stderr = std::str::from_utf8(stderr)
+        .context("lsof warning output is not valid UTF-8; open file observation is incomplete")?;
+    let mut lines = stderr.lines().filter(|line| !line.trim().is_empty());
+    while let Some(line) = lines.next() {
+        let Some(detail) = line.strip_prefix("lsof: WARNING: can't stat() ") else {
+            anyhow::bail!(
+                "lsof returned an unrecognized warning; open file observation is incomplete"
+            );
+        };
+        let Some((_, path)) = detail.split_once(" file system ") else {
+            anyhow::bail!(
+                "lsof returned an unrecognized warning; open file observation is incomplete"
+            );
+        };
+        let inaccessible = Path::new(path);
+        if !normalized_absolute(inaccessible)
+            || protected_scopes
+                .iter()
+                .any(|scope| paths_overlap(scope, inaccessible))
+        {
+            anyhow::bail!(
+                "lsof could not inspect a filesystem that overlaps a cleanup scope: {}",
+                inaccessible.display()
+            );
+        }
+        if lines.next().map(str::trim) != Some("Output information may be incomplete.") {
+            anyhow::bail!(
+                "lsof returned an incomplete warning; open file observation is incomplete"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_lsof_paths(stdout: &[u8]) -> Result<BTreeSet<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    for field in stdout.split(|byte| *byte == 0) {
+        let field = field.strip_prefix(b"\n").unwrap_or(field);
+        let Some(value) = field.strip_prefix(b"n") else {
+            continue;
+        };
+        let value = value.strip_suffix(b" (deleted)").unwrap_or(value);
+        #[cfg(unix)]
+        let path = {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from(OsString::from_vec(value.to_vec()))
+        };
+        #[cfg(not(unix))]
+        let path =
+            PathBuf::from(std::str::from_utf8(value).context(
+                "lsof path output is not valid UTF-8; open file observation is incomplete",
+            )?);
+        if path.is_absolute() {
+            paths.insert(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn observe_open_paths(protected_scopes: &BTreeSet<PathBuf>) -> Result<BTreeSet<PathBuf>> {
+    if protected_scopes.is_empty() {
+        return Ok(BTreeSet::new());
+    }
     let lsof = trust::trusted_system_binary("/usr/bin/lsof", "lsof").map_err(anyhow::Error::msg)?;
-    let mut command = Command::new(lsof);
+    #[cfg(unix)]
+    let requires_elevation = unsafe { libc::geteuid() } != 0;
+    #[cfg(not(unix))]
+    let requires_elevation = false;
+    let mut command = if requires_elevation {
+        let sudo =
+            trust::trusted_system_binary("/usr/bin/sudo", "sudo").map_err(anyhow::Error::msg)?;
+        let mut command = Command::new(sudo);
+        command.args(["--", &lsof]);
+        command
+    } else {
+        Command::new(lsof)
+    };
     process::clear_environment(&mut command);
     command
         .env("PATH", "/usr/bin:/bin")
         .env("LANG", "C")
-        .args(["-nP", "-F", "n"]);
+        .args(["-nP", "-F0n"]);
     let output =
         process::run_host_with_limit(&mut command, OPEN_PATH_TIMEOUT, OPEN_PATH_CAPTURE_BYTES)
             .context("failed to inspect open files")?;
@@ -350,17 +426,8 @@ fn observe_open_paths() -> Result<BTreeSet<PathBuf>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let mut paths = BTreeSet::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some(value) = line.strip_prefix('n') else {
-            continue;
-        };
-        let path = PathBuf::from(value.strip_suffix(" (deleted)").unwrap_or(value));
-        if path.is_absolute() {
-            paths.insert(path);
-        }
-    }
-    Ok(paths)
+    validate_lsof_warnings(&output.stderr, protected_scopes)?;
+    parse_lsof_paths(&output.stdout)
 }
 
 fn overlaps(scope: &Path, open_paths: &BTreeSet<PathBuf>) -> bool {
@@ -478,7 +545,11 @@ pub(crate) fn run(explicit_config: Option<&Path>, dry_run: bool) -> Result<()> {
         candidates.extend(discover_under(&root, false)?);
     }
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
-    let open_paths = observe_open_paths().context(
+    let protected_scopes = candidates
+        .iter()
+        .map(|candidate| candidate.active_scope.clone())
+        .collect::<BTreeSet<_>>();
+    let open_paths = observe_open_paths(&protected_scopes).context(
         "open file observation failed; no cleanup was performed because active sessions cannot be excluded",
     )?;
 
@@ -525,7 +596,11 @@ pub(crate) fn run(explicit_config: Option<&Path>, dry_run: bool) -> Result<()> {
         }
     }
     if !dry_run && !approved_candidates.is_empty() {
-        let latest_open_paths = observe_open_paths().context(
+        let approved_scopes = approved_candidates
+            .iter()
+            .map(|candidate| candidate.active_scope.clone())
+            .collect::<BTreeSet<_>>();
+        let latest_open_paths = observe_open_paths(&approved_scopes).context(
             "final open file observation failed; no approved cleanup was performed because active sessions cannot be excluded",
         )?;
         for candidate in approved_candidates {
@@ -666,6 +741,43 @@ mod tests {
         let mut output = Vec::new();
         assert!(!confirm(&mut empty, &mut output, "delete?").unwrap());
         assert!(confirm(&mut yes, &mut output, "delete?").unwrap());
+    }
+
+    #[test]
+    fn lsof_warning_is_allowed_only_for_a_disjoint_filesystem() {
+        let scopes = BTreeSet::from([PathBuf::from("/media/storage/dev")]);
+        let warning = b"lsof: WARNING: can't stat() fuse.portal file system /run/user/1000/doc\n      Output information may be incomplete.\n";
+        assert!(validate_lsof_warnings(warning, &scopes).is_ok());
+
+        let overlapping = b"lsof: WARNING: can't stat() fuse.portal file system /media/storage\n      Output information may be incomplete.\n";
+        assert!(validate_lsof_warnings(overlapping, &scopes).is_err());
+    }
+
+    #[test]
+    fn unknown_lsof_warning_fails_closed() {
+        let scopes = BTreeSet::from([PathBuf::from("/media/storage/dev")]);
+        assert!(validate_lsof_warnings(b"permission denied\n", &scopes).is_err());
+        assert!(validate_lsof_warnings(b"", &scopes).is_ok());
+    }
+
+    #[test]
+    fn nul_terminated_lsof_paths_are_parsed_without_text_loss() {
+        let output = b"p10\0\nn/tmp/project/src/main.rs\0\nnpipe\0";
+        assert_eq!(
+            parse_lsof_paths(output).unwrap(),
+            BTreeSet::from([PathBuf::from("/tmp/project/src/main.rs")])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_lsof_paths_remain_observable() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let paths = parse_lsof_paths(b"p10\0\nn/tmp/project/\xff\0").unwrap();
+        assert!(paths.contains(&PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/project/\xff".to_vec()
+        ))));
     }
 
     #[test]
