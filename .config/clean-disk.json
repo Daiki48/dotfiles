@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "scan_roots": [
+    "/media/p3plus/dev",
+    "/media/p3plus/develop"
+  ],
+  "trash_retention_days": 3,
+  "build_cache_retention_days": 30,
+  "runner_manifest_dir": null
+}

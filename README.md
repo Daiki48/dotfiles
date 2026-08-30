@@ -65,7 +65,8 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `tmux` | Install tmux via apt/dnf, clone [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager) into `~/.config/tmux/plugins/tpm`, and symlink `~/.config/tmux/tmux.conf`. After setup, press `Ctrl+g` then `I` (capital i) inside tmux to install plugins. | yes |
 | `mise [TOOL@VERSION]...` | Install mise from its recommended apt/dnf repository. Optional tool arguments are installed and recorded in the global mise config; with no arguments, only mise itself is installed. Shell activation is provided by the managed `.zshrc`. | yes |
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
-| `codex` | Require a trusted Codex CLI at `~/.local/bin/codex`, symlink shared instructions, safety rules, and Skills, then release-build and atomically install the Rust Git/GitHub hook plus `codex-worktree` and `codex-delivery` multi-call helpers. The setup preflights every managed destination before mutation and idempotently migrates `~/.codex/config.toml`; it never executes `codex`, `cargo`, or `npm` from `PATH`. Machine-local trust and TUI settings are preserved. | no |
+| `codex` | Require a trusted Codex CLI at `~/.local/bin/codex`, symlink shared instructions, safety rules, Skills, and the generic disk-cleanup policy, then release-build and atomically install the Rust Git/GitHub hook plus `codex-worktree`, `codex-delivery`, and `runner-storage-cleanup` multi-call helpers. The setup preflights every managed destination before mutation and idempotently migrates `~/.codex/config.toml`; it never executes `codex`, `cargo`, or `npm` from `PATH`. Machine-local trust and TUI settings are preserved. | no |
+| `clean-disk [--dry-run]` | Inspect configured development roots, remove old inactive rebuildable Rust caches, ask `y/N` before deleting expired trash, and invoke explicitly registered project-owned runner cleanup adapters. Active or technically unverified paths are never overrideable. | no |
 | `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`, `~/.gemini/GEMINI.md`, and `~/.gemini/policies/`. Requires `GEMINI_API_KEY` exported in your shell. | no |
 
 #### AI CLI configuration policy
@@ -79,6 +80,11 @@ Implementation, fix, addition, and build requests use the managed `codex-worktre
 investigation, design, review, and diagnosis alone do not create a worktree. See
 [Codex worktree運用ガイド](docs/codex-worktrees.ja.md) for the lifecycle, recovery, and safety
 boundaries. The managed root follows the [OpenAI Git worktrees documentation](https://learn.chatgpt.com/docs/environments/git-worktrees).
+
+`cargo run -- clean-disk` scans the configured development roots and the managed Codex worktree
+root once. Old inactive rebuildable Rust caches are removed automatically, expired trash requires `y/N`, and
+paths used by a live process are never offered as an override. Project-owned runner cleanup is
+connected through validated local manifests; see [disk cleanup運用ガイド](docs/clean-disk.ja.md).
 
 Ordinary editing and testing run inside the sandbox. The explicit `.git` grant is process-agnostic:
 the managed hook is an operational policy guard for recognized Git, GitHub, helper, and destructive
@@ -251,3 +257,4 @@ Config for CorvusSKK.
 - [Codex worktree運用](docs/codex-worktrees.ja.md)
 - [Codex delivery運用](docs/codex-delivery.ja.md)
 - [Codex guardrailのRust実装](docs/codex-rust-guardrails.ja.md)
+- [disk cleanup運用](docs/clean-disk.ja.md)

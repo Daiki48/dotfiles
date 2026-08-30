@@ -1,5 +1,6 @@
 mod alacritty;
 mod claude;
+mod clean_disk;
 mod codex;
 mod codex_tools;
 mod common;
@@ -73,6 +74,15 @@ enum Commands {
     Claude,
     /// Setup for Codex CLI
     Codex,
+    /// Safely inspect and clean stale local development storage
+    CleanDisk {
+        /// Report candidates without deleting or prompting
+        #[arg(long)]
+        dry_run: bool,
+        /// Use an explicit machine-local configuration file
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Refresh only managed Codex guardrail binaries from a task worktree
     #[command(hide = true)]
     CodexGuardrails,
@@ -88,6 +98,7 @@ where
         Some("block-git-write") => Some(codex_tools::guard::entrypoint()),
         Some("codex-worktree") => Some(codex_tools::worktree::entrypoint(args)),
         Some("codex-delivery") => Some(codex_tools::delivery::entrypoint(args)),
+        Some("runner-storage-cleanup") => Some(codex_tools::runner_storage::entrypoint(args)),
         _ => None,
     }
 }
@@ -191,6 +202,9 @@ fn run() -> anyhow::Result<()> {
         }
         Commands::Codex => {
             codex::setup()?;
+        }
+        Commands::CleanDisk { dry_run, config } => {
+            clean_disk::run(config.as_deref(), dry_run)?;
         }
         Commands::CodexGuardrails => {
             codex::refresh_guardrails()?;

@@ -20,6 +20,7 @@ use crate::codex_tools::{process, worktree};
 const CODEX_FILES: &[(&str, &str)] = &[
     (".codex/AGENTS.md", ".codex/AGENTS.md"),
     (".codex/rules/default.rules", ".codex/rules/default.rules"),
+    (".config/clean-disk.json", ".config/clean-disk.json"),
 ];
 const MANAGED_HOOK_DESTINATION: &str = ".codex/hooks/block-git-write";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +48,7 @@ const MANAGED_BINARY_DESTINATIONS: &[&str] = &[
     MANAGED_HOOK_DESTINATION,
     ".local/bin/codex-worktree",
     ".local/bin/codex-delivery",
+    ".local/bin/runner-storage-cleanup",
 ];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
 const MANAGED_TRANSACTION_SUFFIX: &str = ".managed.pending";
@@ -4235,6 +4237,7 @@ mod tests {
                 ".codex/hooks/block-git-write",
                 ".local/bin/codex-worktree",
                 ".local/bin/codex-delivery",
+                ".local/bin/runner-storage-cleanup",
             ]
         );
     }
