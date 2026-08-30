@@ -107,7 +107,8 @@ dirty、stale、conflict、判定不能時はPR、branch、worktreeを保持し�
 Codexは対象を`.codex-trash/<timestamp>/`へ移し、そのdirectoryをstageまたは自動削除しません。
 managed root内でmerged、main到達性、clean、未pushなしを厳格に証明したcleanupだけが自律削除の例外です。
 そのcleanupではreview済みSHAをleaseにしたremote task branch削除だけを限定的に許可します。
-ignored artifactもdirtyとして停止し、stateをatomic保存して途中から再検証・再開します。
+既知の再生成可能なignored artifactだけはworktreeとともに破棄できますが、`.codex-trash`や未知の
+ignored artifactは停止し、stateをatomic保存して途中から再検証・再開します。
 The guard checks direct Bash invocations; arbitrary programs, privileged concurrent PR/repository
 mutations, and same-user races remain outside its security boundary.
 
