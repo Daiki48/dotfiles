@@ -6,6 +6,32 @@ managed worktree cleanupまでを同じdeliveryとして扱います。
 
 ## 正本と経路
 
+### main同期が途中で止まった場合
+
+`finish`は、同期先blob・実行bitと一致する変更済みfileを検証してから同期前のHEADへ戻します。
+同期先で新規追加された未追跡fileも、HEADに不存在・通常file・同一UID・hardlinkなし・
+symlink parentなし・内容一致をすべて確認できる場合だけ、`.codex-trash/<日時>-main-sync/`へ
+退避してからff-only同期します。退避は削除せず、pathを標準エラーへ表示します。
+全候補を検証する前に元fileを変更せず、操作直前にもbranch・HEAD・status・inode・mode・blobを再確認します。
+未知の未追跡file、独自のlocal変更、staged変更、削除、rename、type変更は復旧しません。
+
+退避にはHEADの`.gitignore`への`.codex-trash/`登録と実効ignoreが必要です。
+Dockerfileまたは`.dockerignore`がある場合は、HEADの`.dockerignore`にも同じ登録が必要です。
+否定patternがあるDocker除外設定は自動判定せず停止します。
+
+通常の`--sandbox-retry`は従来どおり1回だけです。その再試行を使い切って停止したtaskは、
+Daikiが**今回の追加復旧を含む同一taskの完了処理**を明示承認した場合だけ、
+同じtask・PR・head・planの`approve-review`で承認を記録し、次を1回だけ実行できます。
+
+```text
+codex-delivery finish --task-id <task> --pr <pr> --head <head> --plan-id <plan-v1> --plan-version 1 --recover-main-sync --recover-main-sync-from <同期前mainの40桁SHA> --recover-main-sync-to <同期先origin/mainの40桁SHA>
+```
+
+追加復旧もcanonical helperの経路に限定します。stage=merged、sandbox再試行済み、
+human-approved receipt、現在HEAD=from、fetch後origin/main=to、既存のCI・review・到達性gateを要求します。
+外部検証前に追加復旧の消費を永続化し、失敗しても自動再試行しません。`--sandbox-retry`との併用、
+stateの手編集、直接のmain同期やcleanupによる迂回は禁止です。
+
 `codex-delivery` helperを、次の一連の唯一のreceipt・delivery・finish経路とします。
 
 ```text

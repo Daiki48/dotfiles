@@ -4900,12 +4900,15 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         "--plan-version",
         "--gate-mode",
         "--risk",
+        "--recover-main-sync-from",
+        "--recover-main-sync-to",
     ];
     let switches = [
         "--tests-passed",
         "--independent-review-passed",
         "--specialist-review-passed",
         "--sandbox-retry",
+        "--recover-main-sync",
     ];
     let mut values = HashMap::new();
     let mut seen = Vec::new();
@@ -4951,14 +4954,33 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         if !review_profile_valid
             || !seen.iter().any(|v| v == "--tests-passed")
             || seen.iter().any(|v| v == "--sandbox-retry")
+            || seen.iter().any(|v| v == "--recover-main-sync")
         {
             return Some("delivery helperのreview evidenceまたはriskが不正です".into());
         }
     } else if values.contains_key("--risk")
-        || seen.iter().any(|flag| flag != "--sandbox-retry")
-        || (command == "deliver" && seen.iter().any(|flag| flag == "--sandbox-retry"))
+        || seen
+            .iter()
+            .any(|flag| !["--sandbox-retry", "--recover-main-sync"].contains(&flag.as_str()))
+        || (command == "deliver" && !seen.is_empty())
+        || (seen.iter().any(|flag| flag == "--sandbox-retry")
+            && seen.iter().any(|flag| flag == "--recover-main-sync"))
     {
         return Some("deliver/finishへreview evidenceまたはriskを指定できません".into());
+    }
+    let recovery = seen.iter().any(|flag| flag == "--recover-main-sync");
+    if recovery {
+        if command != "finish"
+            || !["--recover-main-sync-from", "--recover-main-sync-to"]
+                .iter()
+                .all(|key| values.get(*key).is_some_and(|value| valid_oid(value)))
+        {
+            return Some("main同期の復旧はfinishへfrom/to SHAを固定して指定してください".into());
+        }
+    } else if values.contains_key("--recover-main-sync-from")
+        || values.contains_key("--recover-main-sync-to")
+    {
+        return Some("復旧from/toには--recover-main-syncが必要です".into());
     }
     let local_gate = values
         .get("--gate-mode")
@@ -6362,6 +6384,21 @@ mod tests {
             panic!("fixture cwd must be a string");
         };
         assert_eq!(cwd, "/tmp");
+    }
+
+    #[test]
+    fn main_sync_recovery_helper_requires_fixed_bounds_and_exclusive_finish() {
+        let command = "codex-delivery finish --task-id task-example --pr 1 --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --plan-id RECOVERY-TEST-v1 --plan-version 1";
+        let bounds = " --recover-main-sync-from aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --recover-main-sync-to cccccccccccccccccccccccccccccccccccccccc";
+        let recovery = format!("{command} --recover-main-sync{bounds}");
+        assert!(blocked_reason(&recovery, None, 0).is_none());
+        assert!(blocked_reason(&format!("{command} --recover-main-sync"), None, 0).is_some());
+        assert!(blocked_reason(&format!("{command}{bounds}"), None, 0).is_some());
+        assert!(blocked_reason(&format!("{recovery} --sandbox-retry"), None, 0).is_some());
+        assert!(blocked_reason(&recovery.replace(" finish ", " deliver "), None, 0).is_some());
+        assert!(
+            blocked_reason(&recovery.replace(" finish ", " approve-review "), None, 0).is_some()
+        );
     }
 
     #[test]
