@@ -119,13 +119,13 @@ riskと分離し、根拠を確定できる場合は`record-review`、Daikiだ�
 ## Delivery gate（Issue #24）
 
 Draft PR作成後は、PRのrepository、base branch、head branch、head SHAを固定し、固定SHAに対する
-testとriskに応じたreview（low/mediumはSolのself-review、highは独立review、criticalは必要時の専門review）の完了証拠をreceiptへ記録し、
+testとriskに応じたreview（low/mediumはmain agentのself-review、highは独立review、criticalは必要時の専門review）の完了証拠をreceiptへ記録し、
 CIとGitHub review状態はdelivery直前にも再取得します。
 review後にpushされた場合、以前のreceipt、review、CIを
 再利用せず、新しいSHAで最初からやり直します。`review-branch`は読み取り専用であり、receiptの記録と
 delivery判断は呼び出し元の専用`codex-delivery` helperが担当します。
 
-修正可能なactionable指摘はSolが根拠を確認し、共通root causeごとの1つのbatchで自律修正します。同じ問題が修正後も再発するか、2回続けて受け入れ条件・test・既知指摘に証拠上の進展がない場合は、root cause、実装境界、検証手段を再確認します。その後も同じ問題が続く場合だけblockedとし、無変更retryを続けません。
+修正可能なactionable指摘はmain agentが根拠を確認し、共通root causeごとの1つのbatchで自律修正します。同じ問題が修正後も再発するか、2回続けて受け入れ条件・test・既知指摘に証拠上の進展がない場合は、root cause、実装境界、検証手段を再確認します。その後も同じ問題が続く場合だけblockedとし、無変更retryを続けません。
 
 PRやIssueへ内部監査用のschema JSON、fingerprint、digest chain、round logを投稿しません。PR bodyとcommentは、人間が読む変更概要、判断が必要な論点、検証結果、残存事項に限ります。作業はPlanの有限な受け入れ条件・実装単位・対象経路から目的外へ増殖させません。`codex-delivery`はv6 receiptをprivateなmanaged stateへ保存し、固定SHA、test、review、Plan、decision、gateを検証します。v6のdeliveryはPR comments APIに依存しません。既存v5 receiptだけは進行中taskの再開時に旧ledger comment chainを読み取り専用で検証します。
 次の条件が同一SHAで同時に成立した場合だけReady化・merge候補になります。

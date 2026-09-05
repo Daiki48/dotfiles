@@ -4825,7 +4825,7 @@ fn worktree_helper_invocation_reason(tokens: &[String]) -> Option<String> {
                 helper_task_args("doctor", rest)
             }
         }
-        "resume" | "recover" => helper_task_args(command, rest),
+        "resume" | "recover" | "artifacts" | "clean-artifacts" => helper_task_args(command, rest),
         "create" => {
             let mut seen = HashMap::new();
             let mut i = 0;
@@ -5040,9 +5040,9 @@ fn has_write_operation(tokens: &[String]) -> bool {
     if let Some(start) = start {
         match basename(tokens.get(start).unwrap_or(&String::new())) {
             "codex-worktree" => {
-                return tokens
-                    .get(start + 1)
-                    .is_some_and(|v| ["create", "recover"].contains(&v.as_str()));
+                return tokens.get(start + 1).is_some_and(|v| {
+                    ["create", "recover", "artifacts", "clean-artifacts"].contains(&v.as_str())
+                });
             }
             "codex-delivery" => {
                 return tokens.get(start + 1).is_some_and(|v| {
@@ -6332,6 +6332,22 @@ mod tests {
         assert!(blocked_reason("codex-worktree list", None, 0).is_none());
         assert!(blocked_reason("codex-worktree create --task-id task-example", None, 0).is_none());
         assert!(blocked_reason("codex-worktree create --issue 0", None, 0).is_some());
+        for subcommand in ["artifacts", "clean-artifacts"] {
+            let command = format!("codex-worktree {subcommand} --task-id task-example");
+            assert!(blocked_reason(&command, None, 0).is_none());
+            assert!(write_context_reason(&command, None).is_some());
+            for suffix in [
+                "",
+                " --task-id ../escape",
+                " --task-id task-example --force",
+            ] {
+                assert!(
+                    blocked_reason(&format!("codex-worktree {subcommand}{suffix}"), None, 0)
+                        .is_some()
+                );
+            }
+            assert!(blocked_reason(&format!("{command}; git status"), None, 0).is_some());
+        }
         assert!(blocked_reason("codex-delivery deliver --task-id task-example --pr 1 --head 0123456789012345678901234567890123456789 --plan-id PLAN-TEST-v1 --plan-version 1", None, 0).is_none());
     }
 

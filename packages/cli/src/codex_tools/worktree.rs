@@ -18,6 +18,10 @@ use serde_json::{Map, Value};
 
 use super::{guard::GuardGhSandbox, trust};
 
+pub(crate) fn valid_artifact_task_id(task: &str) -> bool {
+    valid_task_id(task)
+}
+
 #[cfg(test)]
 use std::io::Read;
 #[cfg(test)]
@@ -1806,6 +1810,55 @@ pub(crate) fn verify_managed_refresh_source(root: &Path) -> Result<(), WorktreeE
     verify_managed_refresh_source_with_local_origin(root, false)
 }
 
+fn completed_delivery(manifest: &Manifest) -> bool {
+    let worktree = Path::new(&manifest.worktree);
+    let Some(parent) = worktree.parent() else {
+        return false;
+    };
+    let path = parent
+        .join(".state")
+        .join(format!("{}.delivery.json", manifest.task_id));
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_MANIFEST_BYTES
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return false;
+    }
+    let Ok(contents) = fs::read(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&contents) else {
+        return false;
+    };
+    value["version"].as_i64() == Some(1)
+        && value["kind"].as_str() == Some("delivery")
+        && value["stage"].as_str() == Some("completed")
+        && value["task_id"].as_str() == Some(&manifest.task_id)
+        && value["branch"].as_str() == Some(&manifest.branch)
+        && value["repository"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&manifest.github_name))
+        && value["head_sha"].as_str().is_some_and(valid_oid)
+        && matches!(
+            super::artifacts::validate(
+                worktree,
+                &manifest.task_id,
+                Path::new(&manifest.common_git_dir)
+            ),
+            Ok(None)
+        )
+}
+
 fn diagnose(
     cwd: &Path,
     task_id: Option<&str>,
@@ -1840,8 +1893,16 @@ fn diagnose(
                 .as_ref()
                 .is_none_or(|path| path.is_symlink() || !path.exists())
             {
-                status = "missing".to_string();
-                detail = "worktree directoryがありません".to_string();
+                if record.is_none()
+                    && path.as_ref().is_some_and(|path| !path.is_symlink())
+                    && completed_delivery(&manifest)
+                {
+                    status = "completed".to_string();
+                    detail = "deliveryと掃除が完了しています".to_string();
+                } else {
+                    status = "missing".to_string();
+                    detail = "worktree directoryがありません".to_string();
+                }
             } else if record.is_none() {
                 status = "unregistered".to_string();
                 detail = "Git worktreeとして登録されていません".to_string();
@@ -1929,6 +1990,26 @@ fn resume(cwd: &Path, task_id: &str, allow_local_origin: bool) -> Result<PathBuf
     Err(error("指定taskのmanifestがありません"))
 }
 
+fn task_artifacts(
+    cwd: &Path,
+    task_id: &str,
+    clean: bool,
+    allow_local_origin: bool,
+) -> Result<PathBuf, WorktreeError> {
+    let repository = inspect_repository(cwd, allow_local_origin, false)?;
+    let (_, _, lock_path) = managed_paths(&repository, task_id, false)?;
+    let _lock = ExclusiveLock::acquire(&lock_path)?;
+    let path = resume(cwd, task_id, allow_local_origin)?;
+    if clean {
+        super::artifacts::cleanup(&path, task_id, &repository.common_git_dir)
+            .map_err(|cause| error(cause.to_string()))?;
+        Ok(path)
+    } else {
+        super::artifacts::create(&path, task_id, &repository.common_git_dir)
+            .map_err(|cause| error(cause.to_string()))
+    }
+}
+
 fn recover(cwd: &Path, task_id: &str, allow_local_origin: bool) -> Result<PathBuf, WorktreeError> {
     let repository = inspect_repository(cwd, allow_local_origin, false)?;
     let (_, manifest_path, lock_path) = managed_paths(&repository, task_id, false)?;
@@ -2007,6 +2088,19 @@ fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
                 .map_err(|cause| (2, cause.to_string()))?;
             recover(&cwd, &task_id, false).map(|path| path.to_string_lossy().into_owned())
         }
+        "artifacts" | "clean-artifacts" => {
+            let task_id = parsed
+                .task_id
+                .as_deref()
+                .ok_or((2, "--task-idが必要です".into()))?;
+            task_artifacts(&cwd, task_id, parsed.command == "clean-artifacts", false).map(|path| {
+                if parsed.command == "artifacts" {
+                    path.to_string_lossy().into_owned()
+                } else {
+                    "task成果物の掃除が完了しました（sourceは保持）".into()
+                }
+            })
+        }
         "list" | "doctor" => {
             let task_id = parsed.task_id.as_deref();
             diagnose(&cwd, task_id, false).map(|rows| {
@@ -2026,11 +2120,16 @@ fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
             if parsed.command == "doctor" {
                 let rows = diagnose(&cwd, parsed.task_id.as_deref(), false)
                     .map_err(|cause| (1, cause.to_string()))?;
-                return Ok(if rows.iter().all(|row| row.1 == "ready") {
-                    0
-                } else {
-                    1
-                });
+                return Ok(
+                    if rows
+                        .iter()
+                        .all(|row| matches!(row.1.as_str(), "ready" | "completed"))
+                    {
+                        0
+                    } else {
+                        1
+                    },
+                );
             }
             Ok(0)
         }
@@ -2067,12 +2166,12 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         .ok_or_else(|| "commandを指定してください".to_string())?;
     if matches!(command.as_str(), "-h" | "--help") {
         return Err(
-            "usage: codex-worktree <create|list|doctor|resume|recover> [options]".to_string(),
+            "usage: codex-worktree <create|list|doctor|resume|recover|artifacts|clean-artifacts> [options]".to_string(),
         );
     }
     if !matches!(
         command.as_str(),
-        "create" | "list" | "doctor" | "resume" | "recover"
+        "create" | "list" | "doctor" | "resume" | "recover" | "artifacts" | "clean-artifacts"
     ) {
         return Err(format!("unknown command: {command}"));
     }
@@ -2106,7 +2205,10 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
                 );
             }
             "--task-id"
-                if matches!(command.as_str(), "create" | "doctor" | "resume" | "recover") =>
+                if matches!(
+                    command.as_str(),
+                    "create" | "doctor" | "resume" | "recover" | "artifacts" | "clean-artifacts"
+                ) =>
             {
                 index += 1;
                 parsed.task_id = Some(
@@ -2120,7 +2222,11 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         }
         index += 1;
     }
-    if matches!(command.as_str(), "resume" | "recover") && parsed.task_id.is_none() {
+    if matches!(
+        command.as_str(),
+        "resume" | "recover" | "artifacts" | "clean-artifacts"
+    ) && parsed.task_id.is_none()
+    {
         return Err("--task-idが必要です".to_string());
     }
     if command != "create" && parsed.branch.is_some() {
@@ -2766,6 +2872,74 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "task-list-filter");
         assert_eq!(rows[0].1, "ready");
+    }
+
+    #[test]
+    fn task_artifacts_cleanup_preserves_dirty_worktree_and_head() {
+        let fixture = TemporaryRepository::new();
+        let target = create_worktree(
+            &fixture.repository,
+            "feat/artifacts",
+            "task-artifacts",
+            true,
+        )
+        .unwrap();
+        fs::write(target.join("README.md"), "uncommitted source").unwrap();
+        let before = snapshot(&target).unwrap();
+        let artifact = task_artifacts(&fixture.repository, "task-artifacts", false, true).unwrap();
+        fs::write(artifact.join("test.img"), "temporary").unwrap();
+        task_artifacts(&fixture.repository, "task-artifacts", true, true).unwrap();
+        assert!(!artifact.exists());
+        assert_eq!(snapshot(&target).unwrap(), before);
+        assert_eq!(
+            diagnose(&fixture.repository, Some("task-artifacts"), true).unwrap()[0].1,
+            "dirty"
+        );
+    }
+
+    #[test]
+    fn completed_delivery_is_normal_only_when_worktree_is_removed() {
+        let fixture = TemporaryRepository::new();
+        let target = create_worktree(
+            &fixture.repository,
+            "feat/completed",
+            "task-completed",
+            true,
+        )
+        .unwrap();
+        let head = git_stdout(&target, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let state = fixture
+            .manifest("task-completed")
+            .with_file_name("task-completed.delivery.json");
+        let value = serde_json::json!({"version":1, "kind":"delivery", "stage":"completed",
+            "task_id":"task-completed", "repository":"test/local", "branch":"feat/completed",
+            "head_sha":head});
+        fs::write(&state, serde_json::to_vec(&value).unwrap()).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            diagnose(&fixture.repository, None, true).unwrap()[0].1,
+            "ready"
+        );
+        run_git(
+            &fixture.repository,
+            &["worktree", "unlock", target.to_str().unwrap()],
+        );
+        run_git(
+            &fixture.repository,
+            &["worktree", "remove", target.to_str().unwrap()],
+        );
+        assert_eq!(
+            diagnose(&fixture.repository, None, true).unwrap()[0].1,
+            "completed"
+        );
+        fs::write(&state, "{}").unwrap();
+        assert_eq!(
+            diagnose(&fixture.repository, None, true).unwrap()[0].1,
+            "missing"
+        );
     }
 
     #[test]

@@ -32,13 +32,20 @@ struct CleanDiskConfig {
     scan_roots: Vec<PathBuf>,
     trash_retention_days: u64,
     build_cache_retention_days: u64,
+    #[serde(default = "default_codex_retention")]
+    codex_build_cache_retention_days: u64,
     runner_manifest_dir: Option<PathBuf>,
+}
+
+fn default_codex_retention() -> u64 {
+    1
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum CandidateKind {
     Trash,
     BuildCache,
+    CodexBuildCache,
 }
 
 impl CandidateKind {
@@ -46,6 +53,7 @@ impl CandidateKind {
         match self {
             Self::Trash => "期限切れtrash",
             Self::BuildCache => "再生成可能build cache",
+            Self::CodexBuildCache => "Codex再生成可能build cache",
         }
     }
 }
@@ -57,6 +65,7 @@ struct TreeSnapshot {
     newest_modified: SystemTime,
     device: u64,
     inode: u64,
+    contains_repository: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +182,7 @@ fn read_config(path: &Path) -> Result<CleanDiskConfig> {
     }
     if !(1..=3650).contains(&config.trash_retention_days)
         || !(1..=3650).contains(&config.build_cache_retention_days)
+        || !(1..=3650).contains(&config.codex_build_cache_retention_days)
     {
         anyhow::bail!("clean-disk retention days must be between 1 and 3650");
     }
@@ -206,6 +216,7 @@ fn scan_path(path: &Path) -> Result<TreeSnapshot> {
     let root_inode = 0;
     let mut allocated_bytes = 0u64;
     let mut entries = 0usize;
+    let mut contains_repository = false;
     let mut newest_modified = root.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let mut stack = vec![(path.to_path_buf(), 0usize)];
     while let Some((current, depth)) = stack.pop() {
@@ -217,6 +228,7 @@ fn scan_path(path: &Path) -> Result<TreeSnapshot> {
         }
         let metadata = fs::symlink_metadata(&current)
             .with_context(|| format!("cannot inspect cleanup entry {}", current.display()))?;
+        contains_repository |= current.file_name().is_some_and(|name| name == ".git");
         #[cfg(unix)]
         if metadata.dev() != root_device {
             anyhow::bail!(
@@ -260,13 +272,83 @@ fn scan_path(path: &Path) -> Result<TreeSnapshot> {
         newest_modified,
         device: root_device,
         inode: root_inode,
+        contains_repository,
     })
+}
+
+pub(crate) fn validate_artifact_tree(path: &Path) -> Result<()> {
+    validate_scan_root(path)?;
+    #[cfg(target_os = "linux")]
+    {
+        // bind mountは同じdeviceにも作れるため、st_devだけでは検出できない。
+        let mounts = fs::read_to_string("/proc/self/mountinfo")
+            .context("成果物のmount状態を確認できません")?;
+        for line in mounts.lines() {
+            let encoded = line
+                .split_whitespace()
+                .nth(4)
+                .context("invalid mountinfo")?;
+            let mount = encoded
+                .replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\012", "\n")
+                .replace("\\134", "\\");
+            if Path::new(&mount).starts_with(path) {
+                anyhow::bail!("成果物にmountが残っています: {}", path.display());
+            }
+        }
+    }
+    scan_path(path)?;
+    Ok(())
+}
+
+pub(crate) fn remove_artifact_tree(path: &Path) -> Result<()> {
+    validate_artifact_tree(path)?;
+    ensure_artifact_idle(path)?;
+    let candidate = Candidate {
+        path: path.into(),
+        kind: CandidateKind::BuildCache,
+        active_scope: path.into(),
+        snapshot: scan_path(path)?,
+    };
+    remove_candidate(&candidate)
+}
+
+/// 0700のtask専用領域は同一UIDの検証processだけに使う。
+/// 通常のclean-diskと違い他ユーザーの領域を扱わないためsudoを要求しない。
+pub(crate) fn ensure_artifact_idle(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let lsof =
+            trust::trusted_system_binary("/usr/bin/lsof", "lsof").map_err(anyhow::Error::msg)?;
+        let mut command = Command::new(lsof);
+        process::clear_environment(&mut command);
+        command.env("PATH", "/usr/bin:/bin").env("LANG", "C").args([
+            "-nP",
+            "-F0n",
+            "-a",
+            "-u",
+            &unsafe { libc::geteuid() }.to_string(),
+        ]);
+        let result =
+            process::run_host_with_limit(&mut command, OPEN_PATH_TIMEOUT, OPEN_PATH_CAPTURE_BYTES)?;
+        if !result.status.success() {
+            anyhow::bail!("task成果物の使用状況を確認できません（lsof）");
+        }
+        validate_lsof_warnings(&result.stderr, &BTreeSet::from([path.into()]))?;
+        if overlaps(path, &parse_lsof_paths(&result.stdout)?) {
+            anyhow::bail!("task成果物を使用中のprocessがあります。終了してから再実行してください");
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("task成果物のprocess検証はこのOSで未対応です")
 }
 
 fn nearest_repository_root(start: &Path, boundary: &Path) -> Option<PathBuf> {
     let mut current = start;
     loop {
-        if current.join(".git").exists() {
+        if current != boundary && current.join(".git").exists() {
             return Some(current.to_path_buf());
         }
         if current == boundary {
@@ -276,7 +358,43 @@ fn nearest_repository_root(start: &Path, boundary: &Path) -> Option<PathBuf> {
     }
 }
 
-fn discover_under(root: &Path, include_build_cache: bool) -> Result<Vec<Candidate>> {
+fn cache_is_ignored(repository: &Path, path: &Path) -> Result<bool> {
+    let relative = path.strip_prefix(repository)?;
+    let git = trust::trusted_system_binary("/usr/bin/git", "git").map_err(anyhow::Error::msg)?;
+    let query = |args: &[&str]| -> Result<process::Output> {
+        let mut command = Command::new(&git);
+        process::clear_environment(&mut command);
+        command
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(repository);
+        if args.first() == Some(&"ls-files") {
+            command.arg("--literal-pathspecs");
+        }
+        command.args(args).arg(relative);
+        Ok(process::run_host_with_limit(
+            &mut command,
+            OPEN_PATH_TIMEOUT,
+            OPEN_PATH_CAPTURE_BYTES,
+        )?)
+    };
+    let tracked = query(&["ls-files", "-z", "--"])?;
+    if !tracked.status.success() {
+        anyhow::bail!("cacheのGit追跡状態を確認できません");
+    }
+    if !tracked.stdout.is_empty() {
+        return Ok(false);
+    }
+    let ignored = query(&["check-ignore", "-q", "--"])?;
+    match ignored.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!("cacheのGit ignore状態を確認できません"),
+    }
+}
+
+fn discover_under(root: &Path, codex: bool) -> Result<Vec<Candidate>> {
     validate_scan_root(root)?;
     let mut candidates = Vec::new();
     let mut visited = 0usize;
@@ -300,13 +418,38 @@ fn discover_under(root: &Path, include_build_cache: bool) -> Result<Vec<Candidat
                 continue;
             }
             let name = entry.file_name();
-            if name == ".codex-trash" {
+            if codex
+                && (name.to_string_lossy().starts_with(".podman")
+                    || (path.join("storage.lock").exists() && path.join("db.sql").exists()))
+            {
+                println!("NativeCleanupRequired\tPodman管理領域\t{}", path.display());
+                continue;
+            }
+            if codex && name == ".artifacts" {
+                println!(
+                    "TaskArtifacts\tfinish / clean-artifactsで回収\t{}",
+                    path.display()
+                );
+                continue;
+            }
+            if name == ".codex-trash"
+                || (codex
+                    && (matches!(name.to_str(), Some(".preserved" | ".artifact-backups"))
+                        || name.to_string_lossy().starts_with(".codex-trash-")))
+            {
                 let active_scope =
                     nearest_repository_root(&directory, root).unwrap_or_else(|| path.clone());
                 for child in sorted_entries(&path)? {
                     let child_path = child.path();
+                    let snapshot = match scan_path(&child_path) {
+                        Ok(snapshot) => snapshot,
+                        Err(cause) => {
+                            println!("RetainUnverifiable\t{}\t{cause}", child_path.display());
+                            continue;
+                        }
+                    };
                     candidates.push(Candidate {
-                        snapshot: scan_path(&child_path)?,
+                        snapshot,
                         path: child_path,
                         kind: CandidateKind::Trash,
                         active_scope: active_scope.clone(),
@@ -314,12 +457,41 @@ fn discover_under(root: &Path, include_build_cache: bool) -> Result<Vec<Candidat
                 }
                 continue;
             }
-            if include_build_cache && name == "target" && directory.join("Cargo.toml").is_file() {
+            if name == "target" && (codex || directory.join("Cargo.toml").is_file()) {
+                let repository = nearest_repository_root(&directory, root);
+                if let Some(repository) = &repository {
+                    match cache_is_ignored(repository, &path) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            println!("RetainTrackedOrUnignored\t{}", path.display());
+                            continue;
+                        }
+                        Err(cause) => {
+                            println!("RetainUnverifiable\t{}\t{cause}", path.display());
+                            continue;
+                        }
+                    }
+                }
+                let snapshot = match scan_path(&path) {
+                    Ok(snapshot) => snapshot,
+                    Err(cause) => {
+                        println!("RetainUnverifiable\t{}\t{cause}", path.display());
+                        continue;
+                    }
+                };
+                if snapshot.contains_repository {
+                    println!("RetainRepository\t{}", path.display());
+                    continue;
+                }
                 candidates.push(Candidate {
-                    snapshot: scan_path(&path)?,
+                    snapshot,
                     path,
-                    kind: CandidateKind::BuildCache,
-                    active_scope: directory.clone(),
+                    kind: if codex {
+                        CandidateKind::CodexBuildCache
+                    } else {
+                        CandidateKind::BuildCache
+                    },
+                    active_scope: repository.unwrap_or_else(|| directory.clone()),
                 });
                 continue;
             }
@@ -448,7 +620,7 @@ fn disposition(
     }
     let retention_days = match candidate.kind {
         CandidateKind::Trash => trash_retention_days,
-        CandidateKind::BuildCache => build_retention_days,
+        CandidateKind::BuildCache | CandidateKind::CodexBuildCache => build_retention_days,
     };
     let age = now
         .duration_since(candidate.snapshot.newest_modified)
@@ -458,7 +630,7 @@ fn disposition(
     }
     match candidate.kind {
         CandidateKind::Trash => Disposition::Confirm,
-        CandidateKind::BuildCache => Disposition::AutoDelete,
+        CandidateKind::BuildCache | CandidateKind::CodexBuildCache => Disposition::AutoDelete,
     }
 }
 
@@ -478,7 +650,22 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn remove_candidate(candidate: &Candidate) -> Result<()> {
+    if matches!(
+        candidate.kind,
+        CandidateKind::BuildCache | CandidateKind::CodexBuildCache
+    ) && candidate.active_scope.join(".git").exists()
+        && !cache_is_ignored(&candidate.active_scope, &candidate.path)?
+    {
+        anyhow::bail!("cacheが追跡対象またはignore対象外になりました");
+    }
     let current = scan_path(&candidate.path)?;
+    if matches!(
+        candidate.kind,
+        CandidateKind::BuildCache | CandidateKind::CodexBuildCache
+    ) && current.contains_repository
+    {
+        anyhow::bail!("cache内のGit repositoryを保持します");
+    }
     if current != candidate.snapshot {
         anyhow::bail!(
             "candidate changed after inspection: {}",
@@ -537,21 +724,29 @@ pub(crate) fn run(explicit_config: Option<&Path>, dry_run: bool) -> Result<()> {
             println!("SKIP missing scan root: {}", root.display());
             continue;
         }
-        candidates.extend(discover_under(root, true)?);
+        candidates.extend(discover_under(root, false)?);
     }
     if let Some(root) = codex_root
         && root.exists()
     {
-        candidates.extend(discover_under(&root, false)?);
+        candidates.extend(discover_under(&root, true)?);
     }
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
     let protected_scopes = candidates
         .iter()
         .map(|candidate| candidate.active_scope.clone())
         .collect::<BTreeSet<_>>();
-    let open_paths = observe_open_paths(&protected_scopes).context(
+    // dry-runは権限昇格せずinventoryを返す。利用状況は未確認と明示し、適用時に必ず再検証する。
+    let open_paths = if dry_run {
+        BTreeSet::new()
+    } else {
+        observe_open_paths(&protected_scopes).context(
         "open file observation failed; no cleanup was performed because active sessions cannot be excluded",
-    )?;
+    )?
+    };
+    if dry_run {
+        println!("DRY RUN: 使用中processは未確認です。表示は削除許可ではありません");
+    }
 
     let now = SystemTime::now();
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
@@ -565,7 +760,11 @@ pub(crate) fn run(explicit_config: Option<&Path>, dry_run: bool) -> Result<()> {
             &open_paths,
             now,
             config.trash_retention_days,
-            config.build_cache_retention_days,
+            if candidate.kind == CandidateKind::CodexBuildCache {
+                config.codex_build_cache_retention_days
+            } else {
+                config.build_cache_retention_days
+            },
         );
         writeln!(
             output,
@@ -645,7 +844,11 @@ pub(crate) fn run(explicit_config: Option<&Path>, dry_run: bool) -> Result<()> {
             }
         }
     }
-    writeln!(output, "clean-disk: reclaimed {}", human_bytes(reclaimed))?;
+    writeln!(
+        output,
+        "clean-disk: removed allocated bytes {}（共有extentを含み、実際の空き増分とは異なります）",
+        human_bytes(reclaimed)
+    )?;
     Ok(())
 }
 
@@ -693,6 +896,7 @@ mod tests {
                 newest_modified: SystemTime::UNIX_EPOCH,
                 device: 1,
                 inode: 1,
+                contains_repository: false,
             },
         };
         let open = BTreeSet::from([scope.join("src/main.rs")]);
@@ -710,6 +914,7 @@ mod tests {
             newest_modified: SystemTime::UNIX_EPOCH,
             device: 1,
             inode: 1,
+            contains_repository: false,
         };
         let trash = Candidate {
             path: PathBuf::from("/tmp/.codex-trash/old"),
@@ -741,6 +946,27 @@ mod tests {
         let mut output = Vec::new();
         assert!(!confirm(&mut empty, &mut output, "delete?").unwrap());
         assert!(confirm(&mut yes, &mut output, "delete?").unwrap());
+    }
+
+    #[test]
+    fn unverifiable_candidates_do_not_hide_safe_candidates() {
+        use std::os::unix::net::UnixListener;
+        let root = TestDirectory::new("partial-inventory");
+        let trash = root.0.join(".codex-trash");
+        fs::create_dir_all(trash.join("unsafe")).unwrap();
+        let _socket = UnixListener::bind(trash.join("unsafe/agent.sock")).unwrap();
+        fs::create_dir_all(root.0.join("broken/target")).unwrap();
+        fs::write(
+            root.0.join("broken/.git"),
+            "gitdir: /nonexistent-clean-disk-repo",
+        )
+        .unwrap();
+        fs::create_dir(root.0.join("target")).unwrap();
+        let found = discover_under(&root.0, true).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, root.0.join("target"));
+        assert!(trash.join("unsafe/agent.sock").exists());
+        assert!(root.0.join("broken/target").exists());
     }
 
     #[test]
@@ -809,7 +1035,7 @@ mod tests {
         fs::create_dir(repository.join(".codex-trash/old")).unwrap();
         fs::write(repository.join(".codex-trash/old/data"), b"trash").unwrap();
 
-        let candidates = discover_under(&fixture.0, true).unwrap();
+        let candidates = discover_under(&fixture.0, false).unwrap();
         assert_eq!(candidates.len(), 2);
         assert!(candidates.iter().any(|item| {
             item.kind == CandidateKind::BuildCache && item.path == repository.join("target")
@@ -817,6 +1043,74 @@ mod tests {
         assert!(candidates.iter().any(|item| {
             item.kind == CandidateKind::Trash && item.path == repository.join(".codex-trash/old")
         }));
+    }
+
+    #[test]
+    fn codex_targets_and_legacy_trash_are_discovered_without_cargo_manifest() {
+        let fixture = TestDirectory::new("codex-discovery");
+        for relative in [
+            "repo/task-example/target",
+            "repo/.artifact-backups/old",
+            ".codex-trash-legacy/old",
+            ".podman-example/vfs/dir",
+            "repo/.artifacts/task-example",
+        ] {
+            fs::create_dir_all(fixture.0.join(relative)).unwrap();
+        }
+        let candidates = discover_under(&fixture.0, true).unwrap();
+        assert_eq!(candidates.len(), 3);
+        let target = candidates
+            .iter()
+            .find(|c| c.kind == CandidateKind::CodexBuildCache)
+            .unwrap();
+        assert!(target.path.ends_with("repo/task-example/target"));
+        assert_eq!(
+            disposition(target, &BTreeSet::new(), SystemTime::now(), 3, 1),
+            Disposition::SkipRecent
+        );
+        assert_eq!(
+            disposition(target, &BTreeSet::new(), SystemTime::now() + DAY * 2, 3, 1),
+            Disposition::AutoDelete
+        );
+        remove_candidate(target).unwrap();
+        assert!(!target.path.exists());
+        assert!(fixture.0.join("repo/.artifacts/task-example").exists());
+        assert!(fixture.0.join(".podman-example").exists());
+    }
+
+    #[test]
+    fn a_worktree_named_target_is_not_a_cache() {
+        let fixture = TestDirectory::new("target-is-source");
+        fs::create_dir_all(fixture.0.join("target/.git")).unwrap();
+        fs::write(fixture.0.join("target/source"), "preserve").unwrap();
+        assert!(discover_under(&fixture.0, true).unwrap().is_empty());
+        assert!(fixture.0.join("target/source").exists());
+    }
+
+    #[test]
+    fn tracked_or_unignored_cache_is_never_a_candidate() {
+        let fixture = TestDirectory::new("tracked-target");
+        let repo = fixture.0.join("repository");
+        fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("/usr/bin/git")
+                    .current_dir(&repo)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "--quiet"]);
+        fs::create_dir(repo.join("target")).unwrap();
+        fs::write(repo.join("target/source.txt"), "preserve").unwrap();
+        assert!(discover_under(&fixture.0, true).unwrap().is_empty());
+        fs::write(repo.join(".gitignore"), "/target/\n").unwrap();
+        assert_eq!(discover_under(&fixture.0, true).unwrap().len(), 1);
+        git(&["add", "-f", "--", "target/source.txt"]);
+        assert!(discover_under(&fixture.0, true).unwrap().is_empty());
     }
 
     #[test]

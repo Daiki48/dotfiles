@@ -24,7 +24,7 @@ high/criticalで、実装を担当していない`reviewer` (`gpt-5.6-luna`, xhi
 
 criticalで、標準reviewとは別に確認すべき高リスク境界が実際に存在する場合だけ、1つの専門reviewerへ割り当てる。authなら認証・認可、不可逆migrationならデータ損失・rollback、production deliveryなら誤配信防止のように、変更固有の観点だけを確認する。highでは標準reviewへ高リスク境界を含め、別reviewerを増やさない。一般的な反論役、肯定役、複数の専門reviewerは追加しない。
 
-Sol highが固定した証拠集合とreview結果を再判定し、重複、誤検知、根拠不足を除外してdelivery準備可否を決める。重大なセキュリティ・互換性・データ移行、同じ問題の修正後再発、2回続けて証拠上の進展がない状態、同じ入力・外部stateでの失敗反復、またはreview結論の衝突ではroot causeと検証手段を見直す。見直し後も同じ問題または失敗が続く場合はblockedとし、独立した別原因の指摘は呼び出し元へ返せるがtask全体とdeliveryは全actionable解消までblockedとする。Luna maxは、xhighで不足する具体的な根拠がある場合だけ使う。risk分類とdecision requirement（autonomous / human-required / blocked）を別々に判定し、receiptの記録は呼び出し元の`codex-delivery`へ返す。
+main agentが固定した証拠集合とreview結果を再判定し、重複、誤検知、根拠不足を除外してdelivery準備可否を決める。重大なセキュリティ・互換性・データ移行、同じ問題の修正後再発、2回続けて証拠上の進展がない状態、同じ入力・外部stateでの失敗反復、またはreview結論の衝突ではroot causeと検証手段を見直す。見直し後も同じ問題または失敗が続く場合はblockedとし、独立した別原因の指摘は呼び出し元へ返せるがtask全体とdeliveryは全actionable解消までblockedとする。Luna maxは、xhighで不足する具体的な根拠がある場合だけ使う。risk分類とdecision requirement（autonomous / human-required / blocked）を別々に判定し、receiptの記録は呼び出し元の`codex-delivery`へ返す。
 
 subagentを利用できない場合はmain agentが同じ証拠集合で独立passを行い、criticalで別境界がある場合だけ変更固有の専門passを追加する。その制約を結果へ明記する。
 
@@ -40,7 +40,7 @@ subagentを利用できない場合はmain agentが同じ証拠集合で独立pa
 ## 判定を返す
 
 - Plan IDと版、base、branch、HEAD、commit列
-- 独立reviewerの確認範囲と判定、criticalで実施した場合だけ専門reviewerの確認範囲と判定、およびSolの最終判断
+- 独立reviewerの確認範囲と判定、criticalで実施した場合だけ専門reviewerの確認範囲と判定、およびmain agentの最終判断
 - repository、PR、base/head ref、固定head SHA、required CI状態、actionable件数、未解決thread件数
 - 実行した自動検証と結果
 - 確定した指摘を重大度順に整理した一覧、根拠、状態

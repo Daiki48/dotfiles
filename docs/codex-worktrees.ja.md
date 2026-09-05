@@ -122,7 +122,7 @@ codex-worktree doctor --task-id issue-22
 - `branch-mismatch`: manifestのbranchと現在のbranchが異なる
 - `invalid` / `failed`: manifestまたは作成処理に問題がある
 
-`doctor` は全対象が `ready` の場合に成功し、それ以外の状態があれば異常終了します。
+`doctor` は全対象が `ready` または `completed` の場合に成功し、それ以外の状態があれば異常終了します。
 診断は変更を自動修復せず、dirtyな変更、未commit、未pushをclean/reset/削除しません。
 
 ### 再開
@@ -157,12 +157,40 @@ codex-worktree resume --task-id issue-22
 
 ## 状態とライフサイクル
 
+### 検証成果物の作成と回収
+
+build・VM・containerの使い捨て成果物は、親checkoutから次のcommandで作成する領域へ集約します。
+
+```sh
+codex-worktree artifacts --task-id task-example
+# 返されたpathをCARGO_TARGET_DIR、VM出力先、Podmanのroot/runrootなどへ指定する
+codex-worktree clean-artifacts --task-id task-example
+```
+
+領域は`<repo-key>/.artifacts/<task-id>`、所有記録は`.state/<task-id>.artifacts.json`です。
+同一taskの再取得は冪等です。未登録directoryの採用、symlink、所有者・inodeの不一致を拒否します。
+markerは編集しないでください。source、納品物、唯一の証拠、本番データは置けません。
+
+検証process・VMを停止し、containerをnative commandで終了・unmountしてから回収します。
+成果物領域は0700で、同一UIDの検証process専用です。helperはsudoなしのlsofで同一UIDの
+open pathとmountを確認し、使用中・確認不能なら保持します。rootや他UIDの常駐serviceに
+この領域を渡さないでください。containerの別namespaceのmountはnative lifecycleで解消します。
+Podmanはtask専用root/runrootと`--rm`を使い、通常のhostのcontainer領域を混在させないでください。
+`finish`はworktreeの終了条件を証明した後、登録済み成果物も削除します。PRなし作業は
+報告前に`clean-artifacts`を呼び、未commit変更を含むworktree本体を保持します。
+登録済みの使い捨て成果物はtrashへ移し替えず破棄します。異常や削除失敗では保持して再開します。
+
+セッション終了hookや常駐daemonによる削除ではなく、上記commandをAGENTS/execute-planの
+完了手順に組み込む運用です。進行中のsourceを年齢だけで消す処理はありません。
+一覧とdoctorは、delivery記録が一致しworktree・登録済み成果物がなくなったtaskを
+`completed`（正常終了）と表示します。単にpathがないだけのtaskは引き続き`missing`です。
+
 作成処理はおおむね `creating` → `ready` の順でmanifestを更新します。作成中に失敗した
 場合は`failed`と詳細を記録します。強制終了で`creating`が残った場合は、上記の`recover`
 だけが検証済み状態へ進めます。helperは同じrepository管理rootのlifecycle lockを取得して、
 同じtask ID、path、branchの競合を防ぎます。
 
-PRが未mergeの間はworktreeを自動削除しません。`codex-worktree`は作成・診断・再開だけを
+PRが未mergeの間はworktreeを自動削除しません。`codex-worktree`は作成・診断・再開と登録済み成果物の管理を
 担当し、Ready化、merge、main同期、finishのcleanupは専用`codex-delivery`へ委ねます。
 `gh pr merge`や`git worktree remove/prune`などの直接delivery・cleanupは禁止です。
 未commit・未push・dirtyな変更を破壊する操作も実装しません。失敗、timeout、pending、dirty、
@@ -222,13 +250,14 @@ human approvalやrisk引き上げを要求せず、workflowが存在するbase/h
 
 ## 安全境界
 
-- 作成・診断・再開・recoverのworktree lifecycle書き込みは `codex-worktree` に限定します。
+- 作成・診断・再開・recover・登録済み成果物の管理は `codex-worktree` に限定します。
   merge後のmanaged cleanupだけは`codex-delivery finish`が厳格な証明後に実行します。`git worktree
   add/remove/prune`などを直接実行して状態を合わせようとしないでください。
 - managed cleanupは既知の再生成可能なignored directoryをworktreeとともに破棄できます。
   `.codex-trash`、未知のignored artifact、tracked/untrackedの変更があるworktreeは保持して停止します。
-- active、未merge、dirty、判定不能なworktreeには容量・件数・経過日数によるcleanupや作業制限を
-  適用しません。cleanup判定は、merge後の`codex-delivery finish`で終了条件を証明した対象だけに限定します。
+- worktree本体やソースは容量・件数・経過日数を理由に削除しません。本体のcleanupは、
+  merge後の`codex-delivery finish`で終了条件を証明した対象だけに限定します。
+  再生成可能なキャッシュは、`clean-disk`が使用中・追跡状態・保持期間を確認して別途回収します。
 - 親checkoutのbranch切り替え、index、working treeを変更しないことを作成前後に検証します。
 - `origin` のfetch/push先とrepository identityを検証し、最新default branchのOIDを確認して
   からbranchを作成します。
@@ -240,8 +269,8 @@ human approvalやrisk引き上げを要求せず、workflowが存在するbase/h
 
 ## 対象外
 
-Issue #22では、worktree間のbuild output、port、test database、cache、その他のruntime
-resource分離は扱いません。task間でこれらを分離する仕組みは別途設計・実装が必要です。
+build outputなどの使い捨てファイルはtask別の登録済み成果物領域へ分離します。
+portやtest databaseなど、ファイル配置だけでは分離できないruntime resourceの管理は対象外です。
 release、protected branchへのpush、任意のworktreeやbranchの削除は、この運用の自動処理には
 含めません。mergeとmanaged cleanupは`codex-delivery`のlive gateを通った場合だけ行います。
 

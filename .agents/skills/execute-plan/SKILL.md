@@ -19,7 +19,7 @@ description: 内部計画が必要な複数経路・high/criticalの実装、ま
 実装単位を次の基準で分類し、分類結果をreview receiptと完了報告へ記録する。
 
 - **low/medium**: 通常の実装・修正で、delivery安全境界や高リスクデータ・権限に影響しないもの。
-  Solのself-reviewと変更に近い自動検証を既定とし、独立reviewは必須にしない。PR deliveryがscopeにある場合だけReady、merge、main同期、managed cleanupまで進める。
+  main agentのself-reviewと変更に近い自動検証を既定とし、独立reviewは必須にしない。PR deliveryがscopeにある場合だけReady、merge、main同期、managed cleanupまで進める。
 - **high/critical**: CI/workflow、Ruleset、hook、rules、AGENTS、Skills、helper、installerなどの
   delivery安全境界、auth/secrets、billing、production、不可逆migration、breaking changeを含むもの。
   security、互換性、データ損失の重大な懸念も含む。riskはreview深度と残存影響を決めるが、
@@ -54,9 +54,16 @@ highとして十分な独立reviewを行うが、decision assessmentは別に判
 
 ## 実装単位を連続処理する
 
+build・検証の前に親checkoutで`codex-worktree artifacts --task-id <task-id>`を実行し、
+返されたpathを使い捨て成果物の出力先にする。Cargoは`CARGO_TARGET_DIR=<path>/target`、
+VM・RPMは出力先、Podmanは`--root <path>/containers --runroot <path>/runroot`を明示する。
+検証containerは`--rm`等で終了時にnative cleanupする。worktrees直下への未登録成果物生成や、
+成果物を別の兄弟directoryへ移してfinishだけ成功させる運用は行わない。
+source、未commit変更、納品物、唯一の証拠、本番データは成果物領域へ置かない。
+
 依存順に各実装単位を処理する。
 
-rootがSol highならroot自身がlead兼single writerとなり、監督のためだけのSolを追加起動しない。rootがSol highでない場合だけ、最初にSol highをleadとして起動する。leadは固定した最小証拠集合からgo/no-go、仕様解釈、test可能な受け入れ条件、最小実装単位を決める。独立した事前調査は状態変更を禁止した`explorer`、最終監査は状態変更を禁止した`reviewer`（いずれも`gpt-5.6-luna`, xhigh）へ委譲できる。subagentのruntime permissionは親から継承されるため、role-local sandboxを安全境界とみなさない。実装と統合は原則としてrootのSolが行う。writeを委譲する例外は、対象file、変更内容、不変条件、test、停止条件を一意に指定できる機械的な非重複作業だけとし、要件解釈や設計判断が必要になった時点で停止させる。Luna maxは、xhighで不足する具体的な根拠があり、Sol leadが品質向上を見込む場合だけ使う。同じファイルを複数agentへ同時に編集させない。
+main agentがlead兼single writerとして要件解釈、実装、統合、最終受入を担う。デフォルトは設定されたモデルとreasoning effortに従い、モデル名を理由に別のleadを起動しない。独立した調査は状態変更を禁止した`explorer`、最終監査は`reviewer`（`gpt-5.6-luna`, xhigh）へ委譲できる。writeの委譲は対象file、変更内容、不変条件、test、停止条件が一意な機械的非重複作業だけに限定する。同じfileを複数agentで編集しない。
 
 1. 単位の目的、対象、観測可能な受け入れ条件、追加・更新する回帰test、依存する完了単位を確認する。
 2. 周辺実装とテストを読んでから、依頼スコープの最小変更を行う。無関係な整形や後続単位を混ぜない。
@@ -73,7 +80,7 @@ rootがSol highならroot自身がlead兼single writerとなり、監督のた�
 
 実装、test、CI、reviewの反復では、依頼の目的と受け入れ条件に必要な問題だけを扱う。指摘はfile・経路、期待結果、
 実際の結果、修正後の確認方法を示せる場合だけactionableとし、将来改善、好み、根拠のない懸念、依頼と無関係な
-リファクタリングを追加しない。Solが指摘を反証したうえで、同じ原因のものを1つの修正batchへまとめる。
+リファクタリングを追加しない。main agentが指摘を反証したうえで、同じ原因のものを1つの修正batchへまとめる。
 
 変更挙動をtestで観測できる場合は回帰testを追加し、難しい場合は代替の検証方法とtestで保証できない事項を
 完了報告へ残す。修正後は影響する検証とrisk上必要なreviewだけを新しいheadで再実施し、以前のSHAの証拠を
@@ -94,13 +101,17 @@ test、固定SHA review、CI、deliveryに必要な終了予算を優先する�
 
 ## 完了境界とDraft PR前の統合確認を行う
 
-全単位完了後、rootのSol highが固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項を統合確認する。low/mediumはこのself-reviewを既定のreview完了条件とする。highはDraft PR後の固定SHAに対して独立reviewを1件、criticalは実際に別の高リスク境界がある場合だけ専門reviewを1件追加する。
+全単位完了後、rootのmain agentが固定差分、影響する経路、受け入れ条件、高リスク境界、testで保証できない事項を統合確認する。low/mediumはこのself-reviewを既定のreview完了条件とする。highはDraft PR後の固定SHAに対して独立reviewを1件、criticalは実際に別の高リスク境界がある場合だけ専門reviewを1件追加する。
 
 依頼スコープ内の欠陥はまとめて修正、検証、追加commitする。重大な問題や必須条件が残る間はpushしない。
 
 ## scopeに含まれる場合だけpush前監査とDraft PRを作成する
 
 Daikiの依頼、内部計画、repository運用のいずれにもPR deliveryが含まれない場合は、この節以降へ進まず、専用worktree上の変更、検証結果、未実施事項を最終報告する。commitも依頼または安全なcheckpointとして必要な場合だけ行う。
+
+この場合も、検証process・VM・containerを終了してunmountし、親checkoutで
+`codex-worktree clean-artifacts --task-id <task-id>`を実行してから報告する。
+sourceのあるworktree本体は保持する。掃除が失敗した場合は成果物を保持して理由を報告する。
 
 1. 専用worktreeがclean、current branch、task manifest、remoteが計画どおりで、全実装単位とreview修正がcommit済みであることを確認する。人間用checkoutの事前snapshotも不変であることを再確認する。
 2. baseからHEADまでのcommit列、全差分、テスト、secret検査、AI帰属の不在、不要ファイルの不在を再確認する。
@@ -118,10 +129,10 @@ criticalで別の高リスク境界を専門reviewした場合は`--specialist-r
  `record-review`または`approve-review`、`deliver`、`finish`の各commandへ`--gate-mode github-free-private`も指定し、
  strict modeでは省略する。
 
-1. PRのbase、head、head SHAを固定する。low/mediumはSolのself-review結果を使い、独立reviewerを起動しない。high/criticalは`review-branch`を読み取り専用で1回実行し、固定SHAの差分、実装計画、test結果、既存仕様を確認する。criticalで実際に別の高リスク境界がある場合だけ専門reviewerを1つ追加する。反論役、肯定役、変更と無関係な専門観点は追加しない。
+1. PRのbase、head、head SHAを固定する。low/mediumはmain agentのself-review結果を使い、独立reviewerを起動しない。high/criticalは`review-branch`を読み取り専用で1回実行し、固定SHAの差分、実装計画、test結果、既存仕様を確認する。criticalで実際に別の高リスク境界がある場合だけ専門reviewerを1つ追加する。反論役、肯定役、変更と無関係な専門観点は追加しない。
 2. decisionが`autonomous`ならriskに関係なく、review結果とSHA、CI結果、risk分類を
    `codex-delivery record-review`でreceiptに記録する。
-   actionableな指摘があればSolがコード、test、履歴、一次情報で再現し、誤検知と根拠不足を除外する。
+   actionableな指摘があればmain agentがコード、test、履歴、一次情報で再現し、誤検知と根拠不足を除外する。
    確定指摘を前述の収束規則に従ってroot cause単位の1batchで修正、検証、commit、pushし、
    新しいhead SHAで手順1へ戻る。以前のreceipt、review、CIを新SHAの完了根拠として再利用しない。
    同じ問題の再発または証拠上のstallだけを診断と停止条件の対象にする。
@@ -139,6 +150,8 @@ criticalで別の高リスク境界を専門reviewした場合は`--specialist-r
    branch、PR、merged状態、head到達性、ignored artifactを含むclean、未pushなしを厳格に証明できた場合だけmanaged cleanupを行う。
    remote task branch削除だけはreview済みSHAをexpected leaseに固定し、競合更新時は停止する。内容を上書きする
    force push、`rm`、`prune`、`branch -D`は行わない。
+   finish前に検証process・VM・containerを終了してunmountする。finishは同taskの登録済み成果物を
+   worktreeとともに回収し、別task・未登録・所有情報が不一致の成果物には触れない。
 7. `finish`が変更対象の`.codex/`または`.agents/`に対するpermission拒否を識別し、再試行tokenを発行した場合だけ、同じtask・PR・head・planを指定した`codex-delivery finish --sandbox-retry`を同一UIDのsandbox外権限で実行する。helperが最初の外部確認前にtokenを消費するため再試行は1回に限られる。通常のfilesystem権限もこの実行では変わらないため、token不在や再失敗では権限昇格せず、直接`git merge`やcleanupへ迂回しない。
 
 失敗、timeout、pending、dirty、stale、conflict、network障害、判定不能ではdeliver/finishを中断し、PR、branch、
