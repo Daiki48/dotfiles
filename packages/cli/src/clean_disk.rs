@@ -204,6 +204,7 @@ fn sorted_entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
 }
 
 fn scan_path(path: &Path) -> Result<TreeSnapshot> {
+    reject_mounted_tree(path)?;
     let root = fs::symlink_metadata(path)
         .with_context(|| format!("cannot inspect cleanup candidate {}", path.display()))?;
     #[cfg(unix)]
@@ -278,27 +279,37 @@ fn scan_path(path: &Path) -> Result<TreeSnapshot> {
 
 pub(crate) fn validate_artifact_tree(path: &Path) -> Result<()> {
     validate_scan_root(path)?;
+    scan_path(path)?;
+    Ok(())
+}
+
+fn reject_mounted_tree(path: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         // bind mountは同じdeviceにも作れるため、st_devだけでは検出できない。
         let mounts = fs::read_to_string("/proc/self/mountinfo")
-            .context("成果物のmount状態を確認できません")?;
-        for line in mounts.lines() {
-            let encoded = line
-                .split_whitespace()
-                .nth(4)
-                .context("invalid mountinfo")?;
-            let mount = encoded
-                .replace("\\040", " ")
-                .replace("\\011", "\t")
-                .replace("\\012", "\n")
-                .replace("\\134", "\\");
-            if Path::new(&mount).starts_with(path) {
-                anyhow::bail!("成果物にmountが残っています: {}", path.display());
-            }
+            .context("cleanup候補のmount状態を確認できません")?;
+        validate_mountinfo(path, &mounts)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_mountinfo(path: &Path, mounts: &str) -> Result<()> {
+    for line in mounts.lines() {
+        let encoded = line
+            .split_whitespace()
+            .nth(4)
+            .context("invalid mountinfo")?;
+        let mount = encoded
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\");
+        if Path::new(&mount).starts_with(path) {
+            anyhow::bail!("cleanup候補にmountが残っています: {}", path.display());
         }
     }
-    scan_path(path)?;
     Ok(())
 }
 
@@ -345,16 +356,23 @@ pub(crate) fn ensure_artifact_idle(path: &Path) -> Result<()> {
     anyhow::bail!("task成果物のprocess検証はこのOSで未対応です")
 }
 
-fn nearest_repository_root(start: &Path, boundary: &Path) -> Option<PathBuf> {
+fn nearest_repository_root(start: &Path, ignored_root: Option<&Path>) -> Result<Option<PathBuf>> {
     let mut current = start;
     loop {
-        if current != boundary && current.join(".git").exists() {
-            return Some(current.to_path_buf());
+        if Some(current) != ignored_root {
+            match fs::symlink_metadata(current.join(".git")) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    anyhow::bail!("repositoryの.gitがsymlinkです: {}", current.display());
+                }
+                Ok(_) => return Ok(Some(current.to_path_buf())),
+                Err(cause) if cause.kind() == io::ErrorKind::NotFound => {}
+                Err(cause) => return Err(cause.into()),
+            }
         }
-        if current == boundary {
-            return None;
-        }
-        current = current.parent()?;
+        let Some(parent) = current.parent() else {
+            return Ok(None);
+        };
+        current = parent;
     }
 }
 
@@ -437,8 +455,14 @@ fn discover_under(root: &Path, codex: bool) -> Result<Vec<Candidate>> {
                     && (matches!(name.to_str(), Some(".preserved" | ".artifact-backups"))
                         || name.to_string_lossy().starts_with(".codex-trash-")))
             {
-                let active_scope =
-                    nearest_repository_root(&directory, root).unwrap_or_else(|| path.clone());
+                let active_scope = match nearest_repository_root(&directory, codex.then_some(root))
+                {
+                    Ok(repository) => repository.unwrap_or_else(|| path.clone()),
+                    Err(cause) => {
+                        println!("RetainUnverifiable\t{}\t{cause}", path.display());
+                        continue;
+                    }
+                };
                 for child in sorted_entries(&path)? {
                     let child_path = child.path();
                     let snapshot = match scan_path(&child_path) {
@@ -458,7 +482,13 @@ fn discover_under(root: &Path, codex: bool) -> Result<Vec<Candidate>> {
                 continue;
             }
             if name == "target" && (codex || directory.join("Cargo.toml").is_file()) {
-                let repository = nearest_repository_root(&directory, root);
+                let repository = match nearest_repository_root(&directory, codex.then_some(root)) {
+                    Ok(repository) => repository,
+                    Err(cause) => {
+                        println!("RetainUnverifiable\t{}\t{cause}", path.display());
+                        continue;
+                    }
+                };
                 if let Some(repository) = &repository {
                     match cache_is_ignored(repository, &path) {
                         Ok(true) => {}
@@ -653,10 +683,16 @@ fn remove_candidate(candidate: &Candidate) -> Result<()> {
     if matches!(
         candidate.kind,
         CandidateKind::BuildCache | CandidateKind::CodexBuildCache
-    ) && candidate.active_scope.join(".git").exists()
-        && !cache_is_ignored(&candidate.active_scope, &candidate.path)?
-    {
-        anyhow::bail!("cacheが追跡対象またはignore対象外になりました");
+    ) {
+        let parent = candidate
+            .path
+            .parent()
+            .context("cacheの親pathがありません")?;
+        if let Some(repository) = nearest_repository_root(parent, codex_worktree_root().as_deref())?
+            && !cache_is_ignored(&repository, &candidate.path)?
+        {
+            anyhow::bail!("cacheが追跡対象またはignore対象外になりました");
+        }
     }
     let current = scan_path(&candidate.path)?;
     if matches!(
@@ -1088,6 +1124,58 @@ mod tests {
     }
 
     #[test]
+    fn repository_at_or_above_scan_root_protects_source() {
+        let fixture = TestDirectory::new("ancestor-repository");
+        assert!(
+            Command::new("/usr/bin/git")
+                .args(["init", "--quiet"])
+                .arg(&fixture.0)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for directory in [&fixture.0, &fixture.0.join("src")] {
+            fs::create_dir_all(directory.join("target")).unwrap();
+            fs::write(directory.join("Cargo.toml"), "[package]").unwrap();
+            fs::write(directory.join("target/source"), "preserve").unwrap();
+        }
+        assert!(discover_under(&fixture.0, false).unwrap().is_empty());
+        assert!(
+            discover_under(&fixture.0.join("src"), false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(fixture.0.join("src/target/source").exists());
+    }
+
+    #[test]
+    fn dangling_git_symlink_keeps_cache_out_of_candidates() {
+        use std::os::unix::fs::symlink;
+        let fixture = TestDirectory::new("dangling-git");
+        fs::create_dir_all(fixture.0.join("repo/target")).unwrap();
+        symlink("/nonexistent-clean-disk-git", fixture.0.join("repo/.git")).unwrap();
+        assert!(discover_under(&fixture.0, true).unwrap().is_empty());
+        assert!(fixture.0.join("repo/target").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_rejects_candidate_and_descendant_mounts_even_on_same_device() {
+        let path = Path::new("/tmp/cache with space");
+        for mount in [
+            "/tmp/cache\\040with\\040space",
+            "/tmp/cache\\040with\\040space/bind",
+        ] {
+            let mounts = format!("20 1 0:1 / {mount} rw - btrfs /dev/test rw");
+            assert!(validate_mountinfo(path, &mounts).is_err());
+        }
+        assert!(
+            validate_mountinfo(path, "20 1 0:1 / /tmp/cache-other rw - btrfs /dev/test rw").is_ok()
+        );
+        assert!(scan_path(Path::new("/proc")).is_err());
+    }
+
+    #[test]
     fn tracked_or_unignored_cache_is_never_a_candidate() {
         let fixture = TestDirectory::new("tracked-target");
         let repo = fixture.0.join("repository");
@@ -1108,8 +1196,10 @@ mod tests {
         fs::write(repo.join("target/source.txt"), "preserve").unwrap();
         assert!(discover_under(&fixture.0, true).unwrap().is_empty());
         fs::write(repo.join(".gitignore"), "/target/\n").unwrap();
-        assert_eq!(discover_under(&fixture.0, true).unwrap().len(), 1);
+        let candidates = discover_under(&fixture.0, true).unwrap();
+        assert_eq!(candidates.len(), 1);
         git(&["add", "-f", "--", "target/source.txt"]);
+        assert!(remove_candidate(&candidates[0]).is_err());
         assert!(discover_under(&fixture.0, true).unwrap().is_empty());
     }
 
