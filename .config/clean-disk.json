@@ -6,5 +6,6 @@
   ],
   "trash_retention_days": 3,
   "build_cache_retention_days": 30,
+  "codex_build_cache_retention_days": 1,
   "runner_manifest_dir": null
 }

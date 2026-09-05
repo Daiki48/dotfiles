@@ -3782,6 +3782,13 @@ fn finish_locked(
     )?;
     let _lock = task_lock(&repository, task)?;
     let initial_stage = str_value(&state, "stage")?;
+    let artifact_common = PathBuf::from(str_value(&manifest_value, "common_git_dir")?);
+    // 未登録/置換済みの成果物は、worktreeを消す前に検出する。
+    let artifact_path = super::artifacts::validate(&worktree_path, task, &artifact_common)
+        .map_err(|cause| error(cause.to_string()))?;
+    if let Some(path) = &artifact_path {
+        crate::clean_disk::ensure_artifact_idle(path).map_err(|cause| error(cause.to_string()))?;
+    }
     let initial_error = str_value(&state, "last_error")?;
     validate_main_sync_retry(&initial_stage, &initial_error, sandbox_retry)?;
     state = consume_main_sync_retry(&repository, task, &state, sandbox_retry)?;
@@ -3837,6 +3844,7 @@ fn finish_locked(
         if remote_branch(root, &repository, &str_value(&manifest_value, "branch")?)?.is_some()
             || worktree_path.exists()
             || worktree_path.is_symlink()
+            || artifact_path.is_some()
         {
             return Err(error("completed stateのcleanup対象が再出現しました"));
         }
@@ -4034,6 +4042,9 @@ fn finish_locked(
         state = save_stage(&repository, task, &state, "worktree_removed", "")?;
     }
     if str_value(&state, "stage")? == "worktree_removed" {
+        // markerは成功後に消すため、途中失敗後も同じstageから再開できる。
+        super::artifacts::cleanup(&worktree_path, task, &artifact_common)
+            .map_err(|cause| error(cause.to_string()))?;
         let branch = str_value(&manifest_value, "branch")?;
         if remote_branch(root, &repository, &branch)?.is_some() {
             return Err(error("remote task branchがcleanup中に再出現しました"));

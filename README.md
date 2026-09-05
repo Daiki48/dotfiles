@@ -139,7 +139,7 @@ conclusion. This mode is never a fallback for a failed, pending, or unavailable 
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, Draft PRs, and the delivery
 loop are used when the task or an explicit request warrants them. 小さく局所的なlow/medium変更は
-local検証とSolのself-reviewで完了し、commit、push、PR、独立reviewへ自動的に広げません。highは
+local検証とmain agentのself-reviewで完了し、commit、push、PR、独立reviewへ自動的に広げません。highは
 固定head SHAの独立reviewを1つ、criticalは別の高リスク境界が実在する場合だけ専門reviewを1つ追加します。
 actionable=0、未解決thread=0、GitHubが成功として扱う固定head check、またはworkflow不在時のlocal検証を満たし、
 仕様・既存権限・rollback・検証を
@@ -156,7 +156,7 @@ server-side強制がないためriskをhigh/criticalへ引き上げますが、d
 `~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
 `~/.agents/skills`, and `~/.codex/agents` are symlinked from this repository.
 The custom agents use Luna xhigh for non-writing exploration and scoped independent review,
-while the root Sol high agent owns requirements, implementation, integration, and acceptance.
+while the main agent owns requirements, implementation, integration, and acceptance.
 Subagents inherit the parent runtime permissions, so role-local sandbox settings are not treated
 as a security boundary. The single-writer contract and explicit no-mutation instructions are the
 operational controls against delegated writes, not hard sandbox enforcement. Automated tests,

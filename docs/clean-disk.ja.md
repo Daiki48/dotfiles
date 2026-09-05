@@ -9,8 +9,15 @@ worktree rootを1回だけ走査します。daemon、常駐監視、controller�
   processがなければ`y/N`で確認します。退避データは自動削除しません。
 - `Cargo.toml`直下の`target`は、tree全体の最新mtimeから30日経過し、repositoryを使用中のprocessが
   なければ自動削除します。削除後の初回buildでは再コンパイルが発生します。
+- Codex root内では外部出力先の`target`も探索し、既定1日で自動削除候補にします。
+  `codex_build_cache_retention_days`で変更できます。Git repository内ではignoredかつtracked fileを
+  含まないことを探索時・削除直前の双方で確認し、sourceやworktree本体は削除しません。
+- Codex root内の旧`.preserved`、`.artifact-backups`、`.codex-trash-*`の直下entryは
+  trashと同じ保持期間・確認付きの候補になります。退避データの自動削除はしません。
 - open中のpath、最近更新されたpath、走査上限超過、filesystem境界、特殊file、検証中に内容が変わった
   pathは削除しません。active判定は`y`でも上書きできません。
+- 候補内の特殊fileやGit状態の取得失敗は`RetainUnverifiable`としてその候補を保持し、
+  他の候補の探索は続けます。root全体を走査できない場合は停止します。
 - symlinkは辿りません。削除直前にdevice、inode、entry数、割当byte、最新mtimeを再検証します。
 - 削除候補がある場合、open pathの確認は非root実行でも`sudo lsof`を使用します。認証できない場合や、走査対象と
   重なるfilesystemを`lsof`が確認できない場合はfail closedで停止し、削除しません。
@@ -24,9 +31,17 @@ cargo run -- clean-disk --dry-run
 cargo run -- clean-disk
 ```
 
-非対話環境では`y/N`対象を適用しません。`--dry-run`は自動削除も含め、候補表示だけを行います。
-Codex managed worktreeは本体もbuild cacheも走査せず、trashだけを確認候補にします。worktreeの終了時削除は
-`codex-delivery finish`、ChatGPT desktop appが所有するworktreeのsnapshotと削除はCodex自身に任せます。
+非対話環境では`y/N`対象を適用しません。`--dry-run`はsudoや削除を実行せず、利用状況未確認の
+inventoryだけを表示します。表示されたAutoDelete/Confirmは削除許可ではなく、実際の適用時に
+全processのopen pathを確認します。sudoが使えない場合の適用は従来どおり停止します。
+
+worktree本体の終了時削除は`codex-delivery finish`、task登録済みの`.artifacts/<task-id>`は
+`finish`または`codex-worktree clean-artifacts`が担当します。Podman storageは再帰探索せず
+native cleanupが必要と表示します。未登録の任意directoryを名前だけで自動削除しません。
+ChatGPT desktop app所有のworktreeのsnapshotと削除はアプリに任せます。
+
+表示するbyte数は割当blockの合計です。Btrfsの共有extentなどにより、実際の空き容量増分とは
+一致しない場合があります。掃除後は`df -h`で確認してください。
 
 ## Self-hosted runner adapter
 

@@ -80,7 +80,7 @@ Draft PRを作成したら、receiptとmanaged manifestを合わせて次の対�
 - review対象のhead SHAとbase SHA
 - task ID、worktree path、risk分類
 - remote gate mode
-- riskに応じたreview（low/mediumはSolのself-review、highは独立review、criticalは必要時の専門review）、testの完了判定、actionable件数
+- riskに応じたreview（low/mediumはmain agentのself-review、highは独立review、criticalは必要時の専門review）、testの完了判定、actionable件数
 
 receiptは対象SHAに束縛します。review後にcommitをpushしてhead SHAが変わった場合、以前の
 receipt、CI、review、確認を新SHAへ引き継ぎません。新しいSHAでCIとrisk上必要なreviewを実行し、
@@ -109,11 +109,11 @@ remote CIではGitHubがrequired checkの成功状態として扱う`success`、
 通常の実装・修正で、delivery安全境界や高リスクデータ・権限に影響しないタスクをlow/mediumと
 します。CI/workflow、hook、rules、AGENTS、Skills、helper、installer、auth/secrets、production、
 不可逆migration、breaking change、重大なsecurity・互換性・データ損失影響はhigh/criticalです。
-riskはreview深度と残存影響を決めますが、人間確認を自動決定しません。low/mediumはSolのself-review、
+riskはreview深度と残存影響を決めますが、人間確認を自動決定しません。low/mediumはmain agentのself-review、
 highは独立reviewを1つ実行し、criticalは別の高リスク境界が実在する場合だけ専門reviewを1つ追加します。
 一般的な反論役や肯定役は使いません。actionableな指摘は今回修正すべき具体的な欠陥に限り、fileまたは実行経路、期待結果と実際の結果、再現・確認方法、修正後の観測条件を明らかにします。将来改善、好み、具体的な影響根拠のない懸念は含めません。
 
-共通root causeの指摘は1つのbatchで修正し、可能なら回帰testを追加します。修正でSHAが変わった場合は新SHAでreview、CI、receiptをやり直します。同じ問題が修正後も再発するか、2回続けて受け入れ条件・test・既知指摘に証拠上の進展がない場合は、Solがroot cause、実装境界、検証手段を再確認します。その後も同じ問題が続く場合だけblockedとし、無変更retryを続けません。
+共通root causeの指摘は1つのbatchで修正し、可能なら回帰testを追加します。修正でSHAが変わった場合は新SHAでreview、CI、receiptをやり直します。同じ問題が修正後も再発するか、2回続けて受け入れ条件・test・既知指摘に証拠上の進展がない場合は、main agentがroot cause、実装境界、検証手段を再確認します。その後も同じ問題が続く場合だけblockedとし、無変更retryを続けません。
 
 PRやIssueへ内部監査用のschema JSON、fingerprint、digest chain、round logを投稿しません。PR bodyとcommentは、人間が読む変更概要、判断が必要な論点、検証結果、残存事項に限ります。作業範囲は依頼の目的、観測可能な受け入れ条件、変更対象経路、必須検証で区切り、その集合外の改善を自律loopへ追加しません。
 
