@@ -6,6 +6,32 @@ managed worktree cleanupまでを同じdeliveryとして扱います。
 
 ## 正本と経路
 
+### main同期が途中で止まった場合
+
+`finish`は、同期先blob・実行bitと一致する変更済みfileを検証してから同期前のHEADへ戻します。
+同期先で新規追加された未追跡fileも、HEADに不存在・通常file・同一UID・hardlinkなし・
+symlink parentなし・内容一致をすべて確認できる場合だけ、`.codex-trash/<日時>-main-sync/`へ
+退避してからff-only同期します。退避は削除せず、pathを標準エラーへ表示します。
+全候補を検証する前に元fileを変更せず、操作直前にもbranch・HEAD・status・inode・mode・blobを再確認します。
+未知の未追跡file、独自のlocal変更、staged変更、削除、rename、type変更は復旧しません。
+
+退避にはHEADの`.gitignore`への`.codex-trash/`登録と実効ignoreが必要です。
+Dockerfileまたは`.dockerignore`がある場合は、HEADの`.dockerignore`にも同じ登録が必要です。
+否定patternがあるDocker除外設定は自動判定せず停止します。
+
+通常の`--sandbox-retry`は従来どおり1回だけです。その再試行を使い切って停止したtaskは、
+Daikiが**今回の追加復旧を含む同一taskの完了処理**を明示承認した場合だけ、
+同じtask・PR・head・planの`approve-review`で承認を記録し、次を1回だけ実行できます。
+
+```text
+codex-delivery finish --task-id <task> --pr <pr> --head <head> --plan-id <plan-v1> --plan-version 1 --recover-main-sync --recover-main-sync-from <同期前mainの40桁SHA> --recover-main-sync-to <同期先origin/mainの40桁SHA>
+```
+
+追加復旧もcanonical helperの経路に限定します。stage=merged、sandbox再試行済み、
+human-approved receipt、現在HEAD=from、fetch後origin/main=to、既存のCI・review・到達性gateを要求します。
+外部検証前に追加復旧の消費を永続化し、失敗しても自動再試行しません。`--sandbox-retry`との併用、
+stateの手編集、直接のmain同期やcleanupによる迂回は禁止です。
+
 `codex-delivery` helperを、次の一連の唯一のreceipt・delivery・finish経路とします。
 
 ```text
@@ -219,15 +245,17 @@ mergeがGitHubで完了した後、`finish`は次を順に検証します。
 1. PRがmergedである。
 2. receiptのhead commitが`origin/main`の履歴へ到達している。
 3. 人間用checkoutがmainで、未commit・未追跡のないclean状態である。直前の`finish`が中断した場合だけ、後述の限定条件で中断状態を復旧する。
-4. fetch後に`git merge --ff-only origin/main`だけでlocal mainを更新できる。
+4. fetchで固定したSHAへの`git merge --ff-only <SHA>`だけでlocal mainを更新できる。
 5. local mainと`origin/main`が一致する。
 
 `merged` stageのmain同期が中断してworking treeの一部だけ更新された場合、helperは現在のmain HEADが
-取得済み`origin/main`のancestorであることを復旧前に確認します。そのうえでunstagedの通常fileだけを対象にし、
-各fileのbyteと実行bitが取得済み`origin/main`のblobと完全一致し、staged、未追跡、削除、rename、type変更、
-symlink parentがないことを証明できるときだけ、そのfileを元のHEADへ戻してff-onlyを再試行します。
-復旧対象を固定した後も各fileのrestore直前にcheckout branchが`main`であること、HEAD、残りstatus、inode、mode、blobを再検証し、
+取得済み`origin/main`のancestorであることを復旧前に確認します。対象はunstagedの通常fileと、
+元のHEADに存在しない未追跡の通常fileだけです。各fileのbyteと実行bitが取得済みtargetのblobと完全一致し、
+staged、削除、rename、type変更、symlink parentがないことを証明できる場合に限ります。
+unstaged fileは元のHEADへ戻し、検証済みの未追跡fileは前述の`.codex-trash/`へ退避して保持します。
+各fileの変更直前にcheckout branchが`main`であること、固定HEAD、固定origin/main、残りstatus、inode、mode、blobを再検証し、
 途中で1つでも変化した場合は未処理fileへ触れず停止します。
+merge直前にも固定HEADとorigin/mainを再確認し、可変の参照名ではなく固定SHAへff-onlyします。
 固有のlocal変更や判定不能なpathは上書きしません。
 
 この限定復旧条件に合わないdirty checkout、mainのdiverge、remote到達性が判定不能な場合はreset、rebase、

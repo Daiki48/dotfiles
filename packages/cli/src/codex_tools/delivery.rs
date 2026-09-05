@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::{process, trust};
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const MANIFEST_VERSION: i64 = 1;
 const LEGACY_LEDGER_RECEIPT_VERSION: i64 = 5;
@@ -35,6 +35,7 @@ const COMMAND_TIMEOUT: u64 = 45;
 const OPERATION_TIMEOUT: u64 = 300;
 const MAIN_SYNC_SANDBOX_RETRY_READY: &str = "main-sync-sandbox-retry-ready";
 const MAIN_SYNC_SANDBOX_RETRY_CONSUMED: &str = "main-sync-sandbox-retry-consumed";
+const MAIN_SYNC_RECOVERY_CONSUMED: &str = "main-sync-recovery-consumed";
 const SYSTEM_PATH: &str = "/usr/bin:/bin";
 const GIT_BINARY: &str = "/usr/bin/git";
 const GH_BINARY: &str = "/usr/bin/gh";
@@ -2050,6 +2051,7 @@ fn validate_main_sync_retry(stage: &str, last_error: &str, sandbox_retry: bool) 
         && [
             MAIN_SYNC_SANDBOX_RETRY_READY,
             MAIN_SYNC_SANDBOX_RETRY_CONSUMED,
+            MAIN_SYNC_RECOVERY_CONSUMED,
         ]
         .contains(&last_error)
     {
@@ -2077,6 +2079,33 @@ fn consume_main_sync_retry(
     } else {
         Ok(state.clone())
     }
+}
+
+fn validate_main_sync_recovery(stage: &str, last_error: &str, decision: &str) -> Result<()> {
+    if stage != "merged"
+        || last_error != MAIN_SYNC_SANDBOX_RETRY_CONSUMED
+        || decision != "human-approved"
+    {
+        return Err(error(
+            "main同期の追加復旧は、再試行済み・明示承認済みのmerged taskに1回だけ許可されます",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct MainSyncRecovery {
+    from: String,
+    to: String,
+}
+
+fn validate_recovery_bounds(recovery: &MainSyncRecovery, head: &str, target: &str) -> Result<()> {
+    if recovery.from != head || recovery.to != target {
+        return Err(error(
+            "main同期の追加復旧from/toが現在HEADまたはorigin/mainと一致しません",
+        ));
+    }
+    Ok(())
 }
 
 fn receipt_decision(value: &Value) -> Result<String> {
@@ -3395,6 +3424,7 @@ fn assert_main_clean(root: &Path) -> Result<()> {
 
 struct MainSyncCandidate {
     path: String,
+    untracked: bool,
     target_blob: String,
     #[cfg(unix)]
     device: u64,
@@ -3410,6 +3440,7 @@ fn recover_interrupted_main_sync_with_hook(
     expected_head: &str,
     before_restore: impl FnOnce(),
 ) -> Result<()> {
+    validate_main_sync_refs(root, expected_head, target)?;
     let status = git(
         root,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -3430,9 +3461,9 @@ fn recover_interrupted_main_sync_with_hook(
         .filter(|entry| !entry.is_empty())
         .map(|entry| {
             let bytes = entry.as_bytes();
-            if bytes.len() < 4 || bytes[0] != b' ' || bytes[1] != b'M' || bytes[2] != b' ' {
+            if bytes.len() < 4 || (!entry.starts_with(" M ") && !entry.starts_with("?? ")) {
                 return Err(error(
-                    "main同期の中断状態に未追跡、staged、削除、renameまたはtype変更があります",
+                    "main同期の中断状態にstaged、削除、renameまたはtype変更があります",
                 ));
             }
             let path = &entry[3..];
@@ -3445,7 +3476,7 @@ fn recover_interrupted_main_sync_with_hook(
             {
                 return Err(error("main同期の中断pathが安全ではありません"));
             }
-            Ok(path.to_string())
+            Ok((path.to_string(), entry.starts_with("?? ")))
         })
         .collect::<Result<Vec<_>>>()?;
     if paths.is_empty() || paths.len() > MAX_MAIN_SYNC_RECOVERY_PATHS {
@@ -3453,7 +3484,11 @@ fn recover_interrupted_main_sync_with_hook(
     }
 
     let mut candidates = Vec::with_capacity(paths.len());
-    for path in &paths {
+    for (path, untracked) in &paths {
+        if *untracked && !git(root, &["ls-tree", "-z", expected_head, "--", path], true)?.is_empty()
+        {
+            return Err(error("未追跡pathが同期前のHEADに存在します"));
+        }
         let mut current = root.to_path_buf();
         let components = Path::new(path).components().collect::<Vec<_>>();
         for (index, component) in components.iter().enumerate() {
@@ -3492,6 +3527,10 @@ fn recover_interrupted_main_sync_with_hook(
         let metadata = fs::symlink_metadata(&current)
             .map_err(|_| error("main同期の中断path modeを確認できません"))?;
         #[cfg(unix)]
+        if metadata.uid() != unsafe { libc::getuid() } || metadata.nlink() != 1 {
+            return Err(error("main同期の中断pathの所有者またはlink数が不正です"));
+        }
+        #[cfg(unix)]
         if (metadata.mode() & 0o111 != 0) != (fields[0] == "100755") {
             return Err(error("main同期の中断path modeがtargetと一致しません"));
         }
@@ -3503,6 +3542,7 @@ fn recover_interrupted_main_sync_with_hook(
         }
         candidates.push(MainSyncCandidate {
             path: path.clone(),
+            untracked: *untracked,
             target_blob: fields[2].to_string(),
             #[cfg(unix)]
             device: metadata.dev(),
@@ -3513,17 +3553,24 @@ fn recover_interrupted_main_sync_with_hook(
         });
     }
 
+    // 全候補を検証してから退避先を確定する。未登録のlocal変更はここへ到達しない。
+    let backup = if candidates.iter().any(|candidate| candidate.untracked) {
+        Some(main_sync_backup(root)?)
+    } else {
+        None
+    };
     before_restore();
     for (index, candidate) in candidates.iter().enumerate() {
-        if git(root, &["symbolic-ref", "--short", "HEAD"], true)?.trim() != "main" {
-            return Err(error("main同期の復旧前にcheckout branchが変化しました"));
-        }
-        if git(root, &["rev-parse", "HEAD"], true)?.trim() != expected_head {
-            return Err(error("main同期の復旧前にHEADが変化しました"));
-        }
+        validate_main_sync_refs(root, expected_head, target)?;
         let expected_status = candidates[index..]
             .iter()
-            .map(|entry| format!(" M {}\0", entry.path))
+            .map(|entry| {
+                format!(
+                    "{} {}\0",
+                    if entry.untracked { "??" } else { " M" },
+                    entry.path
+                )
+            })
             .collect::<String>();
         if git(
             root,
@@ -3534,6 +3581,11 @@ fn recover_interrupted_main_sync_with_hook(
             return Err(error("main同期の復旧前にworking tree状態が変化しました"));
         }
         let current = root.join(&candidate.path);
+        if fs::canonicalize(&current).map_err(|_| error("復旧pathの実体を確認できません"))?
+            != current
+        {
+            return Err(error("復旧pathのparentがsymlinkへ変化しました"));
+        }
         let metadata = fs::symlink_metadata(&current)
             .map_err(|_| error("main同期の復旧前にpathが変化しました"))?;
         #[cfg(unix)]
@@ -3542,6 +3594,8 @@ fn recover_interrupted_main_sync_with_hook(
             || metadata.dev() != candidate.device
             || metadata.ino() != candidate.inode
             || metadata.mode() != candidate.mode
+            || metadata.uid() != unsafe { libc::getuid() }
+            || metadata.nlink() != 1
         {
             return Err(error("main同期の復旧前にinodeまたはmodeが変化しました"));
         }
@@ -3554,6 +3608,33 @@ fn recover_interrupted_main_sync_with_hook(
             != candidate.target_blob
         {
             return Err(error("main同期の復旧前にfile内容が変化しました"));
+        }
+        if candidate.untracked {
+            safe_directory(backup.as_ref().ok_or_else(|| error("退避先がありません"))?)?;
+            let destination = backup
+                .as_ref()
+                .ok_or_else(|| error("退避先がありません"))?
+                .join(&candidate.path);
+            fs::create_dir_all(
+                destination
+                    .parent()
+                    .ok_or_else(|| error("退避pathが不正です"))?,
+            )
+            .map_err(|_| error("main同期の退避directoryを作成できません"))?;
+            if destination.exists() || destination.is_symlink() {
+                return Err(error("main同期の退避先が既に存在します"));
+            }
+            if fs::canonicalize(destination.parent().unwrap())
+                .map_err(|_| error("退避先の実体を確認できません"))?
+                != destination.parent().unwrap()
+            {
+                return Err(error("main同期の退避先parentがsymlinkです"));
+            }
+            fs::rename(&current, &destination)
+                .map_err(|_| error("main同期の新規fileを退避できません"))?;
+            sync_directory(destination.parent().unwrap(), "main同期退避先")?;
+            sync_directory(current.parent().unwrap(), "main同期退避元")?;
+            continue;
         }
         git(
             root,
@@ -3570,13 +3651,88 @@ fn recover_interrupted_main_sync_with_hook(
     assert_main_clean(root)
 }
 
+fn main_sync_backup(root: &Path) -> Result<PathBuf> {
+    for ignore in [".gitignore", ".dockerignore"] {
+        let required = ignore == ".gitignore"
+            || root.join("Dockerfile").exists()
+            || root.join(".dockerignore").exists();
+        if required {
+            let contents = git(root, &["show", &format!("HEAD:{ignore}")], true)?;
+            if !contents.lines().any(|line| line.trim() == ".codex-trash/") {
+                return Err(error(
+                    "main同期の退避前に.gitignore/.dockerignoreへ.codex-trash/の登録が必要です",
+                ));
+            }
+            if ignore == ".dockerignore"
+                && contents.lines().any(|line| line.trim().starts_with('!'))
+            {
+                return Err(error(
+                    "否定patternを含む.dockerignoreでは退避領域の除外を確定できません",
+                ));
+            }
+        }
+    }
+    git(
+        root,
+        &["check-ignore", "-q", "--", ".codex-trash/recovery-probe"],
+        true,
+    )?;
+    let trash = root.join(".codex-trash");
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    if !trash.exists() && !trash.is_symlink() {
+        builder
+            .create(&trash)
+            .map_err(|_| error("main同期のtrashを作成できません"))?;
+    }
+    let metadata = fs::symlink_metadata(&trash).map_err(|_| error("trashを確認できません"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || fs::canonicalize(&trash).map_err(|_| error("trashの実体を確認できません"))? != trash
+    {
+        return Err(error("main同期のtrashが安全ではありません"));
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::getuid() } || metadata.mode() & 0o022 != 0 {
+        return Err(error("main同期のtrashの所有者またはmodeが不正です"));
+    }
+    let path = trash.join(format!("{}-main-sync", now().replace(':', "-")));
+    builder
+        .create(&path)
+        .map_err(|_| error("main同期の退避先を一意に作成できません"))?;
+    safe_directory(&path)?;
+    sync_directory(&trash, "main同期trash")?;
+    sync_directory(root, "main同期root")?;
+    eprintln!("main同期の中断生成物を保持します: {}", path.display());
+    Ok(path)
+}
+
 fn recover_interrupted_main_sync(root: &Path, target: &str, expected_head: &str) -> Result<()> {
     recover_interrupted_main_sync_with_hook(root, target, expected_head, || {})
 }
 
+fn validate_main_sync_refs(root: &Path, expected_head: &str, target: &str) -> Result<()> {
+    if git(root, &["symbolic-ref", "--short", "HEAD"], true)?.trim() != "main"
+        || git(root, &["rev-parse", "HEAD"], true)?.trim() != expected_head
+        || git(root, &["rev-parse", "refs/remotes/origin/main"], true)?.trim() != target
+    {
+        return Err(error(
+            "main同期の固定branch・HEAD・origin/mainが変化しました",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn prepare_main_sync(root: &Path, target: &str) -> Result<()> {
     let before = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
-    let args = ["merge-base", "--is-ancestor", &before, target];
+    prepare_main_sync_from(root, target, &before)
+}
+
+fn prepare_main_sync_from(root: &Path, target: &str, expected_head: &str) -> Result<()> {
+    validate_main_sync_refs(root, expected_head, target)?;
+    let args = ["merge-base", "--is-ancestor", expected_head, target];
     let av = args
         .iter()
         .map(|value| (*value).to_string())
@@ -3592,7 +3748,7 @@ fn prepare_main_sync(root: &Path, target: &str) -> Result<()> {
     {
         return Err(error("人間用mainに未pushのlocal commitがあります"));
     }
-    recover_interrupted_main_sync(root, target, &before)
+    recover_interrupted_main_sync(root, target, expected_head)
 }
 
 fn assert_main_synced(root: &Path, repository: &str) -> Result<()> {
@@ -3761,6 +3917,7 @@ fn finish_locked(
     expected_plan_version: i64,
     expected_gate: &str,
     sandbox_retry: bool,
+    recover_main_sync: Option<&MainSyncRecovery>,
 ) -> Result<Value> {
     let repository = repository(root)?;
     let (manifest_value, worktree_path) = manifest(root, task, &repository)?;
@@ -3790,8 +3947,26 @@ fn finish_locked(
         crate::clean_disk::ensure_artifact_idle(path).map_err(|cause| error(cause.to_string()))?;
     }
     let initial_error = str_value(&state, "last_error")?;
-    validate_main_sync_retry(&initial_stage, &initial_error, sandbox_retry)?;
-    state = consume_main_sync_retry(&repository, task, &state, sandbox_retry)?;
+    if recover_main_sync.is_some() {
+        if sandbox_retry {
+            return Err(error("main同期の復旧とsandbox再試行は同時指定できません"));
+        }
+        validate_main_sync_recovery(
+            &initial_stage,
+            &initial_error,
+            &receipt_decision(&receipt_value)?,
+        )?;
+        state = save_stage(
+            &repository,
+            task,
+            &state,
+            "merged",
+            MAIN_SYNC_RECOVERY_CONSUMED,
+        )?;
+    } else {
+        validate_main_sync_retry(&initial_stage, &initial_error, sandbox_retry)?;
+        state = consume_main_sync_retry(&repository, task, &state, sandbox_retry)?;
+    }
     let view = pr_view(root, &repository, expected_pr)?;
     if str_value(&view, "state")? != "MERGED"
         || oid(&str_value(&view, "headRefOid")?, "merged PR head")? != head
@@ -3852,12 +4027,11 @@ fn finish_locked(
     }
     if stage == "merged" {
         let remote_main = fetch_main(root, &repository)?;
-        let args = [
-            "merge-base",
-            "--is-ancestor",
-            &head,
-            "refs/remotes/origin/main",
-        ];
+        let sync_from = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
+        if let Some(recovery) = recover_main_sync {
+            validate_recovery_bounds(recovery, &sync_from, &remote_main)?;
+        }
+        let args = ["merge-base", "--is-ancestor", &head, &remote_main];
         let av = args.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
         if !run(
             &git_command(&av)?,
@@ -3870,9 +4044,10 @@ fn finish_locked(
         {
             return Err(error("origin/mainがmerged headへ到達していません"));
         }
-        prepare_main_sync(root, &remote_main)?;
+        prepare_main_sync_from(root, &remote_main, &sync_from)?;
         assert_main_clean(root)?;
-        let args = ["merge", "--ff-only", "refs/remotes/origin/main"];
+        validate_main_sync_refs(root, &sync_from, &remote_main)?;
+        let args = ["merge", "--ff-only", &remote_main];
         let av = args.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
         let merge = run(
             &git_command(&av)?,
@@ -3881,7 +4056,7 @@ fn finish_locked(
             MAX_OUTPUT_BYTES,
         )?;
         if !merge.status.success() {
-            if !sandbox_retry {
+            if !sandbox_retry && recover_main_sync.is_none() {
                 let changed = get(&receipt_value, "changed_files")?
                     .as_array()
                     .ok_or_else(|| error("receipt changed-filesが不正です"))?
@@ -4109,6 +4284,7 @@ fn finish(
     plan_version: i64,
     gate: &str,
     sandbox_retry: bool,
+    recover_main_sync: Option<&MainSyncRecovery>,
 ) -> Result<Value> {
     task_id(task)?;
     with_deadline(|| {
@@ -4123,6 +4299,7 @@ fn finish(
             plan_version,
             gate,
             sandbox_retry,
+            recover_main_sync,
         )
     })
 }
@@ -4220,6 +4397,7 @@ struct CliArgs {
     independent: bool,
     specialist: bool,
     sandbox_retry: bool,
+    recover_main_sync: Option<MainSyncRecovery>,
     gate: String,
 }
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
@@ -4248,6 +4426,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             "independent-review-passed",
             "specialist-review-passed",
             "sandbox-retry",
+            "recover-main-sync",
         ];
         let value_options = [
             "task-id",
@@ -4257,6 +4436,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             "plan-id",
             "plan-version",
             "gate-mode",
+            "recover-main-sync-from",
+            "recover-main-sync-to",
         ];
         if flag_options.contains(&normalized.as_str()) {
             if !flags.insert(normalized) {
@@ -4323,7 +4504,11 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
         ));
     }
     if command == "record-review" || command == "approve-review" {
-        if flags.contains("sandbox-retry") {
+        if flags.contains("sandbox-retry")
+            || flags.contains("recover-main-sync")
+            || values.contains_key("recover-main-sync-from")
+            || values.contains_key("recover-main-sync-to")
+        {
             return Err(error("review記録へsandbox再試行を指定できません"));
         }
         let risk_value = values
@@ -4361,10 +4546,36 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             independent,
             specialist,
             sandbox_retry: false,
+            recover_main_sync: None,
             gate,
         })
     } else {
         let sandbox_retry = flags.remove("sandbox-retry");
+        let recover_main_sync = flags.remove("recover-main-sync");
+        if (sandbox_retry && recover_main_sync) || (recover_main_sync && command != "finish") {
+            return Err(error("main同期の追加復旧はfinishに単独指定してください"));
+        }
+        let recover_main_sync = if recover_main_sync {
+            let from = values
+                .get("recover-main-sync-from")
+                .ok_or_else(|| error("復旧fromが必要です"))?;
+            let to = values
+                .get("recover-main-sync-to")
+                .ok_or_else(|| error("復旧toが必要です"))?;
+            Some(MainSyncRecovery {
+                from: oid(from, "復旧from")?,
+                to: oid(to, "復旧to")?,
+            })
+        } else {
+            if values.contains_key("recover-main-sync-from")
+                || values.contains_key("recover-main-sync-to")
+            {
+                return Err(error(
+                    "復旧from/toは--recover-main-syncとともに指定してください",
+                ));
+            }
+            None
+        };
         if values.contains_key("risk")
             || !flags.is_empty()
             || (command == "deliver" && sandbox_retry)
@@ -4383,6 +4594,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             independent: false,
             specialist: false,
             sandbox_retry,
+            recover_main_sync,
             gate,
         })
     }
@@ -4444,6 +4656,7 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 parsed.plan_version,
                 &parsed.gate,
                 parsed.sandbox_retry,
+                parsed.recover_main_sync.as_ref(),
             ),
             _ => Err(error("不明なcommandです")),
         }
@@ -5409,7 +5622,12 @@ mod tests {
         );
         fs::write(root.join("a"), "old-a\n").unwrap();
         fs::write(root.join("b"), "old-b\n").unwrap();
-        assert!(git_at(&root, &["add", "a", "b"]).status.success());
+        fs::write(root.join(".gitignore"), ".codex-trash/\n").unwrap();
+        assert!(
+            git_at(&root, &["add", "a", "b", ".gitignore"])
+                .status
+                .success()
+        );
         assert!(
             git_at(
                 &root,
@@ -5434,7 +5652,12 @@ mod tests {
         );
         fs::write(root.join("a"), "new-a\n").unwrap();
         fs::write(root.join("b"), "new-b\n").unwrap();
-        assert!(git_at(&root, &["add", "a", "b"]).status.success());
+        fs::write(root.join("new-file"), "new-file\n").unwrap();
+        assert!(
+            git_at(&root, &["add", "a", "b", "new-file"])
+                .status
+                .success()
+        );
         assert!(
             git_at(
                 &root,
@@ -5452,6 +5675,14 @@ mod tests {
             .success()
         );
         let target = String::from_utf8(git_at(&root, &["rev-parse", "HEAD"]).stdout).unwrap();
+        assert!(
+            git_at(
+                &root,
+                &["update-ref", "refs/remotes/origin/main", target.trim()]
+            )
+            .status
+            .success()
+        );
         assert!(git_at(&root, &["checkout", "-q", "main"]).status.success());
         assert!(
             git_at(&root, &["reset", "--hard", base.trim()])
@@ -5459,8 +5690,49 @@ mod tests {
                 .success()
         );
         fs::write(root.join("a"), "new-a\n").unwrap();
+        fs::write(root.join("new-file"), "new-file\n").unwrap();
+        assert!(prepare_main_sync_from(&root, target.trim(), target.trim()).is_err());
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
+        assert!(root.join("new-file").exists());
+        assert!(
+            recover_interrupted_main_sync_with_hook(&root, target.trim(), base.trim(), || {
+                assert!(
+                    git_at(
+                        &root,
+                        &["update-ref", "refs/remotes/origin/main", base.trim()]
+                    )
+                    .status
+                    .success()
+                );
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
+        assert_eq!(
+            fs::read_to_string(root.join("new-file")).unwrap(),
+            "new-file\n"
+        );
+        assert!(
+            git_at(
+                &root,
+                &["update-ref", "refs/remotes/origin/main", target.trim()]
+            )
+            .status
+            .success()
+        );
         prepare_main_sync(&root, target.trim()).expect("recover partial sync");
         assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "old-a\n");
+        assert!(!root.join("new-file").exists());
+        let backup = fs::read_dir(root.join(".codex-trash"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            fs::read_to_string(backup.join("new-file")).unwrap(),
+            "new-file\n"
+        );
         let output = git_at(&root, &["merge", "--ff-only", target.trim()]);
         assert!(output.status.success());
         assert!(
@@ -5468,6 +5740,43 @@ mod tests {
                 .stdout
                 .is_empty()
         );
+
+        assert!(
+            git_at(&root, &["reset", "--hard", base.trim()])
+                .status
+                .success()
+        );
+        fs::write(root.join("a"), "new-a\n").unwrap();
+        fs::write(root.join("new-file"), "unique local data\n").unwrap();
+        assert!(prepare_main_sync(&root, target.trim()).is_err());
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
+        assert_eq!(
+            fs::read_to_string(root.join("new-file")).unwrap(),
+            "unique local data\n"
+        );
+        fs::write(root.join("new-file"), "new-file\n").unwrap();
+        fs::hard_link(root.join("new-file"), root.join(".codex-trash/hardlink")).unwrap();
+        assert!(
+            prepare_main_sync(&root, target.trim())
+                .unwrap_err()
+                .to_string()
+                .contains("link")
+        );
+        fs::remove_file(root.join(".codex-trash/hardlink")).unwrap();
+        fs::set_permissions(root.join("new-file"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(prepare_main_sync(&root, target.trim()).is_err());
+        fs::set_permissions(root.join("new-file"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            recover_interrupted_main_sync_with_hook(&root, target.trim(), base.trim(), || {
+                fs::write(root.join("new-file"), "changed after validation\n").unwrap();
+            })
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("new-file")).unwrap(),
+            "changed after validation\n"
+        );
+        fs::remove_file(root.join("new-file")).unwrap();
 
         assert!(
             git_at(&root, &["reset", "--hard", base.trim()])
@@ -6325,6 +6634,69 @@ mod tests {
                 .is_err()
             );
         });
+    }
+
+    #[test]
+    fn explicit_main_sync_recovery_is_bound_and_not_repeatable() {
+        let arguments = |command: &str| {
+            [
+                command,
+                "--task-id",
+                "task-example",
+                "--pr",
+                "1",
+                "--head",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "--plan-id",
+                "RECOVERY-TEST-v1",
+                "--plan-version",
+                "1",
+                "--recover-main-sync",
+                "--recover-main-sync-from",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--recover-main-sync-to",
+                "cccccccccccccccccccccccccccccccccccccccc",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        };
+        let parsed = parse_args(arguments("finish")).unwrap();
+        let recovery = parsed.recover_main_sync.unwrap();
+        assert!(validate_recovery_bounds(&recovery, &"a".repeat(40), &"c".repeat(40)).is_ok());
+        assert!(validate_recovery_bounds(&recovery, &"b".repeat(40), &"c".repeat(40)).is_err());
+        assert!(validate_recovery_bounds(&recovery, &"a".repeat(40), &"d".repeat(40)).is_err());
+        for command in ["deliver", "record-review", "approve-review"] {
+            assert!(parse_args(arguments(command)).is_err());
+        }
+        let mut both = arguments("finish");
+        both.push("--sandbox-retry".into());
+        assert!(parse_args(both).is_err());
+        let mut missing = arguments("finish");
+        missing.pop();
+        assert!(parse_args(missing).is_err());
+        assert!(
+            validate_main_sync_recovery(
+                "merged",
+                MAIN_SYNC_SANDBOX_RETRY_CONSUMED,
+                "human-approved"
+            )
+            .is_ok()
+        );
+        for (stage, last_error, decision) in [
+            ("merged", MAIN_SYNC_SANDBOX_RETRY_CONSUMED, "autonomous"),
+            ("merged", MAIN_SYNC_SANDBOX_RETRY_READY, "human-approved"),
+            ("merged", MAIN_SYNC_RECOVERY_CONSUMED, "human-approved"),
+            (
+                "completed",
+                MAIN_SYNC_SANDBOX_RETRY_CONSUMED,
+                "human-approved",
+            ),
+        ] {
+            assert!(validate_main_sync_recovery(stage, last_error, decision).is_err());
+        }
+        assert!(validate_main_sync_retry("merged", MAIN_SYNC_RECOVERY_CONSUMED, false).is_err());
+        assert!(validate_main_sync_retry("merged", MAIN_SYNC_RECOVERY_CONSUMED, true).is_err());
     }
 
     #[test]
