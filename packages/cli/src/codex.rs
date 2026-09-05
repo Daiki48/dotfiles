@@ -4613,8 +4613,21 @@ mod tests {
         assert!(super::GuardrailOperationLock::acquire(directory.path()).is_err());
 
         drop(first);
-        let resumed = super::GuardrailOperationLock::acquire(directory.path())
-            .expect("acquire operation lock after interrupted owner exits");
+        // 並列testのforkがFDを継承した場合、execのCLOEXECまで解放が遅れる。
+        // 保持中の拒否は上で検証し、解放後の再取得だけ期限付きで待つ。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let resumed = loop {
+            match super::GuardrailOperationLock::acquire(directory.path()) {
+                Ok(lock) => break lock,
+                Err(error)
+                    if error.to_string() == "Another Codex guardrail operation is active"
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("acquire operation lock after owner exits: {error}"),
+            }
+        };
         begin_refresh_transaction(directory.path()).expect("resume refresh after lock release");
         complete_refresh_transaction(directory.path()).expect("complete resumed refresh");
         drop(resumed);

@@ -5723,16 +5723,14 @@ mod tests {
         prepare_main_sync(&root, target.trim()).expect("recover partial sync");
         assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "old-a\n");
         assert!(!root.join("new-file").exists());
-        let backup = fs::read_dir(root.join(".codex-trash"))
+        // 先行する競合検証は空の退避directoryを残すため、列挙順には依存しない。
+        let backups = fs::read_dir(root.join(".codex-trash"))
             .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        assert_eq!(
-            fs::read_to_string(backup.join("new-file")).unwrap(),
-            "new-file\n"
-        );
+            .map(|entry| entry.unwrap().path().join("new-file"))
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read_to_string(&backups[0]).unwrap(), "new-file\n");
         let output = git_at(&root, &["merge", "--ff-only", target.trim()]);
         assert!(output.status.success());
         assert!(
