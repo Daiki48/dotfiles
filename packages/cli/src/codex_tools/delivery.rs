@@ -3440,6 +3440,7 @@ fn recover_interrupted_main_sync_with_hook(
     expected_head: &str,
     before_restore: impl FnOnce(),
 ) -> Result<()> {
+    validate_main_sync_refs(root, expected_head, target)?;
     let status = git(
         root,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -3560,12 +3561,7 @@ fn recover_interrupted_main_sync_with_hook(
     };
     before_restore();
     for (index, candidate) in candidates.iter().enumerate() {
-        if git(root, &["symbolic-ref", "--short", "HEAD"], true)?.trim() != "main" {
-            return Err(error("main同期の復旧前にcheckout branchが変化しました"));
-        }
-        if git(root, &["rev-parse", "HEAD"], true)?.trim() != expected_head {
-            return Err(error("main同期の復旧前にHEADが変化しました"));
-        }
+        validate_main_sync_refs(root, expected_head, target)?;
         let expected_status = candidates[index..]
             .iter()
             .map(|entry| {
@@ -3716,9 +3712,27 @@ fn recover_interrupted_main_sync(root: &Path, target: &str, expected_head: &str)
     recover_interrupted_main_sync_with_hook(root, target, expected_head, || {})
 }
 
+fn validate_main_sync_refs(root: &Path, expected_head: &str, target: &str) -> Result<()> {
+    if git(root, &["symbolic-ref", "--short", "HEAD"], true)?.trim() != "main"
+        || git(root, &["rev-parse", "HEAD"], true)?.trim() != expected_head
+        || git(root, &["rev-parse", "refs/remotes/origin/main"], true)?.trim() != target
+    {
+        return Err(error(
+            "main同期の固定branch・HEAD・origin/mainが変化しました",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn prepare_main_sync(root: &Path, target: &str) -> Result<()> {
     let before = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
-    let args = ["merge-base", "--is-ancestor", &before, target];
+    prepare_main_sync_from(root, target, &before)
+}
+
+fn prepare_main_sync_from(root: &Path, target: &str, expected_head: &str) -> Result<()> {
+    validate_main_sync_refs(root, expected_head, target)?;
+    let args = ["merge-base", "--is-ancestor", expected_head, target];
     let av = args
         .iter()
         .map(|value| (*value).to_string())
@@ -3734,7 +3748,7 @@ fn prepare_main_sync(root: &Path, target: &str) -> Result<()> {
     {
         return Err(error("人間用mainに未pushのlocal commitがあります"));
     }
-    recover_interrupted_main_sync(root, target, &before)
+    recover_interrupted_main_sync(root, target, expected_head)
 }
 
 fn assert_main_synced(root: &Path, repository: &str) -> Result<()> {
@@ -4013,19 +4027,11 @@ fn finish_locked(
     }
     if stage == "merged" {
         let remote_main = fetch_main(root, &repository)?;
+        let sync_from = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
         if let Some(recovery) = recover_main_sync {
-            validate_recovery_bounds(
-                recovery,
-                git(root, &["rev-parse", "HEAD"], true)?.trim(),
-                &remote_main,
-            )?;
+            validate_recovery_bounds(recovery, &sync_from, &remote_main)?;
         }
-        let args = [
-            "merge-base",
-            "--is-ancestor",
-            &head,
-            "refs/remotes/origin/main",
-        ];
+        let args = ["merge-base", "--is-ancestor", &head, &remote_main];
         let av = args.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
         if !run(
             &git_command(&av)?,
@@ -4038,9 +4044,10 @@ fn finish_locked(
         {
             return Err(error("origin/mainがmerged headへ到達していません"));
         }
-        prepare_main_sync(root, &remote_main)?;
+        prepare_main_sync_from(root, &remote_main, &sync_from)?;
         assert_main_clean(root)?;
-        let args = ["merge", "--ff-only", "refs/remotes/origin/main"];
+        validate_main_sync_refs(root, &sync_from, &remote_main)?;
+        let args = ["merge", "--ff-only", &remote_main];
         let av = args.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
         let merge = run(
             &git_command(&av)?,
@@ -5668,6 +5675,14 @@ mod tests {
             .success()
         );
         let target = String::from_utf8(git_at(&root, &["rev-parse", "HEAD"]).stdout).unwrap();
+        assert!(
+            git_at(
+                &root,
+                &["update-ref", "refs/remotes/origin/main", target.trim()]
+            )
+            .status
+            .success()
+        );
         assert!(git_at(&root, &["checkout", "-q", "main"]).status.success());
         assert!(
             git_at(&root, &["reset", "--hard", base.trim()])
@@ -5676,6 +5691,35 @@ mod tests {
         );
         fs::write(root.join("a"), "new-a\n").unwrap();
         fs::write(root.join("new-file"), "new-file\n").unwrap();
+        assert!(prepare_main_sync_from(&root, target.trim(), target.trim()).is_err());
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
+        assert!(root.join("new-file").exists());
+        assert!(
+            recover_interrupted_main_sync_with_hook(&root, target.trim(), base.trim(), || {
+                assert!(
+                    git_at(
+                        &root,
+                        &["update-ref", "refs/remotes/origin/main", base.trim()]
+                    )
+                    .status
+                    .success()
+                );
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "new-a\n");
+        assert_eq!(
+            fs::read_to_string(root.join("new-file")).unwrap(),
+            "new-file\n"
+        );
+        assert!(
+            git_at(
+                &root,
+                &["update-ref", "refs/remotes/origin/main", target.trim()]
+            )
+            .status
+            .success()
+        );
         prepare_main_sync(&root, target.trim()).expect("recover partial sync");
         assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "old-a\n");
         assert!(!root.join("new-file").exists());
