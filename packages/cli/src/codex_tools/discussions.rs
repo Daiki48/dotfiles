@@ -258,13 +258,7 @@ impl Api for Github {
         command
             .args(graphql_args(query, variables)?)
             .current_dir(&self.cwd);
-        process::clear_environment(&mut command);
-        command
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("GH_HOST", "github.com")
-            .env("GH_CONFIG_DIR", self.sandbox.path())
-            .env("GH_NO_UPDATE_NOTIFIER", "1")
-            .env("PATH", "/usr/bin:/bin");
+        self.sandbox.configure_command(&mut command);
         let output = process::run_with_limit(&mut command, timeout, 4 * 1024 * 1024)
             .map_err(|_| "GitHub呼び出しが失敗またはtimeoutしました")?;
         if !output.status.success() {
