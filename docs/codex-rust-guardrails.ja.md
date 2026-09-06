@@ -17,6 +17,7 @@ atomic installします。起動時は実行file名で処理を分岐します�
 - `~/.codex/hooks/block-git-write`
 - `~/.local/bin/codex-worktree`
 - `~/.local/bin/codex-delivery`
+- `~/.local/bin/codex-discussions`
 
 hookのallow/deny、worktree manifest、delivery receipt v1〜v5の読み取り互換性と再開stateは従来の
 外部契約を維持します。receipt v6とhelper CLIはlow/mediumでmain agentのself-review、high/criticalで独立review、
@@ -51,7 +52,7 @@ proxyや`http_unix_socket`などの既存設定を引き継ぎません。browse
 
 読み取り専用の`git`・`gh`は、`;`、`&&`、改行だけからなる単純chainであれば、他のcommandと連結できます。
 hookはguard対象segmentをそれぞれ独立して検証し、system Git/GitHub CLIと固定environmentへ個別にrewriteします。
-Git/GitHubの書き込み、`codex-worktree`、`codex-delivery`、pipe、fallback/background operator、redirection、
+Git/GitHubの書き込み、`codex-worktree`、`codex-delivery`、`codex-discussions`、pipe、fallback/background operator、redirection、
 shell環境・cwd変更は引き続き単独の直接commandへ限定します。
 
 `codex-worktree`は安全境界としてglobalとrepository固有の`credential.helper`を無効化します。canonicalな
@@ -76,4 +77,4 @@ setupは`~/.local/bin/codex`、`~/.cargo/bin/cargo`、Rust compilerの所有者�
 PATHやbuild overrideを隔離します。Codex CLIの自動npm installは行わないため、先に固定pathへ導入してください。
 config、symlinkの全親component、Cargo config、legacy state、managed binary transactionをread-onlyでpreflightした後、
 setup全体のdurable resume journalを開始します。`packages/cli`をbounded process runnerで`--release --locked` buildし、
-3つの配置先を同一hashへ更新します。途中失敗時はjournalと各file transactionを次回setupで再開します。
+managed binaryの配置先を同一hashへ更新します。途中失敗時はjournalと各file transactionを次回setupで再開します。

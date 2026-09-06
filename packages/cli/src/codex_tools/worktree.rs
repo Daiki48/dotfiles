@@ -1810,6 +1810,24 @@ pub(crate) fn verify_managed_refresh_source(root: &Path) -> Result<(), WorktreeE
     verify_managed_refresh_source_with_local_origin(root, false)
 }
 
+pub(crate) fn managed_refresh_target(root: &Path) -> Result<PathBuf, WorktreeError> {
+    verify_managed_refresh_source(root)?;
+    registered_refresh_target(root)
+}
+
+fn registered_refresh_target(root: &Path) -> Result<PathBuf, WorktreeError> {
+    let task = root
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| error("refresh task IDを確認できません"))?;
+    let common = absolute_git_path(root, "--git-common-dir")?;
+    let path = super::artifacts::validate(root, task, &common)
+        .map_err(|cause| error(cause.to_string()))?
+        .filter(|path| path.is_dir())
+        .ok_or_else(|| error("親checkoutでcodex-worktree artifactsを先に実行してください"))?;
+    Ok(path.join("target"))
+}
+
 fn completed_delivery(manifest: &Manifest) -> bool {
     let worktree = Path::new(&manifest.worktree);
     let Some(parent) = worktree.parent() else {
@@ -2397,6 +2415,13 @@ mod tests {
         let target =
             create_worktree(&fixture.repository, "feat/refresh", "task-refresh", true).unwrap();
         assert!(verify_managed_refresh_source_with_local_origin(&target, true).is_ok());
+        assert!(registered_refresh_target(&target).is_err());
+        let artifact = task_artifacts(&fixture.repository, "task-refresh", false, true).unwrap();
+        assert_eq!(
+            registered_refresh_target(&target).unwrap(),
+            artifact.join("target")
+        );
+        assert!(registered_refresh_target(&fixture.repository).is_err());
 
         fs::write(target.join("untracked.txt"), "dirty\n").expect("dirty managed worktree");
         assert!(verify_managed_refresh_source_with_local_origin(&target, true).is_err());

@@ -48,6 +48,7 @@ const MANAGED_BINARY_DESTINATIONS: &[&str] = &[
     MANAGED_HOOK_DESTINATION,
     ".local/bin/codex-worktree",
     ".local/bin/codex-delivery",
+    ".local/bin/codex-discussions",
     ".local/bin/runner-storage-cleanup",
 ];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
@@ -3978,9 +3979,9 @@ fn valid_release_binary_magic(magic: [u8; 4]) -> bool {
     }
 }
 
-fn verify_release_binary(dotfiles_path: &Path, binary: &Path) -> Result<()> {
-    let expected = dotfiles_path
-        .join("target/release")
+fn verify_release_binary(target_dir: &Path, binary: &Path) -> Result<()> {
+    let expected = target_dir
+        .join("release")
         .join(format!("cli{}", std::env::consts::EXE_SUFFIX));
     if binary != expected {
         anyhow::bail!(
@@ -4040,7 +4041,7 @@ fn preflight_setup_state(home: &Path, codex_dir: &Path, dotfiles_path: &Path) ->
     Ok(())
 }
 
-fn build_managed_binary(dotfiles_path: &Path, home: &Path) -> Result<PathBuf> {
+fn build_managed_binary(dotfiles_path: &Path, home: &Path, target_dir: &Path) -> Result<PathBuf> {
     println!("\nBuilding optimized Codex guardrail binary...");
     reject_cargo_configuration(dotfiles_path, home)?;
     let cargo = trusted_user_executable(home, CARGO_RELATIVE_PATH, "Cargo")?;
@@ -4052,6 +4053,7 @@ fn build_managed_binary(dotfiles_path: &Path, home: &Path) -> Result<PathBuf> {
         .env("HOME", home)
         .env("PATH", SYSTEM_BUILD_PATH)
         .env("RUSTC", rustc)
+        .env("CARGO_TARGET_DIR", target_dir)
         .args(["build", "--release", "--locked", "-p", "cli"]);
     let output = process::run(&mut command, RELEASE_BUILD_TIMEOUT)
         .context("Failed to build the Codex guardrail binary")?;
@@ -4063,10 +4065,10 @@ fn build_managed_binary(dotfiles_path: &Path, home: &Path) -> Result<PathBuf> {
         );
     }
 
-    let binary = dotfiles_path
-        .join("target/release")
+    let binary = target_dir
+        .join("release")
         .join(format!("cli{}", std::env::consts::EXE_SUFFIX));
-    verify_release_binary(dotfiles_path, &binary)?;
+    verify_release_binary(target_dir, &binary)?;
     Ok(binary)
 }
 
@@ -4078,15 +4080,15 @@ pub fn refresh_guardrails() -> Result<()> {
     let codex_dir = resolve_codex_home(&home)?;
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
     validate_absolute_path(&dotfiles_path)?;
-    worktree::verify_managed_refresh_source(&dotfiles_path)
+    let target_dir = worktree::managed_refresh_target(&dotfiles_path)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let _operation_lock = GuardrailOperationLock::acquire(&home)?;
     preflight_private_directory(&codex_dir)?;
     preflight_refresh_transaction(&codex_dir)?;
     preflight_managed_binary_paths(&home)?;
-    validate_absolute_path(&dotfiles_path.join("target/release"))?;
+    validate_absolute_path(&target_dir.join("release"))?;
 
-    let managed_binary = build_managed_binary(&dotfiles_path, &home)?;
+    let managed_binary = build_managed_binary(&dotfiles_path, &home, &target_dir)?;
     preflight_managed_binary_destinations(&managed_binary, &home)?;
     begin_refresh_transaction(&codex_dir)?;
     for destination in MANAGED_BINARY_DESTINATIONS {
@@ -4131,7 +4133,8 @@ pub fn setup() -> Result<()> {
     );
     codex_check(&codex_binary)?;
 
-    let managed_binary = build_managed_binary(&dotfiles_path, &home)?;
+    let managed_binary =
+        build_managed_binary(&dotfiles_path, &home, &dotfiles_path.join("target"))?;
     preflight_managed_binary_destinations(&managed_binary, &home)?;
 
     if !codex_dir.exists() {
@@ -4237,6 +4240,7 @@ mod tests {
                 ".codex/hooks/block-git-write",
                 ".local/bin/codex-worktree",
                 ".local/bin/codex-delivery",
+                ".local/bin/codex-discussions",
                 ".local/bin/runner-storage-cleanup",
             ]
         );

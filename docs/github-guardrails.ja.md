@@ -69,6 +69,57 @@ Codexの[`PreToolUse` hook](https://learn.chatgpt.com/docs/hooks)は現時点で
 毎回確認する[`prompt` rule](https://learn.chatgpt.com/docs/agent-configuration/rules)を組み合わせます。その経路が実装・検証されるまでは、確認済みという
 会話上の事実だけでhard denyを迂回しません。
 
+## Discussions専用helper
+
+`codex-discussions`はcurrent originのGitHub repositoryだけを対象に、固定GraphQL query/mutationを
+実行します。hookは正規形の引数とoriginを検査し、hookと同じ実体のinstalled binaryへ解決します。
+helper自身もoriginを確認し、認証情報だけをprivate snapshotへ固定してsystem `gh`を実行します。
+任意query、host/header指定、環境変数の認証・proxy差し替え、wrapper経由の実行は許可しません。
+
+| 操作 | 必須option（すべてに`--repo OWNER/REPO`が必要） |
+|---|---|
+| categories / list | なし |
+| view / comments | `--discussion NUMBER` |
+| replies | `--discussion NUMBER --comment-id ID`（親comment） |
+| create | `--category-id ID --title TITLE --body-file PATH` |
+| edit | `--discussion NUMBER`とtitle/body-file/category-idのうち1つ以上 |
+| comment | `--discussion NUMBER --body-file PATH` |
+| reply / edit-comment | `--discussion NUMBER --comment-id ID --body-file PATH` |
+| close | `--discussion NUMBER --reason RESOLVED\|OUTDATED\|DUPLICATE` |
+| reopen | `--discussion NUMBER` |
+| mark-answer / unmark-answer | `--discussion NUMBER --comment-id ID` |
+
+`categories/list/comments/replies`は`--limit 1..100`（既定20）と`--after CURSOR`を受け付け、
+JSONの`result.pageInfo.hasNextPage/endCursor`で続きを明示します。1回の呼び出しは1ページです。
+本文は`/tmp/`配下の絶対pathの通常fileを使います。読み取った同じ内容を検査・保持して送信し、
+symlink、別UID、サイズ超過、秘密情報、AI帰属、Copilot mentionを拒否します。
+
+```console
+codex-discussions categories --repo Daiki48/dotfiles
+codex-discussions list --repo Daiki48/dotfiles --limit 20
+codex-discussions view --repo Daiki48/dotfiles --discussion 1
+codex-discussions comment --repo Daiki48/dotfiles --discussion 1 --body-file /tmp/discussion-comment.md
+```
+
+作成先category、対象Discussion、comment/replyの所属はrepository IDとDiscussion IDで検査します。
+編集・close/reopen・回答指定/解除は対応する`viewerCan*`も確認します。書き込み後は独立したqueryで
+ID、所属、指定した本文・title・category・状態・回答を照合します。失敗やtimeout時にmutationを
+自動再送しません。送信済みの可能性があるため、まず読み取りで現状を確認してください。
+GraphQLにはこの操作群の所属・更新時刻を条件にする共通のcompare-and-setがないため、
+事前確認から実行までの外部の移動・同時編集を原子的には防げません。read-back不一致は成功扱いにしません。
+
+GitHub側の認証権限は別途必要です。fine-grained PAT/GitHub Appでは対象repositoryの
+`Discussions: read/write`と、操作に対応するrepository権限を使用します。helperはcredentialや
+scopeを追加しません。削除、repository間の移動、category管理、repository設定変更は対象外です。
+公式API契約は[Discussions reference](https://docs.github.com/en/graphql/reference/discussions)、
+[Repository reference](https://docs.github.com/en/graphql/reference/repos)、
+[Discussions API guide](https://docs.github.com/en/graphql/guides/using-the-graphql-api-for-discussions)を参照します。
+
+変更の適用は既存のmanaged setup/refreshを使います。task worktreeからの
+`codex-guardrails`更新は、親checkoutで登録した`codex-worktree artifacts --task-id TASK`の
+`target/`へrelease buildします。AGENTS/rulesはmainへの反映後に共有先へ反映されるため、
+Codexを再起動して新しいrulesとhook/helperを読み込んでください。
+
 ## main Ruleset
 
 正本は`.github/rulesets/main.json`です。対象は`~DEFAULT_BRANCH`で、次を強制します。
