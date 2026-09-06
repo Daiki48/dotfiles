@@ -1260,6 +1260,19 @@ impl GuardGhSandbox {
         &self.path
     }
 
+    pub(crate) fn configure_command(&self, command: &mut Command) {
+        process::clear_environment(command);
+        // HOME未設定時にGitHub CLIのdevice-idがcwdへ生成されるのを防ぐ。
+        command
+            .env("HOME", &self.path)
+            .env("XDG_STATE_HOME", &self.path)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_HOST", "github.com")
+            .env("GH_CONFIG_DIR", &self.path)
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("PATH", SYSTEM_PATH);
+    }
+
     fn into_persistent(self) -> PathBuf {
         let path = self.path.clone();
         std::mem::forget(self);
@@ -1312,15 +1325,45 @@ fn remove_expired_gh_snapshot(path: &Path) -> Result<(), String> {
         .map_err(|_| "expired GH snapshotを検査できません".to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "expired GH snapshotを検査できません".to_string())?;
-    if entries.len() > 2
-        || entries
-            .iter()
-            .any(|entry| !matches!(entry.file_name().to_str(), Some("hosts.yml" | "config.yml")))
+    if entries.len() > 3
+        || entries.iter().any(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some("hosts.yml" | "config.yml" | "gh")
+            )
+        })
     {
         return Err("expired GH snapshotの構造が不正です".into());
     }
+    let mut files = Vec::new();
+    let mut state_directory = None;
     for entry in &entries {
-        let file = fs::symlink_metadata(entry.path())
+        if entry.file_name() == "gh" {
+            let state = entry.path();
+            let metadata = fs::symlink_metadata(&state)
+                .map_err(|_| "expired GH stateを検査できません".to_string())?;
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != unsafe { libc::getuid() }
+                || metadata.mode() & 0o022 != 0
+            {
+                return Err("expired GH state directoryが安全ではありません".into());
+            }
+            let children = fs::read_dir(&state)
+                .map_err(|_| "expired GH stateを検査できません".to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "expired GH stateを検査できません".to_string())?;
+            if children.len() > 1 || children.iter().any(|v| v.file_name() != "device-id") {
+                return Err("expired GH stateの構造が不正です".into());
+            }
+            files.extend(children.iter().map(|v| v.path()));
+            state_directory = Some(state);
+        } else {
+            files.push(entry.path());
+        }
+    }
+    for path in &files {
+        let file = fs::symlink_metadata(path)
             .map_err(|_| "expired GH snapshotを検査できません".to_string())?;
         if !file.is_file()
             || file.file_type().is_symlink()
@@ -1334,9 +1377,11 @@ fn remove_expired_gh_snapshot(path: &Path) -> Result<(), String> {
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|_| "expired GH snapshotを削除可能にできません".to_string())?;
-    for entry in entries {
-        fs::remove_file(entry.path())
-            .map_err(|_| "expired GH snapshotを削除できません".to_string())?;
+    for path in files {
+        fs::remove_file(path).map_err(|_| "expired GH snapshotを削除できません".to_string())?;
+    }
+    if let Some(state) = state_directory {
+        fs::remove_dir(state).map_err(|_| "expired GH stateを削除できません".to_string())?;
     }
     fs::remove_dir(path).map_err(|_| "expired GH snapshotを削除できません".to_string())
 }
@@ -1379,12 +1424,7 @@ fn run_gh(cwd: &str, args: &[&str]) -> Option<(i32, Vec<u8>)> {
     let gh = trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI").ok()?;
     let mut command = Command::new(gh);
     command.args(args).current_dir(cwd);
-    process::clear_environment(&mut command);
-    command
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_HOST", "github.com")
-        .env("GH_CONFIG_DIR", &sandbox.path)
-        .env("PATH", SYSTEM_PATH);
+    sandbox.configure_command(&mut command);
     let output = process::run_with_limit(
         &mut command,
         GH_COMMAND_TIMEOUT,
@@ -6686,6 +6726,80 @@ mod tests {
 
         fs::remove_dir(&unrelated).expect("remove unrelated directory");
         fs::remove_dir(&root).expect("remove GC fixture root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_state_stays_private_and_expired_state_is_safely_collected() {
+        use std::os::unix::fs::symlink;
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-gh-state-{suffix}"));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let cwd = root.join("repository");
+        let private = root.join("private");
+        fs::create_dir(&cwd).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+        let sandbox = GuardGhSandbox {
+            path: private.clone(),
+        };
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(&cwd)
+            .env("HOME", &cwd).env("XDG_STATE_HOME", &cwd)
+            .env("GH_TOKEN", "fixture")
+            .args(["-c", "mkdir -p \"$XDG_STATE_HOME/gh\"; umask 077; printf fixture > \"$XDG_STATE_HOME/gh/device-id\""]);
+        sandbox.configure_command(&mut command);
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, value)| key == "GH_TOKEN" && value.is_some())
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "HOME" && value == Some(private.as_os_str()))
+        );
+        assert!(command.status().unwrap().success());
+        assert_eq!(fs::read_dir(&cwd).unwrap().count(), 0);
+        assert!(private.join("gh/device-id").is_file());
+        remove_expired_gh_snapshot(&private).unwrap();
+        assert!(!private.exists());
+
+        for unsafe_kind in [
+            "symlink-directory",
+            "symlink-file",
+            "unknown-file",
+            "hardlink-file",
+        ] {
+            fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+            let outside = root.join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            let state = private.join("gh");
+            if unsafe_kind == "symlink-directory" {
+                symlink(&outside, &state).unwrap();
+            } else {
+                fs::create_dir(&state).unwrap();
+                let source = outside.join("keep");
+                fs::write(&source, "保持").unwrap();
+                fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+                match unsafe_kind {
+                    "symlink-file" => symlink(&source, state.join("device-id")).unwrap(),
+                    "hardlink-file" => fs::hard_link(&source, state.join("device-id")).unwrap(),
+                    _ => fs::write(state.join("unknown"), "保持").unwrap(),
+                }
+            }
+            assert!(
+                remove_expired_gh_snapshot(&private).is_err(),
+                "{unsafe_kind}"
+            );
+            assert!(private.exists());
+            assert!(outside.exists());
+            fs::remove_dir_all(&private).unwrap();
+        }
+        drop(sandbox);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

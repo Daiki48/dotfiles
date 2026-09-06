@@ -74,6 +74,9 @@ Codexの[`PreToolUse` hook](https://learn.chatgpt.com/docs/hooks)は現時点で
 `codex-discussions`はcurrent originのGitHub repositoryだけを対象に、固定GraphQL query/mutationを
 実行します。hookは正規形の引数とoriginを検査し、hookと同じ実体のinstalled binaryへ解決します。
 helper自身もoriginを確認し、認証情報だけをprivate snapshotへ固定してsystem `gh`を実行します。
+`HOME`と`XDG_STATE_HOME`もprivate snapshotへ固定し、GitHub CLIが生成する
+`gh/device-id`を作業directoryへ書き込みません。終了時に回収し、中断時の期限切れsnapshotも
+既知のfile名・所有者・mode・link数を検証してから回収します。
 任意query、host/header指定、環境変数の認証・proxy差し替え、wrapper経由の実行は許可しません。
 
 | 操作 | 必須option（すべてに`--repo OWNER/REPO`が必要） |
