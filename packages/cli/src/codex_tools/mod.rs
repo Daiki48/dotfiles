@@ -1,5 +1,6 @@
 pub(crate) mod artifacts;
 pub(crate) mod delivery;
+pub(crate) mod discussions;
 pub(crate) mod guard;
 pub(crate) mod process;
 #[cfg(test)]

@@ -110,7 +110,13 @@ const SHELLS: &[&str] = &["bash", "dash", "sh", "zsh"];
 const WRAPPERS: &[&str] = &[
     "command", "env", "exec", "nice", "nohup", "sudo", "timeout", "xargs",
 ];
-const RESTRICTED_COMMANDS: &[&str] = &["git", "gh", "codex-worktree", "codex-delivery"];
+const RESTRICTED_COMMANDS: &[&str] = &[
+    "git",
+    "gh",
+    "codex-worktree",
+    "codex-delivery",
+    "codex-discussions",
+];
 const SHELL_COMPOUND_PREFIXES: &[&str] = &[
     "!",
     "-",
@@ -3064,7 +3070,7 @@ fn github_text_reason(values: &[String], label: &str) -> Option<String> {
     None
 }
 
-fn body_content_reason(contents: &str, label: &str) -> Option<String> {
+pub(crate) fn body_content_reason(contents: &str, label: &str) -> Option<String> {
     if contains_secret(contents) {
         return Some(format!("{label}に秘密情報らしい値が含まれています"));
     }
@@ -3095,7 +3101,7 @@ fn opened_fd_path(_file: &std::fs::File) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn safe_body_file_contents(path: &str, label: &str) -> Result<String, String> {
+pub(crate) fn safe_body_file_contents(path: &str, label: &str) -> Result<String, String> {
     if path == "-" {
         return Err(format!("{label}は検査可能なファイルで指定してください"));
     }
@@ -3117,7 +3123,9 @@ fn safe_body_file_contents(path: &str, label: &str) -> Result<String, String> {
     }
 
     let mut options = fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let file = options
         .open(&resolved)
         .map_err(|_| format!("{label} fileを安全に検査できません"))?;
@@ -3146,7 +3154,7 @@ fn safe_body_file_contents(path: &str, label: &str) -> Result<String, String> {
 }
 
 #[cfg(not(unix))]
-fn safe_body_file_contents(_path: &str, label: &str) -> Result<String, String> {
+pub(crate) fn safe_body_file_contents(_path: &str, label: &str) -> Result<String, String> {
     Err(format!("{label} fileを安全に検査できません"))
 }
 
@@ -3673,7 +3681,7 @@ fn trusted_helper_ancestor_owner(uid: u32) -> bool {
 fn trusted_installed_helper(name: &str) -> Result<String, String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    if !["codex-worktree", "codex-delivery"].contains(&name) {
+    if !["codex-worktree", "codex-delivery", "codex-discussions"].contains(&name) {
         return Err("helper名を確認できません".into());
     }
     // SAFETY: getpwuid returns process-account data owned by libc.
@@ -3771,7 +3779,7 @@ fn rewrite_helper_safety_command(command: &str) -> Result<Option<String>, String
     let Some(name) = tokens.first().map(String::as_str) else {
         return Ok(None);
     };
-    if !["codex-worktree", "codex-delivery"].contains(&name) {
+    if !["codex-worktree", "codex-delivery", "codex-discussions"].contains(&name) {
         return Ok(None);
     }
     tokens[0] = trusted_installed_helper(name)?;
@@ -4053,7 +4061,7 @@ fn gh_run_cancel_reason(args: &[String], cwd: &str) -> Option<String> {
     None
 }
 
-fn repository_reason(repository: &str, cwd: &str) -> Option<String> {
+pub(crate) fn repository_reason(repository: &str, cwd: &str) -> Option<String> {
     if !repository.contains('/')
         || origin_repository(cwd).is_none_or(|origin| !origin.eq_ignore_ascii_case(repository))
     {
@@ -4765,10 +4773,11 @@ fn python_helper_invocation_reason(tokens: &[String]) -> Option<String> {
                 i += 1;
                 value
             };
-            if ["codex-worktree", "codex-delivery"].contains(&module.as_str())
-                || tokens[i..]
-                    .iter()
-                    .any(|value| ["codex-worktree", "codex-delivery"].contains(&basename(value)))
+            if ["codex-worktree", "codex-delivery", "codex-discussions"].contains(&module.as_str())
+                || tokens[i..].iter().any(|value| {
+                    ["codex-worktree", "codex-delivery", "codex-discussions"]
+                        .contains(&basename(value))
+                })
             {
                 return Some("helperはPython moduleまたはinterpreter経由で実行できません".into());
             }
@@ -4782,7 +4791,8 @@ fn python_helper_invocation_reason(tokens: &[String]) -> Option<String> {
             i += 1;
             continue;
         }
-        if ["codex-worktree", "codex-delivery"].contains(&basename(&tokens[i])) {
+        if ["codex-worktree", "codex-delivery", "codex-discussions"].contains(&basename(&tokens[i]))
+        {
             return Some("helperはPython interpreterやwrapper経由で実行できません".into());
         }
         break;
@@ -4867,6 +4877,25 @@ fn helper_task_args(command: &str, args: &[String]) -> Option<String> {
             "codex-worktree {command}のtask IDを正規形で指定してください"
         ))
     }
+}
+
+fn discussions_helper_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> {
+    let start = command_start(tokens)?;
+    if basename(tokens.get(start)?) != "codex-discussions" {
+        return None;
+    }
+    if start != 0 || tokens[start] != "codex-discussions" {
+        return Some("Discussions helperはPATHから直接実行してください".into());
+    }
+    let args = &tokens[1..];
+    if super::discussions::is_help(args) {
+        return None;
+    }
+    let request = match super::discussions::Request::parse(args) {
+        Ok(request) => request,
+        Err(reason) => return Some(reason),
+    };
+    repository_reason(&request.repo, cwd.unwrap_or(""))
 }
 
 fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
@@ -5065,6 +5094,11 @@ fn has_write_operation(tokens: &[String]) -> bool {
                 return tokens.get(start + 1).is_some_and(|v| {
                     ["create", "recover", "artifacts", "clean-artifacts"].contains(&v.as_str())
                 });
+            }
+            "codex-discussions" => {
+                return tokens
+                    .get(start + 1)
+                    .is_some_and(|v| super::discussions::is_write(v));
             }
             "codex-delivery" => {
                 return tokens.get(start + 1).is_some_and(|v| {
@@ -5468,6 +5502,16 @@ fn blocked_reason(command: &str, cwd: Option<&str>, depth: usize) -> Option<Stri
         }
         if let Some(reason) = worktree_helper_invocation_reason(tokens) {
             return Some(reason);
+        }
+        if let Some(reason) = discussions_helper_invocation_reason(tokens, cwd) {
+            return Some(reason);
+        }
+        if depth > 0
+            && tokens
+                .first()
+                .is_some_and(|v| basename(v) == "codex-discussions")
+        {
+            return Some("Discussions helperはshell wrapperを使わず直接実行してください".into());
         }
         if let Some(reason) = delivery_helper_invocation_reason(tokens) {
             return Some(reason);
@@ -6371,6 +6415,68 @@ mod tests {
             assert!(blocked_reason(&format!("{command}; git status"), None, 0).is_some());
         }
         assert!(blocked_reason("codex-delivery deliver --task-id task-example --pr 1 --head 0123456789012345678901234567890123456789 --plan-id PLAN-TEST-v1 --plan-version 1", None, 0).is_none());
+    }
+
+    #[test]
+    fn discussions_helper_enforces_origin_and_direct_invocation() {
+        let path = std::env::temp_dir().join(format!(
+            "guard-discussions-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/repo.git",
+            ],
+        ] {
+            assert!(
+                Command::new("/usr/bin/git")
+                    .env_clear()
+                    .env("PATH", SYSTEM_PATH)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .current_dir(&path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let cwd = path.to_str().unwrap();
+        let view = "codex-discussions view --repo owner/repo --discussion 1";
+        assert!(blocked_reason(view, Some(cwd), 0).is_none());
+        for input in [
+            view.replace("owner/repo", "other/repo"),
+            format!("env {view}"),
+            format!("/tmp/{view}"),
+            format!("python3 {view}"),
+            format!("sh -c '{view}'"),
+            format!("{view}; git status"),
+            format!("{view} > /tmp/output"),
+            view.replace("view", "delete"),
+            format!("{view} --query mutation"),
+            "gh api graphql -f query=query".into(),
+        ] {
+            assert!(blocked_reason(&input, Some(cwd), 0).is_some(), "{input}");
+        }
+        assert!(blocked_reason(view, None, 0).is_some());
+        assert!(blocked_reason("codex-discussions --help", None, 0).is_none());
+        assert!(blocked_reason("rg codex-discussions docs", None, 0).is_none());
+        assert!(has_write_operation(
+            &["codex-discussions", "comment"].map(str::to_string)
+        ));
+        assert!(!has_write_operation(
+            &["codex-discussions", "view"].map(str::to_string)
+        ));
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
