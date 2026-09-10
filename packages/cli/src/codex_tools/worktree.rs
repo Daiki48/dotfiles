@@ -1680,7 +1680,10 @@ fn validated_manifest(
     let manifest = json_manifest(values)?;
     let (target, expected_path, _) = managed_paths(repository, &manifest.task_id, false)?;
     if manifest.version != MANIFEST_VERSION
-        || !matches!(manifest.status.as_str(), "creating" | "ready" | "failed")
+        || !matches!(
+            manifest.status.as_str(),
+            "creating" | "ready" | "failed" | "retiring" | "retired"
+        )
         || path != expected_path
         || path.file_stem().and_then(OsStr::to_str) != Some(manifest.task_id.as_str())
         || manifest.repository != repository.root.to_string_lossy()
@@ -1913,7 +1916,18 @@ fn diagnose(
             {
                 if record.is_none()
                     && path.as_ref().is_some_and(|path| !path.is_symlink())
-                    && completed_delivery(&manifest)
+                    && (completed_delivery(&manifest)
+                        || (manifest.status == "retired"
+                            && valid_oid(&manifest.detail)
+                            && !branch_exists(&repository, &manifest.branch)?
+                            && matches!(
+                                super::artifacts::validate(
+                                    Path::new(&manifest.worktree),
+                                    &manifest.task_id,
+                                    &repository.common_git_dir
+                                ),
+                                Ok(None)
+                            )))
                 {
                     status = "completed".to_string();
                     detail = "deliveryと掃除が完了しています".to_string();
@@ -2066,6 +2080,170 @@ fn recover(cwd: &Path, task_id: &str, allow_local_origin: bool) -> Result<PathBu
     Ok(PathBuf::from(manifest.worktree))
 }
 
+/// 未反映commit・remote branch・delivery記録がない、明示指定されたtaskだけを終了する。
+fn retire(
+    cwd: &Path,
+    task_id: &str,
+    head: &str,
+    allow_local_origin: bool,
+) -> Result<PathBuf, WorktreeError> {
+    if !valid_task_id(task_id) || !valid_oid(head) {
+        return Err(error("retireのtask/headが不正です"));
+    }
+    let repository = inspect_repository(cwd, allow_local_origin, true)?;
+    let (target, manifest_path, lock_path) = managed_paths(&repository, task_id, false)?;
+    let _lock = ExclusiveLock::acquire(&lock_path)?;
+    let matches: Vec<_> = load_manifests(&repository)?
+        .into_iter()
+        .filter(|(_, m)| m.task_id == task_id && m.status != "invalid")
+        .collect();
+    if matches.len() != 1 {
+        return Err(error("retire対象manifestを一意に確認できません"));
+    }
+    let mut manifest = matches[0].1.clone();
+    if !matches!(manifest.status.as_str(), "ready" | "retiring" | "retired")
+        || (manifest.status != "ready" && manifest.detail != head)
+    {
+        return Err(error("retireの状態または固定headが一致しません"));
+    }
+    let state_root = manifest_path
+        .parent()
+        .ok_or_else(|| error("state rootが不正です"))?;
+    for entry in fs::read_dir(state_root).map_err(|e| error(e.to_string()))? {
+        let name = entry
+            .map_err(|e| error(e.to_string()))?
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if name == format!("{task_id}.delivery.json")
+            || name.starts_with(&format!("{task_id}.receipt."))
+        {
+            return Err(error("delivery対象taskはfinish経路で終了してください"));
+        }
+    }
+    let before = snapshot(&repository.root)?;
+    if git_stdout(&repository.root, &["branch", "--show-current"])?.trim()
+        != repository.default_branch
+        || git_stdout(&repository.root, &["rev-parse", "HEAD"])?.trim() != repository.default_oid
+        || !git_stdout(
+            &repository.root,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?
+        .is_empty()
+    {
+        return Err(error(
+            "retireにはcleanで最新のdefault branch checkoutが必要です",
+        ));
+    }
+    git(
+        &repository.root,
+        &["merge-base", "--is-ancestor", head, &repository.default_oid],
+    )?;
+    let remote_ref = format!("refs/heads/{}", manifest.branch);
+    if !git_stdout(
+        &repository.root,
+        &["ls-remote", "--heads", &repository.origin_url, &remote_ref],
+    )?
+    .is_empty()
+    {
+        return Err(error("remote作業branchが存在するtaskはretireできません"));
+    }
+    if super::artifacts::validate(&target, task_id, &repository.common_git_dir)
+        .map_err(|e| error(e.to_string()))?
+        .is_some()
+    {
+        return Err(error(
+            "先にclean-artifactsで登録済み成果物を回収してください",
+        ));
+    }
+    let local_ref = format!("refs/heads/{}", manifest.branch);
+    let (branch_status, branch_output) =
+        git_allow_failure(&repository.root, &["rev-parse", "--verify", &local_ref])?;
+    if branch_status == 0 {
+        if branch_output.stdout.trim() != head {
+            return Err(error("作業branchのheadが変化しています"));
+        }
+    } else if manifest.status == "ready" || branch_status != 128 {
+        return Err(error("作業branchを安全に確認できません"));
+    }
+    let records = worktree_records(&repository.root)?;
+    let matching: Vec<_> = records
+        .iter()
+        .filter(|r| {
+            r.get("worktree")
+                .is_some_and(|p| p == target.to_string_lossy().as_ref())
+        })
+        .collect();
+    if records.iter().any(|r| {
+        r.get("branch") == Some(&local_ref)
+            && r.get("worktree")
+                .is_none_or(|p| p != target.to_string_lossy().as_ref())
+    }) {
+        return Err(error("作業branchが別worktreeに割り当てられています"));
+    }
+    if target.exists() || target.is_symlink() {
+        reject_symlink_components(&target)?;
+        let meta = fs::symlink_metadata(&target).map_err(|e| error(e.to_string()))?;
+        #[cfg(unix)]
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(error("worktreeの所有者が異なります"));
+        }
+        if !meta.is_dir()
+            || matching.len() != 1
+            || matching[0].get("branch") != Some(&local_ref)
+            || matching[0].get("HEAD").is_none_or(|h| h != head)
+            || absolute_git_path(&target, "--git-common-dir")? != repository.common_git_dir
+            || !git_stdout(
+                &target,
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--ignored",
+                ],
+            )?
+            .is_empty()
+        {
+            return Err(error("worktreeのidentityまたはclean条件が不一致です"));
+        }
+        let lock_reason = format!("codex-task:{task_id}");
+        if matching[0].get("locked").is_some_and(|v| v != &lock_reason)
+            || (manifest.status == "ready" && matching[0].get("locked") != Some(&lock_reason))
+        {
+            return Err(error("worktree lockの所有taskが異なります"));
+        }
+        crate::clean_disk::ensure_artifact_idle(&target).map_err(|e| error(e.to_string()))?;
+        manifest.status = "retiring".into();
+        manifest.detail = head.into();
+        atomic_manifest(&manifest_path, &manifest)?;
+        if snapshot(&repository.root)? != before {
+            return Err(error("親checkoutが変化しました"));
+        }
+        if matching[0].contains_key("locked") {
+            git(
+                &repository.root,
+                &["worktree", "unlock", target.to_string_lossy().as_ref()],
+            )?;
+        }
+        git(
+            &repository.root,
+            &["worktree", "remove", target.to_string_lossy().as_ref()],
+        )?;
+    } else if !matching.is_empty() || manifest.status == "ready" {
+        return Err(error("worktreeが意図したretire途中状態ではありません"));
+    }
+    if snapshot(&repository.root)? != before {
+        return Err(error("親checkoutが変化しました"));
+    }
+    if branch_status == 0 {
+        git(&repository.root, &["branch", "-d", &manifest.branch])?;
+    }
+    manifest.status = "retired".into();
+    manifest.detail = head.into();
+    atomic_manifest(&manifest_path, &manifest)?;
+    Ok(target)
+}
+
 /// `codex-worktree` の process entrypoint。引数エラーは2、操作エラーは1、成功は0。
 /// `args` は実行ファイル名を先頭に含む `std::env::args_os()` 形式を受け取る。
 pub fn entrypoint<I>(args: I) -> i32
@@ -2106,6 +2284,13 @@ fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
                 .map_err(|cause| (2, cause.to_string()))?;
             recover(&cwd, &task_id, false).map(|path| path.to_string_lossy().into_owned())
         }
+        "retire" => retire(
+            &cwd,
+            parsed.task_id.as_deref().unwrap_or(""),
+            parsed.head.as_deref().unwrap_or(""),
+            false,
+        )
+        .map(|_| "未反映変更のないtaskの終了が完了しました".into()),
         "artifacts" | "clean-artifacts" => {
             let task_id = parsed
                 .task_id
@@ -2161,6 +2346,7 @@ struct ParsedArgs {
     branch: Option<String>,
     issue: Option<i64>,
     task_id: Option<String>,
+    head: Option<String>,
 }
 
 fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
@@ -2189,7 +2375,14 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     }
     if !matches!(
         command.as_str(),
-        "create" | "list" | "doctor" | "resume" | "recover" | "artifacts" | "clean-artifacts"
+        "create"
+            | "list"
+            | "doctor"
+            | "resume"
+            | "recover"
+            | "artifacts"
+            | "clean-artifacts"
+            | "retire"
     ) {
         return Err(format!("unknown command: {command}"));
     }
@@ -2201,6 +2394,14 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     while index < values.len() {
         let value = &values[index];
         match value.as_str() {
+            "--head" if command == "retire" && parsed.head.is_none() => {
+                index += 1;
+                let head = values
+                    .get(index)
+                    .filter(|h| valid_oid(h))
+                    .ok_or_else(|| "retireには40桁headを明示してください".to_string())?;
+                parsed.head = Some(head.clone());
+            }
             "-h" | "--help" => return Err(format!("usage: codex-worktree {command} [options]")),
             "--branch" if command == "create" => {
                 index += 1;
@@ -2225,9 +2426,18 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
             "--task-id"
                 if matches!(
                     command.as_str(),
-                    "create" | "doctor" | "resume" | "recover" | "artifacts" | "clean-artifacts"
+                    "create"
+                        | "doctor"
+                        | "resume"
+                        | "recover"
+                        | "artifacts"
+                        | "clean-artifacts"
+                        | "retire"
                 ) =>
             {
+                if parsed.task_id.is_some() {
+                    return Err("--task-idが重複しています".into());
+                }
                 index += 1;
                 parsed.task_id = Some(
                     values
@@ -2249,6 +2459,11 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     }
     if command != "create" && parsed.branch.is_some() {
         return Err("--branchはcreateでのみ使用できます".to_string());
+    }
+    if command == "retire"
+        && (parsed.task_id.as_deref().is_none_or(|v| !valid_task_id(v)) || parsed.head.is_none())
+    {
+        return Err("retireには--task-idと--headが必要です".into());
     }
     Ok(parsed)
 }
@@ -2999,6 +3214,124 @@ mod tests {
             "failed"
         );
         assert!(resume(&fixture.repository, "task-recover", true).is_err());
+    }
+
+    #[test]
+    fn retire_removes_only_an_unchanged_local_task_and_is_idempotent() {
+        let fixture = TemporaryRepository::new();
+        let target =
+            create_worktree(&fixture.repository, "feat/retire", "task-retire", true).unwrap();
+        let other = create_worktree(&fixture.repository, "feat/other", "task-other", true).unwrap();
+        let head = git_stdout(&target, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let before = snapshot(&fixture.repository).unwrap();
+        retire(&fixture.repository, "task-retire", &head, true).unwrap();
+        assert!(!target.exists());
+        assert!(other.exists());
+        assert_eq!(snapshot(&fixture.repository).unwrap(), before);
+        assert_eq!(
+            diagnose(&fixture.repository, Some("task-retire"), true).unwrap()[0].1,
+            "completed"
+        );
+        retire(&fixture.repository, "task-retire", &head, true).unwrap();
+    }
+
+    #[test]
+    fn retire_preserves_dirty_ignored_and_remote_branch_tasks() {
+        let fixture = TemporaryRepository::new();
+        for (task, branch) in [
+            ("task-dirty", "feat/dirty"),
+            ("task-ignored", "feat/ignored"),
+            ("task-remote", "feat/remote"),
+        ] {
+            let target = create_worktree(&fixture.repository, branch, task, true).unwrap();
+            let head = git_stdout(&target, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_string();
+            if task == "task-dirty" {
+                fs::write(target.join("README.md"), "unsaved").unwrap();
+            }
+            if task == "task-ignored" {
+                fs::write(
+                    fixture.repository.join(".git/info/exclude"),
+                    "ignored-data\n",
+                )
+                .unwrap();
+                fs::write(target.join("ignored-data"), "unique data").unwrap();
+            }
+            if task == "task-remote" {
+                run_git(&target, &["push", "origin", branch]);
+            }
+            assert!(
+                retire(&fixture.repository, task, &head, true).is_err(),
+                "{task}"
+            );
+            assert!(target.exists());
+        }
+    }
+
+    #[test]
+    fn retire_preserves_unmerged_commits_and_delivery_tasks() {
+        let fixture = TemporaryRepository::new();
+        let target =
+            create_worktree(&fixture.repository, "feat/unmerged", "task-unmerged", true).unwrap();
+        fs::write(target.join("README.md"), "unmerged\n").unwrap();
+        run_git(&target, &["add", "README.md"]);
+        run_git(&target, &["commit", "-m", "unmerged"]);
+        let head = git_stdout(&target, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(retire(&fixture.repository, "task-unmerged", &head, true).is_err());
+        assert!(target.exists());
+        let target =
+            create_worktree(&fixture.repository, "feat/delivery", "task-delivery", true).unwrap();
+        let head = git_stdout(&target, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        fs::write(
+            fixture
+                .manifest("task-delivery")
+                .with_file_name("task-delivery.delivery.json"),
+            "{}",
+        )
+        .unwrap();
+        assert!(retire(&fixture.repository, "task-delivery", &head, true).is_err());
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn retire_resumes_after_native_removal_without_touching_parent() {
+        let fixture = TemporaryRepository::new();
+        let target =
+            create_worktree(&fixture.repository, "feat/partial", "task-partial", true).unwrap();
+        let head = git_stdout(&target, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let path = fixture.manifest("task-partial");
+        let mut manifest =
+            json_manifest(parse_manifest(&fs::read_to_string(&path).unwrap()).unwrap()).unwrap();
+        manifest.status = "retiring".into();
+        manifest.detail = head.clone();
+        atomic_manifest(&path, &manifest).unwrap();
+        run_git(
+            &fixture.repository,
+            &["worktree", "unlock", target.to_str().unwrap()],
+        );
+        run_git(
+            &fixture.repository,
+            &["worktree", "remove", target.to_str().unwrap()],
+        );
+        retire(&fixture.repository, "task-partial", &head, true).unwrap();
+        assert_eq!(
+            diagnose(&fixture.repository, Some("task-partial"), true).unwrap()[0].1,
+            "completed"
+        );
     }
 
     #[test]

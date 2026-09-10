@@ -4304,6 +4304,145 @@ fn finish(
     })
 }
 
+/// 同一証拠を保った、明示承認済みの手動merge復旧だけを許可する。
+fn recovered_receipt(existing: &Value, args: &CliArgs) -> Result<Value> {
+    if !args.recover_merged
+        || args.command != "approve-review"
+        || args.gate != FREE_PRIVATE_GATE_MODE
+        || existing.get("version").and_then(Value::as_i64) != Some(RECEIPT_VERSION)
+        || ![STRICT_GATE_MODE, FREE_PRIVATE_GATE_MODE]
+            .contains(&receipt_gate_mode(existing)?.as_str())
+    {
+        return Err(error(
+            "このreceiptは明示的な手動merge復旧の対象ではありません",
+        ));
+    }
+    match_cli_receipt(
+        existing,
+        Some(args.pr),
+        Some(&args.head),
+        Some(&args.plan),
+        Some(args.plan_version),
+        &receipt_gate_mode(existing)?,
+    )?;
+    if str_value(existing, "task_id")? != args.task
+        || args.risk.as_deref() != Some(str_value(existing, "risk")?.as_str())
+        || existing.get("tests_passed") != Some(&Value::Bool(args.tests))
+        || existing.get("independent_review_passed") != Some(&Value::Bool(args.independent))
+        || existing.get("specialist_review_passed") != Some(&Value::Bool(args.specialist))
+    {
+        return Err(error("復旧時にtask・risk・review evidenceを変更できません"));
+    }
+    validate_review_evidence_flags(
+        args.risk.as_deref().unwrap_or(""),
+        args.tests,
+        args.independent,
+        args.specialist,
+    )?;
+    validate_gate_review_profile(
+        &args.gate,
+        args.risk.as_deref().unwrap_or(""),
+        "human-approved",
+    )?;
+    let mut proposed = existing.clone();
+    proposed["gate_mode"] = string(FREE_PRIVATE_GATE_MODE);
+    proposed["decision"] = string("human-approved");
+    Ok(proposed)
+}
+
+fn assert_recovery_pr(view: &Value, repository: &str, branch: &str, head: &str) -> Result<()> {
+    if str_value(view, "state")? != "MERGED"
+        || str_value(view, "headRefOid")? != head
+        || str_value(view, "headRefName")? != branch
+        || str_value(view, "baseRefName")? != "main"
+        || view.get("isCrossRepository") != Some(&Value::Bool(false))
+        || !same_head_repository(view, repository)
+        || !view.get("autoMergeRequest").is_some_and(Value::is_null)
+    {
+        return Err(error(
+            "復旧対象PRが固定head・branch・repositoryでmerge済みではありません",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_merged(root: &Path, args: &CliArgs) -> Result<Value> {
+    with_deadline(|| {
+        let repository = repository(root)?;
+        let _lock = task_lock(&repository, &args.task)?;
+        let (manifest_value, worktree_path) = manifest(root, &args.task, &repository)?;
+        let existing = load_receipt(root, &args.task, &args.head, Some(&repository))?;
+        let proposed = recovered_receipt(&existing, args)?;
+        let state_file = state_path(&repository, &args.task)?;
+        if state_file.exists() || state_file.is_symlink() {
+            return Err(error(
+                "delivery stateが既に存在します。既存finish経路で再開してください",
+            ));
+        }
+        let branch = str_value(&manifest_value, "branch")?;
+        worktree(root, &manifest_value, &worktree_path)?;
+        worktree_clean_head(&worktree_path, &args.head)?;
+        validate_receipt_evidence(&worktree_path, &manifest_value, &existing)?;
+        validate_receipt_review_history(root, &existing)?;
+        assert_recovery_pr(
+            &pr_view(root, &repository, args.pr)?,
+            &repository,
+            &branch,
+            &args.head,
+        )?;
+        default_branch(root, &repository)?;
+        free_private_repository(root, &repository)?;
+        let live = fetch_main(root, &repository)?;
+        assert_main_clean(root)?;
+        if git(root, &["rev-parse", "HEAD"], true)?.trim() != live {
+            return Err(error(
+                "手動merge復旧にはローカルmainとlive origin/mainの一致が必要です",
+            ));
+        }
+        git(
+            root,
+            &["merge-base", "--is-ancestor", &args.head, &live],
+            true,
+        )?;
+        check_required_ci(root, &repository, &args.head)?;
+        check_required_ci(root, &repository, &live)?;
+        review_safety(root, &repository, args.pr)?;
+        // 検証中の変更を再照合してから管理記録だけを更新する。
+        assert_merge_base_unchanged(root, &repository, std::slice::from_ref(&live))?;
+        assert_recovery_pr(
+            &pr_view(root, &repository, args.pr)?,
+            &repository,
+            &branch,
+            &args.head,
+        )?;
+        worktree_clean_head(&worktree_path, &args.head)?;
+        validate_receipt_evidence(&worktree_path, &manifest_value, &existing)?;
+        assert_main_clean(root)?;
+        if git(root, &["rev-parse", "HEAD"], true)?.trim() != live {
+            return Err(error("復旧直前にローカルmainが変化しました"));
+        }
+        let state = object([
+            ("version", Value::Number(STATE_VERSION.into())),
+            ("kind", string("delivery")),
+            ("task_id", string(&args.task)),
+            ("repository", string(&repository)),
+            ("pr", Value::Number(args.pr.into())),
+            ("head_sha", string(&args.head)),
+            ("branch", string(&branch)),
+            ("stage", string("merged")),
+            ("updated_at", string(now())),
+            ("last_error", string("")),
+        ]);
+        // 途中停止でreceiptだけ更新された場合も同じ証拠で再検証して再開できる。
+        atomic_json(
+            &receipt_path(&repository, &args.task, &args.head)?,
+            &proposed,
+        )?;
+        atomic_json(&state_file, &state)?;
+        Ok(state)
+    })
+}
+
 fn canonical_helper_path() -> Result<PathBuf> {
     #[cfg(unix)]
     unsafe {
@@ -4398,6 +4537,7 @@ struct CliArgs {
     specialist: bool,
     sandbox_retry: bool,
     recover_main_sync: Option<MainSyncRecovery>,
+    recover_merged: bool,
     gate: String,
 }
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
@@ -4427,6 +4567,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             "specialist-review-passed",
             "sandbox-retry",
             "recover-main-sync",
+            "recover-merged",
         ];
         let value_options = [
             "task-id",
@@ -4504,6 +4645,12 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
         ));
     }
     if command == "record-review" || command == "approve-review" {
+        let recover_merged = flags.contains("recover-merged");
+        if recover_merged && (command != "approve-review" || gate != FREE_PRIVATE_GATE_MODE) {
+            return Err(error(
+                "手動merge復旧はapprove-reviewとgithub-free-privateを明示してください",
+            ));
+        }
         if flags.contains("sandbox-retry")
             || flags.contains("recover-main-sync")
             || values.contains_key("recover-main-sync-from")
@@ -4547,6 +4694,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             specialist,
             sandbox_retry: false,
             recover_main_sync: None,
+            recover_merged,
             gate,
         })
     } else {
@@ -4595,6 +4743,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             specialist: false,
             sandbox_retry,
             recover_main_sync,
+            recover_merged: false,
             gate,
         })
     }
@@ -4624,6 +4773,7 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 parsed.specialist,
                 &parsed.gate,
             ),
+            "approve-review" if parsed.recover_merged => recover_merged(&root, &parsed),
             "approve-review" => write_review(
                 &root,
                 &parsed.task,
@@ -4758,6 +4908,150 @@ mod tests {
             ("gate_mode", string(STRICT_GATE_MODE)),
             ("plan_version", Value::Number(2.into())),
         ])
+    }
+
+    fn manual_recovery_args() -> CliArgs {
+        parse_args(
+            [
+                "approve-review",
+                "--task-id",
+                "issue-24",
+                "--pr",
+                "24",
+                "--head",
+                &"b".repeat(40),
+                "--plan-id",
+                "CODEX-DELIVERY-TEST-v1",
+                "--plan-version",
+                "2",
+                "--risk",
+                "high",
+                "--tests-passed",
+                "--independent-review-passed",
+                "--gate-mode",
+                "github-free-private",
+                "--recover-merged",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn manual_merge_recovery_preserves_all_evidence_and_is_restartable() {
+        let existing = receipt_v6("high", false);
+        let proposed = recovered_receipt(&existing, &manual_recovery_args()).unwrap();
+        assert_eq!(proposed["gate_mode"], FREE_PRIVATE_GATE_MODE);
+        assert_eq!(proposed["decision"], "human-approved");
+        let mut restored = proposed.clone();
+        restored["gate_mode"] = existing["gate_mode"].clone();
+        restored["decision"] = existing["decision"].clone();
+        assert_eq!(restored, existing);
+        assert_eq!(
+            recovered_receipt(&proposed, &manual_recovery_args()).unwrap(),
+            proposed
+        );
+        assert!(!review_receipt_scope_matches(&existing, &proposed));
+    }
+
+    #[test]
+    fn manual_merge_recovery_rejects_changed_binding_or_evidence() {
+        let existing = receipt_v6("high", false);
+        for field in [
+            "task_id",
+            "pr",
+            "head_sha",
+            "plan_id",
+            "plan_version",
+            "risk",
+            "tests_passed",
+            "independent_review_passed",
+            "specialist_review_passed",
+            "version",
+            "gate_mode",
+        ] {
+            let mut changed = existing.clone();
+            changed[field] = match field {
+                "pr" | "plan_version" | "version" => Value::Number(999.into()),
+                "tests_passed" | "independent_review_passed" => Value::Bool(false),
+                "specialist_review_passed" => Value::Bool(true),
+                "gate_mode" => string(LOCAL_VALIDATION_GATE_MODE),
+                "risk" => string("medium"),
+                _ => string("other"),
+            };
+            assert!(
+                recovered_receipt(&changed, &manual_recovery_args()).is_err(),
+                "{field}"
+            );
+        }
+        let mut args = manual_recovery_args();
+        args.command = "record-review".into();
+        assert!(recovered_receipt(&existing, &args).is_err());
+        args.command = "approve-review".into();
+        args.recover_merged = false;
+        assert!(recovered_receipt(&existing, &args).is_err());
+    }
+
+    #[test]
+    fn manual_recovery_parser_rejects_implicit_or_incompatible_commands() {
+        for command in ["record-review", "deliver", "finish"] {
+            assert!(
+                parse_args(
+                    [
+                        command,
+                        "--task-id",
+                        "issue-24",
+                        "--pr",
+                        "24",
+                        "--head",
+                        &"b".repeat(40),
+                        "--plan-id",
+                        "CODEX-DELIVERY-TEST-v1",
+                        "--plan-version",
+                        "2",
+                        "--risk",
+                        "high",
+                        "--tests-passed",
+                        "--independent-review-passed",
+                        "--gate-mode",
+                        "github-free-private",
+                        "--recover-merged"
+                    ]
+                    .into_iter()
+                    .map(OsString::from)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn manual_merge_recovery_rejects_unmerged_or_foreign_pr() {
+        let view = serde_json::json!({"state":"MERGED", "headRefOid":"b".repeat(40),
+            "headRefName":"feat/example", "baseRefName":"main", "isCrossRepository":false,
+            "headRepository":{"nameWithOwner":"owner/repo"},
+            "headRepositoryOwner":{"login":"owner"}, "autoMergeRequest":null});
+        assert!(assert_recovery_pr(&view, "owner/repo", "feat/example", &"b".repeat(40)).is_ok());
+        for (field, value) in [
+            ("state", string("OPEN")),
+            ("headRefOid", string("c".repeat(40))),
+            ("headRefName", string("feat/other")),
+            ("baseRefName", string("develop")),
+            ("isCrossRepository", Value::Bool(true)),
+            (
+                "headRepository",
+                serde_json::json!({"nameWithOwner":"other/repo"}),
+            ),
+            ("autoMergeRequest", serde_json::json!({})),
+        ] {
+            let mut wrong = view.clone();
+            wrong[field] = value;
+            assert!(
+                assert_recovery_pr(&wrong, "owner/repo", "feat/example", &"b".repeat(40)).is_err(),
+                "{field}"
+            );
+        }
     }
 
     fn receipt_v5_with_ledger(risk_value: &str, specialist: bool) -> Value {
