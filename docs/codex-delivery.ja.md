@@ -263,6 +263,23 @@ force update、強制cleanupを行いません。PR、branch、worktreeを保持
 
 ## managed cleanup
 
+### 手動マージ・main同期後の管理状態の復旧
+
+人間がPRをmergeしてmainを同期し、delivery stateが作成されていない場合には、次の明示的な復旧経路を使えます。
+通常の同一headのmode変更禁止は維持し、この復旧操作だけで既存v6 receiptのstrict-rulesetからgithub-free-privateへの変更を認めます。
+Free/private経路と復旧について、先に人間の明示承認を得てください。
+
+```sh
+codex-delivery approve-review --task-id <task> --pr <pr> --head <head> --plan-id <plan-v1> --plan-version 1 --risk high --tests-passed --independent-review-passed --gate-mode github-free-private --recover-merged
+codex-delivery finish --task-id <task> --pr <pr> --head <head> --plan-id <plan-v1> --plan-version 1 --gate-mode github-free-private
+```
+
+復旧は既存receiptと同じtask・PR・head・Plan・risk・review evidenceに限定します。既存stateがある場合は拒否し、従来のfinish経路で扱います。
+PRの同一repository/branch/headでのmerge、headのmain到達、cleanかつ最新mainの親checkout、cleanな作業worktree、private repository identity、
+PR headと現在のmainの両方の全Actions check成功、未解決reviewなしをliveで検証します。CI不在や失敗からのfallbackはしません。
+条件を再照合した後、承認済みreceiptと`merged`状態だけをatomic保存します。receipt更新後に中断した場合は再実行して全条件を検証できます。
+この操作自体はGitHub merge・main同期・worktree削除を行いません。stateの手編集・削除で代用しないでください。
+
 finishの最後に、管理root内の対象worktreeだけをcleanupできます。helperは少なくとも次を同時に
 証明しなければなりません。
 

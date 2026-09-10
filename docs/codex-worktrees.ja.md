@@ -47,6 +47,20 @@ codex-delivery --help
 
 ## 標準手順
 
+### PRを作成しなかったtaskの明示的な終了
+
+納品物を回収・退避し、未反映の変更が不要であることを人間が確認したtaskは、固定headを指定して終了できます。
+
+```sh
+codex-worktree retire --task-id <task-id> --head <40桁SHA>
+```
+
+親checkoutがcleanで最新のdefault branchと一致し、作業headがその履歴に到達していることが必要です。
+tracked/untracked/ignoredの変更、remote作業branch、delivery receipt/state、未回収の登録済み成果物、別taskのlock、使用中のpathは拒否します。
+既存PRのtaskは引き続き`codex-delivery finish`を使います。検証後はnative Gitのunlock/removeと通常のbranch削除だけを行い、forceやpruneを使いません。
+manifestに固定headと`retiring`/`retired`を保存するため、途中停止は同じ指定で再開できます。`doctor`は終了済みをcompletedとして扱います。
+固有データは先に規約どおり退避し、この操作に未コミット変更の破棄を任せないでください。
+
 以降のhelperコマンドは、対象repositoryの親（main checkout）から実行します。既定branch
 以外のcheckoutや、すでに作成したlinked worktreeから、別worktreeを作成・診断しないで
 ください。

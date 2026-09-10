@@ -4876,6 +4876,18 @@ fn worktree_helper_invocation_reason(tokens: &[String]) -> Option<String> {
             }
         }
         "resume" | "recover" | "artifacts" | "clean-artifacts" => helper_task_args(command, rest),
+        "retire" => {
+            if rest.len() == 4
+                && rest[0] == "--task-id"
+                && valid_task_id(&rest[1])
+                && rest[2] == "--head"
+                && valid_oid(&rest[3])
+            {
+                None
+            } else {
+                Some("retireは--task-idと--headを固定して指定してください".into())
+            }
+        }
         "create" => {
             let mut seen = HashMap::new();
             let mut i = 0;
@@ -4978,6 +4990,7 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         "--specialist-review-passed",
         "--sandbox-retry",
         "--recover-main-sync",
+        "--recover-merged",
     ];
     let mut values = HashMap::new();
     let mut seen = Vec::new();
@@ -5009,6 +5022,12 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
                     .into(),
             );
         }
+    }
+    if seen.iter().any(|flag| flag == "--recover-merged")
+        && (command != "approve-review"
+            || values.get("--gate-mode").map(String::as_str) != Some("github-free-private"))
+    {
+        return Some("手動merge復旧はapprove-reviewとgithub-free-privateを明示してください".into());
     }
     if command == "record-review" || command == "approve-review" {
         let risk = values.get("--risk").map(String::as_str).unwrap_or("");
@@ -5132,7 +5151,14 @@ fn has_write_operation(tokens: &[String]) -> bool {
         match basename(tokens.get(start).unwrap_or(&String::new())) {
             "codex-worktree" => {
                 return tokens.get(start + 1).is_some_and(|v| {
-                    ["create", "recover", "artifacts", "clean-artifacts"].contains(&v.as_str())
+                    [
+                        "create",
+                        "recover",
+                        "artifacts",
+                        "clean-artifacts",
+                        "retire",
+                    ]
+                    .contains(&v.as_str())
                 });
             }
             "codex-discussions" => {
@@ -7431,6 +7457,64 @@ mod tests {
             assert!(
                 blocked_reason(command, None, 0).is_some(),
                 "blocked: {command}"
+            );
+        }
+    }
+}
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn manual_merge_recovery_requires_explicit_approval_and_remote_ci_mode() {
+        let base = "--task-id issue-24 --pr 24 --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --plan-id MANUAL-RECOVERY-v1 --plan-version 1 --risk high --tests-passed --independent-review-passed --recover-merged";
+        let args = format!("approve-review {base} --gate-mode github-free-private");
+        assert!(
+            delivery_helper_invocation_reason(
+                &format!("codex-delivery {args}")
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            )
+            .is_none()
+        );
+        for command in [
+            format!("record-review {base} --gate-mode github-free-private"),
+            format!("approve-review {base}"),
+            format!("approve-review {base} --gate-mode github-free-private-local"),
+        ] {
+            assert!(
+                delivery_helper_invocation_reason(
+                    &format!("codex-delivery {command}")
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                )
+                .is_some()
+            );
+        }
+    }
+    #[test]
+    fn retire_guard_binds_task_and_exact_head_without_force_options() {
+        let good = "codex-worktree retire --task-id task-video --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tokens = good
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(worktree_helper_invocation_reason(&tokens).is_none());
+        assert!(has_write_operation(&tokens));
+        for command in [
+            "codex-worktree retire --task-id task-video",
+            "codex-worktree retire --task-id task-video --head main",
+            "codex-worktree retire --task-id task-video --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --force",
+        ] {
+            assert!(
+                worktree_helper_invocation_reason(
+                    &command
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                )
+                .is_some()
             );
         }
     }
