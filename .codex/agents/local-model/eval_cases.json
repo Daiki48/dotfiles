@@ -1,0 +1,56 @@
+[
+  {
+    "id": "minimum_version",
+    "role": "extract",
+    "question": "MIN_TREE_SITTER_CLI_VERSIONの設定行",
+    "source": "const MIN_TREE_SITTER_CLI_VERSION: (u32, u32, u32) = (0, 26, 1);\n",
+    "lines": [
+      1
+    ]
+  },
+  {
+    "id": "fractional_clamp",
+    "role": "summarize",
+    "question": "clamp(12.5)の戻り値を一文で説明してください。",
+    "source": "def clamp(value):\n    return max(0, min(value, 100))\n",
+    "evidence": [
+      2
+    ],
+    "keywords": [
+      "12.5"
+    ],
+    "forbidden": [
+      "整数"
+    ]
+  },
+  {
+    "id": "toml_keys",
+    "role": "inspect",
+    "question": "is_assignment_for(line, &[\"agents.enabled\"])の戻り値を次の5入力の順にtrue/falseで返してください。入力はJSON文字列で表します: [\"agents.enabled = true\", \"\"agents.enabled\" = true\", \"\"agents\".enabled = true\", \"  # agents.enabled = true\", \"agents.enabled = [\" ]。最後の入力はRHSが未完了です。この関数が何を検証するかも説明してください。",
+    "source": "fn assignment_key_path(line: &str) -> Option<Vec<String>> {\n    let trimmed = line.trim_start();\n    if trimmed.starts_with('#') || trimmed.starts_with('[') {\n        return None;\n    }\n    let mut basic = false;\n    let mut literal = false;\n    let mut escaped = false;\n    let equals = trimmed.char_indices().find_map(|(index, character)| {\n        if basic {\n            if escaped {\n                escaped = false;\n            } else if character == '\\\\' {\n                escaped = true;\n            } else if character == '\"' {\n                basic = false;\n            }\n            return None;\n        }\n        if literal {\n            if character == '\\'' {\n                literal = false;\n            }\n            return None;\n        }\n        match character {\n            '\"' => basic = true,\n            '\\'' => literal = true,\n            '=' => return Some(index),\n            _ => {}\n        }\n        None\n    })?;\n    if basic || literal {\n        return None;\n    }\n    let key = trimmed[..equals].trim();\n    if key.is_empty() {\n        return None;\n    }\n    let probe = format!(\"{key} = true\\n\").parse::<DocumentMut>().ok()?;\n    let mut table = probe.as_table();\n    let mut path = Vec::new();\n    loop {\n        if table.len() != 1 {\n            return None;\n        }\n        let (key, item) = table.iter().next()?;\n        path.push(key.to_owned());\n        if item.is_value() {\n            return Some(path);\n        }\n        let next = item.as_table()?;\n        if !next.is_implicit() {\n            return None;\n        }\n        table = next;\n    }\n}\n\nfn is_assignment_for(line: &str, keys: &[&str]) -> bool {\n    let Some(path) = assignment_key_path(line) else {\n        return false;\n    };\n    keys.iter()\n        .any(|key| path.iter().map(String::as_str).eq(key.split('.')))\n}\n",
+    "file": "packages/cli/src/codex.rs",
+    "start": 961,
+    "decisions": [
+      true,
+      false,
+      true,
+      false,
+      true
+    ],
+    "expected_fallback": "syntax_semantics_requires_luna"
+  },
+  {
+    "id": "artifact_recovery",
+    "role": "inspect",
+    "question": "成果物cleanup中断からの復旧を実装したいです。paths、markerの内容/所有権と親directoryの検証は、明記した欠落以外すべて正常とします。次を順にtrue/falseで判断してください。1) 正常なmarkerが残り成果物pathだけが消えているとvalidateはOk(Some(path))を返す。2) その状態でcreateを呼ぶと成果物directoryを自動再作成する。3) markerが存在せず成果物directoryだけが存在する場合、cleanupは未登録directoryを削除する。4) directory削除成功後にmarker削除が失敗した状態では、次のcleanupが残ったmarkerを削除して成功できる。根拠と復旧時の注意を説明してください。",
+    "source": "//! タスク所有の使い捨て成果物。ソースや任意の外部pathは登録できない。\nuse anyhow::{Context, Result, bail};\nuse serde::{Deserialize, Serialize};\nuse std::fs::{self, OpenOptions};\nuse std::io::Write;\n#[cfg(unix)]\nuse std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};\nuse std::path::{Path, PathBuf};\n\n#[derive(Debug, Deserialize, Serialize, PartialEq)]\n#[serde(deny_unknown_fields)]\nstruct Owner {\n    version: u32,\n    task_id: String,\n    worktree: PathBuf,\n    common_git_dir: PathBuf,\n    device: u64,\n    inode: u64,\n}\n\nfn paths(worktree: &Path, task: &str) -> Result<(PathBuf, PathBuf)> {\n    if !super::worktree::valid_artifact_task_id(task)\n        || worktree.file_name().and_then(|v| v.to_str()) != Some(task)\n        || !worktree.is_absolute()\n    {\n        bail!(\"成果物のtask/pathが一致しません\");\n    }\n    let parent = worktree.parent().context(\"taskの管理rootがありません\")?;\n    if fs::canonicalize(parent)? != parent {\n        bail!(\"成果物の管理rootにsymlinkがあります\");\n    }\n    Ok((\n        parent.join(\".artifacts\").join(task),\n        parent.join(\".state\").join(format!(\"{task}.artifacts.json\")),\n    ))\n}\n\nfn private_directory(path: &Path) -> Result<()> {\n    let metadata = fs::symlink_metadata(path)?;\n    if !metadata.is_dir() || metadata.file_type().is_symlink() || fs::canonicalize(path)? != path {\n        bail!(\"成果物directoryが安全ではありません: {}\", path.display());\n    }\n    #[cfg(unix)]\n    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {\n        bail!(\"成果物directoryの所有者またはmodeが不正です\");\n    }\n    Ok(())\n}\n\nfn identity(path: &Path) -> Result<(u64, u64)> {\n    let metadata = fs::symlink_metadata(path)?;\n    #[cfg(unix)]\n    return Ok((metadata.dev(), metadata.ino()));\n    #[cfg(not(unix))]\n    {\n        let _ = metadata;\n        bail!(\"成果物のinode検証はこのOSで未対応です\")\n    }\n}\n\nfn read_owner(marker: &Path) -> Result<Owner> {\n    private_directory(marker.parent().context(\"state rootがありません\")?)?;\n    let metadata = fs::symlink_metadata(marker)?;\n    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16 * 1024 {\n        bail!(\"成果物markerが安全なfileではありません\");\n    }\n    #[cfg(unix)]\n    if metadata.uid() != unsafe { libc::geteuid() }\n        || metadata.mode() & 0o077 != 0\n        || metadata.nlink() != 1\n    {\n        bail!(\"成果物markerの所有者、mode、link数が不正です\");\n    }\n    Ok(serde_json::from_slice(&fs::read(marker)?)?)\n}\n\n/// markerがない既存directoryは採用しない。削除途中の再実行は許可する。\npub(crate) fn validate(worktree: &Path, task: &str, common: &Path) -> Result<Option<PathBuf>> {\n    let (path, marker) = paths(worktree, task)?;\n    if !marker.try_exists()? && !marker.is_symlink() {\n        if path.try_exists()? || path.is_symlink() {\n            bail!(\"未登録の成果物directoryは保持します: {}\", path.display());\n        }\n        return Ok(None);\n    }\n    let owner = read_owner(&marker)?;\n    if owner.version != 1\n        || owner.task_id != task\n        || owner.worktree != worktree\n        || owner.common_git_dir != common\n    {\n        bail!(\"成果物markerとtask manifestが一致しません\");\n    }\n    private_directory(path.parent().context(\"artifacts rootがありません\")?)?;\n    if path.try_exists()? || path.is_symlink() {\n        private_directory(&path)?;\n        if identity(&path)? != (owner.device, owner.inode) {\n            bail!(\"成果物directoryが登録後に置換されています\");\n        }\n        crate::clean_disk::validate_artifact_tree(&path)?;\n    }\n    Ok(Some(path))\n}\n\npub(crate) fn create(worktree: &Path, task: &str, common: &Path) -> Result<PathBuf> {\n    if let Some(path) = validate(worktree, task, common)? {\n        if !path.exists() {\n            bail!(\"成果物の削除が中断しています。clean-artifactsで完了してください\");\n        }\n        return Ok(path);\n    }\n    let (path, marker) = paths(worktree, task)?;\n    private_directory(marker.parent().context(\"state rootがありません\")?)?;\n    let parent = path.parent().context(\"artifacts rootがありません\")?;\n    let mut builder = fs::DirBuilder::new();\n    #[cfg(unix)]\n    builder.mode(0o700);\n    if !parent.try_exists()? {\n        builder.create(parent)?;\n    }\n    private_directory(parent)?;\n    builder.create(&path)?;\n    let (device, inode) = identity(&path)?;\n    let owner = Owner {\n        version: 1,\n        task_id: task.into(),\n        worktree: worktree.into(),\n        common_git_dir: common.into(),\n        device,\n        inode,\n    };\n    let mut options = OpenOptions::new();\n    options.write(true).create_new(true);\n    #[cfg(unix)]\n    options.mode(0o600);\n    let mut file = options.open(&marker)?;\n    file.write_all(&serde_json::to_vec_pretty(&owner)?)?;\n    file.sync_all()?;\n    Ok(path)\n}\n\n/// 呼出元がtask lifecycle lockと終了条件を確認した後だけ実行する。\npub(crate) fn cleanup(worktree: &Path, task: &str, common: &Path) -> Result<()> {\n    let Some(path) = validate(worktree, task, common)? else {\n        return Ok(());\n    };\n    if path.exists() {\n        crate::clean_disk::remove_artifact_tree(&path)?;\n    }\n    let (_, marker) = paths(worktree, task)?;\n    fs::remove_file(marker)?;\n    Ok(())\n}\n\n#[cfg(test)]\nmod tests {\n",
+    "file": "packages/cli/src/codex_tools/artifacts.rs",
+    "start": 1,
+    "decisions": [
+      true,
+      false,
+      false,
+      true
+    ]
+  }
+]
