@@ -155,8 +155,12 @@ server-side強制がないためriskをhigh/criticalへ引き上げますが、d
 
 `~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
 `~/.agents/skills`, and `~/.codex/agents` are symlinked from this repository.
-The custom agents use Luna xhigh for non-writing exploration and scoped independent review,
-while the main agent owns requirements, implementation, integration, and acceptance.
+Small, preselected excerpts prefer the local gpt-oss:20b helper for identifier-based extraction
+or a one-sentence explanation. Larger contexts and cross-file reasoning go directly to Luna
+xhigh, which also handles fallback and scoped independent review. The main agent owns
+requirements, implementation, integration, and acceptance. The helper sends only the excerpt
+to local Ollama; The local model receives no shell tools or Codex conversation history.
+See [ローカルgpt-oss運用](docs/codex-local-model.ja.md) for limits, setup, and validation.
 Subagents inherit the parent runtime permissions, so role-local sandbox settings are not treated
 as a security boundary. The single-writer contract and explicit no-mutation instructions are the
 operational controls against delegated writes, not hard sandbox enforcement. Automated tests,
