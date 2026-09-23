@@ -9,7 +9,7 @@
 # repository内ではconfig.base.tomlという名前にし、project configとして
 # Codexに自動読込されないようにする。
 
-model = "gpt-6-astra"
+model = "gpt-6-sol"
 model_reasoning_effort = "medium"
 plan_mode_reasoning_effort = "high"
 approval_policy = "on-request"
@@ -45,7 +45,7 @@ enabled = true
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 3
-default_subagent_model = "gpt-5.6-luna"
+default_subagent_model = "gpt-6-luna"
 default_subagent_reasoning_effort = "xhigh"
 
 [[hooks.PreToolUse]]
