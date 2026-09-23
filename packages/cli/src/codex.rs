@@ -4271,7 +4271,7 @@ mod tests {
                     .as_str()
                     .is_some_and(|name| !name.is_empty())
             );
-            assert_eq!(document["model"].as_str(), Some("gpt-5.6-luna"));
+            assert_eq!(document["model"].as_str(), Some("gpt-6-luna"));
             assert_eq!(document["model_reasoning_effort"].as_str(), Some("xhigh"));
             assert!(
                 document["developer_instructions"]
@@ -4288,6 +4288,16 @@ mod tests {
             .parse::<toml_edit::DocumentMut>()
             .expect("parse base config");
 
+        assert_eq!(document["model"].as_str(), Some("gpt-6-sol"));
+        assert_eq!(document["model_reasoning_effort"].as_str(), Some("medium"));
+        assert_eq!(
+            document["agents"]["default_subagent_model"].as_str(),
+            Some("gpt-6-luna")
+        );
+        assert_eq!(
+            document["agents"]["default_subagent_reasoning_effort"].as_str(),
+            Some("xhigh")
+        );
         assert_eq!(
             document["default_permissions"].as_str(),
             Some(MANAGED_PERMISSION_PROFILE)
@@ -5112,7 +5122,7 @@ local_agent_setting = "preserved"
         let document = migrated
             .parse::<toml_edit::DocumentMut>()
             .expect("managed config spelling migration must remain valid TOML");
-        assert_eq!(document["model"].as_str(), Some("gpt-6-astra"));
+        assert_eq!(document["model"].as_str(), Some("gpt-6-sol"));
         assert_eq!(document["model_reasoning_effort"].as_str(), Some("medium"));
         assert_eq!(document["approval_policy"].as_str(), Some("on-request"));
         assert!(document.get("profile").is_none());
@@ -5121,7 +5131,7 @@ local_agent_setting = "preserved"
         assert_eq!(document["agents"]["enabled"].as_bool(), Some(true));
         assert_eq!(
             document["agents"]["default_subagent_model"].as_str(),
-            Some("gpt-5.6-luna")
+            Some("gpt-6-luna")
         );
         assert_eq!(
             document["agents"]["local_agent_setting"].as_str(),
@@ -5193,7 +5203,7 @@ local_profile = {
         let document = migrated
             .parse::<toml_edit::DocumentMut>()
             .expect("multiline managed config migration must remain valid TOML");
-        assert_eq!(document["model"].as_str(), Some("gpt-6-astra"));
+        assert_eq!(document["model"].as_str(), Some("gpt-6-sol"));
         assert_eq!(document["model_reasoning_effort"].as_str(), Some("medium"));
         assert_eq!(document["agents"]["enabled"].as_bool(), Some(true));
         assert_eq!(
