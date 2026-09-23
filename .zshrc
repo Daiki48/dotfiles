@@ -28,6 +28,9 @@ zstyle ':completion:*' list-colors 'di=36' 'ex=31' 'ln=35'
 zstyle ':completion:*:default' menu select=1
 zstyle ':completion:*:*:make:*' tag-order 'targets'
 export WORDCHARS='*?_.[];!#$%^{}<>'
+export EDITOR=nvim
+export VISUAL=nvim
+export SUDO_EDITOR=nvim
 
 # Add deno completions to search path
 if [[ ":$FPATH:" != *":$HOME/.zsh/completions:"* ]]; then export FPATH="$HOME/.zsh/completions:$FPATH"; fi
