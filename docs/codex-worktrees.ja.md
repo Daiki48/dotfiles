@@ -193,6 +193,8 @@ Podmanはtask専用root/runrootと`--rm`を使い、通常のhostのcontainer領
 `finish`はworktreeの終了条件を証明した後、登録済み成果物も削除します。PRなし作業は
 報告前に`clean-artifacts`を呼び、未commit変更を含むworktree本体を保持します。
 登録済みの使い捨て成果物はtrashへ移し替えず破棄します。異常や削除失敗では保持して再開します。
+owner marker・task・path・device/inodeが一致する登録領域では、検証で作成したGit fixtureも領域全体とともに回収します。
+source/worktree/common Gitや別taskへは触れず、symlinkの先もたどりません。通常のcache内のGit repositoryは引き続き保護します。
 
 セッション終了hookや常駐daemonによる削除ではなく、上記commandをAGENTS/execute-planの
 完了手順に組み込む運用です。進行中のsourceを年齢だけで消す処理はありません。
@@ -252,9 +254,9 @@ errorから自動fallbackせず、modeを省略した既存commandとv1 receipt�
 
 hosted/self-hosted CIを使わない方針をDaikiが明示承認した場合だけ、high/criticalの
 `approve-review`、`deliver`、`finish`へ`--gate-mode github-free-private-local`を明示できます。
-このmodeはPRのbaseと固定headの双方にworkflow YAMLがないこと、private repositoryとPR/reviewのlive検証を要求し、
-`required-ci`だけをlocal testのreceiptへ置き換えます。workflow YAMLがあれば`runs-on`のrunner種別に
-従って通常CIを使い、`record-review`やCI failureからの自動fallbackには使えません。
+このmodeはPRのlive baseと固定headのworkflowが双方とも不在、またはすべて厳密なタグpush専用であること、private repositoryとPR/reviewのlive検証を要求し、
+固定headのlocal testをreceiptへ記録します。タグpush専用の条件は[delivery運用ガイド](codex-delivery.ja.md#github-freeprivate-local-only)を参照してください。
+PRやbranch pushのCIがあれば通常CIを使い、`record-review`やCI failureからの自動fallbackには使えません。存在するActions checkの成功も必須です。
 
 PRのbaseと固定headの双方にworkflow YAMLが存在しない通常のrepositoryでは`--gate-mode local-validation`を使い、product固有の
 format、lint、型検査、test、buildから該当するlocal検証を固定headへ記録します。CI不在だけを理由に

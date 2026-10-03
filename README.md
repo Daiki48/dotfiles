@@ -136,6 +136,10 @@ checks nevertheless exist for the fixed head, they must all be completed with a 
 conclusion. This mode is never a fallback for a failed, pending, or unavailable runner. The legacy
 `github-free-private-local` mode remains supported for existing receipts.
 
+明示承認した`github-free-private-local`は、baseと固定headの全workflowがタグpush専用である構成も扱います。
+通常のCI必須gateは維持し、不明なYAMLやPR CIをlocal検証へ切り替えません。登録済みの使い捨てartifact内に作成したGit fixtureは
+所有情報と使用状況を検証して回収します。汎用cacheのGit repository、外部symlink先、source、別taskは引き続き保護します。
+
 For a change, build, or fix request, Codex autonomously investigates, implements, and
 verifies the requested scope. Plans, subagents, commits, pushes, Draft PRs, and the delivery
 loop are used when the task or an explicit request warrants them. 小さく局所的なlow/medium変更は
