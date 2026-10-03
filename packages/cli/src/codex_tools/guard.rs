@@ -5025,9 +5025,11 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
     }
     if seen.iter().any(|flag| flag == "--recover-merged")
         && (command != "approve-review"
-            || values.get("--gate-mode").map(String::as_str) != Some("github-free-private"))
+            || !values.get("--gate-mode").is_some_and(|mode| {
+                ["github-free-private", "github-free-private-local"].contains(&mode.as_str())
+            }))
     {
-        return Some("手動merge復旧はapprove-reviewとgithub-free-privateを明示してください".into());
+        return Some("手動merge復旧はapprove-reviewとprivate gateを明示してください".into());
     }
     if command == "record-review" || command == "approve-review" {
         let risk = values.get("--risk").map(String::as_str).unwrap_or("");
@@ -7465,22 +7467,24 @@ mod tests {
 mod recovery_tests {
     use super::*;
     #[test]
-    fn manual_merge_recovery_requires_explicit_approval_and_remote_ci_mode() {
+    fn manual_merge_recovery_requires_explicit_approval_and_private_mode() {
         let base = "--task-id issue-24 --pr 24 --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --plan-id MANUAL-RECOVERY-v1 --plan-version 1 --risk high --tests-passed --independent-review-passed --recover-merged";
-        let args = format!("approve-review {base} --gate-mode github-free-private");
-        assert!(
-            delivery_helper_invocation_reason(
-                &format!("codex-delivery {args}")
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            )
-            .is_none()
-        );
+        for gate in ["github-free-private", "github-free-private-local"] {
+            let args = format!("approve-review {base} --gate-mode {gate}");
+            assert!(
+                delivery_helper_invocation_reason(
+                    &format!("codex-delivery {args}")
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                )
+                .is_none()
+            );
+        }
         for command in [
             format!("record-review {base} --gate-mode github-free-private"),
             format!("approve-review {base}"),
-            format!("approve-review {base} --gate-mode github-free-private-local"),
+            format!("approve-review {base} --gate-mode local-validation"),
         ] {
             assert!(
                 delivery_helper_invocation_reason(

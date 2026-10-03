@@ -7,4 +7,5 @@ pub(crate) mod process;
 mod ruleset;
 pub(crate) mod runner_storage;
 pub(crate) mod trust;
+mod workflow_policy;
 pub(crate) mod worktree;

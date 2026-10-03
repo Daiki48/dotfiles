@@ -65,8 +65,8 @@ codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --pl
 ```
 
 hosted/self-hosted CIを意図的に使わないGitHub Free/private repositoryでは、Daikiが残存リスクを
-明示承認し、固定headに`.github/workflows/*.yml|*.yaml`がない場合に限り、次のlocal-only profileを
-使用できます。workflow YAMLがあれば`runs-on`のrunner種別に従って通常CIを使います。
+明示承認し、live baseと固定headのworkflowが両方とも不在、またはすべてタグpushのみの場合に限り、次のlocal-only profileを
+使用できます。PR・branch pushなどのCIを含むworkflowがあれば通常CIを使います。
 `record-review`では記録できません。
 
 ```sh
@@ -198,13 +198,20 @@ API取得不能ではfail closedにします。
 
 `github-free-private-local`は`github-free-private`と同じlive repository identity、固定head、最新mainの
 ancestor、mergeability、review thread、`CHANGES_REQUESTED`、receiptを検証しますが、唯一
-`required-ci` check runを要求しません。代わりに固定SHAで完了したlocal test・従来必須の独立review・専門reviewを
-receiptへ固定し、workflow YAML不在、high/critical、`human-approved`を必須にします。同一headの既存
+GitHub Actions checkの存在を要求しません。代わりに固定SHAで完了したlocal test・従来必須の独立review・専門reviewを
+receiptへ固定し、後述のworkflow条件、high/critical、`human-approved`を必須にします。同一headの既存
 `github-free-private` receiptは、同じPlan・evidenceのまま明示承認されたこのmodeへだけ更新できます。
 
 このmodeの`tests-passed`はlocal実行結果の構造的な申告であり、GitHubが実行・強制するCI証明では
 ありません。CI失敗・pendingを迂回するfallbackとしては使わず、CI自体を運用しない方針への明示承認が
 ある場合だけ選択します。GitHub側で直接push等を拒否できない残存リスクも引き続き存在します。
+
+live baseと固定headの両方で全workflowを調べます。workflowが存在する場合は、YAMLとして解析した
+`on`が`push`のみ、そのfilterが非空の文字列配列`tags`のみであることを要求します。これは
+[GitHubのタグfilter仕様](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpushbranchestagsbranches-ignoretags-ignore)に従い、PRやbranch pushでは起動しない構成を明示承認のlocal検証で扱うための限定です。
+PR・manual・reusable・schedule等の追加trigger、branches/paths等の追加filter、不明な形式、
+重複key、複数document、anchor/alias/tag/merge keyは拒否します。通常のremote gateとworkflow不在の
+`local-validation`の条件は変更しません。実際のActions checkが存在すれば全件の成功系conclusionを必須とし、pendingや失敗を迂回しません。
 
 ### workflow不在のlocal validation
 
@@ -266,7 +273,7 @@ force update、強制cleanupを行いません。PR、branch、worktreeを保持
 ### 手動マージ・main同期後の管理状態の復旧
 
 人間がPRをmergeしてmainを同期し、delivery stateが作成されていない場合には、次の明示的な復旧経路を使えます。
-通常の同一headのmode変更禁止は維持し、この復旧操作だけで既存v6 receiptのstrict-rulesetからgithub-free-privateへの変更を認めます。
+通常の同一headのmode変更禁止は維持し、この復旧操作だけで既存v6 receiptのstrict-rulesetからprivate profileへの変更を認めます。
 Free/private経路と復旧について、先に人間の明示承認を得てください。
 
 ```sh
@@ -276,7 +283,10 @@ codex-delivery finish --task-id <task> --pr <pr> --head <head> --plan-id <plan-v
 
 復旧は既存receiptと同じtask・PR・head・Plan・risk・review evidenceに限定します。既存stateがある場合は拒否し、従来のfinish経路で扱います。
 PRの同一repository/branch/headでのmerge、headのmain到達、cleanかつ最新mainの親checkout、cleanな作業worktree、private repository identity、
-PR headと現在のmainの両方の全Actions check成功、未解決reviewなしをliveで検証します。CI不在や失敗からのfallbackはしません。
+PR headと現在のmainの両方の全Actions check成功、未解決reviewなしをliveで検証します。明示承認済みの
+local-only構成では、同じevidenceの`github-free-private-local` receiptと`--recover-merged`を使えます。
+その場合も両treeのworkflow条件と、存在する全Actions checkの成功系conclusionを再検証します。
+receiptがない旧作業は、固定headの検証・reviewを完了し通常の`approve-review`で作成してから復旧します。CI失敗からのfallbackはしません。
 条件を再照合した後、承認済みreceiptと`merged`状態だけをatomic保存します。receipt更新後に中断した場合は再実行して全条件を検証できます。
 この操作自体はGitHub merge・main同期・worktree削除を行いません。stateの手編集・削除で代用しないでください。
 

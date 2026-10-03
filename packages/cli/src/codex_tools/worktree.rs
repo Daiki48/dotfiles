@@ -3128,9 +3128,17 @@ mod tests {
         let before = snapshot(&target).unwrap();
         let artifact = task_artifacts(&fixture.repository, "task-artifacts", false, true).unwrap();
         fs::write(artifact.join("test.img"), "temporary").unwrap();
+        let git_fixture = artifact.join("release-validation-fixture");
+        fs::create_dir(&git_fixture).unwrap();
+        run_git(&git_fixture, &["init", "--initial-branch=main"]);
+        assert!(git_fixture.join(".git").is_dir());
+        let common = absolute_git_path(&target, "--git-common-dir").unwrap();
+        let common_head = fs::read(common.join("HEAD")).unwrap();
+        std::os::unix::fs::symlink(&common, artifact.join("source-git-link")).unwrap();
         task_artifacts(&fixture.repository, "task-artifacts", true, true).unwrap();
         assert!(!artifact.exists());
         assert_eq!(snapshot(&target).unwrap(), before);
+        assert_eq!(fs::read(common.join("HEAD")).unwrap(), common_head);
         assert_eq!(
             diagnose(&fixture.repository, Some("task-artifacts"), true).unwrap()[0].1,
             "dirty"

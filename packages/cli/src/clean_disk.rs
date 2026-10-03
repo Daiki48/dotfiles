@@ -322,7 +322,9 @@ pub(crate) fn remove_artifact_tree(path: &Path) -> Result<()> {
         active_scope: path.into(),
         snapshot: scan_path(path)?,
     };
-    remove_candidate(&candidate)
+    // 呼出元がtaskのowner markerを照合した使い捨て領域だけに適用する。
+    // Git fixtureも領域内の成果物として回収し、symlinkの先はたどらない。
+    remove_candidate_with_policy(&candidate, RepositoryPolicy::DisposableArtifact)
 }
 
 /// 0700のtask専用領域は同一UIDの検証processだけに使う。
@@ -679,11 +681,22 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RepositoryPolicy {
+    Preserve,
+    DisposableArtifact,
+}
+
 fn remove_candidate(candidate: &Candidate) -> Result<()> {
+    remove_candidate_with_policy(candidate, RepositoryPolicy::Preserve)
+}
+
+fn remove_candidate_with_policy(candidate: &Candidate, policy: RepositoryPolicy) -> Result<()> {
     if matches!(
         candidate.kind,
         CandidateKind::BuildCache | CandidateKind::CodexBuildCache
-    ) {
+    ) && matches!(policy, RepositoryPolicy::Preserve)
+    {
         let parent = candidate
             .path
             .parent()
@@ -699,6 +712,7 @@ fn remove_candidate(candidate: &Candidate) -> Result<()> {
         candidate.kind,
         CandidateKind::BuildCache | CandidateKind::CodexBuildCache
     ) && current.contains_repository
+        && matches!(policy, RepositoryPolicy::Preserve)
     {
         anyhow::bail!("cache内のGit repositoryを保持します");
     }
@@ -1218,6 +1232,32 @@ mod tests {
         fs::write(target.join("new-artifact"), b"changed").unwrap();
         assert!(remove_candidate(&candidate).is_err());
         assert!(target.exists());
+    }
+
+    #[test]
+    fn generic_cache_preserves_nested_git_repositories() {
+        let fixture = TestDirectory::new("nested-git-cache");
+        let target = fixture.0.join("target");
+        let repository = target.join("fixture");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(
+            Command::new("/usr/bin/git")
+                .current_dir(&repository)
+                .args(["init", "--quiet"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let candidate = Candidate {
+            path: target.clone(),
+            kind: CandidateKind::BuildCache,
+            active_scope: fixture.0.clone(),
+            snapshot: scan_path(&target).unwrap(),
+        };
+        assert!(remove_candidate(&candidate).is_err());
+        assert!(repository.join(".git").is_dir());
+        assert!(discover_under(&fixture.0, false).unwrap().is_empty());
     }
 
     #[cfg(unix)]

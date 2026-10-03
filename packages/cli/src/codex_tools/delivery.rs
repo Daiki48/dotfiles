@@ -2201,6 +2201,7 @@ fn validate_local_gate_workflow_policy(
             &[
                 "ls-tree",
                 "-r",
+                "-z",
                 "--name-only",
                 reference,
                 "--",
@@ -2208,9 +2209,15 @@ fn validate_local_gate_workflow_policy(
             ],
             true,
         )?;
-        if files.lines().any(workflow_yaml_path) {
+        for file in files.split('\0').filter(|file| workflow_yaml_path(file)) {
+            if gate == FREE_PRIVATE_LOCAL_GATE_MODE {
+                let source = git(worktree, &["show", &format!("{reference}:{file}")], true)?;
+                if super::workflow_policy::tag_push_only(&source).map_err(error)? {
+                    continue;
+                }
+            }
             return Err(error(
-                "local validation gateはbaseと固定headの双方にworkflow YAMLが存在しない場合のみ使用できます",
+                "local gateのworkflowは不在、または明示承認のprivate local modeでタグpushのみに限定してください",
             ));
         }
     }
@@ -4308,10 +4315,14 @@ fn finish(
 fn recovered_receipt(existing: &Value, args: &CliArgs) -> Result<Value> {
     if !args.recover_merged
         || args.command != "approve-review"
-        || args.gate != FREE_PRIVATE_GATE_MODE
+        || !free_private_gate(&args.gate)
         || existing.get("version").and_then(Value::as_i64) != Some(RECEIPT_VERSION)
-        || ![STRICT_GATE_MODE, FREE_PRIVATE_GATE_MODE]
-            .contains(&receipt_gate_mode(existing)?.as_str())
+        || ![
+            STRICT_GATE_MODE,
+            FREE_PRIVATE_GATE_MODE,
+            FREE_PRIVATE_LOCAL_GATE_MODE,
+        ]
+        .contains(&receipt_gate_mode(existing)?.as_str())
     {
         return Err(error(
             "このreceiptは明示的な手動merge復旧の対象ではありません",
@@ -4345,7 +4356,7 @@ fn recovered_receipt(existing: &Value, args: &CliArgs) -> Result<Value> {
         "human-approved",
     )?;
     let mut proposed = existing.clone();
-    proposed["gate_mode"] = string(FREE_PRIVATE_GATE_MODE);
+    proposed["gate_mode"] = string(&args.gate);
     proposed["decision"] = string("human-approved");
     Ok(proposed)
 }
@@ -4404,8 +4415,14 @@ fn recover_merged(root: &Path, args: &CliArgs) -> Result<Value> {
             &["merge-base", "--is-ancestor", &args.head, &live],
             true,
         )?;
-        check_required_ci(root, &repository, &args.head)?;
-        check_required_ci(root, &repository, &live)?;
+        validate_local_gate_workflow_policy(&worktree_path, &live, &args.head, &args.gate)?;
+        if remote_ci_required(&args.gate) {
+            check_required_ci(root, &repository, &args.head)?;
+            check_required_ci(root, &repository, &live)?;
+        } else {
+            check_local_validation_ci(root, &repository, &args.head)?;
+            check_local_validation_ci(root, &repository, &live)?;
+        }
         review_safety(root, &repository, args.pr)?;
         // 検証中の変更を再照合してから管理記録だけを更新する。
         assert_merge_base_unchanged(root, &repository, std::slice::from_ref(&live))?;
@@ -4646,9 +4663,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
     }
     if command == "record-review" || command == "approve-review" {
         let recover_merged = flags.contains("recover-merged");
-        if recover_merged && (command != "approve-review" || gate != FREE_PRIVATE_GATE_MODE) {
+        if recover_merged && (command != "approve-review" || !free_private_gate(&gate)) {
             return Err(error(
-                "手動merge復旧はapprove-reviewとgithub-free-privateを明示してください",
+                "手動merge復旧はapprove-reviewとprivate gateを明示してください",
             ));
         }
         if flags.contains("sandbox-retry")
@@ -4991,6 +5008,30 @@ mod tests {
         args.command = "approve-review".into();
         args.recover_merged = false;
         assert!(recovered_receipt(&existing, &args).is_err());
+    }
+
+    #[test]
+    fn manual_local_recovery_preserves_gate_and_all_fixed_evidence() {
+        let mut args = manual_recovery_args();
+        args.gate = FREE_PRIVATE_LOCAL_GATE_MODE.into();
+        for gate in [
+            STRICT_GATE_MODE,
+            FREE_PRIVATE_GATE_MODE,
+            FREE_PRIVATE_LOCAL_GATE_MODE,
+        ] {
+            let mut existing = receipt_v6("high", false);
+            existing["gate_mode"] = string(gate);
+            let proposed = recovered_receipt(&existing, &args).unwrap();
+            assert_eq!(proposed["gate_mode"], FREE_PRIVATE_LOCAL_GATE_MODE);
+            assert_eq!(proposed["decision"], "human-approved");
+            let mut restored = proposed.clone();
+            restored["gate_mode"] = existing["gate_mode"].clone();
+            restored["decision"] = existing["decision"].clone();
+            assert_eq!(restored, existing);
+            assert_eq!(recovered_receipt(&proposed, &args).unwrap(), proposed);
+        }
+        args.risk = Some("medium".into());
+        assert!(recovered_receipt(&receipt_v6("high", false), &args).is_err());
     }
 
     #[test]
@@ -6528,6 +6569,77 @@ mod tests {
         assert!(
             validate_local_gate_workflow_policy(&root, &with_ci, &removed_ci, STRICT_GATE_MODE)
                 .is_ok()
+        );
+        fs::write(
+            root.join(".github/workflows/release.yml"),
+            "on: {push: {tags: ['v*.*.*']}}\n",
+        )
+        .unwrap();
+        let tag_cd = commit(&root, "tag-only cd");
+        for base in [&no_ci, &tag_cd] {
+            assert!(
+                validate_local_gate_workflow_policy(
+                    &root,
+                    base,
+                    &tag_cd,
+                    FREE_PRIVATE_LOCAL_GATE_MODE
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            validate_local_gate_workflow_policy(
+                &root,
+                &tag_cd,
+                &tag_cd,
+                LOCAL_VALIDATION_GATE_MODE
+            )
+            .is_err()
+        );
+        assert!(
+            validate_local_gate_workflow_policy(
+                &root,
+                &with_ci,
+                &tag_cd,
+                FREE_PRIVATE_LOCAL_GATE_MODE
+            )
+            .is_err()
+        );
+        fs::write(root.join(".github/workflows/ci.yml"), "on: pull_request\n").unwrap();
+        let ci_and_cd = commit(&root, "ci and cd");
+        assert!(
+            validate_local_gate_workflow_policy(
+                &root,
+                &tag_cd,
+                &ci_and_cd,
+                FREE_PRIVATE_LOCAL_GATE_MODE
+            )
+            .is_err()
+        );
+        assert!(
+            validate_local_gate_workflow_policy(
+                &root,
+                &ci_and_cd,
+                &tag_cd,
+                FREE_PRIVATE_LOCAL_GATE_MODE
+            )
+            .is_err()
+        );
+        fs::remove_file(root.join(".github/workflows/ci.yml")).unwrap();
+        fs::write(
+            root.join(".github/workflows/odd\nci.yml"),
+            "on: pull_request\n",
+        )
+        .unwrap();
+        let unusual_path = commit(&root, "ci with unusual filename");
+        assert!(
+            validate_local_gate_workflow_policy(
+                &root,
+                &tag_cd,
+                &unusual_path,
+                FREE_PRIVATE_LOCAL_GATE_MODE
+            )
+            .is_err()
         );
         fs::remove_dir_all(root).unwrap();
     }
