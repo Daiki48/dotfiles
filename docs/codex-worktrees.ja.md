@@ -15,6 +15,18 @@ worktreeの管理rootは、OpenAIのGit worktree運用に合わせて `$CODEX_HO
 非保護branchを作ります。親checkoutのbranch、HEAD、index、working treeは作成前後で
 変わらず、親checkoutがdirtyでも変更・破棄しません。
 
+## 初回repositoryの準備
+
+commitに必要なGit identityが不足する場合、Codexは親checkoutで次を実行できます。
+
+```sh
+codex-worktree prepare --user-name Daiki48 --user-email daiki@dnfolio.me
+```
+
+originのfetch/push先が同一GitHub repositoryであることを確認し、local/globalの有効な`user.name`と`user.email`を保持して、不足するkeyだけlocal configへ補完します。既存値が空・重複・不正なら上書きせず停止します。指定値はこのdotfiles所有者の既定であり、別のidentityが必要なら明示してください。設定は同じrepositoryのworktreeにも共有されます。
+
+`create`は最新のremote default branchをfetchするため、手動fetchを前提にしません。初期化済みremoteなら、localにcommitがなくても作業用worktreeを作成し、親のstaged/untracked fileを保持します。空remoteの初回公開、originの推定、無関係な履歴の統合は行いません。空remoteでも`prepare`によるidentityの補完は可能です。
+
 ## 初回インストール
 
 CLIとRust製hook/helperのrelease build・配布、`codex-autonomous` permission profileとmanaged workspace rootの設定・移行は次のコマンドで行います。何度実行
@@ -49,7 +61,7 @@ codex-delivery --help
 
 ### PRを作成しなかったtaskの明示的な終了
 
-納品物を回収・退避し、未反映の変更が不要であることを人間が確認したtaskは、固定headを指定して終了できます。
+納品物と必要なIssue記録を保存し、未反映の変更がないtaskは、固定headを指定して自律的に終了できます。未commit変更の破棄は許可しません。
 
 ```sh
 codex-worktree retire --task-id <task-id> --head <40桁SHA>

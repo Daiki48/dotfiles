@@ -1580,14 +1580,14 @@ fn local_git_value(cwd: &str, key: &str) -> Result<Option<String>, String> {
     single_git_config_value(output, "repository Git identity設定")
 }
 
-fn effective_identity_value(cwd: &str, key: &str) -> Result<Option<String>, String> {
+pub(crate) fn effective_identity_value(cwd: &str, key: &str) -> Result<Option<String>, String> {
     match local_git_value(cwd, key)? {
         Some(value) => Ok(Some(value)),
         None => global_git_value(key),
     }
 }
 
-fn safe_identity_text(value: &str, max: usize) -> bool {
+pub(crate) fn safe_identity_text(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value.len() <= max
         && value
@@ -4861,6 +4861,18 @@ fn worktree_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         return Some("codex-worktreeのhelpはsubcommand直後に単独指定してください".into());
     }
     match command.as_str() {
+        "prepare" => {
+            if rest.len() == 4
+                && rest[0] == "--user-name"
+                && safe_identity_text(&rest[1], 256)
+                && rest[2] == "--user-email"
+                && safe_identity_text(&rest[3], 320)
+            {
+                None
+            } else {
+                Some("prepareは補完用の--user-nameと--user-emailを指定してください".into())
+            }
+        }
         "list" => {
             if rest.is_empty() {
                 None
@@ -4983,6 +4995,7 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         "--risk",
         "--recover-main-sync-from",
         "--recover-main-sync-to",
+        "--issue",
     ];
     let switches = [
         "--tests-passed",
@@ -5022,6 +5035,17 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
                     .into(),
             );
         }
+    }
+    if let Some(issue) = values.get("--issue")
+        && (command != "finish"
+            || issue.parse::<i64>().is_err()
+            || issue.parse::<i64>().is_ok_and(|number| number < 1)
+            || values
+                .get("--task-id")
+                .and_then(|task| task.strip_prefix("issue-"))
+                .is_some_and(|number| number != issue))
+    {
+        return Some("Issue番号はfinishへtaskと一致する正の整数で指定してください".into());
     }
     if seen.iter().any(|flag| flag == "--recover-merged")
         && (command != "approve-review"
@@ -5154,6 +5178,7 @@ fn has_write_operation(tokens: &[String]) -> bool {
             "codex-worktree" => {
                 return tokens.get(start + 1).is_some_and(|v| {
                     [
+                        "prepare",
                         "create",
                         "recover",
                         "artifacts",
@@ -6463,6 +6488,11 @@ mod tests {
 
     #[test]
     fn helper_syntax_is_restricted() {
+        let prepare = "codex-worktree prepare --user-name Daiki48 --user-email daiki@dnfolio.me";
+        assert!(blocked_reason(prepare, None, 0).is_none());
+        assert!(write_context_reason(prepare, None).is_some());
+        assert!(blocked_reason(&format!("{prepare}; git status"), None, 0).is_some());
+        assert!(blocked_reason(&format!("{prepare} --global"), None, 0).is_some());
         assert!(blocked_reason("codex-worktree list", None, 0).is_none());
         assert!(blocked_reason("codex-worktree create --task-id task-example", None, 0).is_none());
         assert!(blocked_reason("codex-worktree create --issue 0", None, 0).is_some());
@@ -6483,6 +6513,21 @@ mod tests {
             assert!(blocked_reason(&format!("{command}; git status"), None, 0).is_some());
         }
         assert!(blocked_reason("codex-delivery deliver --task-id task-example --pr 1 --head 0123456789012345678901234567890123456789 --plan-id PLAN-TEST-v1 --plan-version 1", None, 0).is_none());
+    }
+
+    #[test]
+    fn finish_issue_guard_rejects_wrong_command_and_conflicting_task() {
+        let args = |command: &str, task: &str, number: &str| {
+            format!(
+                "codex-delivery {command} --task-id {task} --pr 7 --head {} --plan-id test-example-v1 --plan-version 1 --issue {number}",
+                "a".repeat(40)
+            )
+        };
+        assert!(blocked_reason(&args("finish", "task-example", "3"), None, 0).is_none());
+        assert!(blocked_reason(&args("finish", "issue-3", "3"), None, 0).is_none());
+        assert!(blocked_reason(&args("finish", "issue-3", "4"), None, 0).is_some());
+        assert!(blocked_reason(&args("finish", "task-example", "0"), None, 0).is_some());
+        assert!(blocked_reason(&args("deliver", "task-example", "3"), None, 0).is_some());
     }
 
     #[test]

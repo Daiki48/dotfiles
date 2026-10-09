@@ -1009,6 +1009,11 @@ fn remote_default(root: &Path, origin: &str) -> Result<(String, String), Worktre
         "HEAD",
     ];
     let output = git_stdout(root, &arguments)?;
+    if output.trim().is_empty() {
+        return Err(error(
+            "originに解決可能なHEADがありません。空remoteへの初回commit・公開は対象と内容を確認してから行ってください",
+        ));
+    }
     let lines: Vec<&str> = output.lines().collect();
     if lines.len() != 2 {
         return Err(error("originのdefault branchを一意に確認できません"));
@@ -1341,14 +1346,84 @@ fn managed_paths(
     ))
 }
 
-fn snapshot(root: &Path) -> Result<(String, String, String, String, String), WorktreeError> {
+type CheckoutSnapshot = (String, Option<String>, String, String, String);
+
+fn snapshot(root: &Path) -> Result<CheckoutSnapshot, WorktreeError> {
+    let (symbolic_code, symbolic) = git_allow_failure(root, &["symbolic-ref", "-q", "HEAD"])?;
+    let (head_code, head) =
+        git_allow_failure(root, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?;
+    let branch = match symbolic_code {
+        0 if symbolic.stdout.trim().starts_with("refs/heads/") => symbolic.stdout,
+        1 if head_code == 0 => "HEAD".into(),
+        _ => return Err(error("親checkoutのHEADを確認できません")),
+    };
+    let head = if head_code == 0 && valid_oid(head.stdout.trim()) {
+        Some(head.stdout)
+    } else {
+        let (ref_code, _) =
+            git_allow_failure(root, &["show-ref", "--verify", "--quiet", branch.trim()])?;
+        if symbolic_code != 0 || ref_code != 1 {
+            return Err(error("未作成branch以外のHEAD解決失敗は許可しません"));
+        }
+        None
+    };
     Ok((
-        git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"])?,
-        git_stdout(root, &["rev-parse", "HEAD"])?,
+        branch,
+        head,
         git_stdout(root, &["status", "--porcelain=v1", "--untracked-files=all"])?,
         git_stdout(root, &["diff", "--cached", "--binary", "--"])?,
         git_stdout(root, &["diff", "--binary", "--"])?,
     ))
+}
+
+fn prepare_identity_with(
+    root: &Path,
+    name: &str,
+    email: &str,
+    mut current: impl FnMut(&str) -> Result<Option<String>, WorktreeError>,
+) -> Result<(), WorktreeError> {
+    let mut missing = Vec::new();
+    for (key, fallback, limit) in [("user.name", name, 256), ("user.email", email, 320)] {
+        if !super::guard::safe_identity_text(fallback, limit) {
+            return Err(error("補完用Git identityが不正です"));
+        }
+        match current(key)? {
+            Some(value) if super::guard::safe_identity_text(&value, limit) => {}
+            Some(_) => return Err(error("既存Git identityが不正です。上書きせず保持します")),
+            None => missing.push((key, fallback)),
+        }
+    }
+    for (key, fallback) in missing {
+        git_stdout(root, &["config", "--local", "--add", key, fallback])?;
+    }
+    Ok(())
+}
+
+fn prepare_repository(cwd: &Path, name: &str, email: &str) -> Result<(), WorktreeError> {
+    // remoteに履歴がなくてもidentityだけは準備できる。fetch/push先の一致は検査する。
+    let repository = inspect_repository(cwd, false, false)?;
+    prepare_identity_locked(
+        &repository.root,
+        &repository.common_git_dir,
+        name,
+        email,
+        |key| {
+            super::guard::effective_identity_value(&repository.root.to_string_lossy(), key)
+                .map_err(error)
+        },
+    )
+}
+
+fn prepare_identity_locked(
+    root: &Path,
+    common: &Path,
+    name: &str,
+    email: &str,
+    current: impl FnMut(&str) -> Result<Option<String>, WorktreeError>,
+) -> Result<(), WorktreeError> {
+    // CODEX_HOMEやtaskが違っても同じrepositoryの初回設定を直列化する。
+    let _lock = ExclusiveLock::acquire(&common.join("codex-identity.lock"))?;
+    prepare_identity_with(root, name, email, current)
 }
 
 fn atomic_manifest(path: &Path, manifest: &Manifest) -> Result<(), WorktreeError> {
@@ -2264,6 +2339,12 @@ fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
     let cwd = std::env::current_dir()
         .map_err(|cause| (1, format!("current directoryを取得できません: {cause}")))?;
     let operation = match parsed.command.as_str() {
+        "prepare" => prepare_repository(
+            &cwd,
+            parsed.user_name.as_deref().unwrap_or(""),
+            parsed.user_email.as_deref().unwrap_or(""),
+        )
+        .map(|_| "既存identityを保持し、不足するGit identityをlocal設定へ補完しました".into()),
         "create" => {
             if parsed.issue.is_some() && parsed.task_id.is_some() {
                 return Err((2, "Issue番号とtask IDは同時に指定できません".to_string()));
@@ -2347,6 +2428,8 @@ struct ParsedArgs {
     issue: Option<i64>,
     task_id: Option<String>,
     head: Option<String>,
+    user_name: Option<String>,
+    user_email: Option<String>,
 }
 
 fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
@@ -2370,12 +2453,13 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         .ok_or_else(|| "commandを指定してください".to_string())?;
     if matches!(command.as_str(), "-h" | "--help") {
         return Err(
-            "usage: codex-worktree <create|list|doctor|resume|recover|artifacts|clean-artifacts> [options]".to_string(),
+            "usage: codex-worktree <prepare|create|list|doctor|resume|recover|artifacts|clean-artifacts|retire> [options]".to_string(),
         );
     }
     if !matches!(
         command.as_str(),
-        "create"
+        "prepare"
+            | "create"
             | "list"
             | "doctor"
             | "resume"
@@ -2394,6 +2478,23 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     while index < values.len() {
         let value = &values[index];
         match value.as_str() {
+            "--user-name" | "--user-email" if command == "prepare" => {
+                let destination = if value == "--user-name" {
+                    &mut parsed.user_name
+                } else {
+                    &mut parsed.user_email
+                };
+                if destination.is_some() {
+                    return Err("Git identityの引数が重複しています".into());
+                }
+                index += 1;
+                *destination = Some(
+                    values
+                        .get(index)
+                        .cloned()
+                        .ok_or("Git identityの値が必要です")?,
+                );
+            }
             "--head" if command == "retire" && parsed.head.is_none() => {
                 index += 1;
                 let head = values
@@ -2449,6 +2550,9 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
             _ => return Err(format!("unknown or misplaced argument: {value}")),
         }
         index += 1;
+    }
+    if command == "prepare" && (parsed.user_name.is_none() || parsed.user_email.is_none()) {
+        return Err("prepareには--user-nameと--user-emailが必要です".into());
     }
     if matches!(
         command.as_str(),
@@ -2593,6 +2697,259 @@ mod tests {
         assert!(normalize_task_id(None, Some("task-UPPER")).is_err());
         assert!(normalize_task_id(None, Some("task-safe-id")).is_ok());
         assert!(valid_task_id(&generate_task_id()));
+    }
+
+    #[test]
+    fn prepare_identity_fills_missing_values_and_preserves_existing_identity() {
+        let fixture = TemporaryRepository::new();
+        run_git(
+            &fixture.repository,
+            &["config", "--local", "--unset-all", "user.name"],
+        );
+        run_git(
+            &fixture.repository,
+            &["config", "--local", "--unset-all", "user.email"],
+        );
+        let before = snapshot(&fixture.repository).unwrap();
+        prepare_identity_with(
+            &fixture.repository,
+            "Fallback",
+            "fallback@example.invalid",
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(
+            git_stdout(&fixture.repository, &["config", "--local", "user.name"])
+                .unwrap()
+                .trim(),
+            "Fallback"
+        );
+        assert_eq!(
+            git_stdout(&fixture.repository, &["config", "--local", "user.email"])
+                .unwrap()
+                .trim(),
+            "fallback@example.invalid"
+        );
+        assert_eq!(snapshot(&fixture.repository).unwrap(), before);
+        let config = fs::read(fixture.repository.join(".git/config")).unwrap();
+        prepare_identity_with(
+            &fixture.repository,
+            "Different",
+            "different@example.invalid",
+            |key| {
+                Ok(Some(
+                    git_stdout(&fixture.repository, &["config", "--local", key])?
+                        .trim()
+                        .into(),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(fixture.repository.join(".git/config")).unwrap(),
+            config
+        );
+        run_git(
+            &fixture.repository,
+            &["commit", "--allow-empty", "-m", "identity is usable"],
+        );
+    }
+
+    #[test]
+    fn global_identity_and_invalid_existing_values_are_not_overwritten() {
+        let fixture = TemporaryRepository::new();
+        run_git(
+            &fixture.repository,
+            &["config", "--local", "--unset-all", "user.name"],
+        );
+        run_git(
+            &fixture.repository,
+            &["config", "--local", "--unset-all", "user.email"],
+        );
+        prepare_identity_with(
+            &fixture.repository,
+            "Fallback",
+            "fallback@example.invalid",
+            |key| {
+                Ok(if key == "user.name" {
+                    Some("Global name".into())
+                } else {
+                    None
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            git_allow_failure(
+                &fixture.repository,
+                &["config", "--local", "--get", "user.name"]
+            )
+            .unwrap()
+            .0,
+            1
+        );
+        let config = fs::read(fixture.repository.join(".git/config")).unwrap();
+        assert!(
+            prepare_identity_with(
+                &fixture.repository,
+                "Fallback",
+                "fallback@example.invalid",
+                |key| {
+                    Ok(if key == "user.email" {
+                        Some(String::new())
+                    } else {
+                        None
+                    })
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(fixture.repository.join(".git/config")).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn concurrent_identity_preparation_rechecks_values_under_the_repository_lock() {
+        use std::sync::Barrier;
+        let fixture = TemporaryRepository::new();
+        run_git(
+            &fixture.repository,
+            &["config", "--local", "--unset-all", "user.name"],
+        );
+        run_git(
+            &fixture.repository,
+            &["config", "--local", "--unset-all", "user.email"],
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let in_read = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let barrier = barrier.clone();
+                let in_read = in_read.clone();
+                let root = fixture.repository.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    prepare_identity_locked(
+                        &root,
+                        &root.join(".git"),
+                        "Fallback",
+                        "fallback@example.invalid",
+                        |key| {
+                            assert!(
+                                !in_read.swap(true, Ordering::SeqCst),
+                                "identity reads must be serialized"
+                            );
+                            let (status, output) =
+                                git_allow_failure(&root, &["config", "--local", "--get-all", key])?;
+                            std::thread::sleep(Duration::from_millis(20));
+                            in_read.store(false, Ordering::SeqCst);
+                            match status {
+                                0 => Ok(Some(output.stdout.trim().into())),
+                                1 => Ok(None),
+                                _ => Err(error("identity query failed")),
+                            }
+                        },
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        for (key, expected) in [
+            ("user.name", "Fallback"),
+            ("user.email", "fallback@example.invalid"),
+        ] {
+            assert_eq!(
+                git_stdout(
+                    &fixture.repository,
+                    &["config", "--local", "--get-all", key]
+                )
+                .unwrap()
+                .trim(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn create_fetches_into_unborn_parent_and_preserves_staged_and_untracked_files() {
+        let fixture = TemporaryRepository::new();
+        let parent = fixture.directory.join("unborn");
+        run_git(
+            &fixture.directory,
+            &["init", "-b", "main", parent.to_str().unwrap()],
+        );
+        run_git(
+            &parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                fixture.directory.join("remote.git").to_str().unwrap(),
+            ],
+        );
+        fs::write(parent.join("staged"), "keep staged").unwrap();
+        fs::write(parent.join("untracked"), "keep untracked").unwrap();
+        run_git(&parent, &["add", "--", "staged"]);
+        let before = snapshot(&parent).unwrap();
+        assert!(before.1.is_none());
+        let target = create_worktree(&parent, "feat/unborn", "task-unborn", true).unwrap();
+        assert_eq!(snapshot(&parent).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(parent.join("staged")).unwrap(),
+            "keep staged"
+        );
+        assert_eq!(
+            fs::read_to_string(parent.join("untracked")).unwrap(),
+            "keep untracked"
+        );
+        assert_eq!(
+            git_stdout(&target, &["rev-parse", "HEAD"]).unwrap(),
+            git_stdout(&fixture.repository, &["rev-parse", "HEAD"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn prepare_arguments_are_narrow_and_empty_remote_does_not_publish() {
+        let fixture = TemporaryRepository::new();
+        let args = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(
+            parse_args(&args(&[
+                "prepare",
+                "--user-name",
+                "Test",
+                "--user-email",
+                "test@example.invalid"
+            ]))
+            .is_ok()
+        );
+        assert!(parse_args(&args(&["prepare", "--user-name", "Test"])).is_err());
+        assert!(
+            parse_args(&args(&[
+                "prepare",
+                "--user-name",
+                "Test",
+                "--user-name",
+                "Other",
+                "--user-email",
+                "test@example.invalid"
+            ]))
+            .is_err()
+        );
+        let empty = fixture.directory.join("empty.git");
+        run_git(
+            &fixture.directory,
+            &["init", "--bare", empty.to_str().unwrap()],
+        );
+        run_git(
+            &fixture.repository,
+            &["remote", "set-url", "origin", empty.to_str().unwrap()],
+        );
+        let before = snapshot(&fixture.repository).unwrap();
+        assert!(create_worktree(&fixture.repository, "feat/empty", "task-empty", true).is_err());
+        assert_eq!(snapshot(&fixture.repository).unwrap(), before);
+        assert!(git_stdout(&empty, &["for-each-ref"]).unwrap().is_empty());
     }
 
     #[test]

@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{process, trust};
+mod work_log;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -24,7 +25,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 const MANIFEST_VERSION: i64 = 1;
 const LEGACY_LEDGER_RECEIPT_VERSION: i64 = 5;
 const RECEIPT_VERSION: i64 = 6;
-const STATE_VERSION: i64 = 1;
+const STATE_VERSION: i64 = 2;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PAGES: usize = 20;
@@ -3318,7 +3319,15 @@ fn load_state(repository: &str, task: &str, receipt_value: &Value, branch: &str)
     if !path.exists() {
         return Err(error("delivery stateが存在しません"));
     }
-    let state = read_json_file(&path, "delivery state")?;
+    let mut state = read_json_file(&path, "delivery state")?;
+    // v1の進行中taskも、既存fieldの厳密検証を保ったまま読み替える。
+    if state.get("version").and_then(Value::as_i64) == Some(1) {
+        if state.get("issue_record").is_some() {
+            return Err(error("v1 delivery stateに未知のIssue fieldがあります"));
+        }
+        state["version"] = Value::from(STATE_VERSION);
+        state["issue_record"] = Value::Null;
+    }
     expected_keys(
         &state,
         &[
@@ -3332,6 +3341,7 @@ fn load_state(repository: &str, task: &str, receipt_value: &Value, branch: &str)
             "stage",
             "updated_at",
             "last_error",
+            "issue_record",
         ],
         "delivery state",
     )?;
@@ -3350,6 +3360,7 @@ fn load_state(repository: &str, task: &str, receipt_value: &Value, branch: &str)
             "remote_deleted",
             "worktree_unlock_started",
             "worktree_removed",
+            "cleanup_complete",
             "completed",
         ]
         .contains(&str_value(&state, "stage")?.as_str())
@@ -3357,6 +3368,7 @@ fn load_state(repository: &str, task: &str, receipt_value: &Value, branch: &str)
     {
         return Err(error("delivery stateがreceipt/manifestと一致しません"));
     }
+    work_log::validate_record(task, get(&state, "issue_record")?)?;
     Ok(state)
 }
 fn worktree_records(root: &Path) -> Result<Vec<HashMap<String, String>>> {
@@ -3720,6 +3732,9 @@ fn recover_interrupted_main_sync(root: &Path, target: &str, expected_head: &str)
 }
 
 fn validate_main_sync_refs(root: &Path, expected_head: &str, target: &str) -> Result<()> {
+    if expected_head.is_empty() {
+        return validate_empty_main_sync(root, target);
+    }
     if git(root, &["symbolic-ref", "--short", "HEAD"], true)?.trim() != "main"
         || git(root, &["rev-parse", "HEAD"], true)?.trim() != expected_head
         || git(root, &["rev-parse", "refs/remotes/origin/main"], true)?.trim() != target
@@ -3727,6 +3742,39 @@ fn validate_main_sync_refs(root: &Path, expected_head: &str, target: &str) -> Re
         return Err(error(
             "main同期の固定branch・HEAD・origin/mainが変化しました",
         ));
+    }
+    Ok(())
+}
+
+fn validate_empty_main_sync(root: &Path, target: &str) -> Result<()> {
+    if git(root, &["symbolic-ref", "HEAD"], true)?.trim() != "refs/heads/main"
+        || git(root, &["rev-parse", "refs/remotes/origin/main"], true)?.trim() != target
+        || !git(root, &["ls-files", "--stage", "-z"], true)?.is_empty()
+    {
+        return Err(error(
+            "初回main同期のbranch・origin/main・indexが一致しません",
+        ));
+    }
+    let arguments = ["show-ref", "--verify", "--quiet", "refs/heads/main"].map(str::to_string);
+    if run(
+        &git_command(&arguments)?,
+        root,
+        Duration::from_secs(COMMAND_TIMEOUT),
+        MAX_OUTPUT_BYTES,
+    )?
+    .status
+    .code()
+        != Some(1)
+    {
+        return Err(error("初回main同期では未作成のmainだけを扱います"));
+    }
+    for entry in fs::read_dir(root).map_err(|_| error("初回checkoutを確認できません"))? {
+        let entry = entry.map_err(|_| error("初回checkoutの内容を確認できません"))?;
+        if entry.file_name() != ".git" {
+            return Err(error(
+                "初回main同期は空checkoutだけに限定します。既存fileを保持します",
+            ));
+        }
     }
     Ok(())
 }
@@ -3739,6 +3787,9 @@ fn prepare_main_sync(root: &Path, target: &str) -> Result<()> {
 
 fn prepare_main_sync_from(root: &Path, target: &str, expected_head: &str) -> Result<()> {
     validate_main_sync_refs(root, expected_head, target)?;
+    if expected_head.is_empty() {
+        return Ok(());
+    }
     let args = ["merge-base", "--is-ancestor", expected_head, target];
     let av = args
         .iter()
@@ -3879,6 +3930,7 @@ fn deliver_locked(
         let state = object([
             ("version", Value::Number(STATE_VERSION.into())),
             ("kind", string("delivery")),
+            ("issue_record", Value::Null),
             ("task_id", string(task)),
             ("repository", string(&repository)),
             ("pr", Value::Number(expected_pr.into())),
@@ -3925,6 +3977,7 @@ fn finish_locked(
     expected_gate: &str,
     sandbox_retry: bool,
     recover_main_sync: Option<&MainSyncRecovery>,
+    issue: Option<i64>,
 ) -> Result<Value> {
     let repository = repository(root)?;
     let (manifest_value, worktree_path) = manifest(root, task, &repository)?;
@@ -3945,6 +3998,11 @@ fn finish_locked(
         &str_value(&manifest_value, "branch")?,
     )?;
     let _lock = task_lock(&repository, task)?;
+    let bound = work_log::bind(root, &state, issue)?;
+    if bound != state {
+        atomic_json(&state_path(&repository, task)?, &bound)?;
+        state = bound;
+    }
     let initial_stage = str_value(&state, "stage")?;
     let artifact_common = PathBuf::from(str_value(&manifest_value, "common_git_dir")?);
     // 未登録/置換済みの成果物は、worktreeを消す前に検出する。
@@ -4019,10 +4077,10 @@ fn finish_locked(
         state = save_stage(&repository, task, &state, "merged", "")?;
     }
     let stage = str_value(&state, "stage")?;
-    if stage != "merged" {
+    if !["merged", "cleanup_complete"].contains(&stage.as_str()) {
         assert_main_clean(root)?;
     }
-    if stage == "completed" {
+    if stage == "completed" || stage == "cleanup_complete" {
         if remote_branch(root, &repository, &str_value(&manifest_value, "branch")?)?.is_some()
             || worktree_path.exists()
             || worktree_path.is_symlink()
@@ -4030,11 +4088,38 @@ fn finish_locked(
         {
             return Err(error("completed stateのcleanup対象が再出現しました"));
         }
+        if stage == "cleanup_complete" {
+            let branch = str_value(&manifest_value, "branch")?;
+            let args = [
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ]
+            .map(str::to_string);
+            let result = run(
+                &git_command(&args)?,
+                root,
+                Duration::from_secs(COMMAND_TIMEOUT),
+                MAX_OUTPUT_BYTES,
+            )?;
+            if result.status.code() != Some(1) {
+                return Err(error("cleanup後にlocal branchが再出現しました"));
+            }
+            work_log::sync(root, &state, true)?;
+            state = save_stage(&repository, task, &state, "completed", "")?;
+        }
         return Ok(state);
     }
     if stage == "merged" {
         let remote_main = fetch_main(root, &repository)?;
-        let sync_from = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
+        let sync_from = git(
+            root,
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            false,
+        )?
+        .trim()
+        .to_string();
         if let Some(recovery) = recover_main_sync {
             validate_recovery_bounds(recovery, &sync_from, &remote_main)?;
         }
@@ -4095,6 +4180,8 @@ fn finish_locked(
     } else {
         assert_main_synced(root, &repository)?;
     }
+    // main同期が終わっても、記録の保存を確認するまでは何も削除しない。
+    work_log::sync(root, &state, false)?;
     let stage = str_value(&state, "stage")?;
     if ["main_synced", "remote_delete_started"].contains(&stage.as_str()) {
         assert_main_synced(root, &repository)?;
@@ -4173,6 +4260,8 @@ fn finish_locked(
                 return Err(error("unlock後のworktree lock reasonが想定外です"));
             }
             if reason.is_some() {
+                crate::clean_disk::ensure_artifact_idle(&worktree_path)
+                    .map_err(|cause| error(cause.to_string()))?;
                 state = save_stage(&repository, task, &state, "worktree_unlock_started", "")?;
                 let args = [
                     "worktree",
@@ -4205,6 +4294,8 @@ fn finish_locked(
             assert_main_synced(root, &repository)?;
             worktree(root, &manifest_value, &worktree_path)?;
             worktree_clean_head(&worktree_path, &head)?;
+            crate::clean_disk::ensure_artifact_idle(&worktree_path)
+                .map_err(|cause| error(cause.to_string()))?;
             let args = [
                 "worktree",
                 "remove",
@@ -4254,6 +4345,8 @@ fn finish_locked(
             }
             git(root, &["branch", "-d", "--", &branch], true)?;
         }
+        state = save_stage(&repository, task, &state, "cleanup_complete", "")?;
+        work_log::sync(root, &state, true)?;
         state = save_stage(&repository, task, &state, "completed", "")?;
     }
     Ok(state)
@@ -4275,10 +4368,10 @@ fn deliver(
     })
 }
 fn finish_requires_review_history_validation(stage: &str) -> bool {
-    stage != "completed"
+    !["completed", "cleanup_complete"].contains(&stage)
 }
 fn finish_requires_live_delivery_gate(stage: &str) -> bool {
-    stage != "completed"
+    !["completed", "cleanup_complete"].contains(&stage)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4292,6 +4385,7 @@ fn finish(
     gate: &str,
     sandbox_retry: bool,
     recover_main_sync: Option<&MainSyncRecovery>,
+    issue: Option<i64>,
 ) -> Result<Value> {
     task_id(task)?;
     with_deadline(|| {
@@ -4307,6 +4401,7 @@ fn finish(
             gate,
             sandbox_retry,
             recover_main_sync,
+            issue,
         )
     })
 }
@@ -4441,6 +4536,7 @@ fn recover_merged(root: &Path, args: &CliArgs) -> Result<Value> {
         let state = object([
             ("version", Value::Number(STATE_VERSION.into())),
             ("kind", string("delivery")),
+            ("issue_record", Value::Null),
             ("task_id", string(&args.task)),
             ("repository", string(&repository)),
             ("pr", Value::Number(args.pr.into())),
@@ -4556,6 +4652,7 @@ struct CliArgs {
     recover_main_sync: Option<MainSyncRecovery>,
     recover_merged: bool,
     gate: String,
+    issue: Option<i64>,
 }
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
     let mut iter = args.into_iter();
@@ -4596,6 +4693,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             "gate-mode",
             "recover-main-sync-from",
             "recover-main-sync-to",
+            "issue",
         ];
         if flag_options.contains(&normalized.as_str()) {
             if !flags.insert(normalized) {
@@ -4653,6 +4751,15 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
         .unwrap_or(STRICT_GATE_MODE)
         .to_string();
     gate_mode(&gate)?;
+    let issue = values
+        .get("issue")
+        .map(|v| v.parse::<i64>())
+        .transpose()
+        .map_err(|_| error("Issue番号が不正です"))?;
+    if issue.is_some() && command != "finish" {
+        return Err(error("--issueはfinishだけに指定できます"));
+    }
+    work_log::issue_for(&task, issue, &Value::Null)?;
     if values
         .get("gate-mode")
         .is_some_and(|v| v == STRICT_GATE_MODE)
@@ -4713,6 +4820,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             recover_main_sync: None,
             recover_merged,
             gate,
+            issue,
         })
     } else {
         let sandbox_retry = flags.remove("sandbox-retry");
@@ -4762,6 +4870,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             recover_main_sync,
             recover_merged: false,
             gate,
+            issue,
         })
     }
 }
@@ -4824,6 +4933,7 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 &parsed.gate,
                 parsed.sandbox_retry,
                 parsed.recover_main_sync.as_ref(),
+                parsed.issue,
             ),
             _ => Err(error("不明なcommandです")),
         }
@@ -4846,6 +4956,111 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_main_sync_accepts_only_an_empty_unborn_main() {
+        let root = env::temp_dir().join(format!(
+            "codex-first-sync-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source");
+        let parent = root.join("parent");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&parent).unwrap();
+        let run_git = |at: &Path, args: &[&str]| {
+            let output = Command::new(GIT_BINARY)
+                .current_dir(at)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run_git(&source, &["init", "-q", "-b", "main"]);
+        fs::write(source.join("README"), "remote file").unwrap();
+        run_git(&source, &["add", "--", "README"]);
+        run_git(&source, &["commit", "-qm", "initial"]);
+        let head = run_git(&source, &["rev-parse", "HEAD"]);
+        run_git(&parent, &["init", "-q", "-b", "main"]);
+        run_git(
+            &parent,
+            &[
+                "fetch",
+                source.to_str().unwrap(),
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+        );
+        prepare_main_sync_from(&parent, head.trim(), "").unwrap();
+        fs::write(parent.join("important"), "keep").unwrap();
+        assert!(prepare_main_sync_from(&parent, head.trim(), "").is_err());
+        assert_eq!(
+            fs::read_to_string(parent.join("important")).unwrap(),
+            "keep"
+        );
+        fs::remove_file(parent.join("important")).unwrap();
+        run_git(&parent, &["symbolic-ref", "HEAD", "refs/heads/other"]);
+        assert!(prepare_main_sync_from(&parent, head.trim(), "").is_err());
+        run_git(&parent, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        validate_main_sync_refs(&parent, "", head.trim()).unwrap();
+        git(&parent, &["merge", "--ff-only", head.trim()], true).unwrap();
+        assert_eq!(git(&parent, &["rev-parse", "HEAD"], true).unwrap(), head);
+        assert_eq!(
+            fs::read_to_string(parent.join("README")).unwrap(),
+            "remote file"
+        );
+        assert!(prepare_main_sync_from(&parent, head.trim(), "").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finish_issue_argument_is_optional_scoped_and_bound_to_task() {
+        let parse = |command: &str, task: &str, issue: Option<&str>| {
+            let mut args = vec![
+                command.to_string(),
+                "--task-id".into(),
+                task.into(),
+                "--pr".into(),
+                "7".into(),
+                "--head".into(),
+                "a".repeat(40),
+                "--plan-id".into(),
+                "test-example-v1".into(),
+                "--plan-version".into(),
+                "1".into(),
+            ];
+            if let Some(issue) = issue {
+                args.extend(["--issue".into(), issue.into()]);
+            }
+            parse_args(args.into_iter().map(OsString::from))
+        };
+        assert!(parse("finish", "task-example", None).is_ok());
+        assert_eq!(
+            parse("finish", "task-example", Some("3")).unwrap().issue,
+            Some(3)
+        );
+        assert!(parse("finish", "issue-3", Some("4")).is_err());
+        assert!(parse("finish", "task-example", Some("0")).is_err());
+        assert!(parse("deliver", "task-example", Some("3")).is_err());
+    }
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::sync::{Mutex, OnceLock};
@@ -6779,6 +6994,21 @@ mod tests {
             );
             let resumed = save_stage("owner/repo", "issue-24", &valid, "merged", "").unwrap();
             assert_eq!(str_value(&resumed, "stage").unwrap(), "merged");
+            let mut current =
+                load_state("owner/repo", "issue-24", &receipt, "feat/issue-24").unwrap();
+            assert_eq!(int_value(&current, "version").unwrap(), STATE_VERSION);
+            current["issue_record"] =
+                object([("number", Value::from(24)), ("body", string("作業と検証"))]);
+            current["stage"] = string("cleanup_complete");
+            write_private(&path, &current);
+            assert!(load_state("owner/repo", "issue-24", &receipt, "feat/issue-24").is_ok());
+            assert!(!finish_requires_live_delivery_gate("cleanup_complete"));
+            assert!(!finish_requires_review_history_validation(
+                "cleanup_complete"
+            ));
+            current["issue_record"]["number"] = Value::from(25);
+            write_private(&path, &current);
+            assert!(load_state("owner/repo", "issue-24", &receipt, "feat/issue-24").is_err());
             let mut invalid = valid.as_object().unwrap().clone();
             invalid.insert("version".into(), Value::Bool(true));
             write_private(&path, &Value::Object(invalid));

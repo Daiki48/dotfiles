@@ -4288,8 +4288,8 @@ mod tests {
             .parse::<toml_edit::DocumentMut>()
             .expect("parse base config");
 
-        assert_eq!(document["model"].as_str(), Some("gpt-6-sol"));
-        assert_eq!(document["model_reasoning_effort"].as_str(), Some("medium"));
+        assert_eq!(document["model"].as_str(), Some("gpt-6.1-sol"));
+        assert_eq!(document["model_reasoning_effort"].as_str(), Some("high"));
         assert_eq!(
             document["agents"]["default_subagent_model"].as_str(),
             Some("gpt-6-luna")
@@ -5122,8 +5122,8 @@ local_agent_setting = "preserved"
         let document = migrated
             .parse::<toml_edit::DocumentMut>()
             .expect("managed config spelling migration must remain valid TOML");
-        assert_eq!(document["model"].as_str(), Some("gpt-6-sol"));
-        assert_eq!(document["model_reasoning_effort"].as_str(), Some("medium"));
+        assert_eq!(document["model"].as_str(), Some("gpt-6.1-sol"));
+        assert_eq!(document["model_reasoning_effort"].as_str(), Some("high"));
         assert_eq!(document["approval_policy"].as_str(), Some("on-request"));
         assert!(document.get("profile").is_none());
         assert!(document.get("sandbox_mode").is_none());
@@ -5203,8 +5203,8 @@ local_profile = {
         let document = migrated
             .parse::<toml_edit::DocumentMut>()
             .expect("multiline managed config migration must remain valid TOML");
-        assert_eq!(document["model"].as_str(), Some("gpt-6-sol"));
-        assert_eq!(document["model_reasoning_effort"].as_str(), Some("medium"));
+        assert_eq!(document["model"].as_str(), Some("gpt-6.1-sol"));
+        assert_eq!(document["model_reasoning_effort"].as_str(), Some("high"));
         assert_eq!(document["agents"]["enabled"].as_bool(), Some(true));
         assert_eq!(
             document["agents"]["local_profile"]["enabled"].as_bool(),

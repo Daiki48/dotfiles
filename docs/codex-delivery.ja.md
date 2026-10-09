@@ -143,7 +143,7 @@ highは独立reviewを1つ実行し、criticalは別の高リスク境界が実�
 
 PRやIssueへ内部監査用のschema JSON、fingerprint、digest chain、round logを投稿しません。PR bodyとcommentは、人間が読む変更概要、判断が必要な論点、検証結果、残存事項に限ります。作業範囲は依頼の目的、観測可能な受け入れ条件、変更対象経路、必須検証で区切り、その集合外の改善を自律loopへ追加しません。
 
-`codex-delivery record-review`はv6 receiptをprivateなmanaged stateへ記録し、固定SHA、変更file、test、riskに応じたreview、Plan、decision、gate modeを固定します。v6の`deliver`と`finish`はPR comments APIや機械監査commentに依存しません。既存v5 receiptだけは進行中taskを安全に再開するため、記録済みの旧ledger comment chainを読み取り専用で再検証します。新しいledger commentは作成しません。
+`codex-delivery record-review`はv6 receiptをprivateなmanaged stateへ記録し、固定SHA、変更file、test、riskに応じたreview、Plan、decision、gate modeを固定します。v6 receiptは機械監査commentに依存しません。Issueを記録先にしたtaskの`finish`だけは、後述の人間向け作業記録をIssue comments APIで保存・確認します。既存v5 receiptだけは進行中taskを安全に再開するため、記録済みの旧ledger comment chainを読み取り専用で再検証します。新しいledger commentは作成しません。
 
 新規Codex sessionでは[公式Configuration Reference](https://developers.openai.com/codex/config-reference)でunder-developmentかつ既定無効のrollout budget trackingを無効のまま使います。失敗時は有限なPlan scopeと観測可能な進展で制御し、同じ問題の無制限retryや目的外の監査作業へ広げません。
 
@@ -268,6 +268,18 @@ merge直前にも固定HEADとorigin/mainを再確認し、可変の参照名で
 この限定復旧条件に合わないdirty checkout、mainのdiverge、remote到達性が判定不能な場合はreset、rebase、
 force update、強制cleanupを行いません。PR、branch、worktreeを保持して再開条件を報告します。
 
+### Issue記録と回収の再開
+
+`issue-N` taskはIssue Nを記録先にします。通常の`task-*`で関連Issueがある場合は、`finish`にだけ`--issue N`を追加してください。Issueなしの軽微なtaskはPRを記録先とし、Issue APIを呼びません。
+
+helperはPR本文を作業記録として固定し、task、PR、source head、完了処理の状態とともに同一repositoryのIssueへ保存します。PR本文に目的、判断、変更、検証、残存事項を記載してください。空本文、別repository、PRをIssueとして指定、taskと異なるIssueを拒否します。削除前の保存確認に失敗したらworktreeは保持します。
+
+同じtask・PR・headの記録は同じcommentへ更新します。投稿の応答を失った場合は再取得して重複を避け、他者のcommentや手動追記のある記録は上書きしません。Issue番号と本文はdelivery state v2へ保存し、再開時に`--issue`を省略しても維持します。v1の進行中stateは読み替え、receipt v6と旧receiptの検証条件は変えません。
+
+回収後は`cleanup_complete`を保存してからIssueを完了へ更新し、成功後に`completed`へ進みます。Issue更新に失敗したら物理回収済み・記録更新待ちとして同じ`finish`で再開でき、sourceの再作成や再削除はしません。完了済みの古いtaskへ後付けでIssueを追加しません。必要な説明は通常のIssue文書として残してください。
+
+初回の親checkoutがunborn mainの場合は、indexと`.git`以外の全内容が空で、固定origin/mainを確認できる場合だけnative Gitで初期同期します。既存file、別branch、壊れたHEAD、中断後の不明な状態は保持し、自動resetや削除をしません。
+
 ## managed cleanup
 
 ### 手動マージ・main同期後の管理状態の復旧
@@ -298,6 +310,7 @@ finishの最後に、管理root内の対象worktreeだけをcleanupできます�
 - worktreeにtracked/untrackedの変更がなく、ignored artifactが既知の再生成可能なdirectoryだけで、
   未push commitがなく、別taskのworktreeではない。`.codex-trash`と未知のignored artifactは保持して停止する。
 - cleanup対象が`$CODEX_HOME/worktrees`のmanaged root内にあり、pathやGit登録を再解決できる。
+- 必要なIssue記録を保存確認でき、同一UIDのprocessがworktreeを使用していない。unlock前とremove直前に使用状況を確認し、使用中・判定不能は保持する。
 
 この証明を満たしたmanaged cleanupだけが、自律的なworktree・対応branch削除の例外です。証明が
 一つでも不足する、対象がdirty、未merge、未push、別taskと競合する、または判定不能な場合は対象を
@@ -309,7 +322,7 @@ finishの最後に、管理root内の対象worktreeだけをcleanupできます�
 cleanupは5分のdeadline付きrepository-wide lifecycle lockとtask単位のmanifest/stateを使う再開可能な
 state machineです。lock取得待ちもdeadlineへ含め、競合processが停止していても無期限には待ちません。
 `merge_started`、`merged`、`main_synced`、`remote_delete_started`、`remote_deleted`、
-`worktree_unlock_started`、`worktree_removed`、`completed`をatomic保存し、state欠落・schema不一致を
+`worktree_unlock_started`、`worktree_removed`、`cleanup_complete`、`completed`をatomic保存し、state欠落・schema不一致を
 成功扱いしません。remote branch削除だけは、削除直前に確認したreview済みSHAを
 `--force-with-lease=refs/heads/<branch>:<SHA>`へ固定して競合更新を拒否します。これはbranch内容を
 上書きするforce pushの許可ではなく、managed finish内部のexpected-SHA付き削除に限る例外です。
