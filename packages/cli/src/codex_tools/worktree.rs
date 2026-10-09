@@ -1402,10 +1402,28 @@ fn prepare_identity_with(
 fn prepare_repository(cwd: &Path, name: &str, email: &str) -> Result<(), WorktreeError> {
     // remoteに履歴がなくてもidentityだけは準備できる。fetch/push先の一致は検査する。
     let repository = inspect_repository(cwd, false, false)?;
-    prepare_identity_with(&repository.root, name, email, |key| {
-        super::guard::effective_identity_value(&repository.root.to_string_lossy(), key)
-            .map_err(error)
-    })
+    prepare_identity_locked(
+        &repository.root,
+        &repository.common_git_dir,
+        name,
+        email,
+        |key| {
+            super::guard::effective_identity_value(&repository.root.to_string_lossy(), key)
+                .map_err(error)
+        },
+    )
+}
+
+fn prepare_identity_locked(
+    root: &Path,
+    common: &Path,
+    name: &str,
+    email: &str,
+    current: impl FnMut(&str) -> Result<Option<String>, WorktreeError>,
+) -> Result<(), WorktreeError> {
+    // CODEX_HOMEやtaskが違っても同じrepositoryの初回設定を直列化する。
+    let _lock = ExclusiveLock::acquire(&common.join("codex-identity.lock"))?;
+    prepare_identity_with(root, name, email, current)
 }
 
 fn atomic_manifest(path: &Path, manifest: &Manifest) -> Result<(), WorktreeError> {
@@ -2790,6 +2808,68 @@ mod tests {
             fs::read(fixture.repository.join(".git/config")).unwrap(),
             config
         );
+    }
+
+    #[test]
+    fn concurrent_identity_preparation_rechecks_values_under_the_repository_lock() {
+        use std::sync::Barrier;
+        let fixture = TemporaryRepository::new();
+        run_git(
+            &fixture.repository,
+            &["config", "--local", "--unset-all", "user.name"],
+        );
+        run_git(
+            &fixture.repository,
+            &["config", "--local", "--unset-all", "user.email"],
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let in_read = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let barrier = barrier.clone();
+                let in_read = in_read.clone();
+                let root = fixture.repository.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    prepare_identity_locked(
+                        &root,
+                        &root.join(".git"),
+                        "Fallback",
+                        "fallback@example.invalid",
+                        |key| {
+                            assert!(
+                                !in_read.swap(true, Ordering::SeqCst),
+                                "identity reads must be serialized"
+                            );
+                            let (status, output) =
+                                git_allow_failure(&root, &["config", "--local", "--get-all", key])?;
+                            std::thread::sleep(Duration::from_millis(20));
+                            in_read.store(false, Ordering::SeqCst);
+                            match status {
+                                0 => Ok(Some(output.stdout.trim().into())),
+                                1 => Ok(None),
+                                _ => Err(error("identity query failed")),
+                            }
+                        },
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        for (key, expected) in [
+            ("user.name", "Fallback"),
+            ("user.email", "fallback@example.invalid"),
+        ] {
+            assert_eq!(
+                git_stdout(
+                    &fixture.repository,
+                    &["config", "--local", "--get-all", key]
+                )
+                .unwrap()
+                .trim(),
+                expected
+            );
+        }
     }
 
     #[test]
