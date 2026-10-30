@@ -78,3 +78,10 @@ PATHやbuild overrideを隔離します。Codex CLIの自動npm installは行わ
 config、symlinkの全親component、Cargo config、legacy state、managed binary transactionをread-onlyでpreflightした後、
 setup全体のdurable resume journalを開始します。`packages/cli`をbounded process runnerで`--release --locked` buildし、
 managed binaryの配置先を同一hashへ更新します。途中失敗時はjournalと各file transactionを次回setupで再開します。
+
+## CIの実行環境
+
+CIは`ubuntu-24.04`へ固定する。`ubuntu-latest`の自動更新でUbuntu 26.04へ移った際、
+既存の固定system binaryの所有者・種類を確認するテストが不適合となったためであり、
+本体の信頼検査やテスト項目は緩めない。imageを更新するときは、`/usr/bin`の実行fileと
+祖先directoryの所有者・mode・symlinkを含む信頼契約を先に確認する。
