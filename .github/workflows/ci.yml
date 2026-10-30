@@ -12,7 +12,8 @@ permissions:
 jobs:
   required-ci:
     name: required-ci
-    runs-on: ubuntu-latest
+    # 固定pathのroot所有・通常fileを検証する契約を、対応済みのimageで再現する。
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       # actions/checkout v7.0.1; SHA from the verified official release.

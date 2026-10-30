@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
@@ -22,6 +23,8 @@ const MAX_TREE_ENTRIES: usize = 2_000_000;
 const MAX_DISCOVERY_DEPTH: usize = 5;
 const MAX_TREE_DEPTH: usize = 64;
 const OPEN_PATH_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+const OPEN_PATH_STREAM_BYTES: usize = 256 * 1024 * 1024;
+const OPEN_PATH_FIELD_BYTES: usize = 64 * 1024;
 const OPEN_PATH_TIMEOUT: Duration = Duration::from_secs(30);
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -597,6 +600,68 @@ fn parse_lsof_paths(stdout: &[u8]) -> Result<BTreeSet<PathBuf>> {
     Ok(paths)
 }
 
+struct OpenScopeObservation {
+    protected_scopes: BTreeSet<PathBuf>,
+    active_scopes: BTreeSet<PathBuf>,
+    field: Vec<u8>,
+    bytes_seen: usize,
+    finished: bool,
+}
+
+impl OpenScopeObservation {
+    fn new(protected_scopes: BTreeSet<PathBuf>) -> Self {
+        Self {
+            protected_scopes,
+            active_scopes: BTreeSet::new(),
+            field: Vec::new(),
+            bytes_seen: 0,
+            finished: false,
+        }
+    }
+
+    fn consume(&mut self, chunk: &[u8]) -> io::Result<()> {
+        if self.finished {
+            return Err(io::Error::other("lsof stream continued after EOF"));
+        }
+        if chunk.is_empty() {
+            // -F0のfieldはNUL終端。最後のrecord区切りだけは残ってよい。
+            if !self.field.is_empty() && self.field != b"\n" {
+                return Err(io::Error::other(
+                    "lsof stream ended with an incomplete field",
+                ));
+            }
+            self.field.clear();
+            self.finished = true;
+            return Ok(());
+        }
+        self.bytes_seen = self
+            .bytes_seen
+            .checked_add(chunk.len())
+            .filter(|total| *total <= OPEN_PATH_STREAM_BYTES)
+            .ok_or_else(|| io::Error::other("lsof stream exceeded its byte budget"))?;
+        for byte in chunk {
+            if *byte == 0 {
+                let paths = parse_lsof_paths(&self.field)
+                    .map_err(|_| io::Error::other("lsof path field is invalid"))?;
+                for path in paths {
+                    for ancestor in path.ancestors() {
+                        if let Some(scope) = self.protected_scopes.get(ancestor) {
+                            self.active_scopes.insert(scope.clone());
+                        }
+                    }
+                }
+                self.field.clear();
+            } else {
+                if self.field.len() >= OPEN_PATH_FIELD_BYTES {
+                    return Err(io::Error::other("lsof stream exceeded its field budget"));
+                }
+                self.field.push(*byte);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn observe_open_paths(protected_scopes: &BTreeSet<PathBuf>) -> Result<BTreeSet<PathBuf>> {
     if protected_scopes.is_empty() {
         return Ok(BTreeSet::new());
@@ -620,9 +685,29 @@ fn observe_open_paths(protected_scopes: &BTreeSet<PathBuf>) -> Result<BTreeSet<P
         .env("PATH", "/usr/bin:/bin")
         .env("LANG", "C")
         .args(["-nP", "-F0n"]);
-    let output =
-        process::run_host_with_limit(&mut command, OPEN_PATH_TIMEOUT, OPEN_PATH_CAPTURE_BYTES)
-            .context("failed to inspect open files")?;
+    run_open_path_observation(&mut command, protected_scopes)
+}
+
+fn run_open_path_observation(
+    command: &mut Command,
+    protected_scopes: &BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>> {
+    let observation = Arc::new(Mutex::new(OpenScopeObservation::new(
+        protected_scopes.clone(),
+    )));
+    let stream_observation = Arc::clone(&observation);
+    let output = process::run_host_with_stdout_consumer(
+        command,
+        OPEN_PATH_TIMEOUT,
+        OPEN_PATH_CAPTURE_BYTES,
+        move |chunk| {
+            stream_observation
+                .lock()
+                .map_err(|_| io::Error::other("lsof stream state is unavailable"))?
+                .consume(chunk)
+        },
+    )
+    .context("failed to inspect open files")?;
     if !output.status.success() {
         anyhow::bail!(
             "lsof failed (exit {:?}): {}",
@@ -631,7 +716,13 @@ fn observe_open_paths(protected_scopes: &BTreeSet<PathBuf>) -> Result<BTreeSet<P
         );
     }
     validate_lsof_warnings(&output.stderr, protected_scopes)?;
-    parse_lsof_paths(&output.stdout)
+    let mut observation = observation
+        .lock()
+        .map_err(|_| anyhow::anyhow!("lsof stream state is unavailable"))?;
+    if !observation.finished {
+        anyhow::bail!("lsof stream did not complete; open file observation is incomplete");
+    }
+    Ok(std::mem::take(&mut observation.active_scopes))
 }
 
 fn overlaps(scope: &Path, open_paths: &BTreeSet<PathBuf>) -> bool {
@@ -1054,6 +1145,119 @@ mod tests {
         assert!(paths.contains(&PathBuf::from(std::ffi::OsString::from_vec(
             b"/tmp/project/\xff".to_vec()
         ))));
+    }
+
+    #[test]
+    fn streamed_observation_finds_active_scope_after_large_unrelated_output() {
+        let scopes = BTreeSet::from([PathBuf::from("/tmp/project")]);
+        let mut observation = OpenScopeObservation::new(scopes.clone());
+        let unrelated = b"p10\0\nn/another/project/target/artifact\0\n";
+        while observation.bytes_seen <= 9 * 1024 * 1024 {
+            observation.consume(unrelated).unwrap();
+        }
+        assert!(observation.active_scopes.is_empty());
+        observation
+            .consume(b"p20\0\nn/tmp/project/src/active.rs\0\n")
+            .unwrap();
+        observation.consume(b"").unwrap();
+        assert_eq!(observation.active_scopes, scopes);
+        assert!(observation.field.is_empty());
+        assert!(observation.finished);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_command_keeps_the_active_scope_beyond_the_old_capture_limit() {
+        let fixture = TestDirectory::new("large-observation");
+        let input_path = fixture.0.join("lsof-output");
+        let unrelated = b"p10\0\nn/another/project/target/artifact\0\n";
+        let mut input = Vec::new();
+        while input.len() <= 9 * 1024 * 1024 {
+            input.extend_from_slice(unrelated);
+        }
+        input.extend_from_slice(b"p20\0\nn/tmp/project/src/active.rs\0\n");
+        fs::write(&input_path, input).unwrap();
+        let scopes = BTreeSet::from([PathBuf::from("/tmp/project")]);
+        let mut command = Command::new("/usr/bin/cat");
+        process::clear_environment(&mut command);
+        command.arg(input_path);
+        let active = run_open_path_observation(&mut command, &scopes).unwrap();
+        assert_eq!(active, scopes);
+        assert!(overlaps(Path::new("/tmp/project"), &active));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_observation_preserves_chunked_non_utf8_deleted_and_newline_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/project/\xff\n".to_vec(),
+        ));
+        let scopes = BTreeSet::from([PathBuf::from("/tmp/project"), path]);
+        let mut observation = OpenScopeObservation::new(scopes.clone());
+        for byte in b"p10\0\nn/tmp/project/\xff\n (deleted)\0\n" {
+            observation.consume(&[*byte]).unwrap();
+        }
+        observation.consume(b"").unwrap();
+        assert_eq!(observation.active_scopes, scopes);
+    }
+
+    #[test]
+    fn streamed_observation_matches_scopes_component_wise_and_deduplicates() {
+        let scopes = BTreeSet::from([
+            PathBuf::from("/tmp/project"),
+            PathBuf::from("/tmp/project/target"),
+        ]);
+        let mut observation = OpenScopeObservation::new(scopes.clone());
+        observation
+            .consume(b"p1\0\nn/tmp/project-other/file\0\nnpipe\0\n")
+            .unwrap();
+        assert!(observation.active_scopes.is_empty());
+        observation
+            .consume(b"n/tmp/project/target/file\0\nn/tmp/project/target/file\0\n")
+            .unwrap();
+        observation.consume(b"").unwrap();
+        assert_eq!(observation.active_scopes, scopes);
+    }
+
+    #[test]
+    fn streamed_observation_rejects_incomplete_oversized_or_continued_fields() {
+        let scopes = BTreeSet::from([PathBuf::from("/tmp/project")]);
+        let mut incomplete = OpenScopeObservation::new(scopes.clone());
+        incomplete.consume(b"p1\0\nn/tmp/project/active").unwrap();
+        assert!(incomplete.consume(b"").is_err());
+
+        let mut oversized = OpenScopeObservation::new(scopes.clone());
+        assert!(
+            oversized
+                .consume(&vec![b'n'; OPEN_PATH_FIELD_BYTES + 1])
+                .is_err()
+        );
+
+        let mut over_budget = OpenScopeObservation::new(scopes.clone());
+        over_budget.bytes_seen = OPEN_PATH_STREAM_BYTES;
+        assert!(over_budget.consume(b"p").is_err());
+
+        let mut finished = OpenScopeObservation::new(scopes);
+        finished.consume(b"").unwrap();
+        assert!(finished.consume(b"n/tmp/project\0").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_observation_rejects_failed_commands_and_incomplete_warnings() {
+        let scopes = BTreeSet::from([PathBuf::from("/tmp/project")]);
+        for script in [
+            "printf 'p1\\0\\nn/tmp/project/active\\0\\n'; exit 1",
+            "printf 'p1\\0\\nn/tmp/project/active\\0\\n'; printf 'permission denied\\n' >&2",
+            "printf 'p1\\0\\nn/tmp/project/active'",
+        ] {
+            let mut command = Command::new("/bin/sh");
+            process::clear_environment(&mut command);
+            command.args(["-c", script]);
+            assert!(run_open_path_observation(&mut command, &scopes).is_err());
+        }
     }
 
     #[test]
