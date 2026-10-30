@@ -21,6 +21,10 @@ worktree rootを1回だけ走査します。daemon、常駐監視、controller�
 - symlinkは辿りません。削除直前にdevice、inode、entry数、割当byte、最新mtimeを再検証します。
 - 削除候補がある場合、open pathの確認は非root実行でも`sudo lsof`を使用します。認証できない場合や、走査対象と
   重なるfilesystemを`lsof`が確認できない場合はfail closedで停止し、削除しません。
+- 全processの`lsof -nP -F0n`出力は順次処理し、使用中の候補scopeだけを保持します。
+  候補外pathや重複pathが8MiBを超えても観測を続けます。入力総量256MiB・field長64KiB・30秒の
+  上限、未終端field、command失敗、warningの検査で不完全と判定した場合は削除しません。
+  初回と削除直前の2回の観測を行い、全processを対象にする条件は変わりません。
 
 設定は`.config/clean-disk.json`です。`scan_roots`にはプロジェクトそのものではなく、将来のプロジェクトも
 配置される親directoryだけを指定します。Codex worktree rootは`CODEX_HOME`または`~/.codex`から自動で

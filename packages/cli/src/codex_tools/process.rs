@@ -95,6 +95,8 @@ enum ReadOutcome {
     Error(io::Error),
 }
 
+type StdoutConsumer = Box<dyn FnMut(&[u8]) -> io::Result<()> + Send + 'static>;
+
 struct ReadMessage {
     stream: &'static str,
     outcome: ReadOutcome,
@@ -638,11 +640,41 @@ pub(crate) fn run_host_with_limit(
     run_with_limit_config(command, timeout, capture_limit, false)
 }
 
+/// 信頼済みhost adapterのstdoutを固定長chunkで処理する。
+/// consumerは短い非blocking処理とし、自然EOF時だけ空sliceを一度受け取る。
+pub(crate) fn run_host_with_stdout_consumer<F>(
+    command: &mut Command,
+    timeout: Duration,
+    stderr_capture_limit: usize,
+    consumer: F,
+) -> Result<Output, ProcessError>
+where
+    F: FnMut(&[u8]) -> io::Result<()> + Send + 'static,
+{
+    run_with_limit_config_and_consumer(
+        command,
+        timeout,
+        stderr_capture_limit,
+        false,
+        Some(Box::new(consumer)),
+    )
+}
+
 fn run_with_limit_config(
     command: &mut Command,
     timeout: Duration,
     capture_limit: usize,
     namespace_available: bool,
+) -> Result<Output, ProcessError> {
+    run_with_limit_config_and_consumer(command, timeout, capture_limit, namespace_available, None)
+}
+
+fn run_with_limit_config_and_consumer(
+    command: &mut Command,
+    timeout: Duration,
+    capture_limit: usize,
+    namespace_available: bool,
+    mut stdout_consumer: Option<StdoutConsumer>,
 ) -> Result<Output, ProcessError> {
     #[cfg(not(target_os = "linux"))]
     let _ = namespace_available;
@@ -734,13 +766,21 @@ fn run_with_limit_config(
     }
     let (sender, receiver) = mpsc::channel();
     let cancel_readers = Arc::new(AtomicBool::new(false));
-    let stdout_reader = spawn_reader(
-        stdout,
-        "stdout",
-        capture_limit,
-        Arc::clone(&cancel_readers),
-        sender.clone(),
-    );
+    let stdout_reader = match stdout_consumer.take() {
+        Some(consumer) => spawn_streaming_reader(
+            stdout,
+            consumer,
+            Arc::clone(&cancel_readers),
+            sender.clone(),
+        ),
+        None => spawn_reader(
+            stdout,
+            "stdout",
+            capture_limit,
+            Arc::clone(&cancel_readers),
+            sender.clone(),
+        ),
+    };
     let stderr_reader = spawn_reader(
         stderr,
         "stderr",
@@ -857,6 +897,21 @@ fn spawn_reader<R: Read + Send + 'static>(
     })
 }
 
+fn spawn_streaming_reader<R: Read + Send + 'static>(
+    reader: R,
+    mut consumer: impl FnMut(&[u8]) -> io::Result<()> + Send + 'static,
+    cancelled: Arc<AtomicBool>,
+    sender: mpsc::Sender<ReadMessage>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let outcome = read_streaming(reader, &cancelled, &mut consumer);
+        let _ = sender.send(ReadMessage {
+            stream: "stdout",
+            outcome,
+        });
+    })
+}
+
 fn read_bounded(mut reader: impl Read, limit: usize, cancelled: &AtomicBool) -> ReadOutcome {
     let mut captured = Vec::with_capacity(limit.min(64 * 1024));
     let mut buffer = [0_u8; 8192];
@@ -870,6 +925,37 @@ fn read_bounded(mut reader: impl Read, limit: usize, cancelled: &AtomicBool) -> 
                 captured.extend_from_slice(&buffer[..read]);
             }
             Ok(_) => return ReadOutcome::Limit,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(error) => return ReadOutcome::Error(error),
+        }
+    }
+}
+
+fn read_streaming(
+    mut reader: impl Read,
+    cancelled: &AtomicBool,
+    consumer: &mut impl FnMut(&[u8]) -> io::Result<()>,
+) -> ReadOutcome {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return ReadOutcome::Data(Vec::new());
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                return match consumer(&[]) {
+                    Ok(()) => ReadOutcome::Data(Vec::new()),
+                    Err(error) => ReadOutcome::Error(error),
+                };
+            }
+            Ok(read) => {
+                if let Err(error) = consumer(&buffer[..read]) {
+                    return ReadOutcome::Error(error);
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(POLL_INTERVAL);
@@ -1070,10 +1156,12 @@ mod tests {
         DescendantTracker, ENVIRONMENT_CLEARED_MARKER, prepare_linux_command, reap_probe_until,
         run_with_limit_config,
     };
-    use super::{ProcessError, run_with_limit};
+    use super::{ProcessError, run_host_with_stdout_consumer, run_with_limit};
     use std::fs;
     use std::io;
     use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[cfg(target_os = "linux")]
@@ -1207,6 +1295,149 @@ mod tests {
         reap_probe_until(&mut child, Instant::now() + Duration::from_millis(500));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(child.try_wait().expect("inspect probe fixture").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streams_large_stdout_in_bounded_chunks_and_notifies_eof_once() {
+        let byte_count = Arc::new(AtomicUsize::new(0));
+        let max_chunk = Arc::new(AtomicUsize::new(0));
+        let eof_count = Arc::new(AtomicUsize::new(0));
+        let mut command = Command::new("head");
+        command.args(["-c", "9437184", "/dev/zero"]);
+
+        let observed_bytes = Arc::clone(&byte_count);
+        let observed_max_chunk = Arc::clone(&max_chunk);
+        let observed_eof = Arc::clone(&eof_count);
+        let output = run_host_with_stdout_consumer(
+            &mut command,
+            Duration::from_secs(5),
+            1024,
+            move |chunk| {
+                if chunk.is_empty() {
+                    observed_eof.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    observed_bytes.fetch_add(chunk.len(), Ordering::SeqCst);
+                    observed_max_chunk.fetch_max(chunk.len(), Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        )
+        .expect("large stdout must be streamed");
+
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert_eq!(byte_count.load(Ordering::SeqCst), 9 * 1024 * 1024);
+        assert!(max_chunk.load(Ordering::SeqCst) <= 8192);
+        assert_eq!(eof_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_test_pid_reaped(pid: libc::pid_t) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: 所有するテストPIDの存在だけを確認し、signalは送らない。
+            let result = unsafe { libc::kill(pid, 0) };
+            if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "escaped test descendant {pid} survived cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn consumer_error_terminates_and_reaps_escaped_descendant() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let pid_file = std::env::temp_dir().join(format!(
+            "codex-process-consumer-error-{}-{nonce}.pid",
+            std::process::id()
+        ));
+        let pid_file = pid_file.to_str().expect("pid file path");
+        let script = format!(
+            "setsid sh -c 'echo $$ > {pid_file}; exec >/dev/null 2>&1; sleep 30' & while [ ! -s {pid_file} ]; do sleep 0.01; done; printf x; wait"
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+        let error =
+            run_host_with_stdout_consumer(&mut command, Duration::from_secs(3), 1024, |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture consumer error",
+                ))
+            })
+            .expect_err("consumer error must stop the process tree");
+        assert!(matches!(
+            error,
+            ProcessError::Capture {
+                stream: "stdout",
+                ..
+            }
+        ));
+        let pid = fs::read_to_string(pid_file)
+            .expect("escaped descendant pid file")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("escaped descendant pid");
+        assert_test_pid_reaped(pid);
+        fs::remove_file(pid_file).expect("remove pid file");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streaming_timeout_terminates_and_reaps_escaped_descendant() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let pid_file = std::env::temp_dir().join(format!(
+            "codex-process-stream-timeout-{}-{nonce}.pid",
+            std::process::id()
+        ));
+        let pid_file = pid_file.to_str().expect("pid file path");
+        let script = format!(
+            "setsid sh -c 'echo $$ > {pid_file}; exec >/dev/null 2>&1; sleep 30' & while [ ! -s {pid_file} ]; do sleep 0.01; done; wait"
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+        let error =
+            run_host_with_stdout_consumer(&mut command, Duration::from_millis(500), 1024, |_| {
+                Ok(())
+            })
+            .expect_err("streaming process must honor its deadline");
+        assert!(matches!(error, ProcessError::Timeout { .. }));
+        let pid = fs::read_to_string(pid_file)
+            .expect("escaped descendant pid file")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("escaped descendant pid");
+        assert_test_pid_reaped(pid);
+        fs::remove_file(pid_file).expect("remove pid file");
+    }
+
+    #[test]
+    fn streaming_api_keeps_the_stderr_capture_limit() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf out; printf err >&2"]);
+        let error =
+            run_host_with_stdout_consumer(&mut command, Duration::from_secs(1), 2, |_| Ok(()))
+                .expect_err("stderr capture remains bounded");
+        assert!(matches!(
+            error,
+            ProcessError::CaptureLimit {
+                stream: "stderr",
+                limit: 2,
+                ..
+            }
+        ));
     }
 
     #[test]
