@@ -4900,6 +4900,23 @@ fn worktree_helper_invocation_reason(tokens: &[String]) -> Option<String> {
                 Some("retireは--task-idと--headを固定して指定してください".into())
             }
         }
+        "sync" => {
+            if rest.len() == 6
+                && rest[0] == "--task-id"
+                && valid_task_id(&rest[1])
+                && rest[2] == "--expected-head"
+                && valid_oid(&rest[3])
+                && rest[4] == "--expected-remote-head"
+                && valid_oid(&rest[5])
+            {
+                None
+            } else {
+                Some(
+                    "syncは--task-id、--expected-head、--expected-remote-headを固定順序で指定してください"
+                        .into(),
+                )
+            }
+        }
         "create" => {
             let mut seen = HashMap::new();
             let mut i = 0;
@@ -5184,6 +5201,7 @@ fn has_write_operation(tokens: &[String]) -> bool {
                         "artifacts",
                         "clean-artifacts",
                         "retire",
+                        "sync",
                     ]
                     .contains(&v.as_str())
                 });
@@ -7501,6 +7519,37 @@ mod tests {
             "git-reset --hard HEAD",
         ];
         for command in blocked {
+            assert!(
+                blocked_reason(command, None, 0).is_some(),
+                "blocked: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_guard_requires_task_and_both_exact_heads() {
+        let good = "codex-worktree sync --task-id issue-422 --expected-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --expected-remote-head cccccccccccccccccccccccccccccccccccccccc";
+        let tokens = good
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(worktree_helper_invocation_reason(&tokens).is_none());
+        assert!(has_write_operation(&tokens));
+        assert!(blocked_reason(good, None, 0).is_none());
+
+        for command in [
+            "codex-worktree sync",
+            "codex-worktree sync --task-id issue-422 --expected-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "codex-worktree sync --task-id issue-422 --task-id issue-422 --expected-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --expected-remote-head cccccccccccccccccccccccccccccccccccccccc",
+            "codex-worktree sync --task-id issue-422 --expected-head main --expected-remote-head cccccccccccccccccccccccccccccccccccccccc",
+            "codex-worktree sync --task-id issue-422 --expected-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --expected-remote-head origin/main",
+            "codex-worktree sync --task-id issue-422 --expected-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --expected-remote-head cccccccccccccccccccccccccccccccccccccccc --force",
+            "codex-worktree sync --task-id issue-422 --expected-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --expected-remote-head cccccccccccccccccccccccccccccccccccccccc --reset",
+            "codex-worktree sync --task-id issue-422 --expected-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --expected-remote-head cccccccccccccccccccccccccccccccccccccccc /tmp/other",
+            "codex-worktree sync --task-id issue-422 --expected-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --expected-remote-head cccccccccccccccccccccccccccccccccccccccc extra",
+            "codex-worktree sync --task-id issue-422 --expected-remote-head cccccccccccccccccccccccccccccccccccccccc --expected-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "codex-worktree sync --task-id issue-422 --expected-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --expected-remote-head cccccccccccccccccccccccccccccccccccccccc; git status",
+        ] {
             assert!(
                 blocked_reason(command, None, 0).is_some(),
                 "blocked: {command}"
