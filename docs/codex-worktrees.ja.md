@@ -163,6 +163,16 @@ codex-worktree resume --task-id issue-22
 cd "$(codex-worktree resume --task-id issue-22)"
 ```
 
+GitHub側でPR branchを更新した場合は、local HEADとGitHubの最新PR headを照合し、親checkoutから次の正規形で同期します。
+
+```sh
+codex-worktree sync --task-id issue-22 --expected-head <同期前の完全SHA> --expected-remote-head <GitHubで確認した完全SHA>
+```
+
+helperはmanifestに登録されたrepository・task branch・pathだけを扱います。親checkoutはcleanなdefault branch、taskはcleanなready worktreeで、Git操作中でないことが必要です。task branchだけをprune・tag取得なしでfetchし、指定remote SHAと祖先関係を照合します。fetch後はremote SHAを再取得し、merge直前にlocal HEAD・manifest・origin・clean状態・Git操作中でないことを再検査して、fast-forwardだけを行います。親checkoutとmanifestのbaseは変えません。未commit・未追跡変更、ignoredファイルの上書き、分岐、SHA不一致、想定外の状態では保持して停止し、reset・stash・forceで解消しません。
+
+lifecycle lockはmanaged helper同士を直列化します。通常Gitやremoteの更新とは原子的な排他にならないため、同期対象を触る他のGit操作は同時に実行しないでください。同期後の不一致を検知した場合も自動rollbackせず、現在の状態を保持して報告します。
+
 `resume` が返すのはpathだけで、directoryの移動や変更のclean化は行いません。`ready` と
 `dirty` のworktreeだけが再開対象です。`missing`、`unregistered`、`branch-mismatch`、
 `invalid`、`failed` の場合は、該当taskのmanifest、Git登録、branch、作業内容を保全した

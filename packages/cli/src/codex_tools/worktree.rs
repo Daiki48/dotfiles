@@ -2097,6 +2097,199 @@ fn resume(cwd: &Path, task_id: &str, allow_local_origin: bool) -> Result<PathBuf
     Err(error("指定taskのmanifestがありません"))
 }
 
+fn ensure_no_git_operation(path: &Path) -> Result<(), WorktreeError> {
+    let git_dir = absolute_git_path(path, "--git-dir")?;
+    for marker in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-apply",
+        "rebase-merge",
+        "sequencer",
+        "index.lock",
+        "HEAD.lock",
+    ] {
+        match fs::symlink_metadata(git_dir.join(marker)) {
+            Err(cause) if cause.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(error("進行中または判定不能のGit操作を保持します")),
+        }
+    }
+    Ok(())
+}
+
+fn verify_sync_task(
+    repository: &Repository,
+    manifest: &Manifest,
+    expected_head: &str,
+    allow_local_origin: bool,
+) -> Result<(), WorktreeError> {
+    let current = load_manifests(repository)?
+        .into_iter()
+        .find(|(_, item)| item.task_id == manifest.task_id)
+        .map(|(_, item)| item)
+        .ok_or_else(|| error("同期対象のmanifestがありません"))?;
+    if current != *manifest
+        || current.status != "ready"
+        || current.base != format!("origin/{}", repository.default_branch)
+        || origin_identity(&repository.root, allow_local_origin)?
+            != (
+                repository.github_name.clone(),
+                repository.origin_url.clone(),
+            )
+    {
+        return Err(error("同期対象のmanifestまたはoriginが一致しません"));
+    }
+    let rows = diagnose(
+        &repository.root,
+        Some(&manifest.task_id),
+        allow_local_origin,
+    )?;
+    if rows.len() != 1 || rows[0].1 != "ready" {
+        return Err(error("同期対象はcleanなready worktreeである必要があります"));
+    }
+    let target = Path::new(&manifest.worktree);
+    ensure_no_git_operation(&repository.root)?;
+    ensure_no_git_operation(target)?;
+    if git_stdout(target, &["rev-parse", "HEAD"])?.trim() != expected_head {
+        return Err(error("同期前のlocal HEADが指定SHAと一致しません"));
+    }
+    Ok(())
+}
+
+fn sync_worktree(
+    cwd: &Path,
+    task_id: &str,
+    expected_head: &str,
+    expected_remote_head: &str,
+    allow_local_origin: bool,
+) -> Result<PathBuf, WorktreeError> {
+    sync_worktree_with_boundary(
+        cwd,
+        task_id,
+        expected_head,
+        expected_remote_head,
+        allow_local_origin,
+        || Ok(()),
+    )
+}
+
+fn sync_worktree_with_boundary(
+    cwd: &Path,
+    task_id: &str,
+    expected_head: &str,
+    expected_remote_head: &str,
+    allow_local_origin: bool,
+    after_fetch: impl FnOnce() -> Result<(), WorktreeError>,
+) -> Result<PathBuf, WorktreeError> {
+    if !valid_task_id(task_id) || !valid_oid(expected_head) || !valid_oid(expected_remote_head) {
+        return Err(error("syncにはtask IDと同期前後の完全なSHAが必要です"));
+    }
+    let expected_head = expected_head.to_ascii_lowercase();
+    let expected_remote_head = expected_remote_head.to_ascii_lowercase();
+    let repository = inspect_repository(cwd, allow_local_origin, true)?;
+    let (_, _, lock_path) = managed_paths(&repository, task_id, false)?;
+    let _lock = ExclusiveLock::acquire(&lock_path)?;
+    let before = snapshot(&repository.root)?;
+    if before.0.trim() != format!("refs/heads/{}", repository.default_branch)
+        || before.1.is_none()
+        || !before.2.is_empty()
+    {
+        return Err(error(
+            "親checkoutはcleanなdefault branchである必要があります",
+        ));
+    }
+    let manifest = load_manifests(&repository)?
+        .into_iter()
+        .find(|(_, item)| item.task_id == task_id)
+        .map(|(_, item)| item)
+        .ok_or_else(|| error("同期対象のmanifestがありません"))?;
+    verify_sync_task(&repository, &manifest, &expected_head, allow_local_origin)?;
+    let target = PathBuf::from(&manifest.worktree);
+    let tracking = format!("refs/remotes/origin/{}", manifest.branch);
+    let refspec = format!("refs/heads/{}:{tracking}", manifest.branch);
+    // taskのtracking refだけを取得する。強制更新・prune・tag・FETCH_HEADの更新はしない。
+    git_stdout(
+        &repository.root,
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-prune",
+            "--no-prune-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--refmap=",
+            "--upload-pack=git-upload-pack",
+            &repository.origin_url,
+            &refspec,
+        ],
+    )?;
+    let fetched = git_stdout(&repository.root, &["rev-parse", "--verify", &tracking])?;
+    if fetched.trim() != expected_remote_head {
+        return Err(error(
+            "取得したremote HEADが指定SHAと一致しません。local変更を保持します",
+        ));
+    }
+    let (ancestor, _) = git_allow_failure(
+        &target,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &expected_head,
+            &expected_remote_head,
+        ],
+    )?;
+    if ancestor != 0 {
+        return Err(error(
+            "remote HEADはlocal HEADの後継ではありません。分岐を保持します",
+        ));
+    }
+    after_fetch()?;
+    // fetch後にremoteが動いていれば、取得済みの古いSHAへ同期しない。
+    let remote_ref = format!("refs/heads/{}", manifest.branch);
+    let remote = git_stdout(
+        &repository.root,
+        &[
+            "ls-remote",
+            "--exit-code",
+            "--refs",
+            "--upload-pack=git-upload-pack",
+            &repository.origin_url,
+            &remote_ref,
+        ],
+    )?;
+    if remote.trim() != format!("{expected_remote_head}\t{remote_ref}") {
+        return Err(error("同期直前のremote HEADが指定SHAと一致しません"));
+    }
+    verify_sync_task(&repository, &manifest, &expected_head, allow_local_origin)?;
+    if snapshot(&repository.root)? != before {
+        return Err(error(
+            "同期前に親checkoutが変化しました。保持して停止します",
+        ));
+    }
+    git_stdout(
+        &target,
+        &[
+            "merge",
+            "--ff-only",
+            "--no-edit",
+            "--no-autostash",
+            "--no-overwrite-ignore",
+            &expected_remote_head,
+        ],
+    )?;
+    verify_sync_task(
+        &repository,
+        &manifest,
+        &expected_remote_head,
+        allow_local_origin,
+    )?;
+    if snapshot(&repository.root)? != before {
+        return Err(error("親checkoutが変化しました。追加操作をせず保持します"));
+    }
+    Ok(target)
+}
+
 fn task_artifacts(
     cwd: &Path,
     task_id: &str,
@@ -2360,6 +2553,14 @@ fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
                 .map_err(|cause| (2, cause.to_string()))?;
             resume(&cwd, &task_id, false).map(|path| path.to_string_lossy().into_owned())
         }
+        "sync" => sync_worktree(
+            &cwd,
+            parsed.task_id.as_deref().unwrap_or(""),
+            parsed.expected_head.as_deref().unwrap_or(""),
+            parsed.expected_remote_head.as_deref().unwrap_or(""),
+            false,
+        )
+        .map(|path| format!("{} を指定SHAへfast-forwardしました", path.display())),
         "recover" => {
             let task_id = normalize_task_id(None, parsed.task_id.as_deref())
                 .map_err(|cause| (2, cause.to_string()))?;
@@ -2428,6 +2629,8 @@ struct ParsedArgs {
     issue: Option<i64>,
     task_id: Option<String>,
     head: Option<String>,
+    expected_head: Option<String>,
+    expected_remote_head: Option<String>,
     user_name: Option<String>,
     user_email: Option<String>,
 }
@@ -2453,7 +2656,7 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         .ok_or_else(|| "commandを指定してください".to_string())?;
     if matches!(command.as_str(), "-h" | "--help") {
         return Err(
-            "usage: codex-worktree <prepare|create|list|doctor|resume|recover|artifacts|clean-artifacts|retire> [options]".to_string(),
+            "usage: codex-worktree <prepare|create|list|doctor|resume|sync|recover|artifacts|clean-artifacts|retire> [options]".to_string(),
         );
     }
     if !matches!(
@@ -2463,6 +2666,7 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
             | "list"
             | "doctor"
             | "resume"
+            | "sync"
             | "recover"
             | "artifacts"
             | "clean-artifacts"
@@ -2478,6 +2682,24 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     while index < values.len() {
         let value = &values[index];
         match value.as_str() {
+            "--expected-head" | "--expected-remote-head" if command == "sync" => {
+                let destination = if value == "--expected-head" {
+                    &mut parsed.expected_head
+                } else {
+                    &mut parsed.expected_remote_head
+                };
+                if destination.is_some() {
+                    return Err("同期SHAの引数が重複しています".into());
+                }
+                index += 1;
+                *destination = Some(
+                    values
+                        .get(index)
+                        .filter(|head| valid_oid(head))
+                        .cloned()
+                        .ok_or("syncには完全なSHAを指定してください")?,
+                );
+            }
             "--user-name" | "--user-email" if command == "prepare" => {
                 let destination = if value == "--user-name" {
                     &mut parsed.user_name
@@ -2530,6 +2752,7 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
                     "create"
                         | "doctor"
                         | "resume"
+                        | "sync"
                         | "recover"
                         | "artifacts"
                         | "clean-artifacts"
@@ -2568,6 +2791,16 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         && (parsed.task_id.as_deref().is_none_or(|v| !valid_task_id(v)) || parsed.head.is_none())
     {
         return Err("retireには--task-idと--headが必要です".into());
+    }
+    if command == "sync"
+        && (parsed
+            .task_id
+            .as_deref()
+            .is_none_or(|id| !valid_task_id(id))
+            || parsed.expected_head.is_none()
+            || parsed.expected_remote_head.is_none())
+    {
+        return Err("syncには--task-id、--expected-head、--expected-remote-headが必要です".into());
     }
     Ok(parsed)
 }
@@ -3411,6 +3644,340 @@ mod tests {
         assert!(create_worktree(&fixture.repository, "feat/second", "issue-22", true).is_err());
         assert!(create_worktree(&fixture.repository, "feat/first", "task-another", true).is_err());
         assert!(target.is_dir());
+    }
+
+    fn sync_fixture() -> (TemporaryRepository, PathBuf, String, String) {
+        let fixture = TemporaryRepository::new();
+        let target = create_worktree(&fixture.repository, "fix/sync", "task-sync", true).unwrap();
+        let old = run_git_output(&target, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        run_git(&target, &["push", "origin", "HEAD:refs/heads/fix/sync"]);
+        let edit = fixture.directory.join("remote-edit");
+        run_git(
+            &fixture.directory,
+            &[
+                "clone",
+                "--branch",
+                "fix/sync",
+                fixture.directory.join("remote.git").to_str().unwrap(),
+                edit.to_str().unwrap(),
+            ],
+        );
+        run_git(&edit, &["config", "user.name", "Test User"]);
+        run_git(&edit, &["config", "user.email", "test@example.invalid"]);
+        fs::write(edit.join("remote.txt"), "remote update\n").unwrap();
+        run_git(&edit, &["add", "--", "remote.txt"]);
+        run_git(&edit, &["commit", "-m", "remote update"]);
+        run_git(&edit, &["push", "origin", "HEAD:refs/heads/fix/sync"]);
+        let new = run_git_output(&edit, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        (fixture, target, old, new)
+    }
+
+    #[test]
+    fn sync_fast_forwards_exact_head_preserves_parent_and_manifest_and_is_idempotent() {
+        let (fixture, target, old, new) = sync_fixture();
+        let parent = snapshot(&fixture.repository).unwrap();
+        let manifest = fs::read(fixture.manifest("task-sync")).unwrap();
+        let fetch_head = fs::read(fixture.repository.join(".git/FETCH_HEAD")).unwrap();
+        assert_eq!(
+            sync_worktree(&fixture.repository, "task-sync", &old, &new, true).unwrap(),
+            target
+        );
+        assert_eq!(run_git_output(&target, &["rev-parse", "HEAD"]).trim(), new);
+        assert!(target.join("remote.txt").is_file());
+        assert_eq!(snapshot(&fixture.repository).unwrap(), parent);
+        assert_eq!(fs::read(fixture.manifest("task-sync")).unwrap(), manifest);
+        assert_eq!(
+            fs::read(fixture.repository.join(".git/FETCH_HEAD")).unwrap(),
+            fetch_head
+        );
+        sync_worktree(&fixture.repository, "task-sync", &new, &new, true).unwrap();
+        assert_eq!(snapshot(&fixture.repository).unwrap(), parent);
+    }
+
+    #[test]
+    fn sync_rejects_dirty_task_and_parent_without_changing_them() {
+        for kind in ["untracked", "unstaged", "staged", "parent"] {
+            let (fixture, target, old, new) = sync_fixture();
+            match kind {
+                "untracked" => fs::write(target.join("local.txt"), "keep").unwrap(),
+                "parent" => fs::write(fixture.repository.join("local.txt"), "keep").unwrap(),
+                _ => {
+                    fs::write(target.join("README.md"), "keep").unwrap();
+                    if kind == "staged" {
+                        run_git(&target, &["add", "--", "README.md"]);
+                    }
+                }
+            }
+            let task_before = snapshot(&target).unwrap();
+            let parent_before = snapshot(&fixture.repository).unwrap();
+            assert!(
+                sync_worktree(&fixture.repository, "task-sync", &old, &new, true).is_err(),
+                "{kind}"
+            );
+            assert_eq!(snapshot(&target).unwrap(), task_before, "{kind}");
+            assert_eq!(
+                snapshot(&fixture.repository).unwrap(),
+                parent_before,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_rejects_stale_heads_and_diverged_history_without_reset() {
+        for kind in ["local-moved", "remote-moved", "diverged", "force-pushed"] {
+            let (fixture, target, old, new) = sync_fixture();
+            let mut expected_local = old.clone();
+            let mut expected_remote = new.clone();
+            if kind == "diverged" {
+                fs::write(target.join("local.txt"), "committed locally").unwrap();
+                run_git(&target, &["add", "--", "local.txt"]);
+                run_git(&target, &["commit", "-m", "local update"]);
+                expected_local = run_git_output(&target, &["rev-parse", "HEAD"])
+                    .trim()
+                    .into();
+            } else if kind == "local-moved" {
+                expected_local = new.clone();
+            } else if kind == "remote-moved" {
+                expected_remote = old.clone();
+            } else {
+                sync_worktree(&fixture.repository, "task-sync", &old, &new, true).unwrap();
+                let edit = fixture.directory.join("remote-edit");
+                run_git(&edit, &["reset", "--hard", &old]);
+                run_git(
+                    &edit,
+                    &["push", "--force", "origin", "HEAD:refs/heads/fix/sync"],
+                );
+                expected_local = new.clone();
+                expected_remote = old.clone();
+            }
+            let task_before = snapshot(&target).unwrap();
+            let parent_before = snapshot(&fixture.repository).unwrap();
+            assert!(
+                sync_worktree(
+                    &fixture.repository,
+                    "task-sync",
+                    &expected_local,
+                    &expected_remote,
+                    true
+                )
+                .is_err(),
+                "{kind}"
+            );
+            assert_eq!(snapshot(&target).unwrap(), task_before, "{kind}");
+            assert_eq!(
+                snapshot(&fixture.repository).unwrap(),
+                parent_before,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_rejects_in_progress_git_and_invalid_manifest_identity() {
+        let (fixture, target, old, new) = sync_fixture();
+        let git_dir = absolute_git_path(&target, "--git-dir").unwrap();
+        let before = snapshot(&target).unwrap();
+        for marker in [
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "rebase-apply",
+            "rebase-merge",
+            "sequencer",
+            "index.lock",
+            "HEAD.lock",
+        ] {
+            fs::write(git_dir.join(marker), "in progress").unwrap();
+            assert!(
+                sync_worktree(&fixture.repository, "task-sync", &old, &new, true).is_err(),
+                "{marker}"
+            );
+            fs::remove_file(git_dir.join(marker)).unwrap();
+            assert_eq!(snapshot(&target).unwrap(), before);
+        }
+        assert!(sync_worktree(&fixture.repository, "task-missing", &old, &new, true).is_err());
+        let original = fs::read_to_string(fixture.manifest("task-sync")).unwrap();
+        for (field, value) in [
+            ("branch", "fix/wrong"),
+            ("repository", "/wrong"),
+            ("github_name", "other/repository"),
+            ("status", "failed"),
+        ] {
+            let mut manifest: Value = serde_json::from_str(&original).unwrap();
+            manifest[field] = value.into();
+            fs::write(
+                fixture.manifest("task-sync"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                sync_worktree(&fixture.repository, "task-sync", &old, &new, true).is_err(),
+                "{field}"
+            );
+            assert_eq!(snapshot(&target).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn sync_rechecks_remote_and_local_boundaries_after_fetch() {
+        for kind in [
+            "remote",
+            "task",
+            "parent",
+            "git-operation",
+            "origin",
+            "manifest",
+        ] {
+            let (fixture, target, old, new) = sync_fixture();
+            let result = sync_worktree_with_boundary(
+                &fixture.repository,
+                "task-sync",
+                &old,
+                &new,
+                true,
+                || {
+                    match kind {
+                        "remote" => {
+                            let edit = fixture.directory.join("remote-edit");
+                            fs::write(edit.join("later.txt"), "later").unwrap();
+                            run_git(&edit, &["add", "--", "later.txt"]);
+                            run_git(&edit, &["commit", "-m", "later"]);
+                            run_git(&edit, &["push", "origin", "HEAD:refs/heads/fix/sync"]);
+                        }
+                        "task" => fs::write(target.join("local.txt"), "keep").unwrap(),
+                        "parent" => {
+                            fs::write(fixture.repository.join("local.txt"), "keep").unwrap()
+                        }
+                        "git-operation" => {
+                            let git_dir = absolute_git_path(&target, "--git-dir").unwrap();
+                            fs::write(git_dir.join("MERGE_HEAD"), &old).unwrap();
+                        }
+                        "origin" => run_git(
+                            &fixture.repository,
+                            &["remote", "set-url", "origin", "/missing/remote.git"],
+                        ),
+                        "manifest" => {
+                            let path = fixture.manifest("task-sync");
+                            let mut value: Value =
+                                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                            value["base_oid"] = new.clone().into();
+                            fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "{kind}");
+            assert_eq!(
+                run_git_output(&target, &["rev-parse", "HEAD"]).trim(),
+                old,
+                "{kind}"
+            );
+            assert!(!target.join("remote.txt").exists(), "{kind}");
+            if kind == "task" {
+                assert_eq!(
+                    fs::read_to_string(target.join("local.txt")).unwrap(),
+                    "keep"
+                );
+            }
+            if kind == "parent" {
+                assert_eq!(
+                    fs::read_to_string(fixture.repository.join("local.txt")).unwrap(),
+                    "keep"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sync_preserves_ignored_files_that_remote_would_overwrite() {
+        let (fixture, target, old, new) = sync_fixture();
+        let git_dir = absolute_git_path(&fixture.repository, "--git-dir").unwrap();
+        fs::write(git_dir.join("info/exclude"), "remote.txt\n").unwrap();
+        fs::write(target.join("remote.txt"), "local ignored data").unwrap();
+        run_git(&target, &["config", "merge.autoStash", "true"]);
+        assert!(sync_worktree(&fixture.repository, "task-sync", &old, &new, true).is_err());
+        assert_eq!(run_git_output(&target, &["rev-parse", "HEAD"]).trim(), old);
+        assert_eq!(
+            fs::read_to_string(target.join("remote.txt")).unwrap(),
+            "local ignored data"
+        );
+        assert!(run_git_output(&target, &["stash", "list"]).is_empty());
+    }
+
+    #[test]
+    fn sync_cli_requires_task_and_two_unique_complete_shas() {
+        let oid = "a".repeat(40);
+        let canonical = [
+            "codex-worktree",
+            "sync",
+            "--task-id",
+            "task-sync",
+            "--expected-head",
+            &oid,
+            "--expected-remote-head",
+            &oid,
+        ];
+        let parse = |values: &[&str]| {
+            parse_args(
+                &values
+                    .iter()
+                    .map(|value| OsString::from(*value))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(parse(&canonical).is_ok());
+        for values in [
+            canonical[..6].to_vec(),
+            vec![
+                "codex-worktree",
+                "sync",
+                "--expected-head",
+                &oid,
+                "--expected-remote-head",
+                &oid,
+            ],
+            vec![
+                "codex-worktree",
+                "sync",
+                "--task-id",
+                "../bad",
+                "--expected-head",
+                &oid,
+                "--expected-remote-head",
+                &oid,
+            ],
+            vec![
+                "codex-worktree",
+                "sync",
+                "--task-id",
+                "task-sync",
+                "--expected-head",
+                "main",
+                "--expected-remote-head",
+                &oid,
+            ],
+        ] {
+            assert!(parse(&values).is_err());
+        }
+        for extra in [
+            vec!["--force"],
+            vec!["--reset"],
+            vec!["--branch", "main"],
+            vec!["--path", "/tmp"],
+            vec!["--expected-head", &oid],
+            vec!["--task-id", "task-other"],
+        ] {
+            let mut values = canonical.to_vec();
+            values.extend(extra);
+            assert!(parse(&values).is_err());
+        }
     }
 
     #[test]
