@@ -343,4 +343,87 @@ impl Store {
         self.path(id)?;
         Ok(self.root.join(format!("{id}.worker.lock")))
     }
+
+    /// 呼出側はstate lockとworker leaseを保持する。task本体と最新結果は回収しない。
+    pub fn collect(&self, task: &mut Task, at: u64) -> Result<Vec<u64>> {
+        if task.phase != super::Phase::Completed
+            || task.run.is_some()
+            || task.acknowledged_sequence != task.event_sequence
+        {
+            return Err("回収には完了・worker停止・全イベントのackが必要です".into());
+        }
+        let cutoff = at.saturating_sub(task.retention_seconds);
+        let runs = self.root.join("runs");
+        let directory = runs.join(&task.id);
+        let mut generations = Vec::new();
+        let mut latest_result = 0;
+        if directory
+            .try_exists()
+            .map_err(|_| "worker結果を確認できません")?
+        {
+            private_dir(&runs)?;
+            private_dir(&directory)?;
+            for entry in fs::read_dir(&directory).map_err(|_| "worker結果を列挙できません")?
+            {
+                let entry = entry.map_err(|_| "worker結果を列挙できません")?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or("worker世代名が不正です")?;
+                let generation: u64 = name.parse().map_err(|_| "worker世代名が不正です")?;
+                if generation.to_string() != name || generation > task.generation {
+                    return Err("所有不明のworker世代を保持しました".into());
+                }
+                let path = entry.path();
+                private_dir(&path)?;
+                let mut files = Vec::new();
+                let mut expired = true;
+                for file in fs::read_dir(&path).map_err(|_| "worker結果を列挙できません")?
+                {
+                    let file = file.map_err(|_| "worker結果を列挙できません")?;
+                    let name = file.file_name();
+                    if ![
+                        "schema.json",
+                        "output.json",
+                        "execution.json",
+                        "result.json",
+                    ]
+                    .iter()
+                    .any(|expected| name == *expected)
+                    {
+                        return Err("所有不明のworker fileを保持しました".into());
+                    }
+                    let metadata = open_private(&file.path(), false)?
+                        .metadata()
+                        .map_err(|_| "worker結果を検査できません")?;
+                    let modified = metadata
+                        .modified()
+                        .map_err(|_| "worker結果の時刻を確認できません")?
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| "worker結果の時刻が不正です")?
+                        .as_secs();
+                    expired &= modified < cutoff;
+                    if name == "result.json" {
+                        // 壊れた結果も唯一の引継ぎになり得るので、内容によらず最新を保持する。
+                        latest_result = latest_result.max(generation);
+                    }
+                    files.push(file.path());
+                }
+                generations.push((generation, path, files, expired));
+            }
+        }
+        let mut removed = Vec::new();
+        for (generation, path, files, expired) in generations {
+            if generation == task.generation || generation == latest_result || !expired {
+                continue;
+            }
+            for file in files {
+                fs::remove_file(file).map_err(|_| "worker結果の回収を完了できません")?;
+            }
+            fs::remove_dir(path).map_err(|_| "worker結果directoryの回収を完了できません")?;
+            removed.push(generation);
+        }
+        task.events.retain(|event| event.at >= cutoff);
+        task.revision += 1;
+        removed.sort_unstable();
+        Ok(removed)
+    }
 }

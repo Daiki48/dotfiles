@@ -19,6 +19,7 @@ codex-task start
 codex-task list
 codex-task show --task-id issue-123 --json
 codex-task events --task-id issue-123 --json
+codex-task ack --task-id issue-123 --through 42
 ```
 
 `submit`は登録、`start`は端末から切り離したcoordinatorの起動です。既に稼働中なら重複起動しません。
@@ -63,6 +64,14 @@ XDG変数はこのtask stateの配置を上書きしません。XDG_CONFIG_HOME�
 
 生のCodex JSONL、shell引数、APIレスポンス、認証情報はログへ保存しません。
 workerのthread参照・正常終了情報・構造化した結果だけをhost内へ保持します。
+`show --json`の`ci_evidence`には、head・base・実際のCI対象SHA、観測時刻（Unix秒）、必要checkと
+個別check run／commit statusを保存します。check ID・app ID/slug・check suite ID・状態/結論・参照URL、
+status ID・提供者ID/login・対象SHA・更新時刻・参照URLを含みます。Actionsはcheck suiteから
+公式APIで取得したrun ID/attempt・runの対象SHA・状態/結論・URLを別に保存します。
+check suite IDをrun IDとして扱いません。Actions以外の提供元や未提供のURL等は`null`です。
+head/base変更時は旧成功を無効化し、API失敗時は`ci_evidence`と成功状態を消して
+`ci_observation_error_at`へ失敗観測時刻を残します。統合起動直前の再観測も保存します。
+APIレスポンスのログ本文・check出力・annotations・認証値は保存対象にしません。
 目的・引継ぎ・結果には非公開productの情報が含まれ得るため、これらも公開repositoryへcommit・転載しません。
 CLIは外部Issue更新を直接組み立てず、既存の対象repositoryの運用と公開範囲を守るworkerが必要な記録を行います。
 
@@ -108,5 +117,29 @@ macOSのhost identity・process監督・launchd adapterは将来対応です。
 この段階ではmain CIが存在するrepositoryの自律pipelineを対象とします。workflow不在repositoryの
 `local-validation`を使うdeliveryは既存helperで可能ですが、coordinatorによるその自動選択は今後の対応です。
 CI起動に独自承認labelが必要なrepositoryは、既存の委任と運用を守り、未知の承認を自動付与しません。
-イベントは直近128件を状態に保持します。長期event archive・結果ack・worker結果の保持期限・OS起動adapterの
-導入管理はIssue #75で継続します。タスク完了後のworktree/artifact回収は既存helperで行い、引継ぎ記録は保持します。
+OS起動adapterの導入管理はIssue #75で継続します。
+
+## 未処理イベントと保持・回収
+
+`events --task-id <ID> --json`は未ackイベントと現在の`event_sequence`・`acknowledged_sequence`を返します。
+`--all`で保持中のack済みイベントも確認できます。内容を確認して必要な対応を済ませてから、
+`ack --task-id <ID> --through <確認したsequence>`でそのsequenceまでを累積ackします。
+表示やackによる削除はなく、確認後に届いた大きいsequenceは未処理のままです。未来のsequenceやackの巻戻しは拒否します。
+旧stateにackがなければ、残っているイベントはすべて未処理として読み込みます。旧版が既に捨てた履歴は復元できません。
+
+件数による自動破棄はありません。state全体の安全上限（1 MiB）を超える保存は明示エラーになり、
+保存済みstate・worker結果を保持します。長期event archiveは未対応です。
+
+```sh
+codex-task retention --task-id issue-123 --seconds 2592000
+codex-task collect --task-id issue-123 --json
+```
+
+保持期間は既定30日で、`retention`は秒単位の設定だけを保存します。自動削除はせず、`collect`で明示的に回収します。
+回収は完了task、worker停止（生存lock取得）、全イベントackを必要とし、進行中・停止中・判断待ちや未ackがあれば拒否します。
+期間を超えたack済みイベントと旧worker世代の既知fileだけを回収し、未知file・symlink・危険な権限は保持してエラーにします。
+worker fileは更新時刻、イベントは発生時刻を使い、期限と同時刻のものは保持します。
+現在世代と最新の結果がある世代は期限によらず残します。task本体・目的・checkpoint・レビュー・最新CI証跡も
+期限によらず保持するため、一覧・依存関係・唯一の引継ぎを失いません。task自体の削除は提供しません。
+タスク完了後のworktree/artifact回収は従来どおり既存delivery helperで行います。
+新しいstate項目を旧binaryは読み込めないため、導入時はcoordinatorを停止して全helperを揃えて更新し、その後再開します。
