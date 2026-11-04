@@ -111,7 +111,7 @@ pub(crate) fn clear_environment(command: &mut Command) {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_pid_namespace_command(command: &Command) -> io::Result<Command> {
+fn linux_pid_namespace_command(command: &Command, mount_proc: bool) -> io::Result<Command> {
     let unshare =
         super::trust::trusted_system_binary(UNSHARE_BINARY, "Unshare").map_err(io::Error::other)?;
     let program = command.get_program().to_os_string();
@@ -147,8 +147,12 @@ fn linux_pid_namespace_command(command: &Command) -> io::Result<Command> {
         "--pid",
         "--fork",
         "--kill-child=KILL",
-        "--",
     ]);
+    // 長時間worker内のhelperは自身のPIDと/procを照合するため、同じ名前空間へ揃える。
+    if mount_proc {
+        isolated.arg("--mount-proc");
+    }
+    isolated.arg("--");
     isolated.arg(program).args(arguments).stdin(Stdio::null());
     Ok(isolated)
 }
@@ -156,55 +160,66 @@ fn linux_pid_namespace_command(command: &Command) -> io::Result<Command> {
 #[cfg(target_os = "linux")]
 fn linux_pid_namespace_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let Ok(unshare) = super::trust::trusted_system_binary(UNSHARE_BINARY, "Unshare") else {
-            return false;
-        };
-        let Ok(true_binary) = super::trust::trusted_system_binary(TRUE_BINARY, "True") else {
-            return false;
-        };
-        let mut probe = Command::new(unshare);
-        probe
-            .env_clear()
-            .args([
-                "--user",
-                "--map-current-user",
-                "--pid",
-                "--fork",
-                "--kill-child=KILL",
-                "--",
-            ])
-            .arg(true_binary)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let Ok(mut child) = probe.spawn() else {
-            return false;
-        };
-        let deadline = Instant::now() + NAMESPACE_PROBE_TIMEOUT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return status.success(),
-                Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
-                Ok(None) => {
-                    let _ = child.kill();
-                    reap_probe_until(&mut child, Instant::now() + NAMESPACE_PROBE_TIMEOUT);
-                    return false;
-                }
-                Err(_) => {
-                    let _ = child.kill();
-                    reap_probe_until(&mut child, Instant::now() + NAMESPACE_PROBE_TIMEOUT);
-                    return false;
-                }
+    *AVAILABLE.get_or_init(|| probe_linux_namespace(false))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_task_namespace_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| probe_linux_namespace(true))
+}
+
+#[cfg(target_os = "linux")]
+fn probe_linux_namespace(mount_proc: bool) -> bool {
+    let Ok(unshare) = super::trust::trusted_system_binary(UNSHARE_BINARY, "Unshare") else {
+        return false;
+    };
+    let Ok(true_binary) = super::trust::trusted_system_binary(TRUE_BINARY, "True") else {
+        return false;
+    };
+    let mut probe = Command::new(unshare);
+    probe.env_clear().args([
+        "--user",
+        "--map-current-user",
+        "--pid",
+        "--fork",
+        "--kill-child=KILL",
+    ]);
+    if mount_proc {
+        probe.arg("--mount-proc");
+    }
+    probe
+        .arg("--")
+        .arg(true_binary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = probe.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + NAMESPACE_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
+            Ok(None) => {
+                let _ = child.kill();
+                reap_probe_until(&mut child, Instant::now() + NAMESPACE_PROBE_TIMEOUT);
+                return false;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                reap_probe_until(&mut child, Instant::now() + NAMESPACE_PROBE_TIMEOUT);
+                return false;
             }
         }
-    })
+    }
 }
 
 pub(crate) fn task_isolation_available() -> bool {
     #[cfg(target_os = "linux")]
     {
-        linux_pid_namespace_available()
+        linux_task_namespace_available()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -227,9 +242,10 @@ fn reap_probe_until(child: &mut std::process::Child, deadline: Instant) {
 fn prepare_linux_command(
     command: &mut Command,
     namespace_available: bool,
+    mount_proc: bool,
 ) -> io::Result<Option<Command>> {
     if namespace_available {
-        linux_pid_namespace_command(command).map(Some)
+        linux_pid_namespace_command(command, mount_proc).map(Some)
     } else {
         // This marker exists only to preserve env_clear while constructing the
         // unshare wrapper. Do not expose it to a directly executed target.
@@ -749,12 +765,12 @@ fn run_with_limit_config_and_consumer(
     descendants.mark_command(command);
     #[cfg(target_os = "linux")]
     let mut isolated_command =
-        prepare_linux_command(command, namespace_available).map_err(|source| {
-            ProcessError::Isolation {
+        prepare_linux_command(command, namespace_available, cancelled.is_some()).map_err(
+            |source| ProcessError::Isolation {
                 program: program.clone(),
                 source,
-            }
-        })?;
+            },
+        )?;
     #[cfg(target_os = "linux")]
     let command = match isolated_command.as_mut() {
         Some(isolated) => isolated,
@@ -1246,7 +1262,7 @@ mod tests {
         super::clear_environment(&mut command);
         command.arg("-c").arg("exit 0");
         assert!(
-            prepare_linux_command(&mut command, false)
+            prepare_linux_command(&mut command, false, false)
                 .expect("prepare fallback command")
                 .is_none()
         );
@@ -1553,6 +1569,38 @@ mod tests {
         let output = run_with_limit(&mut command, Duration::from_millis(500), 1024)
             .expect("PID namespace teardown must stop the escaped pipe holder");
         assert!(output.status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn task_worker_can_run_nested_process_helpers() {
+        const CHILD: &str = "CODEX_TEST_NESTED_PROCESS_HELPER";
+        if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            let mut command = Command::new("/usr/bin/true");
+            let output = super::run(&mut command, Duration::from_secs(5))
+                .expect("worker内でもPIDとprocfsが一致し、helperの子processを監督できること");
+            assert!(output.status.success());
+            return;
+        }
+        if !super::task_isolation_available() {
+            return;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "task_worker_can_run_nested_process_helpers",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1");
+        let output = super::run_task_worker(
+            &mut command,
+            Duration::from_secs(15),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| Ok(()),
+        )
+        .expect("実際のworker隔離下で入れ子のprocess runnerを実行できること");
+        assert!(output.status.success(), "{:?}", output.stderr);
     }
 
     #[cfg(target_os = "linux")]
