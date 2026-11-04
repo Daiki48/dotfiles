@@ -141,6 +141,9 @@ pub(super) fn worker_phase(phase: &Phase) -> bool {
 }
 
 pub(super) fn preflight(context: &Context) -> Result<PathBuf> {
+    if !runtime_write_available(context)? {
+        return Err(HOST_LAUNCH_REASON.into());
+    }
     if !process::task_isolation_available() {
         return Err(
             "user/PID namespaceによるworker隔離を利用できません。doctorで環境を確認してください"
@@ -235,15 +238,58 @@ pub(super) fn preflight(context: &Context) -> Result<PathBuf> {
 }
 
 pub(super) fn doctor(context: &Context) -> Result<Value> {
+    let host_launch_required = runtime_write_available(context).is_ok_and(|writable| !writable);
     let diagnosis = preflight(context);
     Ok(json!({
         "ready": diagnosis.is_ok(), "reason": diagnosis.err(),
         "platform": std::env::consts::OS, "codex_home": context.codex_home,
         "state_directory": context.store.root, "timer_required": false,
         "process_isolation": process::task_isolation_available(),
+        "host_launch_required": host_launch_required,
         "lifecycle": "run実行中に自律継続します。OS起動adapterは任意です。WSL停止中は待機し、次回起動後に照合します。",
         "privacy": "この診断・task state・worker報告はローカル用です。公開Issueへそのまま転載しないでください。"
     }))
+}
+
+const HOST_LAUNCH_REASON: &str = "現在のsandboxではCodex runtimeの保存領域がread-onlyです。既存approvalに従い、同じUIDの通常ホスト側からdoctor/start/run/reconcileを実行してください。子Codexのpermission・hookは変更しません";
+
+fn runtime_write_available(context: &Context) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        // Codex runtimeはtool用sandboxとは別に、設定・cache・stateへの通常の書込みを使う。
+        // setsidだけでは親shellのread-only mountを解放できない。
+        for path in [
+            &context.codex_home,
+            &context.home.join(".cache"),
+            &context.home.join(".local/state"),
+        ] {
+            let mut existing = path.as_path();
+            while !existing
+                .try_exists()
+                .map_err(|_| "Codex runtimeの保存領域を確認できません")?
+            {
+                existing = existing
+                    .parent()
+                    .ok_or("Codex runtimeの保存領域が不正です")?;
+            }
+            let path = std::ffi::CString::new(existing.as_os_str().as_bytes())
+                .map_err(|_| "Codex runtimeの保存先が不正です")?;
+            let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+                return Err("Codex runtimeのmount属性を確認できません".into());
+            }
+            if unsafe { stat.assume_init() }.f_flag & libc::ST_RDONLY != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = context;
+        Err("このOSのworker起動adapterは未対応です".into())
+    }
 }
 
 fn schema() -> Value {
@@ -506,6 +552,26 @@ fn run(context: &Context, task: &Task) -> Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_runtime_is_rejected_before_starting_codex() {
+        let home = crate::codex::setup_home_dir().unwrap();
+        let context = Context {
+            codex_home: crate::codex::resolve_codex_home(&home).unwrap(),
+            home,
+            repository: PathBuf::from("/example/product"),
+            github: "example/product".into(),
+            store: Store {
+                root: PathBuf::from("/example/state"),
+                host: "a".repeat(64),
+            },
+        };
+        if !runtime_write_available(&context).unwrap() {
+            assert_eq!(preflight(&context).unwrap_err(), HOST_LAUNCH_REASON);
+            assert_eq!(doctor(&context).unwrap()["host_launch_required"], true);
+        }
+    }
 
     #[test]
     fn worker_environment_clearing_survives_the_namespace_wrapper() {
