@@ -56,6 +56,10 @@ fn shared_resource_release_wakes_monitoring_without_a_new_writer_while_held() {
     store::private_dir(&root).unwrap();
     let path = root.join(format!("{:x}", Sha256::digest(b"cpu")));
     let lease = Lock::try_acquire(&path).unwrap().unwrap();
+    let inherited_fd = unsafe { libc::dup(lease.fd()) };
+    assert!(inherited_fd >= 3);
+    let descendant = unsafe { Lock::from_inherited(inherited_fd, &path) }.unwrap();
+    descendant.close_on_exec().unwrap();
     task.recovery.origin = Some(Phase::Implementation);
     task.monitor("別repositoryの共有資源を監視");
     monitor_task(&fixture.0, &mut task);
@@ -63,8 +67,21 @@ fn shared_resource_release_wakes_monitoring_without_a_new_writer_while_held() {
     monitor_task(&fixture.0, &mut task);
     assert_eq!(task.phase, Phase::Waiting);
     drop(lease);
+    // 親のdropだけでは子に残る同じopen file descriptionのlockは解放されない。
     task.recovery.next_observation = 0;
     monitor_task(&fixture.0, &mut task);
+    assert_eq!(task.phase, Phase::Waiting);
+    drop(descendant);
+    // 並列testのfork→exec間にもCLOEXECのFDが一時的に残る。実際の解放後の復帰を観測する。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        task.recovery.next_observation = 0;
+        monitor_task(&fixture.0, &mut task);
+        if task.phase == Phase::Diagnosis || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert_eq!(task.phase, Phase::Diagnosis);
     assert!(task.run.is_none());
 }
