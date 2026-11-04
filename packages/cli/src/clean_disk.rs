@@ -1016,6 +1016,21 @@ mod tests {
             fs::create_dir(&path).unwrap();
             Self(path)
         }
+
+        // 管理artifactの祖先に別repositoryがあってもfixtureの意味を固定する。
+        fn isolated_repository(&self) {
+            let status = Command::new("/usr/bin/git")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .current_dir(&self.0)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            fs::write(self.0.join(".gitignore"), "target/\n").unwrap();
+        }
     }
 
     impl Drop for TestDirectory {
@@ -1092,9 +1107,24 @@ mod tests {
     #[test]
     fn unverifiable_candidates_do_not_hide_safe_candidates() {
         use std::os::unix::net::UnixListener;
-        let root = TestDirectory::new("partial-inventory");
+        let parent = TestDirectory::new("partial-inventory");
+        parent.isolated_repository();
+        let root = TestDirectory(parent.0.join("managed"));
+        fs::create_dir(&root.0).unwrap();
         let trash = root.0.join(".codex-trash");
         fs::create_dir_all(trash.join("unsafe")).unwrap();
+        #[cfg(target_os = "linux")]
+        let _socket = {
+            use std::os::fd::AsRawFd;
+            let directory = fs::File::open(trash.join("unsafe")).unwrap();
+            // socket作成時だけ短い参照を使い、走査pathは実際の絶対pathで検証する。
+            UnixListener::bind(format!(
+                "/proc/self/fd/{}/agent.sock",
+                directory.as_raw_fd()
+            ))
+            .unwrap()
+        };
+        #[cfg(not(target_os = "linux"))]
         let _socket = UnixListener::bind(trash.join("unsafe/agent.sock")).unwrap();
         fs::create_dir_all(root.0.join("broken/target")).unwrap();
         fs::write(
@@ -1275,6 +1305,7 @@ mod tests {
     #[test]
     fn discovery_is_limited_to_trash_entries_and_cargo_targets() {
         let fixture = TestDirectory::new("discovery");
+        fixture.isolated_repository();
         let repository = fixture.0.join("repository");
         fs::create_dir(&repository).unwrap();
         fs::write(
@@ -1301,7 +1332,10 @@ mod tests {
 
     #[test]
     fn codex_targets_and_legacy_trash_are_discovered_without_cargo_manifest() {
-        let fixture = TestDirectory::new("codex-discovery");
+        let parent = TestDirectory::new("codex-discovery");
+        parent.isolated_repository();
+        let fixture = TestDirectory(parent.0.join("managed"));
+        fs::create_dir(&fixture.0).unwrap();
         for relative in [
             "repo/task-example/target",
             "repo/.artifact-backups/old",

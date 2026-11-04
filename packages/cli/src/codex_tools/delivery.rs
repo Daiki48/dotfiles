@@ -590,6 +590,61 @@ fn gh_json(cwd: &Path, args: &[String]) -> Result<Value> {
     parse_json(&gh(cwd, args, true)?, "GitHub")
 }
 
+/// タスク監視は既存の認証隔離・実行file検証を通す読み取りだけを使う。
+pub(crate) fn task_gh_json(cwd: &Path, args: &[String]) -> std::result::Result<Value, String> {
+    if args.first().map(String::as_str) != Some("api")
+        || !args.get(1).is_some_and(|endpoint| {
+            endpoint.starts_with("repos/") && !endpoint.contains(['\n', '\r', '#'])
+        })
+    {
+        return Err("task監視はGitHub RESTの読み取りだけに対応します".into());
+    }
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--method" if args.get(index + 1).map(String::as_str) == Some("GET") => index += 2,
+            "--paginate" | "--slurp" => index += 1,
+            _ => return Err("task監視のGitHub引数が読み取り契約に一致しません".into()),
+        }
+    }
+    let sandbox = GhSandbox::create(cwd).map_err(|_| "GitHub認証の隔離に失敗しました")?;
+    let args = sandbox
+        .snapshot_args(args)
+        .map_err(|_| "GitHub認証の隔離に失敗しました")?;
+    let mut command = vec![
+        trusted_binary(GH_BINARY, "GitHub CLI").map_err(|_| "GitHub CLIを信頼検証できません")?,
+    ];
+    command.extend(args);
+    let output = run_with_config(
+        &command,
+        cwd,
+        Duration::from_secs(COMMAND_TIMEOUT),
+        MAX_OUTPUT_BYTES,
+        Some(&sandbox.path),
+    )
+    .map_err(|_| "GitHub APIの通信・実行に失敗しました")?;
+    if !output.status.success() {
+        let message = output.stderr.to_ascii_lowercase();
+        return Err(
+            if message.contains("rate limit") || message.contains("http 429") {
+                "GitHub APIはrate limit中です。backoff後に再照合します"
+            } else if message.contains("http 401")
+                || message.contains("not logged")
+                || message.contains("authentication")
+            {
+                "GitHub認証を確認できません。認証復旧後に再照合します"
+            } else if message.contains("http 403") {
+                "GitHub APIの権限または実行承認を確認できません"
+            } else {
+                "GitHub APIの取得に失敗しました。CI失敗とは分けて再照合します"
+            }
+            .into(),
+        );
+    }
+    parse_json(&output.stdout, "GitHub task監視")
+        .map_err(|_| "GitHub APIの応答形式を確認できません".into())
+}
+
 fn sha256(value: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(value.as_ref()))
 }

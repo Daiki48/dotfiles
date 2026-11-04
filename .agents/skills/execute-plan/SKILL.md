@@ -7,6 +7,8 @@ description: GitHub repositoryの実装依頼を、専用worktree、比例した
 
 Daikiの実装依頼を許可の正本とし、目的・受け入れ条件・非目標を固定する。通常のGitHub実装はPR、merge、main同期、作業場の回収まで進める。明示された「変更だけ」「PRまで」などの境界は優先する。計画承認やcommitごとの確認は求めない。
 
+複数Issueの並列実装や進行中に別taskを追加する依頼は`parallel-development`へつなぐ。既に`codex-task`のworkerとして起動されている場合は再登録せず、与えられた既存worktreeと停止境界でこの手順を実行する。
+
 ## 計画・作業場・記録
 
 - 複数経路やhigh/criticalの変更では、`plan-change`の調査を内部計画へ引き継ぐ。小さな変更では短い目的と検証方針で足り、計画書やsubagentを義務化しない。delivery用のPlan ID（例 `fix-example-v1`）と版を付ける。

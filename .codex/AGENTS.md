@@ -20,6 +20,7 @@
 - 調査順序、分割、委譲は品質・時間・contextの効果を見てmainが判断する。独立した読み取り調査はLuna xhighの`explorer`、独立reviewはLuna xhighの`reviewer`を使える。単純な検索や直列作業を義務的に委譲しない。maxへの昇格はxhighで不足する具体的根拠がある場合だけにする。
 - ローカルgpt-ossは任意の補助手段。使う場合だけdotfilesの`docs/codex-local-model.ja.md`を読み、入力制限・構文解釈の除外を守る。失敗を同条件で繰り返さずmainまたは適切なexplorerが引き取る。
 - native subagentは親のruntime permissionを継承する。role設定を安全境界とせずmainのsingle-writerを原則とする。write委譲は対象file、変更、不変条件、test、停止条件を一意に指定できる機械的な独立作業だけに限る。
+- 複数Issueの並列実装・進行中の別task追加・task状態確認は`parallel-development`を使う。FedoraとWSL2は各実行hostのstate・worktree・認証を使い、暗黙のhost移動やwriter追加をしない。task workerは既存taskと指定された停止境界を守り、同じ依頼を再登録しない。
 - test・lint・型検査・buildはrepositoryの設定を正本とし、変更に比例させる。回帰testは重要な変更挙動を観測するものにする。形式手法やmutation testは通常testで捉えにくい性質に効果がある場合だけ使う。
 - reviewは固定差分、影響経路、受け入れ条件、高リスク境界、testで保証できない事項へ絞る。同じ原因の指摘をまとめて修正し、影響する検証を新headで行う。同条件の失敗や進展のない修正が続いたら、patchを重ねず原因と検証方法を見直す。
 
