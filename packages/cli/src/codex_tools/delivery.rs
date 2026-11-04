@@ -590,6 +590,142 @@ fn gh_json(cwd: &Path, args: &[String]) -> Result<Value> {
     parse_json(&gh(cwd, args, true)?, "GitHub")
 }
 
+pub(crate) fn task_ci_label_args(
+    repository: &str,
+    pr: u64,
+    labels: &[String],
+) -> std::result::Result<Vec<String>, String> {
+    let parts = repository.split('/').collect::<Vec<_>>();
+    if parts.len() != 2
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || [".", ".."].contains(part)
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        })
+        || pr == 0
+        || labels.is_empty()
+        || !super::task::valid_ci_labels(labels)
+    {
+        return Err("CI起動labelの対象または値が不正です".into());
+    }
+    let mut args = vec![
+        "api".into(),
+        format!("repos/{repository}/issues/{pr}/labels"),
+        "--method".into(),
+        "POST".into(),
+    ];
+    for label in labels {
+        args.extend(["-f".into(), format!("labels[]={label}")]);
+    }
+    Ok(args)
+}
+
+/// 受付時に委任された既存labelの追加だけを行う。任意のPR編集・Git操作は受け付けない。
+pub(crate) fn task_add_ci_labels(
+    cwd: &Path,
+    repository: &str,
+    pr: u64,
+    head: &str,
+    base: &str,
+    labels: &[String],
+) -> std::result::Result<(), String> {
+    let args = task_ci_label_args(repository, pr, labels)?;
+    let read_pr = vec!["api".into(), format!("repos/{repository}/pulls/{pr}")];
+    let matches = |value: &Value| {
+        value.get("number").and_then(Value::as_u64) == Some(pr)
+            && value.get("state").and_then(Value::as_str) == Some("open")
+            && value.pointer("/head/sha").and_then(Value::as_str) == Some(head)
+            && value.pointer("/base/sha").and_then(Value::as_str) == Some(base)
+            && value
+                .pointer("/head/repo/full_name")
+                .and_then(Value::as_str)
+                == Some(repository)
+            && value
+                .pointer("/base/repo/full_name")
+                .and_then(Value::as_str)
+                == Some(repository)
+    };
+    if !matches(&task_gh_json(cwd, &read_pr)?) {
+        return Err("CI起動直前にPRのidentity・HEAD・baseが変化しました".into());
+    }
+    for label in labels {
+        let encoded = label
+            .bytes()
+            .map(|byte| format!("%{byte:02X}"))
+            .collect::<String>();
+        let existing = task_gh_json(
+            cwd,
+            &["api".into(), format!("repos/{repository}/labels/{encoded}")],
+        )?;
+        if existing.get("name").and_then(Value::as_str) != Some(label) {
+            return Err("委任された既存CI起動labelを確認できません".into());
+        }
+    }
+    gh_json(cwd, &args)
+        .map_err(|_| "CI起動labelを付与できません。状態を再照合してから再試行します".to_string())?;
+    if !matches(&task_gh_json(cwd, &read_pr)?) {
+        return Err("CI起動後にPRのidentity・HEAD・baseが変化しました".into());
+    }
+    Ok(())
+}
+
+/// タスク監視は既存の認証隔離・実行file検証を通す読み取りだけを使う。
+pub(crate) fn task_gh_json(cwd: &Path, args: &[String]) -> std::result::Result<Value, String> {
+    if args.first().map(String::as_str) != Some("api")
+        || !args.get(1).is_some_and(|endpoint| {
+            endpoint.starts_with("repos/") && !endpoint.contains(['\n', '\r', '#'])
+        })
+    {
+        return Err("task監視はGitHub RESTの読み取りだけに対応します".into());
+    }
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--method" if args.get(index + 1).map(String::as_str) == Some("GET") => index += 2,
+            "--paginate" | "--slurp" => index += 1,
+            _ => return Err("task監視のGitHub引数が読み取り契約に一致しません".into()),
+        }
+    }
+    let sandbox = GhSandbox::create(cwd).map_err(|_| "GitHub認証の隔離に失敗しました")?;
+    let args = sandbox
+        .snapshot_args(args)
+        .map_err(|_| "GitHub認証の隔離に失敗しました")?;
+    let mut command = vec![
+        trusted_binary(GH_BINARY, "GitHub CLI").map_err(|_| "GitHub CLIを信頼検証できません")?,
+    ];
+    command.extend(args);
+    let output = run_with_config(
+        &command,
+        cwd,
+        Duration::from_secs(COMMAND_TIMEOUT),
+        MAX_OUTPUT_BYTES,
+        Some(&sandbox.path),
+    )
+    .map_err(|_| "GitHub APIの通信・実行に失敗しました")?;
+    if !output.status.success() {
+        let message = output.stderr.to_ascii_lowercase();
+        return Err(
+            if message.contains("rate limit") || message.contains("http 429") {
+                "GitHub APIはrate limit中です。backoff後に再照合します"
+            } else if message.contains("http 401")
+                || message.contains("not logged")
+                || message.contains("authentication")
+            {
+                "GitHub認証を確認できません。認証復旧後に再照合します"
+            } else if message.contains("http 403") {
+                "GitHub APIの権限または実行承認を確認できません"
+            } else {
+                "GitHub APIの取得に失敗しました。CI失敗とは分けて再照合します"
+            }
+            .into(),
+        );
+    }
+    parse_json(&output.stdout, "GitHub task監視")
+        .map_err(|_| "GitHub APIの応答形式を確認できません".into())
+}
+
 fn sha256(value: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(value.as_ref()))
 }

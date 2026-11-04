@@ -64,6 +64,8 @@ pub(crate) enum ProcessError {
     },
     #[error("{program} exceeded its deadline of {timeout:?}")]
     Timeout { program: String, timeout: Duration },
+    #[error("{program} was cancelled and its process tree was reaped")]
+    Cancelled { program: String },
     #[error("failed to wait for {program}: {source}")]
     Wait {
         program: String,
@@ -197,6 +199,17 @@ fn linux_pid_namespace_available() -> bool {
             }
         }
     })
+}
+
+pub(crate) fn task_isolation_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_pid_namespace_available()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -657,6 +670,36 @@ where
         stderr_capture_limit,
         false,
         Some(Box::new(consumer)),
+        None,
+    )
+}
+
+/// 長時間workerは専用processで呼ぶ。coordinatorのAPI照合とlockを共有しない。
+pub(crate) fn run_task_worker<F>(
+    command: &mut Command,
+    timeout: Duration,
+    cancelled: Arc<AtomicBool>,
+    consumer: F,
+) -> Result<Output, ProcessError>
+where
+    F: FnMut(&[u8]) -> io::Result<()> + Send + 'static,
+{
+    if !task_isolation_available() {
+        return Err(ProcessError::Isolation {
+            program: command.get_program().to_string_lossy().into_owned(),
+            source: io::Error::new(
+                io::ErrorKind::Unsupported,
+                "task worker isolation is unavailable",
+            ),
+        });
+    }
+    run_with_limit_config_and_consumer(
+        command,
+        timeout,
+        MAX_CAPTURE_BYTES,
+        true,
+        Some(Box::new(consumer)),
+        Some(cancelled),
     )
 }
 
@@ -666,7 +709,14 @@ fn run_with_limit_config(
     capture_limit: usize,
     namespace_available: bool,
 ) -> Result<Output, ProcessError> {
-    run_with_limit_config_and_consumer(command, timeout, capture_limit, namespace_available, None)
+    run_with_limit_config_and_consumer(
+        command,
+        timeout,
+        capture_limit,
+        namespace_available,
+        None,
+        None,
+    )
 }
 
 fn run_with_limit_config_and_consumer(
@@ -675,6 +725,7 @@ fn run_with_limit_config_and_consumer(
     capture_limit: usize,
     namespace_available: bool,
     mut stdout_consumer: Option<StdoutConsumer>,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> Result<Output, ProcessError> {
     #[cfg(not(target_os = "linux"))]
     let _ = namespace_available;
@@ -795,14 +846,38 @@ fn run_with_limit_config_and_consumer(
     let mut stderr = None;
     let mut result_error = None;
     let mut completed_cleanup = false;
+    // 長時間workerではhost全体の/proc走査を短時間commandと同じ頻度で繰り返さない。
+    let poll_interval = if cancelled.is_some() {
+        Duration::from_millis(50)
+    } else {
+        POLL_INTERVAL
+    };
+    let refresh_interval = if cancelled.is_some() {
+        Duration::from_millis(250)
+    } else {
+        POLL_INTERVAL
+    };
+    let mut next_refresh = Instant::now();
 
     while result_error.is_none() && (status.is_none() || stdout.is_none() || stderr.is_none()) {
-        if let Err(source) = descendants.refresh() {
-            result_error = Some(ProcessError::Isolation {
+        if cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            result_error = Some(ProcessError::Cancelled {
                 program: program.clone(),
-                source,
             });
             break;
+        }
+        if Instant::now() >= next_refresh {
+            if let Err(source) = descendants.refresh() {
+                result_error = Some(ProcessError::Isolation {
+                    program: program.clone(),
+                    source,
+                });
+                break;
+            }
+            next_refresh = Instant::now() + refresh_interval;
         }
         drain_messages(
             &receiver,
@@ -844,7 +919,7 @@ fn run_with_limit_config_and_consumer(
             });
             break;
         }
-        thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(Instant::now())));
     }
 
     if result_error.is_some() {
@@ -1551,5 +1626,23 @@ mod tests {
         );
         unrelated.kill().expect("stop unrelated test child");
         unrelated.wait().expect("reap unrelated test child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn task_cancellation_reaps_the_process_before_returning() {
+        let mut command = Command::new("/usr/bin/sleep");
+        command.arg("30");
+        let cancelled = Arc::new(super::AtomicBool::new(true));
+        let error = super::run_with_limit_config_and_consumer(
+            &mut command,
+            Duration::from_secs(30),
+            1024,
+            false,
+            None,
+            Some(cancelled),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::Cancelled { .. }));
     }
 }

@@ -114,6 +114,7 @@ const RESTRICTED_COMMANDS: &[&str] = &[
     "git",
     "gh",
     "codex-worktree",
+    "codex-task",
     "codex-delivery",
     "codex-discussions",
 ];
@@ -2288,7 +2289,7 @@ fn git_write_target(session_cwd: Option<&str>, explicit: Option<&str>) -> Result
         if target_root != resolved || target_common != common {
             return Err("git -CのworktreeがCodex sessionのrepositoryと一致しません".into());
         }
-        if session_root == main {
+        if session_root == main || target_root == session_root {
             target_root
         } else {
             return Err("linked worktree sessionから別worktreeへ書き込むことはできません".into());
@@ -3718,10 +3719,17 @@ fn trusted_helper_ancestor_owner(uid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn trusted_installed_helper(name: &str) -> Result<String, String> {
+pub(crate) fn trusted_installed_helper(name: &str) -> Result<String, String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    if !["codex-worktree", "codex-delivery", "codex-discussions"].contains(&name) {
+    if ![
+        "codex-worktree",
+        "codex-delivery",
+        "codex-discussions",
+        "codex-task",
+    ]
+    .contains(&name)
+    {
         return Err("helper名を確認できません".into());
     }
     // SAFETY: getpwuid returns process-account data owned by libc.
@@ -3806,7 +3814,7 @@ fn trusted_installed_helper(name: &str) -> Result<String, String> {
 }
 
 #[cfg(not(unix))]
-fn trusted_installed_helper(_name: &str) -> Result<String, String> {
+pub(crate) fn trusted_installed_helper(_name: &str) -> Result<String, String> {
     Err("helper binaryの信頼検証はUnixだけに対応しています".into())
 }
 
@@ -3819,7 +3827,14 @@ fn rewrite_helper_safety_command(command: &str) -> Result<Option<String>, String
     let Some(name) = tokens.first().map(String::as_str) else {
         return Ok(None);
     };
-    if !["codex-worktree", "codex-delivery", "codex-discussions"].contains(&name) {
+    if ![
+        "codex-worktree",
+        "codex-delivery",
+        "codex-discussions",
+        "codex-task",
+    ]
+    .contains(&name)
+    {
         return Ok(None);
     }
     tokens[0] = trusted_installed_helper(name)?;
@@ -4813,10 +4828,21 @@ fn python_helper_invocation_reason(tokens: &[String]) -> Option<String> {
                 i += 1;
                 value
             };
-            if ["codex-worktree", "codex-delivery", "codex-discussions"].contains(&module.as_str())
+            if [
+                "codex-worktree",
+                "codex-delivery",
+                "codex-discussions",
+                "codex-task",
+            ]
+            .contains(&module.as_str())
                 || tokens[i..].iter().any(|value| {
-                    ["codex-worktree", "codex-delivery", "codex-discussions"]
-                        .contains(&basename(value))
+                    [
+                        "codex-worktree",
+                        "codex-delivery",
+                        "codex-discussions",
+                        "codex-task",
+                    ]
+                    .contains(&basename(value))
                 })
             {
                 return Some("helperはPython moduleまたはinterpreter経由で実行できません".into());
@@ -4831,7 +4857,13 @@ fn python_helper_invocation_reason(tokens: &[String]) -> Option<String> {
             i += 1;
             continue;
         }
-        if ["codex-worktree", "codex-delivery", "codex-discussions"].contains(&basename(&tokens[i]))
+        if [
+            "codex-worktree",
+            "codex-delivery",
+            "codex-discussions",
+            "codex-task",
+        ]
+        .contains(&basename(&tokens[i]))
         {
             return Some("helperはPython interpreterやwrapper経由で実行できません".into());
         }
@@ -5192,6 +5224,12 @@ fn has_write_operation(tokens: &[String]) -> bool {
     let start = command_start(tokens);
     if let Some(start) = start {
         match basename(tokens.get(start).unwrap_or(&String::new())) {
+            "codex-task" => {
+                return tokens.iter().skip(start + 1).any(|value| {
+                    ["submit", "resume", "pause", "run", "start", "reconcile"]
+                        .contains(&value.as_str())
+                });
+            }
             "codex-worktree" => {
                 return tokens.get(start + 1).is_some_and(|v| {
                     [
@@ -5610,6 +5648,16 @@ fn blocked_reason(command: &str, cwd: Option<&str>, depth: usize) -> Option<Stri
         }
         if let Some(reason) = python_helper_invocation_reason(tokens) {
             return Some(reason);
+        }
+        if let Some(start) = command_start(tokens)
+            && basename(&tokens[start]) == "codex-task"
+        {
+            if start != 0 || tokens[start] != "codex-task" || depth > 0 {
+                return Some("task helperはwrapperを使わずPATHから直接実行してください".into());
+            }
+            if let Some(reason) = super::task::invocation_reason(&tokens[1..]) {
+                return Some(reason);
+            }
         }
         if let Some(reason) = worktree_helper_invocation_reason(tokens) {
             return Some(reason);
@@ -7615,5 +7663,35 @@ mod recovery_tests {
                 .is_some()
             );
         }
+    }
+
+    #[test]
+    fn task_helper_rejects_internal_workers_paths_wrappers_and_command_chains() {
+        for command in [
+            "codex-task list",
+            "codex-task doctor",
+            "codex-task show --task-id task-example --json",
+            "codex-task submit --task-id task-example --objective implement",
+            "codex-task run --poll-seconds 15",
+        ] {
+            assert!(blocked_reason(command, None, 0).is_none(), "{command}");
+        }
+        for command in [
+            "codex-task worker --task-id task-example --generation 1 --lease-fd 3",
+            "/tmp/codex-task list",
+            "env codex-task list",
+            "python3 /tmp/codex-task list",
+            "sh -c 'codex-task list'",
+            "codex-task run --force",
+            "codex-task list; git status",
+        ] {
+            assert!(blocked_reason(command, None, 0).is_some(), "{command}");
+        }
+        assert!(has_write_operation(
+            &["codex-task", "reconcile"].map(str::to_string)
+        ));
+        assert!(!has_write_operation(
+            &["codex-task", "list"].map(str::to_string)
+        ));
     }
 }

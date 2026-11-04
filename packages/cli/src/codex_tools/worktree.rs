@@ -1065,6 +1065,67 @@ fn inspect_repository(
     })
 }
 
+/// タスク制御からも既存のrepository検証とmanaged worktree契約を使う。
+pub(crate) fn task_repository(cwd: &Path) -> Result<(PathBuf, String, String), WorktreeError> {
+    let repository = inspect_repository(cwd, false, false)?;
+    Ok((
+        repository.root.clone(),
+        repository.github_name.clone(),
+        repository.key()?,
+    ))
+}
+
+pub(crate) fn task_workspace(
+    cwd: &Path,
+    task: &str,
+    branch: &str,
+) -> Result<PathBuf, WorktreeError> {
+    if !valid_task_id(task) {
+        return Err(error("task IDが不正です"));
+    }
+    let repository = inspect_repository(cwd, false, false)?;
+    let (_, manifest, _) = managed_paths(&repository, task, false)?;
+    if manifest
+        .try_exists()
+        .map_err(|_| error("task manifestを確認できません"))?
+    {
+        let path = resume(cwd, task, false)?;
+        let stored = load_manifests(&repository)?
+            .into_iter()
+            .find(|(_, manifest)| manifest.task_id == task)
+            .ok_or_else(|| error("task manifestがありません"))?
+            .1;
+        if stored.branch != branch {
+            return Err(error("taskの既存branchが登録内容と一致しません"));
+        }
+        crate::clean_disk::ensure_artifact_idle(&path).map_err(|_| {
+            error("既存worktreeを使用中または使用状況を確認できません。新workerは起動しません")
+        })?;
+        Ok(path)
+    } else {
+        create_worktree(cwd, branch, task, false)
+    }
+}
+
+pub(crate) fn task_head(cwd: &Path) -> Result<String, WorktreeError> {
+    git_stdout(cwd, &["rev-parse", "--verify", "HEAD^{commit}"]).map(|head| head.trim().into())
+}
+
+pub(crate) fn task_completed(cwd: &Path, task: &str) -> Result<bool, WorktreeError> {
+    let repository = inspect_repository(cwd, false, false)?;
+    let manifests = load_manifests(&repository)?;
+    let Some((_, manifest)) = manifests
+        .iter()
+        .find(|(_, manifest)| manifest.task_id == task)
+    else {
+        return Ok(false);
+    };
+    Ok(!Path::new(&manifest.worktree)
+        .try_exists()
+        .map_err(|_| error("worktreeを確認できません"))?
+        && completed_delivery(manifest))
+}
+
 fn repository_key(github_name: &str) -> Result<String, WorktreeError> {
     let (owner, name) = github_name
         .split_once('/')

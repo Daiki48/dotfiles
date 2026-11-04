@@ -49,6 +49,7 @@ const MANAGED_BINARY_DESTINATIONS: &[&str] = &[
     ".local/bin/codex-worktree",
     ".local/bin/codex-delivery",
     ".local/bin/codex-discussions",
+    ".local/bin/codex-task",
     ".local/bin/runner-storage-cleanup",
 ];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
@@ -83,6 +84,13 @@ const LEGACY_PYTHON_HOOKS: &[(&str, &str)] = &[
 const CODEX_DIRS: &[(&str, &str)] = &[
     (".agents/skills", ".agents/skills"),
     (".codex/agents", ".codex/agents"),
+];
+
+// CODEX_HOMEが別配置でも、Codexが実際に探索する共有設定を揃える。
+const ACTIVE_CODEX_LINKS: &[(&str, &str)] = &[
+    (".codex/AGENTS.md", "AGENTS.md"),
+    (".codex/rules/default.rules", "rules/default.rules"),
+    (".codex/agents", "agents"),
 ];
 
 // config.tomlはproject trustやhook trustなどの端末固有値を保持するため、
@@ -145,6 +153,19 @@ const RUSTUP_RELATIVE_PATH: &str = ".cargo/bin/rustup";
 const SYSTEM_BUILD_PATH: &str = "/usr/bin";
 const TOOL_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const RELEASE_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn preflight_task_path(home: &Path, paths: &OsStr) -> Result<()> {
+    let expected = home.join(".local/bin");
+    for directory in std::env::split_paths(paths) {
+        if directory == expected {
+            return Ok(());
+        }
+        if fs::symlink_metadata(directory.join("codex-task")).is_ok() {
+            anyhow::bail!("PATH上の別のcodex-taskがmanaged helperより優先されています");
+        }
+    }
+    anyhow::bail!("managed helper directoryをPATHへ追加してください");
+}
 
 #[cfg(unix)]
 fn current_uid() -> u32 {
@@ -240,7 +261,7 @@ fn validate_resolved_user_executable(home: &Path, canonical: &Path, name: &str) 
     Ok(())
 }
 
-fn codex_binary_path(home: &Path) -> Result<PathBuf> {
+pub(crate) fn codex_binary_path(home: &Path) -> Result<PathBuf> {
     trusted_user_executable(home, CODEX_RELATIVE_PATH, "Codex CLI")
 }
 
@@ -3481,7 +3502,7 @@ fn validate_absolute_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_codex_home(home: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_codex_home(home: &Path) -> Result<PathBuf> {
     let configured = std::env::var_os("CODEX_HOME");
     let candidate = configured
         .map(PathBuf::from)
@@ -3565,7 +3586,7 @@ fn account_home_dir() -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn setup_home_dir() -> Result<PathBuf> {
+pub(crate) fn setup_home_dir() -> Result<PathBuf> {
     let configured = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -3574,7 +3595,7 @@ fn setup_home_dir() -> Result<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn setup_home_dir() -> Result<PathBuf> {
+pub(crate) fn setup_home_dir() -> Result<PathBuf> {
     let home = home::home_dir().context("Cannot find home directory")?;
     validate_absolute_path(&home)?;
     Ok(home)
@@ -4033,6 +4054,11 @@ fn preflight_setup_state(home: &Path, codex_dir: &Path, dotfiles_path: &Path) ->
     for (source, destination) in CODEX_DIRS {
         preflight_shared_symlink(dotfiles_path, home, source, destination)?;
     }
+    if codex_dir != home.join(".codex") {
+        for (source, destination) in ACTIVE_CODEX_LINKS {
+            preflight_shared_symlink(dotfiles_path, codex_dir, source, destination)?;
+        }
+    }
     preflight_config_state(codex_dir, &dotfiles_path.join(CODEX_CONFIG_TEMPLATE), home)?;
     preflight_retired_state(codex_dir)?;
     preflight_setup_transaction(codex_dir)?;
@@ -4116,6 +4142,7 @@ pub fn setup() -> Result<()> {
             helper_directory.display()
         );
     }
+    preflight_task_path(&home, &std::env::var_os("PATH").unwrap_or_default())?;
     let codex_dir = resolve_codex_home(&home)?;
     let dotfiles_path = std::env::current_dir().context("Failed to get current directory")?;
     let _operation_lock = GuardrailOperationLock::acquire(&home)?;
@@ -4161,6 +4188,11 @@ pub fn setup() -> Result<()> {
     for (source, dest) in CODEX_DIRS {
         ensure_shared_symlink(&dotfiles_path, &home, source, dest)?;
     }
+    if codex_dir != home.join(".codex") {
+        for (source, destination) in ACTIVE_CODEX_LINKS {
+            ensure_shared_symlink(&dotfiles_path, &codex_dir, source, destination)?;
+        }
+    }
 
     backup_legacy_config(&codex_dir)?;
     archive_retired_profiles(&codex_dir)?;
@@ -4168,6 +4200,19 @@ pub fn setup() -> Result<()> {
     println!("\nMigrating shared Codex settings...");
     migrate_managed_config(&codex_dir, &home)?;
     archive_legacy_python_hooks(&codex_dir)?;
+    let mut task_check = Command::new(home.join(".local/bin/codex-task"));
+    process::clear_environment(&mut task_check);
+    task_check
+        .env("HOME", &home)
+        .env("PATH", SYSTEM_BUILD_PATH)
+        .arg("--version");
+    let task_check = process::run(&mut task_check, TOOL_CHECK_TIMEOUT)
+        .context("導入済みcodex-taskを実行できません")?;
+    if !task_check.status.success()
+        || !String::from_utf8_lossy(&task_check.stdout).starts_with("codex-task ")
+    {
+        anyhow::bail!("導入済みcodex-taskのversionを確認できません");
+    }
     complete_setup_transaction(&codex_dir)?;
 
     println!("\n✅ Codex CLI setup completed!");
@@ -4241,9 +4286,23 @@ mod tests {
                 ".local/bin/codex-worktree",
                 ".local/bin/codex-delivery",
                 ".local/bin/codex-discussions",
+                ".local/bin/codex-task",
                 ".local/bin/runner-storage-cleanup",
             ]
         );
+    }
+
+    #[test]
+    fn setup_rejects_a_shadowing_task_binary_before_installing() {
+        let directory = TestDirectory::new("task-path");
+        let early = directory.path().join("early");
+        fs::create_dir(&early).unwrap();
+        let home = directory.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let paths = std::env::join_paths([early.clone(), home.join(".local/bin")]).unwrap();
+        assert!(super::preflight_task_path(&home, &paths).is_ok());
+        fs::write(early.join("codex-task"), "unknown binary").unwrap();
+        assert!(super::preflight_task_path(&home, &paths).is_err());
     }
 
     #[test]
@@ -4750,6 +4809,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nondefault_codex_home_receives_active_instruction_rule_and_agent_links() {
+        let directory = TestDirectory::new("active-codex-home");
+        let codex_home = directory.path().join("custom codex");
+        ensure_private_directory(&codex_home).unwrap();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        for (source, destination) in super::ACTIVE_CODEX_LINKS {
+            preflight_shared_symlink(repository, &codex_home, source, destination).unwrap();
+            ensure_shared_symlink(repository, &codex_home, source, destination).unwrap();
+            ensure_shared_symlink(repository, &codex_home, source, destination).unwrap();
+            assert_eq!(
+                fs::read_link(codex_home.join(destination)).unwrap(),
+                fs::canonicalize(repository.join(source)).unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_instruction_install_preserves_unknown_local_files() {
+        let directory = TestDirectory::new("active-local-instructions");
+        let codex_home = directory.path().join("custom");
+        ensure_private_directory(&codex_home).unwrap();
+        let destination = codex_home.join("AGENTS.md");
+        fs::write(&destination, "local instructions").unwrap();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert!(
+            preflight_shared_symlink(repository, &codex_home, ".codex/AGENTS.md", "AGENTS.md")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(destination).unwrap(),
+            "local instructions"
+        );
     }
 
     #[test]

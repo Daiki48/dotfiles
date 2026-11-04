@@ -6,6 +6,7 @@ pub(crate) mod process;
 #[cfg(test)]
 mod ruleset;
 pub(crate) mod runner_storage;
+pub(crate) mod task;
 pub(crate) mod trust;
 mod workflow_policy;
 pub(crate) mod worktree;
