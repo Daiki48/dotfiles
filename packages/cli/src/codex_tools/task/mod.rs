@@ -135,6 +135,10 @@ enum Commands {
         generation: u64,
         #[arg(long)]
         lease_fd: i32,
+        #[arg(long)]
+        admission_fd: i32,
+        #[arg(long)]
+        admission_slot: usize,
     },
     #[command(hide = true)]
     Coordinator {
@@ -277,6 +281,11 @@ impl Task {
                 .dependencies
                 .iter()
                 .any(|id| !valid_id(id) || id == &self.id)
+            || self
+                .recovery
+                .repair_task
+                .as_ref()
+                .is_some_and(|id| !valid_id(id) || !self.recovery.children.contains(id))
             || self.resources.iter().any(|value| !resource_name(value))
             || self.head.as_deref().is_some_and(|head| !valid_sha(head))
             || self.base.as_deref().is_some_and(|head| !valid_sha(head))
@@ -819,6 +828,26 @@ fn register_followups(
     assessment: &recovery::Assessment,
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
+    if assessment
+        .followups
+        .iter()
+        .filter(|next| next.purpose == recovery::FollowupPurpose::RepairMainCi)
+        .count()
+        > 1
+    {
+        return Err("1つのmain CI失敗には修復専用taskを1つだけ紐付けてください".into());
+    }
+    if assessment
+        .followups
+        .iter()
+        .any(|next| next.purpose == recovery::FollowupPurpose::RepairMainCi)
+        && !(task.recovery.barrier
+            && task.merge_commit.is_some()
+            && task.ci_state == Some(ci::CiState::Failure)
+            && matches!(task.effective_phase(), Phase::MainCi | Phase::Finish))
+    {
+        return Err("実在するmain CI失敗に対してのみ修復専用taskを登録できます".into());
+    }
     if task.recovery.children.len() + assessment.followups.len() > 32 {
         return Err("後続taskの登録数が上限です。既存の計画・依存関係を見直してください".into());
     }
@@ -840,6 +869,31 @@ fn register_followups(
             Sha256::digest(format!("{}\n{}", task.id, next.objective))
         );
         let id = format!("task-followup-{}", &digest[..20]);
+        let repairs_main = next.purpose == recovery::FollowupPurpose::RepairMainCi;
+        if repairs_main
+            && task
+                .recovery
+                .repair_task
+                .as_ref()
+                .is_some_and(|existing| existing != &id)
+        {
+            return Err(
+                "既存の修復専用taskを継続してください。別taskへbarrier例外を付与しません".into(),
+            );
+        }
+        {
+            let _lock = context.store.lock()?;
+            let current = context.load(&task.id)?;
+            if current.pause_requested
+                || current.generation != task.generation
+                || current.revision != task.revision
+            {
+                return Err(
+                    "親taskの停止・世代・追加指示が変化しました。後続登録を保留して再照合します"
+                        .into(),
+                );
+            }
+        }
         let dependencies = if next.after_previous {
             previous.clone().into_iter().collect()
         } else {
@@ -873,8 +927,11 @@ fn register_followups(
             return Err("後続taskの所有元が一致しません".into());
         }
         child.recovery.parent = Some(task.id.clone());
-        child.recovery.repairs_main = task.recovery.barrier && task.merge_commit.is_some();
+        child.recovery.repairs_main = repairs_main;
         context.store.save(&child)?;
+        if repairs_main {
+            task.recovery.repair_task = Some(id.clone());
+        }
         if !task.recovery.children.contains(&id) {
             task.recovery.children.push(id.clone());
             task.event("followup_registered", "元の依頼内の後続taskを登録しました");
@@ -927,9 +984,7 @@ fn waiting_observation(context: &Context, task: &Task) -> String {
     }
     value.push_str(&format!(
         "|{:?}",
-        resources::Budget::load(&context.store.root)
-            .and_then(|budget| budget.capacity(&context.store.root))
-            .map(|capacity| capacity > 0)
+        host_capacity(context).map(|capacity| capacity > 0)
     ));
     value.push_str(&format!(
         "|{:?}",
@@ -1026,6 +1081,9 @@ fn refresh_repair(context: &Context, task: &mut Task) -> Result<bool> {
         return Ok(false);
     };
     for id in task.recovery.children.clone() {
+        if task.recovery.repair_task.as_ref() != Some(&id) {
+            continue;
+        }
         let child = context.load(&id)?;
         if child.phase != Phase::Completed
             || !child.recovery.repairs_main
@@ -1033,7 +1091,22 @@ fn refresh_repair(context: &Context, task: &mut Task) -> Result<bool> {
         {
             continue;
         }
-        let (Some(pr), Some(head)) = (child.pr, child.head.as_deref()) else {
+        let mut verified = child;
+        let mut visited = std::collections::BTreeSet::from([task.id.clone()]);
+        while let Some(next) = verified.recovery.repair_task.clone() {
+            if !visited.insert(verified.id.clone()) || visited.len() > 4 {
+                return Err("修復taskの親子関係が循環または上限を超えています".into());
+            }
+            let successor = context.load(&next)?;
+            if successor.phase != Phase::Completed
+                || !successor.recovery.repairs_main
+                || successor.recovery.parent.as_ref() != Some(&verified.id)
+            {
+                return Ok(false);
+            }
+            verified = successor;
+        }
+        let (Some(pr), Some(head)) = (verified.pr, verified.head.as_deref()) else {
             continue;
         };
         let observation = match ci::observe_repair(
@@ -1042,8 +1115,8 @@ fn refresh_repair(context: &Context, task: &mut Task) -> Result<bool> {
             &original_merge,
             pr,
             head,
-            child.delivery_gate(),
-            child.requested_gate,
+            verified.delivery_gate(),
+            verified.requested_gate,
         ) {
             Ok(observation) => observation,
             Err(reason) => {
@@ -1054,6 +1127,7 @@ fn refresh_repair(context: &Context, task: &mut Task) -> Result<bool> {
         };
         task.recovery.repair_evidence = Some(recovery::RepairEvidence {
             task_id: id,
+            verified_task_id: verified.id,
             original_merge,
             observation,
         });
@@ -1073,6 +1147,8 @@ fn repair_ready(task: &Task) -> bool {
         .as_ref()
         .is_some_and(|repair| {
             task.recovery.children.contains(&repair.task_id)
+                && task.recovery.repair_task.as_ref() == Some(&repair.task_id)
+                && valid_id(&repair.verified_task_id)
                 && task.merge_commit.as_ref() == Some(&repair.original_merge)
                 && repair.observation.merged
                 && repair.observation.allows_delivery()
@@ -1292,6 +1368,9 @@ fn resume_with_options(
     task.failures = 0;
     task.recovery.attempts = 0;
     task.recovery.assessment = None;
+    task.recovery.next_authorization = 0;
+    task.recovery.authorization_attempts = 0;
+    task.next_check = 0;
     task.checkpoint = instruction;
     if matches!(
         task.phase,
@@ -1326,6 +1405,11 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
                 | Phase::Finish
                 | Phase::Diagnosis
         )
+    {
+        return Ok(false);
+    }
+    if let Some(parent) = &task.recovery.parent
+        && context.load(parent)?.pause_requested
     {
         return Ok(false);
     }
@@ -1364,9 +1448,7 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
     if matches!(task.phase, Phase::Integration | Phase::Finish) {
         if tasks.iter().any(|other| {
             other.id != task.id
-                && (integration_barrier(other)
-                    && !(task.recovery.repairs_main
-                        && task.recovery.parent.as_ref() == Some(&other.id))
+                && (integration_barrier(other) && !repair_exempt(task, other, tasks)
                     || other
                         .run
                         .as_ref()
@@ -1423,16 +1505,18 @@ pub(super) fn valid_ci_labels(labels: &[String]) -> bool {
 }
 
 fn authorize_ci(context: &Context, task: &mut Task) -> Result<()> {
-    authorize_ci_with(task, |task| {
-        super::delivery::task_add_ci_labels(
-            &context.repository,
-            &context.github,
-            task.pr.ok_or("PRがありません")?,
-            task.head.as_deref().ok_or("HEADがありません")?,
-            task.base.as_deref().ok_or("baseがありません")?,
-            &task.ci_labels,
-        )
-    })
+    authorize_ci_with(task, |task| add_ci_labels(context, task))
+}
+
+fn add_ci_labels(context: &Context, task: &Task) -> Result<()> {
+    super::delivery::task_add_ci_labels(
+        &context.repository,
+        &context.github,
+        task.pr.ok_or("PRがありません")?,
+        task.head.as_deref().ok_or("HEADがありません")?,
+        task.base.as_deref().ok_or("baseがありません")?,
+        &task.ci_labels,
+    )
 }
 
 fn authorize_ci_with(
@@ -1453,6 +1537,7 @@ fn authorize_ci_with(
             task.event("ci_authorization_wait", &reason);
             task.ci_state = None;
             task.next_check = now() + 120;
+            task.recovery.next_authorization = now() + 120;
             task.diagnose(&reason);
             return Ok(());
         }
@@ -1469,6 +1554,47 @@ fn authorize_ci_with(
         "ci_authorized",
         "受付時に明示された既存CI起動操作を確認しました。CI待機はRustが担当します",
     );
+    Ok(())
+}
+
+fn retry_ci_authorization_with(
+    task: &mut Task,
+    mut add_labels: impl FnMut(&Task) -> Result<()>,
+) -> Result<()> {
+    if task.phase != Phase::Waiting
+        || task.pause_requested
+        || !review_ready(task)
+        || task.effective_phase() != &Phase::CiAuthorization
+        || task.ci_labels.is_empty()
+        || task.base.is_none()
+        || task.recovery.next_authorization > now()
+    {
+        return Ok(());
+    }
+    match add_labels(task) {
+        Ok(()) => {
+            task.phase = Phase::Integration;
+            task.invalidate_ci();
+            task.ci_activation_until = now() + 300;
+            task.next_check = 0;
+            task.recovery.authorization_attempts = 0;
+            task.event(
+                "ci_authorized",
+                "委任済みのlabel操作を再照合して確認しました。新権限は追加せず実CIを監視します",
+            );
+        }
+        Err(reason) => {
+            task.recovery.authorization_attempts =
+                task.recovery.authorization_attempts.saturating_add(1);
+            task.recovery.next_authorization =
+                now() + (120u64 << task.recovery.authorization_attempts.min(5)).min(3600);
+            if !task.events.last().is_some_and(|event| {
+                event.kind == "ci_authorization_wait" && event.detail == reason
+            }) {
+                task.event("ci_authorization_wait", &reason);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1494,6 +1620,7 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
             }
         }
         if task.run.is_none() {
+            retry_ci_authorization_with(task, |task| add_ci_labels(context, task))?;
             // コードreview後、CI結果の失敗分類より先に委任済みの認可を行う。
             authorize_ci(context, task)?;
             observe_ci(context, task)?;
@@ -1515,7 +1642,7 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
         }
         context.store.save(task)?;
     }
-    let capacity = resources::Budget::load(&context.store.root)?.capacity(&context.store.root)?;
+    let capacity = host_capacity(context)?;
     tasks.sort_by_key(|task| {
         (
             std::cmp::Reverse(recovery::scheduling_score(task, now())),
@@ -1558,6 +1685,11 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
         let lease = match Lock::try_acquire(&context.store.lease_path(&tasks[index].id)?)? {
             Some(lease) => lease,
             None => continue,
+        };
+        let budget = resources::Budget::load(&context.store.root)?;
+        let admission_root = context.codex_home.join("worktrees/.task-admission");
+        let Some(admission) = resources::Reservation::acquire(&admission_root, &budget)? else {
+            continue;
         };
         let task = &mut tasks[index];
         {
@@ -1612,7 +1744,7 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
             task.event("worker_start", &format!("{:?}", task.phase));
             context.store.save(task)?;
         }
-        match worker::spawn(context, task, &lease) {
+        match worker::spawn(context, task, &lease, &admission) {
             Ok(child) => {
                 children.push(child);
                 launched.push(task.id.clone());
@@ -1629,6 +1761,20 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
     Ok(
         json!({"launched":launched,"running":running,"tasks":tasks.iter().map(|task| json!({"task_id":task.id,"phase":task.phase,"running":task.run.is_some()})).collect::<Vec<_>>()}),
     )
+}
+
+fn host_capacity(context: &Context) -> Result<usize> {
+    let budget = resources::Budget::load(&context.store.root)?;
+    let capacity = budget.capacity(&context.store.root)?;
+    if capacity == 0 {
+        return Ok(0);
+    }
+    // 照会用のpermitは直ちに解放する。起動時には別途保持するpermitを原子的に取得する。
+    let permit = resources::Reservation::acquire(
+        &context.codex_home.join("worktrees/.task-admission"),
+        &budget,
+    )?;
+    Ok(if permit.is_some() { capacity } else { 0 })
 }
 
 fn recover_legacy(task: &mut Task) {
@@ -1656,6 +1802,27 @@ fn integration_barrier(task: &Task) -> bool {
             task.resume_phase,
             Phase::MainCi | Phase::Finish | Phase::Integration
         )
+}
+
+fn repair_exempt(task: &Task, barrier: &Task, tasks: &[Task]) -> bool {
+    let mut cursor = task;
+    let mut visited = std::collections::BTreeSet::new();
+    while cursor.recovery.repairs_main && visited.len() < 4 && visited.insert(cursor.id.clone()) {
+        let Some(parent) = tasks
+            .iter()
+            .find(|parent| cursor.recovery.parent.as_ref() == Some(&parent.id))
+        else {
+            return false;
+        };
+        if parent.recovery.repair_task.as_ref() != Some(&cursor.id) {
+            return false;
+        }
+        if parent.id == barrier.id {
+            return true;
+        }
+        cursor = parent;
+    }
+    false
 }
 
 fn run_loop(
@@ -1768,8 +1935,7 @@ fn execute(cli: Cli) -> Result<Value> {
         }
         Commands::List => {
             let tasks = context.store.list()?;
-            let capacity =
-                resources::Budget::load(&context.store.root)?.capacity(&context.store.root)?;
+            let capacity = host_capacity(&context)?;
             Ok(json!(tasks.iter().map(|task| json!({"task_id":task.id,"phase":task.phase,"running":task.run.is_some(),"updated":task.updated,"next_check":task.next_check,"waiting_on":waiting_on(task,&tasks,capacity),"recovery":task.recovery})).collect::<Vec<_>>()))
         }
         Commands::Show { task_id } => Ok(json!(context.load(&task_id)?)),
@@ -1865,7 +2031,16 @@ fn execute(cli: Cli) -> Result<Value> {
             task_id,
             generation,
             lease_fd,
-        } => worker::execute(&context, &task_id, generation, lease_fd),
+            admission_fd,
+            admission_slot,
+        } => worker::execute(
+            &context,
+            &task_id,
+            generation,
+            lease_fd,
+            admission_fd,
+            admission_slot,
+        ),
     }
 }
 
@@ -1914,9 +2089,7 @@ fn waiting_on(task: &Task, tasks: &[Task], capacity: usize) -> &'static str {
     }
     if matches!(task.phase, Phase::Integration | Phase::Finish)
         && tasks.iter().any(|other| {
-            other.id != task.id
-                && integration_barrier(other)
-                && !(task.recovery.repairs_main && task.recovery.parent.as_ref() == Some(&other.id))
+            other.id != task.id && integration_barrier(other) && !repair_exempt(task, other, tasks)
         })
     {
         return "integration-barrier";

@@ -28,6 +28,16 @@ pub(super) struct Followup {
     pub objective: String,
     pub authorization: String,
     pub after_previous: bool,
+    #[serde(default)]
+    pub purpose: FollowupPurpose,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum FollowupPurpose {
+    #[default]
+    Continuation,
+    RepairMainCi,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +114,9 @@ pub(super) struct State {
     pub children: Vec<String>,
     pub parent: Option<String>,
     pub repairs_main: bool,
+    pub repair_task: Option<String>,
+    pub next_authorization: u64,
+    pub authorization_attempts: u32,
     pub barrier: bool,
     pub last_scheduled: u64,
     pub repair_evidence: Option<RepairEvidence>,
@@ -113,6 +126,8 @@ pub(super) struct State {
 #[serde(deny_unknown_fields)]
 pub(super) struct RepairEvidence {
     pub task_id: String,
+    #[serde(default)]
+    pub verified_task_id: String,
     pub original_merge: String,
     pub observation: super::ci::Observation,
 }

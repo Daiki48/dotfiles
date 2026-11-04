@@ -188,6 +188,11 @@ fn strict_observation(state: ci::CiState, merged: bool) -> ci::Observation {
 
 fn ready_for_integration(fixture: &Fixture, id: &str) -> Task {
     let mut task = fixture.submit(id, "high", recovery::Boundary::Finish);
+    make_ready_for_integration(&mut task);
+    task
+}
+
+fn make_ready_for_integration(task: &mut Task) {
     task.phase = Phase::Integration;
     task.pr = Some(18);
     task.head = Some("a".repeat(40));
@@ -206,7 +211,6 @@ fn ready_for_integration(fixture: &Fixture, id: &str) -> Task {
     task.ci_state = Some(observation.state);
     task.ci_fingerprint = observation.fingerprint.clone();
     task.ci_evidence = Some(observation);
-    task
 }
 
 #[test]
@@ -387,6 +391,7 @@ fn followups_are_idempotent_and_inherit_the_parent_contract_without_new_scope() 
         objective: "既存PRの失敗原因を調べ、元依頼内で修復案を実装する".into(),
         authorization: "元依頼は既存機能の不具合修正を許可している".into(),
         after_previous: false,
+        purpose: recovery::FollowupPurpose::Continuation,
     });
     register_followups(&fixture.0, &mut parent, &plan).unwrap();
     register_followups(&fixture.0, &mut parent, &plan).unwrap();
@@ -421,13 +426,63 @@ fn main_ci_failure_preserves_barrier_except_for_its_repair_child() {
     assert_eq!(failed.phase, Phase::Diagnosis);
     assert!(failed.recovery.barrier);
 
-    let mut repair = ready_for_integration(&fixture, "main-ci-repair");
-    repair.recovery.parent = Some(failed.id.clone());
-    repair.recovery.repairs_main = true;
-    let unrelated = ready_for_integration(&fixture, "unrelated-integration");
+    let mut plan = assessment();
+    plan.followups = vec![
+        recovery::Followup {
+            objective: "失敗したmain CIの原因を修復する".into(),
+            authorization: "元の不具合修正".into(),
+            after_previous: false,
+            purpose: recovery::FollowupPurpose::RepairMainCi,
+        },
+        recovery::Followup {
+            objective: "元依頼に含まれる独立した文書を更新する".into(),
+            authorization: "元の文書更新".into(),
+            after_previous: false,
+            purpose: recovery::FollowupPurpose::Continuation,
+        },
+    ];
+    register_followups(&fixture.0, &mut failed, &plan).unwrap();
+    let mut repair = fixture
+        .0
+        .load(failed.recovery.repair_task.as_ref().unwrap())
+        .unwrap();
+    let mut unrelated = fixture
+        .0
+        .load(
+            failed
+                .recovery
+                .children
+                .iter()
+                .find(|id| *id != &repair.id)
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(!unrelated.recovery.repairs_main);
+    make_ready_for_integration(&mut repair);
+    make_ready_for_integration(&mut unrelated);
     let tasks = vec![failed.clone(), repair.clone(), unrelated.clone()];
     assert!(ready(&fixture.0, &repair, &tasks).unwrap());
     assert!(!ready(&fixture.0, &unrelated, &tasks).unwrap());
+
+    // 自己申告のflagや別の修復taskへの差し替えでは例外を広げない。
+    unrelated.recovery.repairs_main = true;
+    assert!(!repair_exempt(&unrelated, &failed, &tasks));
+    let mut duplicate = plan.clone();
+    duplicate.followups[1].purpose = recovery::FollowupPurpose::RepairMainCi;
+    assert!(register_followups(&fixture.0, &mut failed, &duplicate).is_err());
+    duplicate.followups = vec![duplicate.followups[1].clone()];
+    assert!(register_followups(&fixture.0, &mut failed, &duplicate).is_err());
+
+    // 修復PR自体のmain CI失敗では、指定された修復の連鎖だけを通す。
+    repair.recovery.barrier = true;
+    let mut nested = fixture.submit("nested-main-repair", "high", recovery::Boundary::Finish);
+    nested.recovery.parent = Some(repair.id.clone());
+    nested.recovery.repairs_main = true;
+    repair.recovery.repair_task = Some(nested.id.clone());
+    repair.recovery.children.push(nested.id.clone());
+    let nested_tasks = vec![failed.clone(), repair.clone(), nested.clone()];
+    assert!(repair_exempt(&nested, &failed, &nested_tasks));
+    assert!(repair_exempt(&nested, &repair, &nested_tasks));
 
     // 独立したImplementation作業はmain CIのbarrierで停止しない。
     let implementation = fixture.submit(
@@ -436,6 +491,38 @@ fn main_ci_failure_preserves_barrier_except_for_its_repair_child() {
         recovery::Boundary::Finish,
     );
     assert!(ready(&fixture.0, &implementation, &tasks).unwrap());
+}
+
+#[test]
+fn ci_authorization_external_recovery_is_retried_without_requiring_a_ci_fingerprint_change() {
+    let fixture = Fixture::new();
+    let mut task = ready_for_integration(&fixture, "authorization-retry");
+    task.phase = Phase::CiAuthorization;
+    task.next_check = 0;
+    authorize_ci_with(&mut task, |_| Err("一時的なAPI実行拒否".into())).unwrap();
+    assert_eq!(task.phase, Phase::Diagnosis);
+    let mut diagnosis = report(task.generation, "waiting", Some(assessment()));
+    diagnosis.pr = task.pr;
+    diagnosis.head = task.head.clone();
+    apply_diagnosis(&fixture.0, &mut task, &diagnosis).unwrap();
+    assert_eq!(task.phase, Phase::Waiting);
+    let original_fingerprint = task.ci_fingerprint.clone();
+    task.recovery.next_authorization = 0;
+    retry_ci_authorization_with(&mut task, |_| Err("一時的なAPI実行拒否".into())).unwrap();
+    assert_eq!(task.phase, Phase::Waiting);
+    assert!(task.recovery.next_authorization > now());
+    assert!(task.run.is_none());
+    task.recovery.next_authorization = 0;
+    assert_eq!(original_fingerprint, task.ci_fingerprint);
+    retry_ci_authorization_with(&mut task, |_| Ok(())).unwrap();
+    assert_eq!(task.phase, Phase::Integration);
+    assert!(task.ci_evidence.is_none());
+    assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+    task.phase = Phase::AwaitingDecision;
+    retry_ci_authorization_with(&mut task, |_| {
+        panic!("人間判断の待機中は認可操作を行わない")
+    })
+    .unwrap();
 }
 
 #[test]

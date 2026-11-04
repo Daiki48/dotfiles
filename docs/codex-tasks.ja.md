@@ -124,10 +124,15 @@ OS停止中の実行はできませんが、同hostで次回start/runしたと�
 コードレビューは固定差分と比例したlocal検証を確認します。CI起動と成功はその後の段階です。
 Rustはレビュー後に委任済みの既存labelだけをPR/head/baseと照合して付与し、最大5分の状態反映待ちを
 挟んで実CIを観測します。CI未起動やadmission failureだけでコードレビューをblockedにしません。
+label操作の一時失敗を診断して外部待機となった場合、Rustが同じ委任済み操作をbackoff付きで再照合します。
+CI fingerprintが変わらなくても復帰でき、成功後は旧CI証拠を無効化して実CIの完了を待ちます。
+新たな権限を追加したり、真正な判断待ち・利用者のpauseを解除したりはしません。
 CI状態が15分進まない場合は診断へ渡し、許可内の再実行・復旧と外部待機を区別します。
 
 main CI失敗では後続mergeのbarrierを維持し、読み取り専用診断から元依頼内の修復task/PRを登録できます。
-その修復taskだけは親barrierを通せます。元の失敗証跡を保持し、修復task完了後に修復mergeの成功・
+`purpose=repair-main-ci`で1件に限定して紐付けた修復taskだけ、親barrierを通せます。
+同時に分割した通常の後続作業は例外を継承しません。修復PRのmain CIにも失敗した場合は、
+同じ明示的な親子関係で次の修復を紐付けます。元の失敗証跡を保持し、修復task完了後に修復mergeの成功・
 固定head・元mergeからの祖先関係を再観測した証拠を別に保存してから、元taskのfinishへ進みます。
 元のreceipt、PR head CI、review、live policy、main到達性、cleanupのhelper検証は維持します。
 CI待ちにはCodexを起動せず、Rustが現在のPR・head・base・test merge commitとcheck/statusを照合します。
@@ -155,12 +160,18 @@ Finish起動直前にも再観測し、古い証跡やAPIエラーでは起動�
 finishの既存receipt・live main・固定headの検証とmanaged cleanupは維持します。
 
 CPU、MemAvailable、disk空き容量を測り、実行枠を決めます。受付task数に固定上限はありません。
-host-localの`.tasks/budget.json`でworkerごとのRAM予約量、hostに残すRAM、最低disk空きを調整できます。
-既定はそれぞれ2048、1024、2048 MiBです。portやDB等の共有資源は`--resource`で排他し、
+host-localの`.tasks/budget.json`で`worker_memory_mib`、`worker_disk_mib`、
+`reserve_memory_mib`、`minimum_disk_mib`を調整できます。既定はそれぞれ2048、2048、1024、2048 MiBです。
+同じCODEX_HOMEの全repositoryが`worktrees/.task-admission`でCPU枠とRAM・disk予約を原子的に取得し、
+workerの子processまで生存lockを継承します。同時起動による同じ空き容量の二重使用を防ぎ、
+枠がなければ保存状態を監視しながら次の起動機会を待ちます。予約はOSの使用量上限ではなく、
+実測空き容量から稼働workerの予約分も引く保守的な起動判断です。
+portやDB等の共有資源は`--resource`で排他し、
 依存関係は`--depends-on`で記録します。単なるtext conflictの有無で互換性を保証しません。
 
 CI待ちはAI worker枠を占有しません。実行可能なtaskを段階と待機時間で並べ、review・統合・後処理に
 小さな優先度を付けつつ、長く待った実装にも順番を回します。各起動直前にもhost資源を再計測します。
+この予約に対応しない旧helperのworker/coordinatorを停止してからhelperを更新してください。
 ここでのRAM・diskはCodex実行hostの値です。CI runnerの余力・queue・完了見込を推測して選びません。
 `list --json`の`waiting_on`はCI、依存、共有資源、host容量、統合barrier、外部観測、人間判断を区別します。
 診断の後続taskはpolicy・risk・CI label・利用者の終了境界を継承し、同じ目的の再報告を二重登録しません。

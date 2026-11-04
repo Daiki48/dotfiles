@@ -113,7 +113,12 @@ pub(super) fn configure_environment(command: &mut Command, context: &Context) {
     }
 }
 
-pub(super) fn spawn(context: &Context, task: &Task, lease: &Lock) -> Result<Child> {
+pub(super) fn spawn(
+    context: &Context,
+    task: &Task,
+    lease: &Lock,
+    admission: &super::resources::Reservation,
+) -> Result<Child> {
     if !worker_phase(&task.phase) {
         return Err("この段階ではCodex workerを起動しません".into());
     }
@@ -135,11 +140,16 @@ pub(super) fn spawn(context: &Context, task: &Task, lease: &Lock) -> Result<Chil
             &task.generation.to_string(),
             "--lease-fd",
             &lease.fd().to_string(),
+            "--admission-fd",
+            &admission.fd().to_string(),
+            "--admission-slot",
+            &admission.slot().to_string(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     lease.inherit()?;
+    admission.inherit()?;
     command
         .spawn()
         .map_err(|_| "workerを起動できません。状態を保持しました".into())
@@ -318,8 +328,9 @@ fn schema() -> Value {
         "resume_when":{"type":"string"},"decision":decision,
         "watch_paths":{"type":"array","items":{"type":"string"}},
         "followups":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
-            "objective":{"type":"string"},"authorization":{"type":"string"},"after_previous":{"type":"boolean"}
-        },"required":["objective","authorization","after_previous"]}}
+            "objective":{"type":"string"},"authorization":{"type":"string"},"after_previous":{"type":"boolean"},
+            "purpose":{"type":"string","enum":["continuation","repair-main-ci"]}
+        },"required":["objective","authorization","after_previous","purpose"]}}
     },"required":["cause","evidence","next_action","resume_when","decision","watch_paths","followups"]});
     json!({"type":"object","additionalProperties":false,"properties":{
         "generation":{"type":"integer"},"outcome":{"type":"string","enum":["ready","needs_changes","awaiting_decision","blocked","waiting"]},
@@ -356,7 +367,7 @@ pub(super) fn prompt(task: &Task) -> String {
         phase.into()
     };
     let phase = format!(
-        "{phase}\n元の利用者依頼と明示境界はauthorization、親が分割した今回の作業はobjectiveです。旧taskでauthorizationが空の場合はobjectivesと既存の引継ぎから許可範囲を照合し、許可を推測で追加しないでください。上位依頼に含まれる後続作業があればassessment.followupsへ根拠付きで提案し、task CLIを直接呼んで二重登録しないでください。実装段階では最初のafter_previous=trueで本source完了を待ち、続くtrueで前の後続taskを待ちます。診断段階では保留中の親に依存させず、独立部分だけを分けます。\n受付時のリスク下限は{}です。workerの自己申告で下げず、変更内容から必要なら引き上げてください。CI/workflow・hook・rules・AGENTS・Skills・helper・installer・auth/secrets・billing・production・不可逆migration・breaking changeはhigh以上です。",
+        "{phase}\n元の利用者依頼と明示境界はauthorization、親が分割した今回の作業はobjectiveです。旧taskでauthorizationが空の場合はobjectiveと既存の引継ぎから許可範囲を照合し、許可を推測で追加しないでください。上位依頼に含まれる後続作業があればassessment.followupsへ根拠付きで提案し、task CLIを直接呼んで二重登録しないでください。purposeは通常continuationです。実在するmain CI失敗の修復だけrepair-main-ciを1件に限定し、その他の独立作業へbarrier例外を与えないでください。実装段階では最初のafter_previous=trueで本source完了を待ち、続くtrueで前の後続taskを待ちます。診断段階では保留中の親に依存させず、独立部分だけを分けます。\n受付時のリスク下限は{}です。workerの自己申告で下げず、変更内容から必要なら引き上げてください。CI/workflow・hook・rules・AGENTS・Skills・helper・installer・auth/secrets・billing・production・不可逆migration・breaking changeはhigh以上です。",
         task.risk
     );
     let phase = if matches!(task.phase, Phase::Integration | Phase::Finish) {
@@ -432,9 +443,16 @@ pub(super) fn execute(
     id: &str,
     generation: u64,
     lease_fd: i32,
+    admission_fd: i32,
+    admission_slot: usize,
 ) -> Result<Value> {
     #[cfg(unix)]
     let _lease = unsafe { Lock::from_inherited(lease_fd, &context.store.lease_path(id)?)? };
+    let _admission = super::resources::Reservation::from_inherited(
+        &context.codex_home.join("worktrees/.task-admission"),
+        admission_slot,
+        admission_fd,
+    )?;
     let task = {
         let _lock = context.store.lock()?;
         context.load(id)?
