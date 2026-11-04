@@ -48,7 +48,7 @@ enum Commands {
         resource: Vec<String>,
         #[arg(long, default_value = "high", value_parser = ["low", "medium", "high", "critical"])]
         risk: String,
-        /// repositoryの既存方針で委任済みのCI起動labelだけを明示する。
+        /// PRと後続pushのCI起動が既存方針で委任済みのlabel。SHA単位の認可には使わない。
         #[arg(long)]
         ci_label: Vec<String>,
     },

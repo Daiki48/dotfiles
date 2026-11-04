@@ -32,9 +32,13 @@ OSサービスを登録せずに使えます。`run`は前景で継続し、`rec
 既定はhighです。実装workerの報告では引き下げず、必要な場合は引き上げます。
 受付時点でlow/mediumと判断できた場合は実装時のself-review、高以上は別workerの独立レビューを使います。
 統合はrepository単位で順序を管理し、merge commitのmain CI完了まで後続統合を待たせます。
-CI起動labelの付与が既存方針で明示的に委任されている場合は、受付時に`--ci-label <既存label>`を渡します。
+対象PRと後続pushのCI起動が既存方針で明示的に委任されているlabelだけを、受付時に`--ci-label <既存label>`へ渡します。
 固定HEADのレビュー後、RustがPR・HEAD・baseとlabelの実在を照合し、登録されたlabelの追加だけを行います。
 CI起動用のAI workerは起動せず、RustがCI成功を確認してから統合workerを起動します。
+GitHubの[label API](https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue)はPR単位です。
+照合と追加の間にpushが入る可能性があり、後から検知してもCI起動を取り消せません。
+このadapterは固定SHA単位のCI実行認可が必要な運用には使いません。
+labelをレビュー証拠には使わず、HEAD/base変更時はレビューを無効化し、merge前に再照合します。
 既存deliveryのreview receipt・固定SHA・remote gate・cleanup検証を省略しません。
 
 ## 保存場所とhost境界
