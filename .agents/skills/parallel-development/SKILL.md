@@ -17,6 +17,8 @@ description: 複数Issueの並列実装、進行中に別タスクを追加す�
 - 依存taskは`--depends-on <ID>`、共有port・DB等は`--resource <衝突を避ける名前>`で登録する。各taskのbuild・DB・container等にもtask固有の名前と既存の登録済みartifact領域を使う。
 - 状況確認は`list --json`、詳細・引継ぎ・個別CI証跡は`show --task-id <ID> --json`、未処理イベントは`events --task-id <ID> --json`を使う。確認して必要な対応を済ませたsequenceまで`ack --task-id <ID> --through <sequence>`で累積ackする。表示だけではackしない。`events --all`は保持中のack済み履歴も返す。保持期間は`retention --task-id <ID> --seconds <秒>`（既定30日）で指定し、`collect --task-id <ID>`で完了・全ack・worker停止を確認して期限超過の旧結果だけを回収する。task本体・checkpoint・最新結果は保持される。これらはローカル情報であり、公開Issueへ生出力を転載しない。
 - 通常のCI待ち・コード修正・レビュー・既存権限内の統合は自律的に進める。製品判断・追加権限・費用・不可逆操作は`awaiting_decision`の内容を具体化して利用者へ返す。未知の承認をworkerへ代わって与えず、guard・trust・sandboxを迂回しない。
+- coordinatorはlive base refと固定headのcommit/treeから、両方にworkflowがない場合だけ`local-validation`を選ぶ。API不明・不完全なtree・実在checkの失敗や未完了を成功へ変換しない。`record-review`・`deliver`・`finish`はlocal時だけ`--gate-mode local-validation`を明示し、strict時は`--gate-mode`を省略する。固定headの比例したlocal検証、riskに必要なレビュー、既存receiptとhead/baseの検証を維持する。追加push/base変更では旧CI・旧レビューを使わない。merge後も実merge commitのmain到達、workflowと実在checkを確認してからFinishへ進む。起動直前の再観測やreceiptのgate照合を省略しない。
+- Finishでmainが最初cleanかつmanaged Skill等の更新を含む場合は、同一UIDの通常ホスト側でexecの`require_escalated`/既存auto-reviewを通して正規helperを実行する。permission設定を変更しない。通常sandboxで失敗しhelperが`sandbox-retry-ready`を発行した場合だけ、同じhostで1回の`--sandbox-retry`を使う。消費後の追加復旧には人間の明示承認が必要で、他taskの承認を流用しない。未知dirtyは保持する。
 - FedoraとWSL2はそれぞれ実行先のpath・認証・stateを使う。SSH経由の依頼は接続先が所有host。host間の暗黙移動やfailoverを行わない。
 
 起動・停止・復旧・現在の対応範囲は[タスク運用ガイド](../../../docs/codex-tasks.ja.md)を必要時に読む。
