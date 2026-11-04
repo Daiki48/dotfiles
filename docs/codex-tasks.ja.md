@@ -84,7 +84,7 @@ status ID・提供者ID/login・対象SHA・更新時刻・参照URLを含みま
 check suite IDをrun IDとして扱いません。Actions以外の提供元や未提供のURL等は`null`です。
 head/base変更時は旧成功を無効化し、API失敗時は`ci_evidence`と成功状態を消して
 `ci_observation_error_at`へ失敗観測時刻を残します。統合・後処理の起動直前にも再観測して保存します。
-`gate_mode`は`strict`または`local-validation`で、merge後もreceiptに選んだgateを保持します。
+`gate_mode`は`strict`、`local-validation`、`github-free-private`で、merge後もreceiptに選んだgateを保持します。
 local gateの`ci_state`はCI成功と区別した`local_validation`です。`ci_evidence.workflows`には
 live base・固定head・main側対象commitのSHA、tree SHA、workflow一覧を保存します。
 旧task JSONでこれらがない場合はstrictを既定とし、現在の一次情報で再観測します。
