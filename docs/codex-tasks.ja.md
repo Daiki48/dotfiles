@@ -36,10 +36,10 @@ OSサービスを登録せずに使えます。`run`は前景で継続し、`rec
 受付を担当するmainが`submit --risk low|medium|high|critical`でレビュー深度の下限を決めます。
 既定はhighです。実装workerの報告では引き下げず、必要な場合は引き上げます。
 受付時点でlow/mediumと判断できた場合は実装時のself-review、高以上は別workerの独立レビューを使います。
-統合はrepository単位で順序を管理し、merge commitのmain CI完了まで後続統合を待たせます。
+統合はrepository単位で順序を管理し、merge commitのmain側gate確認まで後続統合を待たせます。
 対象PRと後続pushのCI起動が既存方針で明示的に委任されているlabelだけを、受付時に`--ci-label <既存label>`へ渡します。
 固定HEADのレビュー後、RustがPR・HEAD・baseとlabelの実在を照合し、登録されたlabelの追加だけを行います。
-CI起動用のAI workerは起動せず、RustがCI成功を確認してから統合workerを起動します。
+CI起動用のAI workerは起動せず、RustがCI成功または後述のlocal gate条件を確認してから統合workerを起動します。
 GitHubの[label API](https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue)はPR単位です。
 照合と追加の間にpushが入る可能性があり、後から検知してもCI起動を取り消せません。
 このadapterは固定SHA単位のCI実行認可が必要な運用には使いません。
@@ -70,7 +70,11 @@ status ID・提供者ID/login・対象SHA・更新時刻・参照URLを含みま
 公式APIで取得したrun ID/attempt・runの対象SHA・状態/結論・URLを別に保存します。
 check suite IDをrun IDとして扱いません。Actions以外の提供元や未提供のURL等は`null`です。
 head/base変更時は旧成功を無効化し、API失敗時は`ci_evidence`と成功状態を消して
-`ci_observation_error_at`へ失敗観測時刻を残します。統合起動直前の再観測も保存します。
+`ci_observation_error_at`へ失敗観測時刻を残します。統合・後処理の起動直前にも再観測して保存します。
+`gate_mode`は`strict`または`local-validation`で、merge後もreceiptに選んだgateを保持します。
+local gateの`ci_state`はCI成功と区別した`local_validation`です。`ci_evidence.workflows`には
+live base・固定head・main側対象commitのSHA、tree SHA、workflow一覧を保存します。
+旧task JSONでこれらがない場合はstrictを既定とし、現在の一次情報で再観測します。
 APIレスポンスのログ本文・check出力・annotations・認証値は保存対象にしません。
 目的・引継ぎ・結果には非公開productの情報が含まれ得るため、これらも公開repositoryへcommit・転載しません。
 CLIは外部Issue更新を直接組み立てず、既存の対象repositoryの運用と公開範囲を守るworkerが必要な記録を行います。
@@ -95,6 +99,27 @@ codex-task start
 CI待ちにはCodexを起動せず、Rustが現在のPR・head・base・test merge commitとcheck/statusを照合します。
 APIエラーはCI失敗と分けてbackoffし、check不足・cancel・timeout・skipのみを成功扱いしません。
 
+### workflow不在repositoryのlocal gate
+
+PR payloadの`base.sha`は古い場合があるため、対象branchのlive refを観測の前後で直接照合します。
+live baseと固定headのcommit/treeをGitHub APIから取得し、両方の`.github/workflows/`直下に
+YAMLが存在しないと確認した場合だけ`local-validation`を選びます。APIエラー、不完全なtree、
+対象SHA不一致は不在へ変換せず待機し、どちらかにworkflowがあれば従来のstrict gateを使います。
+local gateでも固定headに実在するcheck/statusと必須checkを確認し、test mergeの成功で失敗や未完了を隠しません。
+実在checkのcancel・timeout・skipのみ、必須check不足でも統合workerを起動しません。
+
+Review・Integration・Finishのworkerにはgate-modeと観測証跡を明示します。
+固定headに比例したlocal検証とriskに必要なレビューを揃え、`record-review`・`deliver`・`finish`の
+すべてへ`--gate-mode local-validation`を渡します。local検証の実行とreview receiptの記録はworkerが担当します。
+strict時は既存parserの契約どおり`--gate-mode`を省略します。`strict`や`strict-ruleset`の明示指定はしません。
+head/base一致、最新base、review receipt、未解決thread等の既存delivery gateは引き続きhelperが検証します。
+追加pushやbase変更では旧CI・旧レビューを無効化し、現在のheadで実装・検証・レビューをやり直します。
+
+merge後は実merge commitがlive mainの履歴に含まれることを確認し、そのcommitのworkflowと
+実在check/statusを観測します。local gateの条件を満たしたときだけmain-ci待機からFinishへ進みます。
+Finish起動直前にも再観測し、古い証跡やAPIエラーでは起動しません。mainのworkflow追加をlocalへ読み替えず、
+finishの既存receipt・live main・固定headの検証とmanaged cleanupは維持します。
+
 CPU、MemAvailable、disk空き容量を測り、実行枠を決めます。受付task数に固定上限はありません。
 host-localの`.tasks/budget.json`でworkerごとのRAM予約量、hostに残すRAM、最低disk空きを調整できます。
 既定はそれぞれ2048、1024、2048 MiBです。portやDB等の共有資源は`--resource`で排他し、
@@ -114,10 +139,9 @@ worker内のhelperがPIDを照合できるよう、worker専用のmount namespac
 doctorはこのprocfsの作成も確認し、通常の短時間commandの隔離とは分けて診断します。
 macOSのhost identity・process監督・launchd adapterは将来対応です。
 
-この段階ではmain CIが存在するrepositoryの自律pipelineを対象とします。workflow不在repositoryの
-`local-validation`を使うdeliveryは既存helperで可能ですが、coordinatorによるその自動選択は今後の対応です。
+main CIが存在するrepositoryと、前述の一次情報でworkflow不在を確認できるrepositoryを対象とします。
 CI起動に独自承認labelが必要なrepositoryは、既存の委任と運用を守り、未知の承認を自動付与しません。
-OS起動adapterの導入管理はIssue #75で継続します。
+OS起動adapterの導入は今回の対応範囲に含みません。
 
 ## 未処理イベントと保持・回収
 

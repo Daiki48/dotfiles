@@ -185,6 +185,9 @@ struct Task {
     checkpoint: String,
     ci_fingerprint: String,
     ci_state: Option<ci::CiState>,
+    // merge後もreceiptに選んだgateを保持する。旧taskはstrictで再観測する。
+    #[serde(default)]
+    gate_mode: ci::GateMode,
     #[serde(default)]
     ci_evidence: Option<ci::Observation>,
     #[serde(default)]
@@ -299,6 +302,10 @@ impl Task {
         self.ci_state = None;
         self.ci_fingerprint.clear();
         self.ci_evidence = None;
+    }
+
+    fn delivery_gate(&self) -> ci::GateMode {
+        self.gate_mode
     }
 
     fn stop(&mut self, phase: Phase, message: &str) {
@@ -425,6 +432,7 @@ fn submit(
         checkpoint: String::new(),
         ci_fingerprint: String::new(),
         ci_state: None,
+        gate_mode: ci::GateMode::Strict,
         ci_evidence: None,
         ci_observation_error_at: None,
         next_check: 0,
@@ -531,6 +539,7 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
                     task.failures = 0;
                 }
                 task.invalidate_ci();
+                task.gate_mode = ci::GateMode::Strict;
                 task.pr = Some(pr);
                 task.head = Some(head.into());
                 task.review = None;
@@ -606,7 +615,11 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
     if task.next_check > now()
         || !matches!(
             task.phase,
-            Phase::Review | Phase::CiAuthorization | Phase::Integration | Phase::MainCi
+            Phase::Review
+                | Phase::CiAuthorization
+                | Phase::Integration
+                | Phase::MainCi
+                | Phase::Finish
         )
     {
         return Ok(());
@@ -618,11 +631,7 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
         &context.repository,
         &context.github,
         pr,
-        if task.phase == Phase::MainCi {
-            task.merge_commit.as_deref()
-        } else {
-            None
-        },
+        matches!(task.phase, Phase::MainCi | Phase::Finish).then_some(task.delivery_gate()),
     );
     record_ci_result(task, result)
 }
@@ -640,22 +649,27 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
         }
     };
     task.ci_observation_error_at = None;
+    let eligible = observation.allows_delivery();
     task.ci_evidence = Some(observation.clone());
     task.ci_state = Some(observation.state);
     if task.ci_fingerprint != observation.fingerprint {
         task.ci_fingerprint = observation.fingerprint;
         task.event("ci", &format!("{:?}", observation.state));
     }
-    if task.phase == Phase::MainCi {
-        if !observation.merged {
+    if matches!(task.phase, Phase::MainCi | Phase::Finish) {
+        if !observation.merged
+            || observation.merge_commit.as_ref() != Some(&observation.target)
+            || task.head.as_ref() != Some(&observation.head)
+            || task
+                .merge_commit
+                .as_ref()
+                .is_some_and(|sha| Some(sha) != observation.merge_commit.as_ref())
+        {
+            task.invalidate_ci();
             task.stop(Phase::Blocked, "merge済みであることを確認できません");
             return Ok(());
         }
-        if task.merge_commit.is_none() {
-            task.merge_commit = observation.merge_commit;
-            task.next_check = 0;
-            return Ok(());
-        }
+        task.merge_commit = observation.merge_commit;
     } else {
         if task.head.as_ref() != Some(&observation.head) {
             stale_head(task);
@@ -668,14 +682,18 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
         {
             task.invalidate_ci();
             task.review = None;
+            task.review_independent = false;
             task.phase = Phase::Implementation;
             task.checkpoint =
                 "baseが更新されました。既存worktreeを安全に更新して検証をやり直してください".into();
+            task.base = Some(observation.base);
+            return Ok(());
         }
         task.base = Some(observation.base);
+        task.gate_mode = observation.gate_mode;
     }
     match observation.state {
-        ci::CiState::Success => {
+        ci::CiState::Success | ci::CiState::LocalValidation if eligible => {
             if task.phase == Phase::MainCi {
                 task.phase = Phase::Finish;
             } else if task.phase == Phase::CiAuthorization {
@@ -683,7 +701,7 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
             }
         }
         ci::CiState::Failure => {
-            if task.phase == Phase::MainCi {
+            if matches!(task.phase, Phase::MainCi | Phase::Finish) {
                 task.stop(
                     Phase::Blocked,
                     "merge commitのmain CIが失敗しました。後続統合を保留します",
@@ -696,7 +714,9 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
                 task.failures += 1;
             }
         }
-        ci::CiState::Pending
+        ci::CiState::Success
+        | ci::CiState::LocalValidation
+        | ci::CiState::Pending
         | ci::CiState::Missing
         | ci::CiState::Cancelled
         | ci::CiState::TimedOut
@@ -709,6 +729,7 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
 fn stale_head(task: &mut Task) {
     task.invalidate_ci();
     task.review = None;
+    task.review_independent = false;
     task.stop(Phase::Blocked,"PRのHEADがworker報告と異なります。再開時に実装段階からGit・PRを照合してレビューをやり直します");
     task.resume_phase = Phase::Implementation;
 }
@@ -752,7 +773,11 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
     if task.failures >= 3 {
         return Ok(false);
     }
-    if matches!(task.phase, Phase::CiAuthorization | Phase::Integration) && !review_ready(task) {
+    if matches!(
+        task.phase,
+        Phase::CiAuthorization | Phase::Integration | Phase::Finish
+    ) && !review_ready(task)
+    {
         return Ok(false);
     }
     for dependency in &task.dependencies {
@@ -781,18 +806,24 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
         }) {
             return Ok(false);
         }
-        if task.phase == Phase::Integration {
-            // 起動直前の再観測もstateへ保存してから、このgateへ渡す。
-            if task.ci_state != Some(ci::CiState::Success)
-                || task.ci_observation_error_at.is_some()
-                || task.ci_evidence.as_ref().is_none_or(|observation| {
-                    observation.state != ci::CiState::Success
-                        || task.head.as_ref() != Some(&observation.head)
-                        || task.base.as_ref() != Some(&observation.base)
-                })
-            {
-                return Ok(false);
-            }
+        // 起動直前の再観測もstateへ保存してから、このgateへ渡す。
+        if task.ci_observation_error_at.is_some()
+            || task.ci_evidence.as_ref().is_none_or(|observation| {
+                !observation.allows_delivery()
+                    || task.delivery_gate() != observation.gate_mode
+                    || task.ci_state != Some(observation.state)
+                    || task.head.as_ref() != Some(&observation.head)
+                    || observation.observed_at > now()
+                    || now().saturating_sub(observation.observed_at) > 120
+                    || if task.phase == Phase::Finish {
+                        !observation.merged
+                            || task.merge_commit.as_ref() != Some(&observation.target)
+                    } else {
+                        observation.merged || task.base.as_ref() != Some(&observation.base)
+                    }
+            })
+        {
+            return Ok(false);
         }
     }
     Ok(true)
@@ -905,7 +936,9 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
             break;
         }
         // 実際の統合起動直前の観測も永続化する。API失敗時に旧成功を残さない。
-        if tasks[index].phase == Phase::Integration && tasks[index].run.is_none() {
+        if matches!(tasks[index].phase, Phase::Integration | Phase::Finish)
+            && tasks[index].run.is_none()
+        {
             let original = tasks[index].clone();
             tasks[index].next_check = 0;
             observe_ci(context, &mut tasks[index])?;
@@ -1344,6 +1377,7 @@ mod tests {
             "revision",
             "ci_evidence",
             "ci_observation_error_at",
+            "gate_mode",
         ] {
             legacy.as_object_mut().unwrap().remove(field);
         }
@@ -1352,6 +1386,7 @@ mod tests {
         assert_eq!(loaded.acknowledged_sequence, 0);
         assert_eq!(loaded.retention_seconds, 30 * 24 * 60 * 60);
         assert!(loaded.ci_evidence.is_none());
+        assert_eq!(loaded.delivery_gate(), ci::GateMode::Strict);
     }
 
     #[test]
@@ -1471,6 +1506,163 @@ mod tests {
         record_ci_result(&mut task, Ok(changed)).unwrap();
         assert_eq!(task.phase, Phase::Blocked);
         assert!(task.ci_state.is_none() && task.ci_evidence.is_none());
+    }
+
+    fn local_observation(merged: bool) -> ci::Observation {
+        let tree = |sha: &str| json!({"commit":sha,"tree":sha,"workflows":[]});
+        let mut value = serde_json::to_value(successful_observation()).unwrap();
+        value["state"] = json!("local_validation");
+        value["gate_mode"] = json!("local-validation");
+        value["workflows"] = json!({
+            "base":tree(&"b".repeat(40)),"head":tree(&"a".repeat(40)),"main":null
+        });
+        if merged {
+            value["merged"] = json!(true);
+            value["merge_commit"] = json!("c".repeat(40));
+            value["target"] = json!("c".repeat(40));
+            value["workflows"]["main"] = tree(&"c".repeat(40));
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn reviewed_task(fixture: &Fixture) -> Task {
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        task.phase = Phase::CiAuthorization;
+        task.pr = Some(12);
+        task.head = Some("a".repeat(40));
+        task.base = Some("b".repeat(40));
+        task.review = Some(worker::Report {
+            generation: 1,
+            outcome: "ready".into(),
+            summary: "固定headの独立review済み".into(),
+            pr: task.pr,
+            head: task.head.clone(),
+            risk: "high".into(),
+        });
+        task.review_independent = true;
+        task
+    }
+
+    #[test]
+    fn delivery_workers_preserve_the_existing_strict_and_local_argument_contract() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        for phase in [Phase::Review, Phase::Integration, Phase::Finish] {
+            task.phase = phase;
+            task.gate_mode = ci::GateMode::Strict;
+            let strict = worker::prompt(&task);
+            assert!(strict.contains("--gate-mode を省略"));
+            assert!(!strict.contains("--gate-mode strict"));
+            assert!(!strict.contains("--gate-mode local-validation"));
+            task.gate_mode = ci::GateMode::LocalValidation;
+            let local = worker::prompt(&task);
+            assert!(
+                local.contains(
+                    "record-review・deliver・finishにはすべて --gate-mode local-validation"
+                )
+            );
+            assert!(!local.contains("--gate-mode を省略"));
+        }
+    }
+
+    #[test]
+    fn local_gate_connects_review_integration_main_and_finish_without_ci_success() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        record_ci_result(&mut task, Ok(local_observation(false))).unwrap();
+        assert_eq!(task.phase, Phase::Integration);
+        assert_eq!(task.ci_state, Some(ci::CiState::LocalValidation));
+        assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        fixture.0.store.save(&task).unwrap();
+        let mut task = fixture.0.load(&task.id).unwrap();
+        assert_eq!(task.delivery_gate(), ci::GateMode::LocalValidation);
+        task.phase = Phase::MainCi;
+        record_ci_result(&mut task, Ok(local_observation(true))).unwrap();
+        assert_eq!(task.phase, Phase::Finish);
+        assert_eq!(task.merge_commit, Some("c".repeat(40)));
+        assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        record_ci_result(&mut task, Err("API unavailable".into())).unwrap();
+        assert_eq!(task.delivery_gate(), ci::GateMode::LocalValidation);
+        assert!(task.ci_evidence.is_none());
+        assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        record_ci_result(&mut task, Ok(local_observation(true))).unwrap();
+        assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+    }
+
+    #[test]
+    fn local_gate_rejects_missing_review_old_observations_and_mismatched_evidence() {
+        let fixture = Fixture::new();
+        let mut original = reviewed_task(&fixture);
+        record_ci_result(&mut original, Ok(local_observation(false))).unwrap();
+        for case in 0..10 {
+            let mut task = original.clone();
+            match case {
+                0 => task.review = None,
+                1 => task.review_independent = false,
+                2 => task.ci_evidence.as_mut().unwrap().observed_at = now() - 121,
+                3 => task.ci_evidence.as_mut().unwrap().observed_at = now() + 30,
+                4 => task.ci_evidence.as_mut().unwrap().head = "d".repeat(40),
+                5 => task.ci_evidence.as_mut().unwrap().base = "d".repeat(40),
+                6 => task.ci_evidence.as_mut().unwrap().workflows = None,
+                7 => task.ci_state = Some(ci::CiState::Success),
+                8 => task.gate_mode = ci::GateMode::Strict,
+                _ => task.ci_evidence = None,
+            }
+            assert!(
+                !ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_push_and_base_changes_discard_both_ci_and_independent_review() {
+        let fixture = Fixture::new();
+        let mut original = reviewed_task(&fixture);
+        record_ci_result(&mut original, Ok(local_observation(false))).unwrap();
+        for head_changed in [true, false] {
+            let mut task = original.clone();
+            let mut observation = local_observation(false);
+            if head_changed {
+                observation.head = "d".repeat(40);
+            } else {
+                observation.base = "d".repeat(40);
+            }
+            record_ci_result(&mut task, Ok(observation)).unwrap();
+            assert!(task.review.is_none() && !task.review_independent);
+            assert!(task.ci_evidence.is_none() && task.ci_state.is_none());
+            assert_eq!(
+                task.phase,
+                if head_changed {
+                    Phase::Blocked
+                } else {
+                    Phase::Implementation
+                }
+            );
+            assert!(!review_ready(&task));
+        }
+    }
+
+    #[test]
+    fn local_main_gate_keeps_barrier_for_unmerged_wrong_head_wrong_merge_or_failure() {
+        let fixture = Fixture::new();
+        let mut original = reviewed_task(&fixture);
+        record_ci_result(&mut original, Ok(local_observation(false))).unwrap();
+        original.phase = Phase::MainCi;
+        for case in 0..4 {
+            let mut task = original.clone();
+            let mut observation = local_observation(true);
+            match case {
+                0 => observation.merged = false,
+                1 => observation.head = "d".repeat(40),
+                2 => observation.merge_commit = Some("d".repeat(40)),
+                _ => observation.state = ci::CiState::Failure,
+            }
+            record_ci_result(&mut task, Ok(observation)).unwrap();
+            assert_eq!(task.phase, Phase::Blocked);
+            assert!(integration_barrier(&task));
+        }
     }
 
     #[test]

@@ -252,7 +252,7 @@ fn free_private_gate(value: &str) -> bool {
 fn remote_ci_required(value: &str) -> bool {
     ![FREE_PRIVATE_LOCAL_GATE_MODE, LOCAL_VALIDATION_GATE_MODE].contains(&value)
 }
-fn workflow_yaml_path(value: &str) -> bool {
+pub(super) fn workflow_yaml_path(value: &str) -> bool {
     let Some(name) = value.strip_prefix(".github/workflows/") else {
         return false;
     };
@@ -7320,6 +7320,45 @@ mod tests {
             #[cfg(unix)]
             assert!(open_private_regular(&state, "managed file").is_err());
         });
+    }
+
+    #[test]
+    fn task_delivery_commands_accept_only_implicit_strict_or_explicit_local_validation() {
+        for command in ["record-review", "deliver", "finish"] {
+            let mut common = vec![
+                command.to_string(),
+                "--task-id".into(),
+                "task-example".into(),
+                "--pr".into(),
+                "24".into(),
+                "--head".into(),
+                "b".repeat(40),
+                "--plan-id".into(),
+                "task-example-v1".into(),
+                "--plan-version".into(),
+                "1".into(),
+            ];
+            if command == "record-review" {
+                common.extend([
+                    "--risk".into(),
+                    "high".into(),
+                    "--tests-passed".into(),
+                    "--independent-review-passed".into(),
+                ]);
+            }
+            let parse = |args: Vec<String>| parse_args(args.into_iter().map(OsString::from));
+            assert_eq!(parse(common.clone()).unwrap().gate, STRICT_GATE_MODE);
+            for gate in ["strict", STRICT_GATE_MODE, LOCAL_VALIDATION_GATE_MODE] {
+                let mut args = common.clone();
+                args.extend(["--gate-mode".into(), gate.into()]);
+                let result = parse(args);
+                if gate == LOCAL_VALIDATION_GATE_MODE {
+                    assert_eq!(result.unwrap().gate, LOCAL_VALIDATION_GATE_MODE);
+                } else {
+                    assert!(result.is_err(), "{command}: {gate}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -10,17 +10,54 @@ use sha2::{Digest, Sha256};
 
 use crate::codex_tools::delivery::task_gh_json;
 
+#[cfg(test)]
+#[path = "ci_tests.rs"]
+mod gate_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum CiState {
     Pending,
     Success,
+    // CI成功ではなく、固定headのlocal検証とreview receiptを要求する状態。
+    LocalValidation,
     Failure,
     Missing,
     Stale,
     Cancelled,
     TimedOut,
     Skipped,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum GateMode {
+    #[default]
+    Strict,
+    LocalValidation,
+}
+
+impl GateMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::LocalValidation => "local-validation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct WorkflowTree {
+    commit: String,
+    tree: String,
+    workflows: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct WorkflowEvidence {
+    base: WorkflowTree,
+    head: WorkflowTree,
+    main: Option<WorkflowTree>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +72,34 @@ pub(super) struct Observation {
     pub observed_at: u64,
     pub required: Vec<RequiredCheck>,
     pub snapshot: Snapshot,
+    #[serde(default)]
+    pub gate_mode: GateMode,
+    #[serde(default)]
+    pub workflows: Option<WorkflowEvidence>,
+}
+
+impl Observation {
+    pub fn allows_delivery(&self) -> bool {
+        match (self.gate_mode, self.state) {
+            (GateMode::Strict, CiState::Success) => true,
+            (GateMode::LocalValidation, CiState::LocalValidation) => {
+                self.workflows.as_ref().is_some_and(|evidence| {
+                    evidence.base.commit == self.base
+                        && evidence.head.commit == self.head
+                        && evidence.base.workflows.is_empty()
+                        && evidence.head.workflows.is_empty()
+                        && if self.merged {
+                            evidence.main.as_ref().is_some_and(|main| {
+                                main.commit == self.target && main.workflows.is_empty()
+                            })
+                        } else {
+                            self.target == self.head && evidence.main.is_none()
+                        }
+                })
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,55 +164,96 @@ struct PullRequest {
     merged: bool,
 }
 
-/// 現在のPR、または`main`指定時はそのcommitを観測する。
+/// 現在のPR、または`main`指定時は実merge commitを指定gateで観測する。
 ///
 /// API・認証・rate limitの失敗はエラーとして返し、`Missing`や成功には置き換えない。
 pub(super) fn observe(
     root: &Path,
     repository: &str,
     pr: u64,
-    main: Option<&str>,
+    main: Option<GateMode>,
+) -> Result<Observation, String> {
+    observe_with(repository, pr, main, &mut |args| task_gh_json(root, args))
+}
+
+type Fetch<'a> = dyn FnMut(&[String]) -> Result<Value, String> + 'a;
+
+fn observe_with(
+    repository: &str,
+    pr: u64,
+    main: Option<GateMode>,
+    fetch: &mut Fetch<'_>,
 ) -> Result<Observation, String> {
     validate_repository(repository)?;
     if pr == 0 {
         return Err("PR番号は1以上である必要があります".into());
     }
 
-    if let Some(sha) = main {
-        validate_sha(sha)?;
-    }
-
-    let before = fetch_pull_request(root, repository, pr)?;
-
-    let rules = required_checks(root, repository, &before.base_ref)?;
-    let (target, snapshot) = if let Some(sha) = main {
-        let target = sha.to_ascii_lowercase();
-        let snapshot = fetch_snapshot(root, repository, &target)?;
-        (target, snapshot)
+    let before = fetch_pull_request(repository, pr, fetch)?;
+    let base = workflow_tree(repository, &before.base, fetch)?;
+    let head = workflow_tree(repository, &before.head, fetch)?;
+    let workflow_free = base.workflows.is_empty() && head.workflows.is_empty();
+    let gate_mode = if let Some(gate) = main {
+        // merge前に選んだreceiptのgateを保持し、mainの変化で切り替えない。
+        if gate == GateMode::LocalValidation && !workflow_free {
+            return Err("local-validationのbase/headにworkflowが存在します".into());
+        }
+        gate
+    } else if workflow_free {
+        GateMode::LocalValidation
     } else {
-        let head_snapshot = fetch_snapshot(root, repository, &before.head)?;
+        GateMode::Strict
+    };
+    let rules = required_checks(repository, &before.base_ref, fetch)?;
+    let (target, snapshot, main_tree) = if main.is_some() {
+        let target = before
+            .merge_commit
+            .clone()
+            .filter(|_| before.merged)
+            .ok_or("merge実体を確認できません")?;
+        // merge済みフラグだけでなく、対象commitがlive mainに到達済みか確認する。
+        let comparison = get(
+            fetch,
+            format!("repos/{repository}/compare/{target}...{}", before.base),
+        )?;
+        if nested_sha(
+            &comparison,
+            &["merge_base_commit", "sha"],
+            "mainのmerge base",
+        )? != target
+        {
+            return Err("merge commitがlive mainへ到達していません".into());
+        }
+        let tree = workflow_tree(repository, &target, fetch)?;
+        let snapshot = fetch_snapshot(repository, &target, fetch)?;
+        (target, snapshot, Some(tree))
+    } else {
+        let head_snapshot = fetch_snapshot(repository, &before.head, fetch)?;
         let merge_snapshot = before
             .merge_commit
             .as_deref()
-            .filter(|candidate| *candidate != before.head)
-            .map(|candidate| fetch_snapshot(root, repository, candidate))
+            .filter(|candidate| gate_mode == GateMode::Strict && *candidate != before.head)
+            .map(|candidate| fetch_snapshot(repository, candidate, fetch))
             .transpose()?;
-        select_target(
-            &before.head,
-            before.merge_commit.as_deref(),
-            head_snapshot,
-            merge_snapshot,
-        )
+        let (target, snapshot) = if gate_mode == GateMode::LocalValidation {
+            // test mergeの成功で固定headに実在するActions checkを隠さない。
+            (before.head.clone(), head_snapshot)
+        } else {
+            select_target(
+                &before.head,
+                before.merge_commit.as_deref(),
+                head_snapshot,
+                merge_snapshot,
+            )
+        };
+        (target, snapshot, None)
     };
 
     // rules/check/statusを個別に照会した後、PRを再取得する。
     // 観測中にGitHub上のPRが変わっていたら、このsnapshotを信頼しない。
-    let after = fetch_pull_request(root, repository, pr)?;
+    let after = fetch_pull_request(repository, pr, fetch)?;
     let changed = before != after;
-    let main_sha_mismatch = main.is_some_and(|sha| {
-        after.merge_commit.as_deref() != Some(sha.to_ascii_lowercase().as_str())
-    });
-    let state = if changed || main_sha_mismatch {
+    let mut state = if changed {
         CiState::Stale
     } else {
         classify(&rules, &snapshot.runs, &snapshot.statuses, &target)
@@ -167,7 +273,30 @@ pub(super) fn observe(
     {
         return Err("checkとActions runの成功証跡が一致しません。再観測します".into());
     }
-    let fingerprint = snapshot_fingerprint(&after, &target, state == CiState::Stale, &snapshot);
+    let workflows = WorkflowEvidence {
+        base,
+        head,
+        main: main_tree,
+    };
+    if gate_mode == GateMode::LocalValidation
+        && !changed
+        && workflows
+            .main
+            .as_ref()
+            .is_none_or(|tree| tree.workflows.is_empty())
+        && (state == CiState::Success
+            || (state == CiState::Missing && rules.is_empty() && !contains_any_status(&snapshot)))
+    {
+        state = CiState::LocalValidation;
+    }
+    let fingerprint = format!(
+        "{}:{:x}",
+        snapshot_fingerprint(&after, &target, state == CiState::Stale, &snapshot),
+        Sha256::digest(
+            serde_json::to_vec(&(gate_mode, &workflows))
+                .expect("workflow evidence is serializable")
+        )
+    );
     Ok(Observation {
         state,
         head: after.head,
@@ -179,23 +308,41 @@ pub(super) fn observe(
         observed_at: super::store::now(),
         required: rules,
         snapshot,
+        gate_mode,
+        workflows: Some(workflows),
     })
 }
 
-fn fetch_pull_request(root: &Path, repository: &str, pr: u64) -> Result<PullRequest, String> {
-    let value = task_gh_json(
-        root,
-        &[
-            "api".into(),
-            format!("repos/{repository}/pulls/{pr}"),
-            "--method".into(),
-            "GET".into(),
-        ],
+fn fetch_pull_request(
+    repository: &str,
+    pr: u64,
+    fetch: &mut Fetch<'_>,
+) -> Result<PullRequest, String> {
+    let value = fetch(&[
+        "api".into(),
+        format!("repos/{repository}/pulls/{pr}"),
+        "--method".into(),
+        "GET".into(),
+    ])?;
+    let base_ref = nested_text(&value, &["base", "ref"], "PR base branch")?;
+    // PR payloadのbase.shaはmerge後も古いことがある。対象branchの実refを正本にする。
+    let reference = get(
+        fetch,
+        format!(
+            "repos/{repository}/git/ref/heads/{}",
+            encoded_path_component(&base_ref)
+        ),
     )?;
+    if reference.get("ref").and_then(Value::as_str)
+        != Some(format!("refs/heads/{base_ref}").as_str())
+        || reference.pointer("/object/type").and_then(Value::as_str) != Some("commit")
+    {
+        return Err("live base refを確認できません".into());
+    }
     Ok(PullRequest {
         head: nested_sha(&value, &["head", "sha"], "PR head")?,
-        base: nested_sha(&value, &["base", "sha"], "PR base")?,
-        base_ref: nested_text(&value, &["base", "ref"], "PR base branch")?,
+        base: nested_sha(&reference, &["object", "sha"], "live base")?,
+        base_ref,
         merge_commit: optional_sha(value.get("merge_commit_sha"), "merge commit")?,
         merged: value
             .get("merged")
@@ -300,10 +447,58 @@ fn encoded_path_component(value: &str) -> String {
     encoded
 }
 
+fn get(fetch: &mut Fetch<'_>, endpoint: String) -> Result<Value, String> {
+    fetch(&["api".into(), endpoint, "--method".into(), "GET".into()])
+}
+
+fn workflow_tree(
+    repository: &str,
+    sha: &str,
+    fetch: &mut Fetch<'_>,
+) -> Result<WorkflowTree, String> {
+    validate_sha(sha)?;
+    let commit = get(fetch, format!("repos/{repository}/git/commits/{sha}"))?;
+    if nested_sha(&commit, &["sha"], "workflow対象commit")? != sha {
+        return Err("workflow対象commitが一致しません".into());
+    }
+    let tree = nested_sha(&commit, &["tree", "sha"], "workflow対象tree")?;
+    let value = get(
+        fetch,
+        format!("repos/{repository}/git/trees/{tree}?recursive=1"),
+    )?;
+    if nested_sha(&value, &["sha"], "workflow tree")? != tree
+        || value.get("truncated").and_then(Value::as_bool) != Some(false)
+    {
+        return Err("workflow treeが不完全または一致しません".into());
+    }
+    let entries = value
+        .get("tree")
+        .and_then(Value::as_array)
+        .filter(|entries| entries.len() <= 100_000)
+        .ok_or("workflow treeの応答形式が不正です")?;
+    let mut workflows = Vec::new();
+    for entry in entries {
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or("workflow treeのpathが不正です")?;
+        // deliveryと同じ直下のYAML判定を使う。symlink等も不在には変換しない。
+        if crate::codex_tools::delivery::workflow_yaml_path(path) {
+            workflows.push(path.to_owned());
+        }
+    }
+    workflows.sort();
+    Ok(WorkflowTree {
+        commit: sha.into(),
+        tree,
+        workflows,
+    })
+}
+
 fn required_checks(
-    root: &Path,
     repository: &str,
     branch: &str,
+    fetch: &mut Fetch<'_>,
 ) -> Result<Vec<RequiredCheck>, String> {
     if branch.is_empty() || branch.len() > 256 || branch.bytes().any(|byte| byte.is_ascii_control())
     {
@@ -313,10 +508,7 @@ fn required_checks(
         "repos/{repository}/rules/branches/{}",
         encoded_path_component(branch)
     );
-    let value = task_gh_json(
-        root,
-        &["api".into(), endpoint, "--method".into(), "GET".into()],
-    )?;
+    let value = fetch(&["api".into(), endpoint, "--method".into(), "GET".into()])?;
     parse_required_rules(&value)
 }
 
@@ -371,19 +563,16 @@ fn parse_required_rules(value: &Value) -> Result<Vec<RequiredCheck>, String> {
     Ok(required)
 }
 
-fn fetch_snapshot(root: &Path, repository: &str, sha: &str) -> Result<Snapshot, String> {
+fn fetch_snapshot(repository: &str, sha: &str, fetch: &mut Fetch<'_>) -> Result<Snapshot, String> {
     validate_sha(sha)?;
-    let checks = task_gh_json(
-        root,
-        &[
-            "api".into(),
-            format!("repos/{repository}/commits/{sha}/check-runs?filter=latest&per_page=100"),
-            "--paginate".into(),
-            "--slurp".into(),
-            "--method".into(),
-            "GET".into(),
-        ],
-    )?;
+    let checks = fetch(&[
+        "api".into(),
+        format!("repos/{repository}/commits/{sha}/check-runs?filter=latest&per_page=100"),
+        "--paginate".into(),
+        "--slurp".into(),
+        "--method".into(),
+        "GET".into(),
+    ])?;
     let mut runs = parse_check_runs(&checks, sha)?;
     let suites: std::collections::BTreeSet<_> = runs
         .iter()
@@ -392,30 +581,24 @@ fn fetch_snapshot(root: &Path, repository: &str, sha: &str) -> Result<Snapshot, 
         .collect();
     for suite in suites {
         // check_suite.idはActions run IDではない。公式APIで対応するrunとattemptを取得する。
-        let workflows = task_gh_json(
-            root,
-            &[
-                "api".into(),
-                format!("repos/{repository}/actions/runs?check_suite_id={suite}&per_page=100"),
-                "--paginate".into(),
-                "--slurp".into(),
-                "--method".into(),
-                "GET".into(),
-            ],
-        )?;
-        attach_workflow_run(&mut runs, suite, &workflows)?;
-    }
-    let statuses = task_gh_json(
-        root,
-        &[
+        let workflows = fetch(&[
             "api".into(),
-            format!("repos/{repository}/commits/{sha}/statuses?per_page=100"),
+            format!("repos/{repository}/actions/runs?check_suite_id={suite}&per_page=100"),
             "--paginate".into(),
             "--slurp".into(),
             "--method".into(),
             "GET".into(),
-        ],
-    )?;
+        ])?;
+        attach_workflow_run(&mut runs, suite, &workflows)?;
+    }
+    let statuses = fetch(&[
+        "api".into(),
+        format!("repos/{repository}/commits/{sha}/statuses?per_page=100"),
+        "--paginate".into(),
+        "--slurp".into(),
+        "--method".into(),
+        "GET".into(),
+    ])?;
     let statuses = parse_statuses(&statuses, sha)?;
     Ok(Snapshot { runs, statuses })
 }
@@ -486,6 +669,9 @@ fn pages<'a>(value: &'a Value, key: &str) -> Result<Vec<&'a Value>, String> {
         .ok_or_else(|| format!("{key}応答のページ形式が不正です"))?;
     // 上限に達した場合、最終ページが満杯だと次ページの有無を証明できない。
     // 不完全な結果を現状の全件として扱わず、安全側に倒す。
+    if pages.is_empty() {
+        return Err(format!("{key}応答にページがありません"));
+    }
     if pages.len() >= 20 {
         return Err(format!("{key}応答のページ数が安全上限に達しました"));
     }
@@ -563,9 +749,10 @@ fn parse_check_runs(value: &Value, sha: &str) -> Result<Vec<CheckRun>, String> {
             });
         }
     }
-    // endpointは指定commitに限定されるが、不正または古い応答で通過しないよう
-    // SHAが完全一致するrunだけを残す。
-    parsed.retain(|run| run.head_sha == sha);
+    // 古い応答を空のcheck一覧へ変換するとlocal gateで通過してしまう。
+    if parsed.iter().any(|run| run.head_sha != sha) {
+        return Err("check-runsの対象SHAが一致しません".into());
+    }
     if declared_total.is_some_and(|expected| total != expected) {
         return Err("check-runsのページ取得が不完全です".into());
     }
@@ -831,6 +1018,8 @@ mod tests {
             observed_at: 42,
             required: vec![required("ci", Some(15368))],
             snapshot: Snapshot { runs, statuses },
+            gate_mode: GateMode::Strict,
+            workflows: None,
         };
         let saved = serde_json::to_value(&observation).unwrap();
         assert_eq!(saved["snapshot"]["runs"][0]["run_id"], 99);
@@ -1136,7 +1325,7 @@ mod tests {
                 "run_attempt": 1
             }]
         }]);
-        assert!(parse_check_runs(&value, HEAD).unwrap().is_empty());
+        assert!(parse_check_runs(&value, HEAD).is_err());
 
         let rules = json!([{
             "type": "required_status_checks",
