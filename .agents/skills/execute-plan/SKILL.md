@@ -36,7 +36,7 @@ riskと人間判断を分ける。
 - high: 独立reviewを1件。critical: 実在する別の高リスク境界がある場合だけ専門reviewを追加する。
 - autonomous: 依頼scope、権限、rollback、test・CI・reviewで判断できる。riskによらず`record-review`を使う。
 - human-required: 製品判断、scope拡大、新規権限・費用、不可逆性、重大な残存リスク受容などDaikiの判断が必要。具体的な結果と論点を準備し、明示回答後だけ`approve-review`を使う。
-- blocked: 必須検証失敗、dirty/stale/conflict、identity不一致、network/API不明など。approvalで技術gateを迂回しない。
+- blocked: 必須検証失敗、dirty/stale/conflict、identity不一致、network/API不明などは対象操作を保留する。approvalで技術gateを迂回せず、原因調査・許可内の修復・再計画・外部監視・独立作業を継続する。親のfile分割とユーザーの明示境界を区別し、技術的な難しさや回数だけで人間待ちにしない。
 
 CI/workflow、Ruleset、hook、AGENTS、Skills、helper、installer等の安全境界はhigh以上。必要な検証が通ったら目的外の改善へ広げない。PR/Issueには人間向けの目的、判断、変更、検証、残存事項を残し、機械監査JSONやdigestを投稿しない。
 

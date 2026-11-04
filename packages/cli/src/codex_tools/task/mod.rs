@@ -1,9 +1,14 @@
 //! OSタイマーに依存しない、ホスト内のタスク制御。
 
+#[cfg(test)]
+mod autonomy_tests;
 mod ci;
+mod recovery;
 mod resources;
 mod store;
 mod worker;
+#[cfg(test)]
+mod workflow_tests;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -40,6 +45,9 @@ enum Commands {
         task_id: String,
         #[arg(long)]
         objective: String,
+        /// 元の利用者依頼と明示境界。親が分割したobjectiveと区別する。
+        #[arg(long)]
+        authorization: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
@@ -51,6 +59,12 @@ enum Commands {
         /// PRと後続pushのCI起動が既存方針で委任済みのlabel。SHA単位の認可には使わない。
         #[arg(long)]
         ci_label: Vec<String>,
+        /// 既存方針で明示されたremote gate。API失敗から推測しない。
+        #[arg(long, default_value = "strict", value_parser = ["strict", "github-free-private"])]
+        gate_mode: String,
+        /// 利用者の終了境界。worker内部のPR作成段階とは別に保存する。
+        #[arg(long, default_value = "finish", value_parser = ["pr", "merge", "finish"])]
+        stop_after: String,
     },
     List,
     Show {
@@ -100,6 +114,10 @@ enum Commands {
         task_id: String,
         #[arg(long)]
         instruction: String,
+        #[arg(long, value_parser = ["strict", "github-free-private"])]
+        gate_mode: Option<String>,
+        #[arg(long)]
+        authorization: Option<String>,
     },
     /// 次のworker起動を止める。動作中workerは停止要求を受けて回収する。
     Pause {
@@ -117,6 +135,10 @@ enum Commands {
         generation: u64,
         #[arg(long)]
         lease_fd: i32,
+        #[arg(long)]
+        admission_fd: i32,
+        #[arg(long)]
+        admission_slot: usize,
     },
     #[command(hide = true)]
     Coordinator {
@@ -138,6 +160,9 @@ enum Phase {
     AwaitingDecision,
     Blocked,
     Paused,
+    Diagnosis,
+    Waiting,
+    BoundaryReached,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +192,8 @@ struct Task {
     github: String,
     branch: String,
     objective: String,
+    #[serde(default)]
+    authorization: String,
     risk: String,
     ci_labels: Vec<String>,
     dependencies: Vec<String>,
@@ -189,9 +216,17 @@ struct Task {
     #[serde(default)]
     gate_mode: ci::GateMode,
     #[serde(default)]
+    requested_gate: ci::GateMode,
+    #[serde(default)]
+    stop_after: recovery::Boundary,
+    #[serde(default)]
+    recovery: recovery::State,
+    #[serde(default)]
     ci_evidence: Option<ci::Observation>,
     #[serde(default)]
     ci_observation_error_at: Option<u64>,
+    #[serde(default)]
+    ci_activation_until: u64,
     next_check: u64,
     failures: u32,
     pause_requested: bool,
@@ -236,6 +271,7 @@ impl Task {
             || self.host.len() != 64
             || !self.repository.is_absolute()
             || !safe_text(&self.objective, 32 * 1024)
+            || !self.authorization.is_empty() && !safe_text(&self.authorization, 32 * 1024)
             || risk_rank(&self.risk) == usize::MAX
             || !valid_ci_labels(&self.ci_labels)
             || !self.github.contains('/')
@@ -245,6 +281,11 @@ impl Task {
                 .dependencies
                 .iter()
                 .any(|id| !valid_id(id) || id == &self.id)
+            || self
+                .recovery
+                .repair_task
+                .as_ref()
+                .is_some_and(|id| !valid_id(id) || !self.recovery.children.contains(id))
             || self.resources.iter().any(|value| !resource_name(value))
             || self.head.as_deref().is_some_and(|head| !valid_sha(head))
             || self.base.as_deref().is_some_and(|head| !valid_sha(head))
@@ -262,6 +303,25 @@ impl Task {
                 .windows(2)
                 .any(|events| events[0].sequence >= events[1].sequence)
             || self.checkpoint.len() > 32 * 1024
+            || self.recovery.children.len() > 32
+            || self
+                .recovery
+                .children
+                .iter()
+                .any(|id| !valid_id(id) || id == &self.id)
+            || self
+                .recovery
+                .parent
+                .as_deref()
+                .is_some_and(|id| !valid_id(id) || id == self.id)
+            || self
+                .recovery
+                .assessment
+                .as_ref()
+                .is_some_and(|assessment| assessment.validate().is_err())
+            || self.requested_gate == ci::GateMode::LocalValidation
+            || self.requested_gate == ci::GateMode::GithubFreePrivate
+                && risk_rank(&self.risk) < risk_rank("high")
             || self
                 .review
                 .as_ref()
@@ -365,6 +425,7 @@ impl Context {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn submit(
     context: &Context,
@@ -376,9 +437,45 @@ fn submit(
     risk: String,
     ci_labels: Vec<String>,
 ) -> Result<Value> {
+    submit_with_policy(
+        context,
+        id,
+        objective.clone(),
+        objective,
+        branch,
+        dependencies,
+        resources,
+        risk,
+        ci_labels,
+        ci::GateMode::Strict,
+        recovery::Boundary::Finish,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_with_policy(
+    context: &Context,
+    id: String,
+    objective: String,
+    authorization: String,
+    branch: Option<String>,
+    dependencies: Vec<String>,
+    resources: Vec<String>,
+    risk: String,
+    ci_labels: Vec<String>,
+    requested_gate: ci::GateMode,
+    stop_after: recovery::Boundary,
+) -> Result<Value> {
     if !valid_id(&id) || !safe_text(&objective, 32 * 1024) {
         return Err("task IDまたは目的が不正です".into());
     }
+    let risk = if requested_gate == ci::GateMode::GithubFreePrivate
+        && risk_rank(&risk) < risk_rank("high")
+    {
+        "high".to_string()
+    } else {
+        risk
+    };
     let _lock = context.store.lock()?;
     if context
         .store
@@ -392,6 +489,9 @@ fn submit(
             && task.resources == resources
             && task.risk == risk
             && task.ci_labels == ci_labels
+            && task.requested_gate == requested_gate
+            && task.stop_after == stop_after
+            && task.authorization == authorization
             && branch.as_ref().is_none_or(|branch| branch == &task.branch)
         {
             return Ok(json!({"task_id":id,"existing":true,"phase":task.phase}));
@@ -414,6 +514,7 @@ fn submit(
         github: context.github.clone(),
         branch: branch.unwrap_or_else(|| format!("feat/{id}")),
         objective,
+        authorization,
         risk,
         ci_labels,
         dependencies,
@@ -433,8 +534,12 @@ fn submit(
         ci_fingerprint: String::new(),
         ci_state: None,
         gate_mode: ci::GateMode::Strict,
+        requested_gate,
+        stop_after,
+        recovery: recovery::State::default(),
         ci_evidence: None,
         ci_observation_error_at: None,
+        ci_activation_until: 0,
         next_check: 0,
         failures: 0,
         pause_requested: false,
@@ -451,6 +556,16 @@ fn submit(
 }
 
 fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
+    apply_report_with(context, task, |context, task| {
+        worktree::task_completed(&context.repository, &task.id).map_err(|error| error.to_string())
+    })
+}
+
+fn apply_report_with(
+    context: &Context,
+    task: &mut Task,
+    completed: impl Fn(&Context, &Task) -> Result<bool>,
+) -> Result<()> {
     let Some(run) = task.run.clone() else {
         return Ok(());
     };
@@ -463,7 +578,7 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
             Ok(report) => report,
             Err(reason) => {
                 task.run = None;
-                task.stop(Phase::Blocked, &reason);
+                task.diagnose(&reason);
                 return Ok(());
             }
         },
@@ -472,13 +587,11 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
             task.failures += 1;
             if task.pause_requested {
                 task.stop(Phase::Paused, "workerの停止を確認しました");
-            } else if task.failures >= 3 {
-                task.stop(
-                    Phase::Blocked,
-                    "worker中断が繰り返されました。作業を保持し、原因の確認を待ちます",
-                );
+            } else if run.phase == Phase::Diagnosis {
+                task.recovery.attempts += 1;
+                task.monitor("診断workerが中断しました。状態変化を監視して再診断します");
             } else {
-                task.checkpoint = "前回workerの停止を生存lockで確認しました。既存worktree・Git・PR・delivery記録を照合して同じ段階を再開してください。完了済み操作を重複しないでください。".into();
+                task.diagnose("前回workerの停止を生存lockで確認しました。既存worktree・Git・PR・delivery記録を照合し、中断原因と再開方法を診断してください。");
                 task.event(
                     "worker_recovery",
                     "旧writerの停止を確認し、保存済み作業から再開します",
@@ -490,15 +603,12 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
     };
     if report.generation != run.generation {
         task.run = None;
-        task.stop(
-            Phase::Blocked,
-            "古いworker報告を拒否しました。旧報告は保持し、再開時は新しい実行世代を使います",
-        );
+        task.diagnose("古いworker報告を拒否しました。旧報告を保持して現在の状態を診断します");
         return Ok(());
     }
     if let Err(reason) = report.validate() {
         task.run = None;
-        task.stop(Phase::Blocked, &reason);
+        task.diagnose(&reason);
         return Ok(());
     }
     if risk_rank(&report.risk) > risk_rank(&task.risk) {
@@ -506,12 +616,18 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
     }
     if run.phase != Phase::Implementation && (report.head != task.head || report.pr != task.pr) {
         task.run = None;
-        task.stop(Phase::Blocked, "worker報告のレビュー対象HEADが一致しません");
+        task.diagnose("worker報告のレビュー対象HEADが一致しません");
         task.resume_phase = Phase::Implementation;
+        task.recovery.origin = Some(Phase::Implementation);
         return Ok(());
     }
     task.run = None;
     task.checkpoint = report.summary.clone();
+    if run.phase == Phase::Implementation && report.pr.is_some() && report.head.is_some() {
+        task.pr = report.pr;
+        task.head = report.head.clone();
+        task.invalidate_ci();
+    }
     let review_outdated = run.phase == Phase::Integration && !review_ready(task);
     if task.pause_requested {
         task.stop(Phase::Paused, "workerの停止と回収を確認しました");
@@ -522,10 +638,24 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
         }
         return Ok(());
     }
+    if let Some(assessment) = &report.assessment {
+        task.record_assessment(assessment);
+    }
+    if run.phase == Phase::Diagnosis {
+        apply_diagnosis(context, task, &report)?;
+        task.event("worker_result", &report.outcome);
+        return Ok(());
+    }
     match report.outcome.as_str() {
-        "resource_wait" => (),
+        "resource_wait" => {
+            task.recovery.origin = Some(run.phase);
+            task.monitor("別taskが共有資源を使用しています。生存lockの解放を監視して再開します");
+        }
         "ready" => match run.phase {
             Phase::Implementation => {
+                if let Some(assessment) = &report.assessment {
+                    register_followups(context, task, assessment)?;
+                }
                 let pr = report
                     .pr
                     .filter(|number| *number > 0)
@@ -535,11 +665,8 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
                     .as_deref()
                     .filter(|head| valid_sha(head))
                     .ok_or("worker報告に固定HEADがありません")?;
-                if task.head.as_deref() != Some(head) {
-                    task.failures = 0;
-                }
                 task.invalidate_ci();
-                task.gate_mode = ci::GateMode::Strict;
+                task.gate_mode = task.requested_gate;
                 task.pr = Some(pr);
                 task.head = Some(head.into());
                 task.review = None;
@@ -554,6 +681,10 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
                     task.phase = Phase::Review;
                 }
                 task.next_check = 0;
+                if task.stop_after == recovery::Boundary::Pr && task.phase == Phase::CiAuthorization
+                {
+                    task.phase = Phase::BoundaryReached;
+                }
             }
             Phase::Review => {
                 task.review = Some(worker::Report {
@@ -562,6 +693,9 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
                 });
                 task.review_independent = true;
                 task.phase = Phase::CiAuthorization;
+                if task.stop_after == recovery::Boundary::Pr {
+                    task.phase = Phase::BoundaryReached;
+                }
             }
             Phase::Integration => {
                 if review_ready(task) {
@@ -574,15 +708,13 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
                         "riskが上がりました。新しい深度の独立レビューを行います".into();
                 }
                 task.next_check = 0;
+                if task.stop_after == recovery::Boundary::Merge && task.phase == Phase::MainCi {
+                    task.phase = Phase::BoundaryReached;
+                }
             }
             Phase::Finish => {
-                if !worktree::task_completed(&context.repository, &task.id)
-                    .map_err(|error| error.to_string())?
-                {
-                    task.stop(
-                        Phase::Blocked,
-                        "delivery完了記録とworktree回収を確認できません",
-                    );
+                if !completed(context, task)? {
+                    task.diagnose("delivery完了記録とworktree回収を確認できません");
                 } else {
                     task.phase = Phase::Completed;
                 }
@@ -592,29 +724,328 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
         "needs_changes" => {
             task.phase = Phase::Implementation;
             task.review = None;
+            task.review_independent = false;
+            task.invalidate_ci();
             task.failures += 1;
+            if task.failures >= 3 {
+                task.diagnose("修正が反復しています。回数で終了せず、観測できた進展・原因・実装境界・検証方法を見直してください");
+            }
         }
-        "awaiting_decision" => task.stop(Phase::AwaitingDecision, &report.summary),
-        _ => task.stop(Phase::Blocked, &report.summary),
+        _ => task.diagnose(&report.summary),
     }
     if review_outdated
         && matches!(
             task.phase,
-            Phase::Blocked | Phase::AwaitingDecision | Phase::Paused
+            Phase::Blocked
+                | Phase::AwaitingDecision
+                | Phase::Paused
+                | Phase::Diagnosis
+                | Phase::Waiting
         )
     {
         task.review = None;
         task.review_independent = false;
         task.resume_phase = Phase::Review;
+        task.recovery.origin = Some(Phase::Review);
     }
     task.event("worker_result", &report.outcome);
     Ok(())
 }
 
+fn apply_diagnosis(context: &Context, task: &mut Task, report: &worker::Report) -> Result<()> {
+    let Some(assessment) = &report.assessment else {
+        task.recovery.attempts += 1;
+        task.monitor(
+            "診断に根拠・次の対応・再開条件がありません。既存状態を保持して変化を監視します",
+        );
+        return Ok(());
+    };
+    task.record_assessment(assessment);
+    task.recovery.attempts += 1;
+    if report.outcome == "awaiting_decision" && assessment.decision.is_some() {
+        task.stop(Phase::AwaitingDecision, &report.summary);
+        task.resume_phase = task
+            .recovery
+            .origin
+            .clone()
+            .unwrap_or(Phase::Implementation);
+        if matches!(
+            task.resume_phase,
+            Phase::Integration | Phase::CiAuthorization
+        ) && !review_ready(task)
+        {
+            task.resume_phase = Phase::Review;
+        }
+        return Ok(());
+    }
+    if assessment.decision.is_some() {
+        task.monitor("意思決定と実行要求が一致しません。書込みは行わず、保存状態を監視します");
+        return Ok(());
+    }
+    register_followups(context, task, assessment)?;
+    if task.recovery.attempts > 3
+        || report.outcome == "waiting"
+        || !assessment.followups.is_empty()
+        || matches!(report.outcome.as_str(), "blocked" | "awaiting_decision")
+    {
+        task.monitor(&report.summary);
+        return Ok(());
+    }
+    let origin = task
+        .recovery
+        .origin
+        .clone()
+        .unwrap_or(Phase::Implementation);
+    task.checkpoint = format!(
+        "{}\n診断の根拠: {}\n次の対応: {}",
+        report.summary, assessment.evidence, assessment.next_action
+    );
+    task.phase = if report.outcome == "needs_changes" && task.merge_commit.is_none() {
+        task.review = None;
+        task.review_independent = false;
+        Phase::Implementation
+    } else if origin == Phase::Diagnosis || origin == Phase::Waiting {
+        Phase::Implementation
+    } else {
+        origin
+    };
+    task.failures = 0;
+    task.next_check = 0;
+    // 古いreviewを使って統合へ戻さない。
+    if matches!(task.phase, Phase::Integration | Phase::CiAuthorization) && !review_ready(task) {
+        task.phase = Phase::Review;
+    }
+    task.event(
+        "replanned",
+        "元の依頼と既存許可を照合し、診断に基づく対応へ戻します",
+    );
+    Ok(())
+}
+
+fn register_followups(
+    context: &Context,
+    task: &mut Task,
+    assessment: &recovery::Assessment,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    if assessment
+        .followups
+        .iter()
+        .filter(|next| next.purpose == recovery::FollowupPurpose::RepairMainCi)
+        .count()
+        > 1
+    {
+        return Err("1つのmain CI失敗には修復専用taskを1つだけ紐付けてください".into());
+    }
+    if assessment
+        .followups
+        .iter()
+        .any(|next| next.purpose == recovery::FollowupPurpose::RepairMainCi)
+        && !(task.recovery.barrier
+            && task.merge_commit.is_some()
+            && task.ci_state == Some(ci::CiState::Failure)
+            && matches!(task.effective_phase(), Phase::MainCi | Phase::Finish))
+    {
+        return Err("実在するmain CI失敗に対してのみ修復専用taskを登録できます".into());
+    }
+    if task.recovery.children.len() + assessment.followups.len() > 32 {
+        return Err("後続taskの登録数が上限です。既存の計画・依存関係を見直してください".into());
+    }
+    let mut ancestors = std::collections::BTreeSet::from([task.id.clone()]);
+    let mut parent = task.recovery.parent.clone();
+    while let Some(id) = parent {
+        if !ancestors.insert(id.clone()) || ancestors.len() > 4 {
+            return Err(
+                "後続taskの依存・分割が深すぎます。元の目的へ戻して計画を見直してください".into(),
+            );
+        }
+        parent = context.load(&id)?.recovery.parent;
+    }
+    let mut previous = (task.phase == Phase::Implementation).then_some(task.id.clone());
+    for next in &assessment.followups {
+        // 同じ目的の再報告や中断後の再読込みで同じ後続taskを二重登録しない。
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(format!("{}\n{}", task.id, next.objective))
+        );
+        let id = format!("task-followup-{}", &digest[..20]);
+        let repairs_main = next.purpose == recovery::FollowupPurpose::RepairMainCi;
+        if repairs_main
+            && task
+                .recovery
+                .repair_task
+                .as_ref()
+                .is_some_and(|existing| existing != &id)
+        {
+            return Err(
+                "既存の修復専用taskを継続してください。別taskへbarrier例外を付与しません".into(),
+            );
+        }
+        {
+            let _lock = context.store.lock()?;
+            let current = context.load(&task.id)?;
+            if current.pause_requested
+                || current.generation != task.generation
+                || current.revision != task.revision
+            {
+                return Err(
+                    "親taskの停止・世代・追加指示が変化しました。後続登録を保留して再照合します"
+                        .into(),
+                );
+            }
+        }
+        let dependencies = if next.after_previous {
+            previous.clone().into_iter().collect()
+        } else {
+            vec![]
+        };
+        let objective = format!(
+            "元の許可済み依頼: {}\n\n今回の部分作業: {}\n元依頼に含まれる根拠: {}\n新規権限・費用・製品判断・不可逆操作を追加しない。",
+            task.objective, next.objective, next.authorization
+        );
+        submit_with_policy(
+            context,
+            id.clone(),
+            objective,
+            task.authorization.clone(),
+            None,
+            dependencies,
+            task.resources.clone(),
+            task.risk.clone(),
+            task.ci_labels.clone(),
+            task.requested_gate,
+            task.stop_after.clone(),
+        )?;
+        let _lock = context.store.lock()?;
+        let mut child = context.load(&id)?;
+        if child
+            .recovery
+            .parent
+            .as_ref()
+            .is_some_and(|parent| parent != &task.id)
+        {
+            return Err("後続taskの所有元が一致しません".into());
+        }
+        child.recovery.parent = Some(task.id.clone());
+        child.recovery.repairs_main = repairs_main;
+        context.store.save(&child)?;
+        if repairs_main {
+            task.recovery.repair_task = Some(id.clone());
+        }
+        if !task.recovery.children.contains(&id) {
+            task.recovery.children.push(id.clone());
+            task.event("followup_registered", "元の依頼内の後続taskを登録しました");
+        }
+        previous = Some(id);
+    }
+    Ok(())
+}
+
+fn waiting_observation(context: &Context, task: &Task) -> String {
+    use sha2::{Digest, Sha256};
+    let mut value = format!(
+        "{:?}|{:?}|{:?}",
+        task.ci_fingerprint,
+        task.ci_state,
+        task.ci_observation_error_at.is_none()
+    );
+    if let Some(event) = task.events.iter().rev().find(|event| {
+        matches!(
+            event.kind.as_str(),
+            "api_wait" | "ci_authorization_wait" | "repair_wait"
+        )
+    }) {
+        value.push_str(&event.detail);
+    }
+    for id in &task.recovery.children {
+        let child = context.load(id);
+        value.push_str(&format!(
+            "|{:?}",
+            child.map(|child| (child.phase, child.updated))
+        ));
+    }
+    let resource_root = context.codex_home.join("worktrees/.task-resources");
+    for resource in &task.resources {
+        let key = format!("{:x}", Sha256::digest(resource.as_bytes()));
+        let available = if resource_root.is_dir() {
+            Lock::try_acquire(&resource_root.join(key)).map(|lease| lease.is_some())
+        } else {
+            Ok(true)
+        };
+        value.push_str(&format!("|resource:{available:?}"));
+    }
+    if let Some(workspace) = &task.worktree {
+        value.push_str(&format!("|{:?}", worktree::task_observation(workspace)));
+        if let Some(assessment) = &task.recovery.assessment {
+            for relative in &assessment.watch_paths {
+                value.push_str(&format!("|{:?}", watch_metadata(workspace, relative)));
+            }
+        }
+    }
+    value.push_str(&format!(
+        "|{:?}",
+        host_capacity(context).map(|capacity| capacity > 0)
+    ));
+    value.push_str(&format!(
+        "|{:?}",
+        watch_metadata(&context.codex_home, "config.toml")
+    ));
+    format!("{:x}", Sha256::digest(value))
+}
+
+fn watch_metadata(root: &std::path::Path, relative: &str) -> Result<(u64, u128)> {
+    if !recovery::safe_relative(relative) {
+        return Err("監視pathが不正です".into());
+    }
+    let mut path = root.to_path_buf();
+    for part in std::path::Path::new(relative).components() {
+        path.push(part);
+        if std::fs::symlink_metadata(&path)
+            .map_err(|_| "監視対象は未作成です")?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("監視対象のsymlinkは読みません".into());
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| "監視対象を確認できません")?;
+    Ok((
+        metadata.len(),
+        metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0),
+    ))
+}
+
+fn monitor_task(context: &Context, task: &mut Task) {
+    if task.phase != Phase::Waiting {
+        return;
+    }
+    if task.recovery.observation.is_empty() {
+        task.recovery.observation = waiting_observation(context, task);
+        return;
+    }
+    if task.recovery.next_observation > now() {
+        return;
+    }
+    let observation = waiting_observation(context, task);
+    if !task.recovery.observation.is_empty() && task.recovery.observation != observation {
+        task.recovery.attempts = 0;
+        task.diagnose(
+            "監視対象の状態が変化しました。保存済みの原因・解消条件を照合して継続してください",
+        );
+    }
+    task.recovery.observation = observation;
+    task.recovery.next_observation = now() + 120;
+}
+
 fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
     if task.next_check > now()
         || !matches!(
-            task.phase,
+            task.effective_phase(),
             Phase::Review
                 | Phase::CiAuthorization
                 | Phase::Integration
@@ -627,13 +1058,103 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
     let Some(pr) = task.pr else {
         return Err("CI照合対象のPRがありません".into());
     };
+    if task.recovery.barrier
+        && matches!(task.effective_phase(), Phase::MainCi | Phase::Finish)
+        && refresh_repair(context, task)?
+    {
+        return Ok(());
+    }
     let result = ci::observe(
         &context.repository,
         &context.github,
         pr,
-        matches!(task.phase, Phase::MainCi | Phase::Finish).then_some(task.delivery_gate()),
+        matches!(task.effective_phase(), Phase::MainCi | Phase::Finish)
+            .then_some(task.delivery_gate()),
+        task.requested_gate,
     );
     record_ci_result(task, result)
+}
+
+fn refresh_repair(context: &Context, task: &mut Task) -> Result<bool> {
+    task.recovery.repair_evidence = None;
+    let Some(original_merge) = task.merge_commit.clone() else {
+        return Ok(false);
+    };
+    for id in task.recovery.children.clone() {
+        if task.recovery.repair_task.as_ref() != Some(&id) {
+            continue;
+        }
+        let child = context.load(&id)?;
+        if child.phase != Phase::Completed
+            || !child.recovery.repairs_main
+            || child.recovery.parent.as_ref() != Some(&task.id)
+        {
+            continue;
+        }
+        let mut verified = child;
+        let mut visited = std::collections::BTreeSet::from([task.id.clone()]);
+        while let Some(next) = verified.recovery.repair_task.clone() {
+            if !visited.insert(verified.id.clone()) || visited.len() > 4 {
+                return Err("修復taskの親子関係が循環または上限を超えています".into());
+            }
+            let successor = context.load(&next)?;
+            if successor.phase != Phase::Completed
+                || !successor.recovery.repairs_main
+                || successor.recovery.parent.as_ref() != Some(&verified.id)
+            {
+                return Ok(false);
+            }
+            verified = successor;
+        }
+        let (Some(pr), Some(head)) = (verified.pr, verified.head.as_deref()) else {
+            continue;
+        };
+        let observation = match ci::observe_repair(
+            &context.repository,
+            &context.github,
+            &original_merge,
+            pr,
+            head,
+            verified.delivery_gate(),
+            verified.requested_gate,
+        ) {
+            Ok(observation) => observation,
+            Err(reason) => {
+                task.event("repair_wait", &reason);
+                task.next_check = now() + 120;
+                return Ok(false);
+            }
+        };
+        task.recovery.repair_evidence = Some(recovery::RepairEvidence {
+            task_id: id,
+            verified_task_id: verified.id,
+            original_merge,
+            observation,
+        });
+        task.ci_observation_error_at = None;
+        task.next_check = now() + 30;
+        if !matches!(task.phase, Phase::Diagnosis | Phase::Waiting) {
+            task.phase = Phase::Finish;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn repair_ready(task: &Task) -> bool {
+    task.recovery
+        .repair_evidence
+        .as_ref()
+        .is_some_and(|repair| {
+            task.recovery.children.contains(&repair.task_id)
+                && task.recovery.repair_task.as_ref() == Some(&repair.task_id)
+                && valid_id(&repair.verified_task_id)
+                && task.merge_commit.as_ref() == Some(&repair.original_merge)
+                && repair.observation.merged
+                && repair.observation.allows_delivery()
+                && repair.observation.observed_at <= now()
+                && now().saturating_sub(repair.observation.observed_at) <= 120
+        })
 }
 
 fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<()> {
@@ -642,9 +1163,21 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
         Ok(observation) => observation,
         Err(reason) => {
             task.invalidate_ci();
-            task.ci_observation_error_at = Some(now());
-            task.event("api_wait", &reason);
+            task.ci_observation_error_at.get_or_insert(now());
+            if !task
+                .events
+                .last()
+                .is_some_and(|event| event.kind == "api_wait" && event.detail == reason)
+            {
+                task.event("api_wait", &reason);
+            }
             task.next_check = now() + 120;
+            if !matches!(
+                task.phase,
+                Phase::Diagnosis | Phase::Waiting | Phase::Review
+            ) {
+                task.diagnose(&reason);
+            }
             return Ok(());
         }
     };
@@ -656,7 +1189,7 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
         task.ci_fingerprint = observation.fingerprint;
         task.event("ci", &format!("{:?}", observation.state));
     }
-    if matches!(task.phase, Phase::MainCi | Phase::Finish) {
+    if matches!(task.effective_phase(), Phase::MainCi | Phase::Finish) {
         if !observation.merged
             || observation.merge_commit.as_ref() != Some(&observation.target)
             || task.head.as_ref() != Some(&observation.head)
@@ -666,13 +1199,36 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
                 .is_some_and(|sha| Some(sha) != observation.merge_commit.as_ref())
         {
             task.invalidate_ci();
-            task.stop(Phase::Blocked, "merge済みであることを確認できません");
+            task.diagnose("merge済みであることを確認できません");
             return Ok(());
         }
         task.merge_commit = observation.merge_commit;
     } else {
+        if !observation.merged && task.merge_commit.is_none() {
+            task.recovery.barrier = false;
+        }
         if task.head.as_ref() != Some(&observation.head) {
             stale_head(task);
+            return Ok(());
+        }
+        if observation.merged {
+            if matches!(task.effective_phase(), Phase::Integration)
+                && review_ready(task)
+                && observation.merge_commit.is_some()
+            {
+                task.merge_commit = observation.merge_commit;
+                task.recovery.barrier = true;
+                task.recovery.origin = Some(Phase::MainCi);
+                task.phase = Phase::MainCi;
+                task.invalidate_ci();
+                task.next_check = 0;
+                task.event(
+                    "merge_recovered",
+                    "固定headの実mergeを再取得しました。mergeを再送せずmain側gateを確認します",
+                );
+            } else {
+                task.diagnose("想定外の段階でPRがmergeされています。receipt・固定head・所有権を照合し、既存gateを省略せず診断してください");
+            }
             return Ok(());
         }
         if task
@@ -692,6 +1248,17 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
         task.base = Some(observation.base);
         task.gate_mode = observation.gate_mode;
     }
+    // 診断・外部監視中も証跡を更新するが、その観測だけで診断を飛ばさない。
+    if matches!(
+        task.phase,
+        Phase::Diagnosis | Phase::Waiting | Phase::Review
+    ) {
+        return Ok(());
+    }
+    if task.phase == Phase::CiAuthorization && !task.ci_labels.is_empty() {
+        // 初回base観測がreview後になっても、admission failureより認可を先に行う。
+        return Ok(());
+    }
     match observation.state {
         ci::CiState::Success | ci::CiState::LocalValidation if eligible => {
             if task.phase == Phase::MainCi {
@@ -701,17 +1268,21 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
             }
         }
         ci::CiState::Failure => {
+            if task.ci_activation_until > now() && task.phase == Phase::Integration {
+                return Ok(());
+            }
             if matches!(task.phase, Phase::MainCi | Phase::Finish) {
-                task.stop(
-                    Phase::Blocked,
-                    "merge commitのmain CIが失敗しました。後続統合を保留します",
-                );
+                task.recovery.barrier = true;
+                task.diagnose("merge commitのmain CIが失敗しました。後続mergeを保留し、原因調査・許可内の修復PR・再検証を進めてください");
             } else {
                 task.phase = Phase::Implementation;
                 task.review = None;
                 task.checkpoint =
                     "現在のPR CIが失敗しました。対象SHAの失敗原因を確認して修正してください".into();
                 task.failures += 1;
+                if task.failures >= 3 {
+                    task.diagnose("PR CIの失敗が反復しています。実装修正・CI認可・実行環境のどこが原因かを診断し、対応方法を見直してください");
+                }
             }
         }
         ci::CiState::Success
@@ -721,7 +1292,11 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
         | ci::CiState::Cancelled
         | ci::CiState::TimedOut
         | ci::CiState::Skipped
-        | ci::CiState::Stale => (),
+        | ci::CiState::Stale => {
+            if now().saturating_sub(task.updated) >= 900 {
+                task.diagnose("CIの状態が15分以上進んでいません。対象SHA・runner・実行承認・cancel/timeoutを診断し、許可内の復旧か外部監視へ分けてください");
+            }
+        }
     }
     Ok(())
 }
@@ -730,11 +1305,23 @@ fn stale_head(task: &mut Task) {
     task.invalidate_ci();
     task.review = None;
     task.review_independent = false;
-    task.stop(Phase::Blocked,"PRのHEADがworker報告と異なります。再開時に実装段階からGit・PRを照合してレビューをやり直します");
+    task.diagnose("PRのHEADがworker報告と異なります。所有権を照合し、実装段階でGit・PRと検証・レビューを更新してください");
     task.resume_phase = Phase::Implementation;
+    task.recovery.origin = Some(Phase::Implementation);
 }
 
+#[cfg(test)]
 fn resume_task(context: &Context, task_id: &str, instruction: String) -> Result<Value> {
+    resume_with_options(context, task_id, instruction, None, None)
+}
+
+fn resume_with_options(
+    context: &Context,
+    task_id: &str,
+    instruction: String,
+    gate_mode: Option<String>,
+    authorization: Option<String>,
+) -> Result<Value> {
     if !safe_text(&instruction, 32 * 1024) {
         return Err("追加指示が不正です".into());
     }
@@ -743,17 +1330,64 @@ fn resume_task(context: &Context, task_id: &str, instruction: String) -> Result<
     if task.run.is_some() || Lock::try_acquire(&context.store.lease_path(task_id)?)?.is_none() {
         return Err("workerが動作中です。停止と回収を確認するまで再割当てしません".into());
     }
-    if task.phase == Phase::Completed {
+    if matches!(task.phase, Phase::Completed | Phase::BoundaryReached) {
         return Err("完了taskへ追加作業は登録できません。別taskとして依頼してください".into());
+    }
+    if let Some(authorization) = authorization {
+        if !safe_text(&authorization, 32 * 1024) {
+            return Err("元の利用者依頼が不正です".into());
+        }
+        task.authorization = authorization;
+    }
+    if let Some(gate) = gate_mode {
+        let gate = match gate.as_str() {
+            "strict" => ci::GateMode::Strict,
+            "github-free-private" => ci::GateMode::GithubFreePrivate,
+            _ => return Err("受付policyが不正です".into()),
+        };
+        if gate != task.requested_gate {
+            if task.merge_commit.is_some() {
+                return Err("merge後のreceipt policyは変更できません".into());
+            }
+            task.requested_gate = gate;
+            task.gate_mode = gate;
+            if gate == ci::GateMode::GithubFreePrivate && risk_rank(&task.risk) < risk_rank("high")
+            {
+                task.risk = "high".into();
+            }
+            task.review = None;
+            task.review_independent = false;
+            task.invalidate_ci();
+            task.ci_activation_until = 0;
+            task.resume_phase = Phase::Implementation;
+            task.recovery.origin = Some(Phase::Implementation);
+            task.phase = Phase::Implementation;
+        }
     }
     task.pause_requested = false;
     task.failures = 0;
+    task.recovery.attempts = 0;
+    task.recovery.assessment = None;
+    task.recovery.next_authorization = 0;
+    task.recovery.authorization_attempts = 0;
+    task.next_check = 0;
     task.checkpoint = instruction;
     if matches!(
         task.phase,
-        Phase::Blocked | Phase::AwaitingDecision | Phase::Paused
+        Phase::Blocked
+            | Phase::AwaitingDecision
+            | Phase::Paused
+            | Phase::Waiting
+            | Phase::Diagnosis
     ) {
-        task.phase = task.resume_phase.clone();
+        task.phase = if matches!(task.phase, Phase::Waiting | Phase::Diagnosis) {
+            task.recovery
+                .origin
+                .clone()
+                .unwrap_or_else(|| task.resume_phase.clone())
+        } else {
+            task.resume_phase.clone()
+        };
     }
     task.event("resumed", "追加指示を保存しました");
     context.store.save(&task)?;
@@ -765,12 +1399,21 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
         || task.pause_requested
         || !matches!(
             task.phase,
-            Phase::Implementation | Phase::Review | Phase::Integration | Phase::Finish
+            Phase::Implementation
+                | Phase::Review
+                | Phase::Integration
+                | Phase::Finish
+                | Phase::Diagnosis
         )
     {
         return Ok(false);
     }
-    if task.failures >= 3 {
+    if let Some(parent) = &task.recovery.parent
+        && context.load(parent)?.pause_requested
+    {
+        return Ok(false);
+    }
+    if task.phase == Phase::Diagnosis && task.recovery.attempts > 3 {
         return Ok(false);
     }
     if matches!(
@@ -781,24 +1424,31 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
         return Ok(false);
     }
     for dependency in &task.dependencies {
-        if context.load(dependency)?.phase != Phase::Completed {
+        if task.phase != Phase::Diagnosis
+            && !matches!(
+                context.load(dependency)?.phase,
+                Phase::Completed | Phase::BoundaryReached
+            )
+        {
             return Ok(false);
         }
     }
-    if tasks.iter().any(|other| {
-        other.id != task.id
-            && other.run.is_some()
-            && other
-                .resources
-                .iter()
-                .any(|resource| task.resources.contains(resource))
-    }) {
+    if task.phase != Phase::Diagnosis
+        && tasks.iter().any(|other| {
+            other.id != task.id
+                && other.run.is_some()
+                && other
+                    .resources
+                    .iter()
+                    .any(|resource| task.resources.contains(resource))
+        })
+    {
         return Ok(false);
     }
     if matches!(task.phase, Phase::Integration | Phase::Finish) {
         if tasks.iter().any(|other| {
             other.id != task.id
-                && (integration_barrier(other)
+                && (integration_barrier(other) && !repair_exempt(task, other, tasks)
                     || other
                         .run
                         .as_ref()
@@ -807,21 +1457,22 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
             return Ok(false);
         }
         // 起動直前の再観測もstateへ保存してから、このgateへ渡す。
-        if task.ci_observation_error_at.is_some()
-            || task.ci_evidence.as_ref().is_none_or(|observation| {
-                !observation.allows_delivery()
-                    || task.delivery_gate() != observation.gate_mode
-                    || task.ci_state != Some(observation.state)
-                    || task.head.as_ref() != Some(&observation.head)
-                    || observation.observed_at > now()
-                    || now().saturating_sub(observation.observed_at) > 120
-                    || if task.phase == Phase::Finish {
-                        !observation.merged
-                            || task.merge_commit.as_ref() != Some(&observation.target)
-                    } else {
-                        observation.merged || task.base.as_ref() != Some(&observation.base)
-                    }
-            })
+        if !(task.phase == Phase::Finish && repair_ready(task))
+            && (task.ci_observation_error_at.is_some()
+                || task.ci_evidence.as_ref().is_none_or(|observation| {
+                    !observation.allows_delivery()
+                        || task.delivery_gate() != observation.gate_mode
+                        || task.ci_state != Some(observation.state)
+                        || task.head.as_ref() != Some(&observation.head)
+                        || observation.observed_at > now()
+                        || now().saturating_sub(observation.observed_at) > 120
+                        || if task.phase == Phase::Finish {
+                            !observation.merged
+                                || task.merge_commit.as_ref() != Some(&observation.target)
+                        } else {
+                            observation.merged || task.base.as_ref() != Some(&observation.base)
+                        }
+                }))
         {
             return Ok(false);
         }
@@ -854,37 +1505,96 @@ pub(super) fn valid_ci_labels(labels: &[String]) -> bool {
 }
 
 fn authorize_ci(context: &Context, task: &mut Task) -> Result<()> {
+    authorize_ci_with(task, |task| add_ci_labels(context, task))
+}
+
+fn add_ci_labels(context: &Context, task: &Task) -> Result<()> {
+    super::delivery::task_add_ci_labels(
+        &context.repository,
+        &context.github,
+        task.pr.ok_or("PRがありません")?,
+        task.head.as_deref().ok_or("HEADがありません")?,
+        task.base.as_deref().ok_or("baseがありません")?,
+        &task.ci_labels,
+    )
+}
+
+fn authorize_ci_with(
+    task: &mut Task,
+    mut add_labels: impl FnMut(&Task) -> Result<()>,
+) -> Result<()> {
     if task.phase != Phase::CiAuthorization
         || task.pause_requested
         || !review_ready(task)
-        || !matches!(
-            task.ci_state,
-            Some(ci::CiState::Pending | ci::CiState::Missing)
-        )
+        || task.base.is_none()
+        || task.next_check > now()
     {
         return Ok(());
     }
     if !task.ci_labels.is_empty() {
-        let result = super::delivery::task_add_ci_labels(
-            &context.repository,
-            &context.github,
-            task.pr.ok_or("PRがありません")?,
-            task.head.as_deref().ok_or("HEADがありません")?,
-            task.base.as_deref().ok_or("baseがありません")?,
-            &task.ci_labels,
-        );
+        let result = add_labels(task);
         if let Err(reason) = result {
             task.event("ci_authorization_wait", &reason);
             task.ci_state = None;
             task.next_check = now() + 120;
+            task.recovery.next_authorization = now() + 120;
+            task.diagnose(&reason);
             return Ok(());
         }
     }
     task.phase = Phase::Integration;
+    task.ci_activation_until = if task.ci_labels.is_empty() {
+        0
+    } else {
+        now() + 300
+    };
+    task.invalidate_ci();
+    task.next_check = 0;
     task.event(
         "ci_authorized",
         "受付時に明示された既存CI起動操作を確認しました。CI待機はRustが担当します",
     );
+    Ok(())
+}
+
+fn retry_ci_authorization_with(
+    task: &mut Task,
+    mut add_labels: impl FnMut(&Task) -> Result<()>,
+) -> Result<()> {
+    if task.phase != Phase::Waiting
+        || task.pause_requested
+        || !review_ready(task)
+        || task.effective_phase() != &Phase::CiAuthorization
+        || task.ci_labels.is_empty()
+        || task.base.is_none()
+        || task.recovery.next_authorization > now()
+    {
+        return Ok(());
+    }
+    match add_labels(task) {
+        Ok(()) => {
+            task.phase = Phase::Integration;
+            task.invalidate_ci();
+            task.ci_activation_until = now() + 300;
+            task.next_check = 0;
+            task.recovery.authorization_attempts = 0;
+            task.event(
+                "ci_authorized",
+                "委任済みのlabel操作を再照合して確認しました。新権限は追加せず実CIを監視します",
+            );
+        }
+        Err(reason) => {
+            task.recovery.authorization_attempts =
+                task.recovery.authorization_attempts.saturating_add(1);
+            task.recovery.next_authorization =
+                now() + (120u64 << task.recovery.authorization_attempts.min(5)).min(3600);
+            if !task.events.last().is_some_and(|event| {
+                event.kind == "ci_authorization_wait" && event.detail == reason
+            }) {
+                task.event("ci_authorization_wait", &reason);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -899,22 +1609,26 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
     for task in &mut tasks {
         let original_sequence = task.event_sequence;
         let original_revision = task.revision;
+        recover_legacy(task);
         // APIとbuildの待機中にstate lockを保持しない。
-        apply_report(context, task)?;
-        if task.failures >= 3
-            && !matches!(
-                task.phase,
-                Phase::Blocked | Phase::Paused | Phase::AwaitingDecision
-            )
-        {
-            task.stop(
-                Phase::Blocked,
-                "同じtaskの修正・中断が繰り返されました。作業を保持して原因を確認します",
-            );
+        if let Err(reason) = apply_report(context, task) {
+            task.recovery.attempts += 1;
+            if task.recovery.attempts > 3 {
+                task.monitor(&reason);
+            } else {
+                task.diagnose(&reason);
+            }
         }
         if task.run.is_none() {
+            retry_ci_authorization_with(task, |task| add_ci_labels(context, task))?;
+            // コードreview後、CI結果の失敗分類より先に委任済みの認可を行う。
+            authorize_ci(context, task)?;
             observe_ci(context, task)?;
             authorize_ci(context, task)?;
+            monitor_task(context, task);
+            if task.phase == Phase::Diagnosis && task.recovery.attempts > 3 {
+                task.monitor("同じ観測で診断が反復しています。別の方法と外部解消条件を記録し、状態変化を監視します");
+            }
         }
         let _lock = context.store.lock()?;
         let current = context.load(&task.id)?;
@@ -928,11 +1642,22 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
         }
         context.store.save(task)?;
     }
-    let capacity = resources::Budget::load(&context.store.root)?.capacity(&context.store.root)?;
+    let capacity = host_capacity(context)?;
+    tasks.sort_by_key(|task| {
+        (
+            std::cmp::Reverse(recovery::scheduling_score(task, now())),
+            task.created,
+            task.id.clone(),
+        )
+    });
     let mut running = tasks.iter().filter(|task| task.run.is_some()).count();
     let mut launched = Vec::new();
     for index in 0..tasks.len() {
         if running >= capacity {
+            break;
+        }
+        // 他repositoryのbuild/workerも同じhostを使うため、起動直前にも再計測する。
+        if resources::Budget::load(&context.store.root)?.capacity(&context.store.root)? == 0 {
             break;
         }
         // 実際の統合起動直前の観測も永続化する。API失敗時に旧成功を残さない。
@@ -961,6 +1686,11 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
             Some(lease) => lease,
             None => continue,
         };
+        let budget = resources::Budget::load(&context.store.root)?;
+        let admission_root = context.codex_home.join("worktrees/.task-admission");
+        let Some(admission) = resources::Reservation::acquire(&admission_root, &budget)? else {
+            continue;
+        };
         let task = &mut tasks[index];
         {
             let _lock = context.store.lock()?;
@@ -973,11 +1703,25 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
                 continue;
             }
         }
-        if task.worktree.is_none() {
-            task.worktree = Some(
-                worktree::task_workspace(&context.repository, &task.id, &task.branch)
-                    .map_err(|error| error.to_string())?,
-            );
+        if task.phase != Phase::Diagnosis && task.phase != Phase::Finish {
+            match worktree::task_workspace(&context.repository, &task.id, &task.branch) {
+                Ok(workspace) => task.worktree = Some(workspace),
+                Err(error) => {
+                    task.diagnose(&error.to_string());
+                    let _lock = context.store.lock()?;
+                    let current = context.load(&task.id)?;
+                    if current.revision == task.revision
+                        && current.event_sequence + 1 == task.event_sequence
+                        && current.generation == task.generation
+                        && !current.pause_requested
+                    {
+                        context.store.save(task)?;
+                    } else {
+                        *task = current;
+                    }
+                    continue;
+                }
+            }
         }
         {
             let _lock = context.store.lock()?;
@@ -991,6 +1735,7 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
                 continue;
             }
             task.generation += 1;
+            task.recovery.last_scheduled = now();
             task.run = Some(Run {
                 generation: task.generation,
                 phase: task.phase.clone(),
@@ -999,18 +1744,57 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
             task.event("worker_start", &format!("{:?}", task.phase));
             context.store.save(task)?;
         }
-        let child = worker::spawn(context, task, &lease)?;
-        children.push(child);
-        launched.push(task.id.clone());
-        running += 1;
+        match worker::spawn(context, task, &lease, &admission) {
+            Ok(child) => {
+                children.push(child);
+                launched.push(task.id.clone());
+                running += 1;
+            }
+            Err(reason) => {
+                let _lock = context.store.lock()?;
+                task.run = None;
+                task.diagnose(&reason);
+                context.store.save(task)?;
+            }
+        }
     }
     Ok(
         json!({"launched":launched,"running":running,"tasks":tasks.iter().map(|task| json!({"task_id":task.id,"phase":task.phase,"running":task.run.is_some()})).collect::<Vec<_>>()}),
     )
 }
 
+fn host_capacity(context: &Context) -> Result<usize> {
+    let budget = resources::Budget::load(&context.store.root)?;
+    let capacity = budget.capacity(&context.store.root)?;
+    if capacity == 0 {
+        return Ok(0);
+    }
+    // 照会用のpermitは直ちに解放する。起動時には別途保持するpermitを原子的に取得する。
+    let permit = resources::Reservation::acquire(
+        &context.codex_home.join("worktrees/.task-admission"),
+        &budget,
+    )?;
+    Ok(if permit.is_some() { capacity } else { 0 })
+}
+
+fn recover_legacy(task: &mut Task) {
+    if task.run.is_none()
+        && (task.phase == Phase::Blocked
+            || task.phase == Phase::AwaitingDecision
+                && task
+                    .recovery
+                    .assessment
+                    .as_ref()
+                    .is_none_or(|assessment| assessment.decision.is_none()))
+    {
+        let checkpoint = task.checkpoint.clone();
+        task.diagnose(&checkpoint);
+    }
+}
+
 fn integration_barrier(task: &Task) -> bool {
-    matches!(task.phase, Phase::MainCi | Phase::Finish)
+    task.recovery.barrier && task.phase != Phase::Completed
+        || matches!(task.phase, Phase::MainCi | Phase::Finish)
         || matches!(
             task.phase,
             Phase::Blocked | Phase::AwaitingDecision | Phase::Paused
@@ -1018,6 +1802,27 @@ fn integration_barrier(task: &Task) -> bool {
             task.resume_phase,
             Phase::MainCi | Phase::Finish | Phase::Integration
         )
+}
+
+fn repair_exempt(task: &Task, barrier: &Task, tasks: &[Task]) -> bool {
+    let mut cursor = task;
+    let mut visited = std::collections::BTreeSet::new();
+    while cursor.recovery.repairs_main && visited.len() < 4 && visited.insert(cursor.id.clone()) {
+        let Some(parent) = tasks
+            .iter()
+            .find(|parent| cursor.recovery.parent.as_ref() == Some(&parent.id))
+        else {
+            return false;
+        };
+        if parent.recovery.repair_task.as_ref() != Some(&cursor.id) {
+            return false;
+        }
+        if parent.id == barrier.id {
+            return true;
+        }
+        cursor = parent;
+    }
+    false
 }
 
 fn run_loop(
@@ -1044,6 +1849,7 @@ fn run_loop(
                                 | Phase::Blocked
                                 | Phase::AwaitingDecision
                                 | Phase::Paused
+                                | Phase::BoundaryReached
                         )
                 })
             {
@@ -1091,13 +1897,54 @@ fn start(context: &Context) -> Result<Value> {
 fn execute(cli: Cli) -> Result<Value> {
     let context = Context::open()?;
     match cli.command {
-        Commands::Submit { task_id, objective, branch, depends_on, resource, risk, ci_label } => submit(&context, task_id, objective, branch, depends_on, resource, risk, ci_label),
-        Commands::List => Ok(json!(context.store.list()?.iter().map(|task| json!({"task_id":task.id,"phase":task.phase,"running":task.run.is_some(),"updated":task.updated})).collect::<Vec<_>>())),
+        Commands::Submit {
+            task_id,
+            objective,
+            authorization,
+            branch,
+            depends_on,
+            resource,
+            risk,
+            ci_label,
+            gate_mode,
+            stop_after,
+        } => {
+            let requested_gate = if gate_mode == "github-free-private" {
+                ci::GateMode::GithubFreePrivate
+            } else {
+                ci::GateMode::Strict
+            };
+            let stop_after = match stop_after.as_str() {
+                "pr" => recovery::Boundary::Pr,
+                "merge" => recovery::Boundary::Merge,
+                _ => recovery::Boundary::Finish,
+            };
+            submit_with_policy(
+                &context,
+                task_id,
+                objective.clone(),
+                authorization.unwrap_or(objective),
+                branch,
+                depends_on,
+                resource,
+                risk,
+                ci_label,
+                requested_gate,
+                stop_after,
+            )
+        }
+        Commands::List => {
+            let tasks = context.store.list()?;
+            let capacity = host_capacity(&context)?;
+            Ok(json!(tasks.iter().map(|task| json!({"task_id":task.id,"phase":task.phase,"running":task.run.is_some(),"updated":task.updated,"next_check":task.next_check,"waiting_on":waiting_on(task,&tasks,capacity),"recovery":task.recovery})).collect::<Vec<_>>()))
+        }
         Commands::Show { task_id } => Ok(json!(context.load(&task_id)?)),
         Commands::Events { task_id, all } => {
             let task = context.load(&task_id)?;
-            Ok(json!({"task_id":task_id,"acknowledged_sequence":task.acknowledged_sequence,"event_sequence":task.event_sequence,
-                "events":task.events.iter().filter(|event| all || event.sequence > task.acknowledged_sequence).collect::<Vec<_>>()}))
+            Ok(
+                json!({"task_id":task_id,"acknowledged_sequence":task.acknowledged_sequence,"event_sequence":task.event_sequence,
+                "events":task.events.iter().filter(|event| all || event.sequence > task.acknowledged_sequence).collect::<Vec<_>>()}),
+            )
         }
         Commands::Ack { task_id, through } => {
             let _lock = context.store.lock()?;
@@ -1117,45 +1964,137 @@ fn execute(cli: Cli) -> Result<Value> {
         Commands::Collect { task_id } => {
             let _lock = context.store.lock()?;
             let mut task = context.load(&task_id)?;
-            let _lease = Lock::try_acquire(&context.store.lease_path(&task_id)?)?.ok_or("workerが動作中です")?;
+            let _lease = Lock::try_acquire(&context.store.lease_path(&task_id)?)?
+                .ok_or("workerが動作中です")?;
             let removed = context.store.collect(&mut task, now())?;
             context.store.save(&task)?;
-            Ok(json!({"task_id":task_id,"removed_worker_generations":removed,"retained_events":task.events.len()}))
+            Ok(
+                json!({"task_id":task_id,"removed_worker_generations":removed,"retained_events":task.events.len()}),
+            )
         }
         Commands::Pause { task_id } => {
             let _lock = context.store.lock()?;
             let mut task = context.load(&task_id)?;
             task.pause_requested = true;
-            if task.run.is_none() { task.stop(Phase::Paused, "利用者の指示で停止しました"); }
+            if task.run.is_none() {
+                task.stop(Phase::Paused, "利用者の指示で停止しました");
+            }
             task.event("pause_requested", "次のworker起動を停止します");
             context.store.save(&task)?;
             Ok(json!({"task_id":task_id,"pause_requested":true}))
         }
-        Commands::Resume { task_id, instruction } => {
-            resume_task(&context,&task_id,instruction)
-        }
+        Commands::Resume {
+            task_id,
+            instruction,
+            gate_mode,
+            authorization,
+        } => resume_with_options(&context, &task_id, instruction, gate_mode, authorization),
         Commands::Reconcile | Commands::Run { .. } => {
             worker::preflight(&context)?;
-            let mut coordinator = Some(Lock::try_acquire(&context.store.root.join("coordinator.lock"))?.ok_or("このrepositoryのcoordinatorは既に稼働中です")?);
+            let mut coordinator = Some(
+                Lock::try_acquire(&context.store.root.join("coordinator.lock"))?
+                    .ok_or("このrepositoryのcoordinatorは既に稼働中です")?,
+            );
             let mut children = Vec::new();
-            if matches!(cli.command, Commands::Reconcile) { return reconcile(&context, &mut children); }
-            let Commands::Run { poll_seconds, timeout_seconds } = cli.command else { unreachable!() };
+            if matches!(cli.command, Commands::Reconcile) {
+                return reconcile(&context, &mut children);
+            }
+            let Commands::Run {
+                poll_seconds,
+                timeout_seconds,
+            } = cli.command
+            else {
+                unreachable!()
+            };
             run_loop(&context, poll_seconds, timeout_seconds, &mut coordinator)
         }
         Commands::Start => start(&context),
         Commands::Coordinator { lock_fd } => {
-            let lock = unsafe { Lock::from_inherited(lock_fd, &context.store.root.join("coordinator.lock"))? };
+            let lock = unsafe {
+                Lock::from_inherited(lock_fd, &context.store.root.join("coordinator.lock"))?
+            };
             lock.close_on_exec()?;
             worker::preflight(&context)?;
             let mut coordinator = Some(lock);
-            let result = run_loop(&context,15,None,&mut coordinator);
-            store::atomic_json(&context.store.root.join("coordinator-status.json"), &json!({"stopped":true,"at":now(),"error":result.as_ref().err()}))?;
+            let result = run_loop(&context, 15, None, &mut coordinator);
+            store::atomic_json(
+                &context.store.root.join("coordinator-status.json"),
+                &json!({"stopped":true,"at":now(),"error":result.as_ref().err()}),
+            )?;
             result
         }
         Commands::Doctor => worker::doctor(&context),
-        Commands::LaunchCommand => Ok(json!({"executable":context.home.join(".local/bin/codex-task"),"arguments":["run"],"working_directory":context.repository,"codex_home":context.codex_home,"timer_required":false,"note":"OS起動adapterは任意です。WSL停止中は待機し、次回稼働時に照合します。"})),
-        Commands::Worker { task_id, generation, lease_fd } => worker::execute(&context, &task_id, generation, lease_fd),
+        Commands::LaunchCommand => Ok(
+            json!({"executable":context.home.join(".local/bin/codex-task"),"arguments":["run"],"working_directory":context.repository,"codex_home":context.codex_home,"timer_required":false,"note":"OS起動adapterは任意です。WSL停止中は待機し、次回稼働時に照合します。"}),
+        ),
+        Commands::Worker {
+            task_id,
+            generation,
+            lease_fd,
+            admission_fd,
+            admission_slot,
+        } => worker::execute(
+            &context,
+            &task_id,
+            generation,
+            lease_fd,
+            admission_fd,
+            admission_slot,
+        ),
     }
+}
+
+fn waiting_on(task: &Task, tasks: &[Task], capacity: usize) -> &'static str {
+    if task.run.is_some() {
+        return "running";
+    }
+    match task.phase {
+        Phase::AwaitingDecision => return "user-decision",
+        Phase::Paused => return "user-paused",
+        Phase::BoundaryReached | Phase::Completed => return "complete",
+        Phase::Waiting => return "external-observation",
+        Phase::CiAuthorization | Phase::MainCi => return "ci",
+        _ => (),
+    }
+    if task.dependencies.iter().any(|id| {
+        tasks
+            .iter()
+            .find(|other| &other.id == id)
+            .is_none_or(|other| !matches!(other.phase, Phase::Completed | Phase::BoundaryReached))
+    }) {
+        return "dependency";
+    }
+    if task.phase != Phase::Diagnosis
+        && tasks.iter().any(|other| {
+            other.id != task.id
+                && other.run.is_some()
+                && other
+                    .resources
+                    .iter()
+                    .any(|resource| task.resources.contains(resource))
+        })
+    {
+        return "shared-resource";
+    }
+    if capacity == 0 {
+        return "host-capacity";
+    }
+    if task.phase == Phase::Integration
+        && task
+            .ci_evidence
+            .as_ref()
+            .is_none_or(|ci| !ci.allows_delivery())
+    {
+        return "ci";
+    }
+    if matches!(task.phase, Phase::Integration | Phase::Finish)
+        && tasks.iter().any(|other| {
+            other.id != task.id && integration_barrier(other) && !repair_exempt(task, other, tasks)
+        })
+    {
+        return "integration-barrier";
+    }
+    "eligible"
 }
 
 pub fn entrypoint<I: IntoIterator<Item = OsString>>(args: I) -> i32 {
@@ -1267,8 +2206,15 @@ pub(crate) fn invocation_reason(args: &[String]) -> Option<String> {
         Commands::Resume {
             task_id,
             instruction,
+            authorization,
+            ..
         } => (!valid_id(&task_id) || !safe_text(&instruction, 32 * 1024))
-            .then(|| "再開指示が不正です".into()),
+            .then(|| "再開指示が不正です".into())
+            .or_else(|| {
+                authorization
+                    .is_some_and(|text| !safe_text(&text, 32 * 1024))
+                    .then(|| "元の利用者依頼が不正です".into())
+            }),
         _ => None,
     }
 }
@@ -1280,9 +2226,9 @@ mod tests {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct Fixture(Context);
+    pub(super) struct Fixture(pub(super) Context);
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let base = std::env::var_os("CARGO_TARGET_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
@@ -1309,7 +2255,7 @@ mod tests {
                 },
             })
         }
-        fn submit(&self, id: &str) {
+        pub(super) fn submit(&self, id: &str) {
             submit(
                 &self.0,
                 id.into(),
@@ -1329,7 +2275,7 @@ mod tests {
         }
     }
 
-    fn successful_observation() -> ci::Observation {
+    pub(super) fn successful_observation() -> ci::Observation {
         serde_json::from_value(json!({
             "state":"success","head":"a".repeat(40),"base":"b".repeat(40),
             "target":"a".repeat(40),"fingerprint":"observed","merge_commit":null,
@@ -1504,7 +2450,7 @@ mod tests {
         let mut changed = successful_observation();
         changed.head = "d".repeat(40);
         record_ci_result(&mut task, Ok(changed)).unwrap();
-        assert_eq!(task.phase, Phase::Blocked);
+        assert_eq!(task.phase, Phase::Diagnosis);
         assert!(task.ci_state.is_none() && task.ci_evidence.is_none());
     }
 
@@ -1539,6 +2485,7 @@ mod tests {
             pr: task.pr,
             head: task.head.clone(),
             risk: "high".into(),
+            assessment: None,
         });
         task.review_independent = true;
         task
@@ -1548,7 +2495,7 @@ mod tests {
     fn delivery_workers_preserve_the_existing_strict_and_local_argument_contract() {
         let fixture = Fixture::new();
         let mut task = reviewed_task(&fixture);
-        for phase in [Phase::Review, Phase::Integration, Phase::Finish] {
+        for phase in [Phase::Integration, Phase::Finish] {
             task.phase = phase;
             task.gate_mode = ci::GateMode::Strict;
             let strict = worker::prompt(&task);
@@ -1585,7 +2532,9 @@ mod tests {
         record_ci_result(&mut task, Err("API unavailable".into())).unwrap();
         assert_eq!(task.delivery_gate(), ci::GateMode::LocalValidation);
         assert!(task.ci_evidence.is_none());
-        assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        assert_eq!(task.phase, Phase::Diagnosis);
+        assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        task.phase = Phase::Finish;
         record_ci_result(&mut task, Ok(local_observation(true))).unwrap();
         assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
     }
@@ -1635,7 +2584,7 @@ mod tests {
             assert_eq!(
                 task.phase,
                 if head_changed {
-                    Phase::Blocked
+                    Phase::Diagnosis
                 } else {
                     Phase::Implementation
                 }
@@ -1660,7 +2609,7 @@ mod tests {
                 _ => observation.state = ci::CiState::Failure,
             }
             record_ci_result(&mut task, Ok(observation)).unwrap();
-            assert_eq!(task.phase, Phase::Blocked);
+            assert_eq!(task.phase, Phase::Diagnosis);
             assert!(integration_barrier(&task));
         }
     }
@@ -1784,6 +2733,7 @@ mod tests {
             pr: Some(12),
             head: Some("b".repeat(40)),
             risk: "medium".into(),
+            assessment: None,
         };
         store::atomic_json(
             &worker::report_path(&fixture.0.store, &task.id, 1).unwrap(),
@@ -1802,7 +2752,7 @@ mod tests {
         assert_eq!(task.risk, "high");
         assert!(task.run.is_none());
         assert_eq!(task.pr, Some(12));
-        assert_eq!(task.failures, 0);
+        assert_eq!(task.failures, 2);
     }
 
     #[test]
@@ -1817,7 +2767,7 @@ mod tests {
             started: now(),
         });
         apply_report(&fixture.0, &mut task).unwrap();
-        assert_eq!(task.phase, Phase::Implementation);
+        assert_eq!(task.phase, Phase::Diagnosis);
         assert!(task.run.is_none());
         assert_eq!(task.failures, 1);
         task.phase = Phase::Implementation;
@@ -1833,6 +2783,7 @@ mod tests {
             pr: Some(1),
             head: Some("b".repeat(40)),
             risk: "low".into(),
+            assessment: None,
         };
         store::atomic_json(
             &worker::report_path(&fixture.0.store, &task.id, 2).unwrap(),
@@ -1840,7 +2791,7 @@ mod tests {
         )
         .unwrap();
         apply_report(&fixture.0, &mut task).unwrap();
-        assert_eq!(task.phase, Phase::Blocked);
+        assert_eq!(task.phase, Phase::Diagnosis);
         assert!(task.run.is_none());
         fixture.0.store.save(&task).unwrap();
         resume_task(
@@ -1883,10 +2834,11 @@ mod tests {
             pr: task.pr,
             head: task.head.clone(),
             risk: "high".into(),
+            assessment: None,
         });
         stale_head(&mut task);
         fixture.0.store.save(&task).unwrap();
-        assert_eq!(task.phase, Phase::Blocked);
+        assert_eq!(task.phase, Phase::Diagnosis);
         assert!(task.review.is_none());
         resume_task(
             &fixture.0,
@@ -1927,6 +2879,7 @@ mod tests {
             pr: Some(1),
             head: Some("b".repeat(40)),
             risk: "low".into(),
+            assessment: None,
         };
         store::atomic_json(
             &worker::report_path(&fixture.0.store, &task.id, 1).unwrap(),
@@ -1945,6 +2898,7 @@ mod tests {
         let mut task = fixture.0.load("task-one").unwrap();
         task.phase = Phase::CiAuthorization;
         task.pr = Some(12);
+        task.base = Some("b".repeat(40));
         task.head = Some("a".repeat(40));
         task.ci_state = Some(ci::CiState::Pending);
         assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
@@ -1955,6 +2909,7 @@ mod tests {
             pr: task.pr,
             head: task.head.clone(),
             risk: "high".into(),
+            assessment: None,
         });
         task.review_independent = true;
         assert!(!worker::worker_phase(&task.phase));
@@ -1973,7 +2928,7 @@ mod tests {
             task.phase = Phase::CiAuthorization;
             task.ci_state = state;
             authorize_ci(&fixture.0, &mut task).unwrap();
-            assert_eq!(task.phase, Phase::CiAuthorization);
+            assert_eq!(task.phase, Phase::Integration);
         }
     }
 
@@ -1993,6 +2948,7 @@ mod tests {
             pr: task.pr,
             head: task.head.clone(),
             risk: "low".into(),
+            assessment: None,
         });
         assert!(review_ready(&task));
         task.generation = 2;
@@ -2034,6 +2990,7 @@ mod tests {
             pr: task.pr,
             head: task.head.clone(),
             risk: "low".into(),
+            assessment: None,
         });
         task.generation = 2;
         task.run = Some(Run {
@@ -2053,7 +3010,7 @@ mod tests {
         )
         .unwrap();
         apply_report(&fixture.0, &mut task).unwrap();
-        assert_eq!(task.phase, Phase::AwaitingDecision);
+        assert_eq!(task.phase, Phase::Diagnosis);
         assert_eq!(task.resume_phase, Phase::Review);
         fixture.0.store.save(&task).unwrap();
         resume_task(&fixture.0, &task.id, "判断を反映してレビューする".into()).unwrap();
