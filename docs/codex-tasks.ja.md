@@ -110,6 +110,8 @@ coordinator自体の異常終了後やOS再起動後の自動起動が必要な�
 WSLのsystemd serviceはWSL instanceを生存させません。停止中は待機し、次回`start`／`run`で照合します。
 OS起動adapterを使う場合も、WSL起動前からの処理継続は保証しません。
 Linux user/PID namespace・pidfd等の必要機能はdoctorで確認します。利用不能なら安全性を落として実行しません。
+worker内のhelperがPIDを照合できるよう、worker専用のmount namespaceで`/proc`をマウントします。
+doctorはこのprocfsの作成も確認し、通常の短時間commandの隔離とは分けて診断します。
 macOSのhost identity・process監督・launchd adapterは将来対応です。
 
 この段階ではmain CIが存在するrepositoryの自律pipelineを対象とします。workflow不在repositoryの
