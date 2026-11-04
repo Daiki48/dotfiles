@@ -8,6 +8,7 @@ description: 複数Issueの並列実装、進行中に別タスクを追加す�
 利用者の自然な依頼を`codex-task`の操作へ変換する。固定の発話形式は要求しない。通常の単発実装は`execute-plan`を使い、既にtask workerとして実行中なら新taskを再登録しない。workerに指定されたPRまで・mergeまで等の停止境界を優先する。
 
 - 最初に親checkoutで`codex-task doctor --json`を確認する。未導入ならdotfilesのセットアップ状態を確認し、通常運用でtaskごとにCargo buildしない。
+- Codexのshell sandboxからのworker起動は、親sandboxのread-only mountを継承させないため、既存approvalに従って同じUIDの通常ホスト側へ渡す。`doctor`で`host_launch_required=true`なら、toolの`sandbox_permissions="require_escalated"`で同じdoctorを実行する。`start`・継続`run`・workerを起動する`reconcile`も同じ通常ホスト側で実行する。scope内の通常起動は既存auto-reviewへ審査を委ね、改めて人間の許可待ちにしない。子Codexの`codex-autonomous`・auto-review・hookは保持し、bypass flagやconfig書換えで権限を広げない。通常ホストでもread-onlyの場合やapproval拒否時は理由を具体化して止まり、迂回しない。
 - 別Issueの実装依頼は`submit --task-id issue-<番号> --objective '<許可された目的・受入条件・停止境界>'`へ変換する。Issueなしは衝突しない`task-<ID>`を使う。相談・調査・Issue化だけの依頼を実装へ変換しない。
 - 受付を担当するmainがAGENTSの基準でriskを判断し、`--risk low|medium|high|critical`へ渡す。判断できなければ既定のhighを使う。登録riskはレビュー深度の下限であり、実装workerの自己申告では下げない。
 - repositoryの既存方針で対象PRと後続pushのCI起動が明示的に委任されているlabelだけを、受付時に`--ci-label <既存label>`へ渡す。PR-wide labelは固定SHA単位の実行認可を保証しない。SHAごとの承認が必要な運用、未確認のlabel、新しい承認や権限を推測して登録しない。レビュー後のlabel追加はRustがPR・HEAD・baseとlabelの実在を照合して行い、CI起動専用のAI workerは作らない。

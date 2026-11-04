@@ -22,6 +22,10 @@ codex-task events --task-id issue-123 --json
 ```
 
 `submit`は登録、`start`は端末から切り離したcoordinatorの起動です。既に稼働中なら重複起動しません。
+Codexのshell sandboxからは、既存approvalで同UIDの通常ホスト側に`start`／`run`／`reconcile`を渡します。
+子Codex runtimeはローカル設定・cache・stateへの書込みが必要で、`setsid`は親sandboxのread-only mountを解放しません。
+`doctor`の`host_launch_required=true`はこの状態を示します。子Codexのtool権限・hook・auto-reviewは設定どおり維持します。
+登録・状態確認・停止要求・追加指示は通常のsandbox内から行えます。
 OSサービスを登録せずに使えます。`run`は前景で継続し、`reconcile`は一度だけ照合・起動します。
 `run --poll-seconds 15 --timeout-seconds 3600`のように監視期限を指定できます。
 期限到達はCI失敗として扱わず、動作中workerと状態を保持します。
