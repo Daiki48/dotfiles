@@ -484,6 +484,8 @@ fn git(cwd: &Path, args: &[&str], check: bool) -> Result<String> {
 fn gh(cwd: &Path, args: &[String], check: bool) -> Result<String> {
     let sandbox = GhSandbox::create(cwd)?;
     let args = sandbox.snapshot_args(args)?;
+    let is_merge = args.first().is_some_and(|arg| arg == "pr")
+        && args.get(1).is_some_and(|arg| arg == "merge");
     let mut command = vec![trusted_binary(GH_BINARY, "GitHub CLI")?];
     command.extend(args);
     let result = run_with_config(
@@ -494,9 +496,97 @@ fn gh(cwd: &Path, args: &[String], check: bool) -> Result<String> {
         Some(&sandbox.path),
     )?;
     if check && !result.status.success() {
+        if is_merge {
+            return Err(error(merge_failure_diagnostic(
+                result.status.code(),
+                &result.stderr,
+            )));
+        }
         return Err(error("GitHub CLI commandに失敗しました"));
     }
     Ok(result.stdout)
+}
+
+fn merge_failure_diagnostic(code: Option<i32>, stderr: &str) -> String {
+    // 外部応答には認証情報や未信頼の本文が含まれ得るため、固定分類だけを返す。
+    let text = stderr.to_ascii_lowercase();
+    let category = if text.contains("rate limit") {
+        "rate-limited"
+    } else if [
+        "bad credentials",
+        "requires authentication",
+        "authentication failed",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+    {
+        "authentication"
+    } else if [
+        "resource not accessible",
+        "permission denied",
+        "not authorized",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+    {
+        "authorization"
+    } else if ["head branch was modified", "expectedheadoid", "head sha"]
+        .iter()
+        .any(|pattern| text.contains(pattern))
+    {
+        "head-changed"
+    } else if [
+        "not mergeable",
+        "protected branch",
+        "required status check",
+        "review is required",
+        "reviews are required",
+        "repository rule",
+        "base branch policy",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+    {
+        "merge-policy"
+    } else if ["timeout", "timed out", "deadline exceeded"]
+        .iter()
+        .any(|pattern| text.contains(pattern))
+    {
+        "timeout"
+    } else if [
+        "dial tcp",
+        "no such host",
+        "connection reset",
+        "connection refused",
+        "tls handshake",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+    {
+        "transport"
+    } else if text.contains("http 401") {
+        "http-401"
+    } else if text.contains("http 403") {
+        "http-403"
+    } else if text.contains("http 404") {
+        "http-404"
+    } else if text.contains("http 409") {
+        "http-409"
+    } else if text.contains("http 422") {
+        "http-422"
+    } else if text.contains("http 5") {
+        "http-5xx"
+    } else if text.contains("graphql") {
+        "graphql-other"
+    } else if text.contains("git") && text.contains("exit status") {
+        "local-git"
+    } else {
+        "other"
+    };
+    let code = code.map_or_else(|| "signal".into(), |code| code.to_string());
+    format!(
+        "GitHub CLI commandに失敗しました（PR merge: exit={code}, category={category}）。PR・delivery stateを再取得してから再開してください"
+    )
 }
 
 fn dangerous_local_git_key(key: &str) -> bool {
@@ -5118,6 +5208,42 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_diagnostic_classifies_failures_without_returning_untrusted_output() {
+        for (stderr, category) in [
+            ("HTTP 403: API rate limit exceeded", "rate-limited"),
+            ("HTTP 401: Bad credentials", "authentication"),
+            (
+                "GraphQL: Resource not accessible by integration",
+                "authorization",
+            ),
+            ("GraphQL: Head branch was modified", "head-changed"),
+            ("GraphQL: Pull Request is not mergeable", "merge-policy"),
+            ("net/http: TLS handshake timeout", "timeout"),
+            ("dial tcp: connection refused", "transport"),
+            ("HTTP 401: unknown", "http-401"),
+            ("HTTP 403: unknown", "http-403"),
+            ("HTTP 404: unknown", "http-404"),
+            ("HTTP 409: unknown", "http-409"),
+            ("HTTP 422: unknown", "http-422"),
+            ("HTTP 502: unknown", "http-5xx"),
+            ("GraphQL: unknown", "graphql-other"),
+            ("failed to run git: exit status 128", "local-git"),
+            ("unknown", "other"),
+        ] {
+            let input = format!(
+                "{stderr}\nAuthorization: Bearer TEST_SECRET\nhttps://example.invalid/?private=TEST_PRIVATE\n"
+            );
+            let diagnostic = merge_failure_diagnostic(Some(1), &input);
+            assert!(diagnostic.contains(&format!("exit=1, category={category}")));
+            assert!(!diagnostic.contains("TEST_SECRET"));
+            assert!(!diagnostic.contains("TEST_PRIVATE"));
+            assert!(!diagnostic.contains("example.invalid"));
+            assert!(!diagnostic.contains('\n'));
+        }
+        assert!(merge_failure_diagnostic(None, "").contains("exit=signal, category=other"));
+    }
 
     #[test]
     fn first_main_sync_accepts_only_an_empty_unborn_main() {
