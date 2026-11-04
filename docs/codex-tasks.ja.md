@@ -22,6 +22,19 @@ codex-task events --task-id issue-123 --json
 codex-task ack --task-id issue-123 --through 42
 ```
 
+親が作業を分割するときは、`--authorization '利用者の元の目的・明示境界'`を別に保存します。
+`--objective`は今回の部分作業です。通常はfinishまで進み、利用者が明示した場合だけ
+`--stop-after pr`または`--stop-after merge`を指定します。内部workerの「PRまで」は段階間の
+引継ぎであり、上位の依頼の終了境界にはなりません。終了境界へ到達したtaskは
+`boundary_reached`となり、未統合のsource・PRを保持します。
+
+既存方針でFree/private経路が明示されているrepositoryは、受付時に
+`--gate-mode github-free-private`を付けます。risk下限はhighです。Rules APIの403から推測せず、
+live private repository policy、同repositoryのPR、固定headと実mergeのActions・statusを確認します。
+既存の停止taskへこの明示policyを反映する場合は、worker停止を確認後、
+`resume --task-id <ID> --instruction '<既存許可と次の作業>' --gate-mode github-free-private`
+を使います。旧review/CIを無効化して実装・検証から再照合し、merge後のpolicy変更は拒否します。
+
 `submit`は登録、`start`は端末から切り離したcoordinatorの起動です。既に稼働中なら重複起動しません。
 Codexのshell sandboxからは、既存approvalで同UIDの通常ホスト側に`start`／`run`／`reconcile`を渡します。
 子Codex runtimeはローカル設定・cache・stateへの書込みが必要で、`setsid`は親sandboxのread-only mountを解放しません。
@@ -95,7 +108,28 @@ codex-task start
 `pause`はworkerへ停止を要求し、既存のLinux process-tree監督が子processを回収します。
 `resume`はworkerの状態と生存lockが解放されるまで拒否します。古い実行世代の結果を新しい結果へ混ぜません。
 完了報告前に中断した場合も、旧writer停止を確認した後に既存のGit・PR・delivery状態から再開します。
-同じtaskの修正・中断が3回続けば作業を保持して停止します。これはtask受付数の上限ではありません。
+技術的なblocked、未分類の判断待ち、中断、反復修正は、旧writerの停止確認後に読み取り専用の
+`diagnosis`へ戻します。診断は元のauthorizationと親のfile分割、原因、証拠、次の対応、解消条件を
+分け、修復・再分割・元依頼内の後続task登録へ接続します。高riskや回数だけで人間待ちにしません。
+真正な製品・scope・新権限・費用・不可逆性・重大リスクの判断だけ、質問・影響・推奨案を保存して
+`awaiting_decision`へ返します。利用者によるpauseと終了境界は自動解除しません。
+
+同じ原因・証拠での診断再試行は有限です。3回の再試行後も進展がなければ`waiting`へ移し、
+CI/Git状態、後続task、hostの実行可否、非秘密のworkspace相対pathのmetadataをRustが120秒ごとに
+監視します。変化がない限りAI workerを再起動せず、変化後に再診断します。
+watch_pathsは診断が指定する相対pathで、絶対path・親参照・.git・symlink経由は拒否し、内容を読みません。
+外部条件を直接観測できない場合は、その条件を反映する非秘密file等の観測対象を指定します。
+OS停止中の実行はできませんが、同hostで次回start/runしたときに保存状態から再照合できます。
+
+コードレビューは固定差分と比例したlocal検証を確認します。CI起動と成功はその後の段階です。
+Rustはレビュー後に委任済みの既存labelだけをPR/head/baseと照合して付与し、最大5分の状態反映待ちを
+挟んで実CIを観測します。CI未起動やadmission failureだけでコードレビューをblockedにしません。
+CI状態が15分進まない場合は診断へ渡し、許可内の再実行・復旧と外部待機を区別します。
+
+main CI失敗では後続mergeのbarrierを維持し、読み取り専用診断から元依頼内の修復task/PRを登録できます。
+その修復taskだけは親barrierを通せます。元の失敗証跡を保持し、修復task完了後に修復mergeの成功・
+固定head・元mergeからの祖先関係を再観測した証拠を別に保存してから、元taskのfinishへ進みます。
+元のreceipt、PR head CI、review、live policy、main到達性、cleanupのhelper検証は維持します。
 CI待ちにはCodexを起動せず、Rustが現在のPR・head・base・test merge commitとcheck/statusを照合します。
 APIエラーはCI失敗と分けてbackoffし、check不足・cancel・timeout・skipのみを成功扱いしません。
 
@@ -124,6 +158,13 @@ CPU、MemAvailable、disk空き容量を測り、実行枠を決めます。受�
 host-localの`.tasks/budget.json`でworkerごとのRAM予約量、hostに残すRAM、最低disk空きを調整できます。
 既定はそれぞれ2048、1024、2048 MiBです。portやDB等の共有資源は`--resource`で排他し、
 依存関係は`--depends-on`で記録します。単なるtext conflictの有無で互換性を保証しません。
+
+CI待ちはAI worker枠を占有しません。実行可能なtaskを段階と待機時間で並べ、review・統合・後処理に
+小さな優先度を付けつつ、長く待った実装にも順番を回します。各起動直前にもhost資源を再計測します。
+ここでのRAM・diskはCodex実行hostの値です。CI runnerの余力・queue・完了見込を推測して選びません。
+`list --json`の`waiting_on`はCI、依存、共有資源、host容量、統合barrier、外部観測、人間判断を区別します。
+診断の後続taskはpolicy・risk・CI label・利用者の終了境界を継承し、同じ目的の再報告を二重登録しません。
+実装段階で後続taskの先行待ちを指定すると親sourceの完了を待ち、診断中は独立した部分作業へ分けます。
 
 ## OS起動管理と現在の対応範囲
 

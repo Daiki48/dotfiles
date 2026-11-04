@@ -1111,6 +1111,33 @@ pub(crate) fn task_head(cwd: &Path) -> Result<String, WorktreeError> {
     git_stdout(cwd, &["rev-parse", "--verify", "HEAD^{commit}"]).map(|head| head.trim().into())
 }
 
+/// 監視には状態のdigestだけを渡し、file名や内容をtaskイベントへ保存しない。
+pub(crate) fn task_observation(cwd: &Path) -> Result<String, WorktreeError> {
+    use sha2::{Digest, Sha256};
+    let head = task_head(cwd)?;
+    let status = git_stdout(
+        cwd,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+    )?;
+    let mut observed = format!("{head}\n{status}");
+    for row in status.split('\0') {
+        if row.len() < 4 {
+            continue;
+        }
+        let relative = &row[3..];
+        if !Path::new(relative)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        if let Ok(metadata) = fs::symlink_metadata(cwd.join(relative)) {
+            observed.push_str(&format!("|{}|{:?}", metadata.len(), metadata.modified()));
+        }
+    }
+    Ok(format!("{:x}", Sha256::digest(observed)))
+}
+
 pub(crate) fn task_completed(cwd: &Path, task: &str) -> Result<bool, WorktreeError> {
     let repository = inspect_repository(cwd, false, false)?;
     let manifests = load_manifests(&repository)?;

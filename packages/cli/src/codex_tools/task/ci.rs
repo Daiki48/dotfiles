@@ -35,6 +35,7 @@ pub(super) enum GateMode {
     #[default]
     Strict,
     LocalValidation,
+    GithubFreePrivate,
 }
 
 impl GateMode {
@@ -42,6 +43,7 @@ impl GateMode {
         match self {
             Self::Strict => "strict",
             Self::LocalValidation => "local-validation",
+            Self::GithubFreePrivate => "github-free-private",
         }
     }
 }
@@ -82,6 +84,9 @@ impl Observation {
     pub fn allows_delivery(&self) -> bool {
         match (self.gate_mode, self.state) {
             (GateMode::Strict, CiState::Success) => true,
+            (GateMode::GithubFreePrivate, CiState::Success) => {
+                free_private_actions_success(&self.snapshot, &self.target)
+            }
             (GateMode::LocalValidation, CiState::LocalValidation) => {
                 self.workflows.as_ref().is_some_and(|evidence| {
                     evidence.base.commit == self.base
@@ -172,28 +177,96 @@ pub(super) fn observe(
     repository: &str,
     pr: u64,
     main: Option<GateMode>,
+    policy: GateMode,
 ) -> Result<Observation, String> {
-    observe_with(repository, pr, main, &mut |args| task_gh_json(root, args))
+    observe_with_policy(repository, pr, main, policy, &mut |args| {
+        task_gh_json(root, args)
+    })
+}
+
+pub(super) fn observe_repair(
+    root: &Path,
+    repository: &str,
+    original_merge: &str,
+    pr: u64,
+    head: &str,
+    main: GateMode,
+    policy: GateMode,
+) -> Result<Observation, String> {
+    observe_repair_with(
+        repository,
+        original_merge,
+        pr,
+        head,
+        main,
+        policy,
+        &mut |args| task_gh_json(root, args),
+    )
 }
 
 type Fetch<'a> = dyn FnMut(&[String]) -> Result<Value, String> + 'a;
 
+#[cfg(test)]
 fn observe_with(
     repository: &str,
     pr: u64,
     main: Option<GateMode>,
     fetch: &mut Fetch<'_>,
 ) -> Result<Observation, String> {
+    // 既存fixture用の互換wrapper。main receiptがなければ従来の自動選択を保つ。
+    observe_with_selection(repository, pr, main, main, fetch)
+}
+
+fn observe_with_policy(
+    repository: &str,
+    pr: u64,
+    main: Option<GateMode>,
+    policy: GateMode,
+    fetch: &mut Fetch<'_>,
+) -> Result<Observation, String> {
+    // Strict is the default policy: workflow-free repositories retain the local gate.
+    // Preserve an existing local receipt, but never reinterpret a FreePrivate receipt.
+    let selection = if policy == GateMode::Strict {
+        if main == Some(GateMode::GithubFreePrivate) {
+            return Err("github-free-private receiptをstrict policyへ変更できません".into());
+        }
+        None
+    } else {
+        Some(policy)
+    };
+    observe_with_selection(repository, pr, main, selection, fetch)
+}
+
+fn observe_with_selection(
+    repository: &str,
+    pr: u64,
+    main: Option<GateMode>,
+    policy: Option<GateMode>,
+    fetch: &mut Fetch<'_>,
+) -> Result<Observation, String> {
     validate_repository(repository)?;
     if pr == 0 {
         return Err("PR番号は1以上である必要があります".into());
     }
+    if main.is_some_and(|receipt| policy.is_some_and(|policy| receipt != policy)) {
+        return Err("mainのCI gate modeが受付policyと一致しません".into());
+    }
 
-    let before = fetch_pull_request(repository, pr, fetch)?;
+    let requested_mode = main.or(policy);
+    if requested_mode == Some(GateMode::GithubFreePrivate) {
+        validate_github_free_private_repository(repository, fetch)?;
+    }
+
+    let before = fetch_pull_request(
+        repository,
+        pr,
+        requested_mode == Some(GateMode::GithubFreePrivate),
+        fetch,
+    )?;
     let base = workflow_tree(repository, &before.base, fetch)?;
     let head = workflow_tree(repository, &before.head, fetch)?;
     let workflow_free = base.workflows.is_empty() && head.workflows.is_empty();
-    let gate_mode = if let Some(gate) = main {
+    let gate_mode = if let Some(gate) = requested_mode {
         // merge前に選んだreceiptのgateを保持し、mainの変化で切り替えない。
         if gate == GateMode::LocalValidation && !workflow_free {
             return Err("local-validationのbase/headにworkflowが存在します".into());
@@ -204,7 +277,12 @@ fn observe_with(
     } else {
         GateMode::Strict
     };
-    let rules = required_checks(repository, &before.base_ref, fetch)?;
+    let rules = if gate_mode == GateMode::GithubFreePrivate {
+        // FreePrivateはRules APIに依存しない。403などのAPI失敗を別modeへ変換しない。
+        Vec::new()
+    } else {
+        required_checks(repository, &before.base_ref, fetch)?
+    };
     let (target, snapshot, main_tree) = if main.is_some() {
         let target = before
             .merge_commit
@@ -235,8 +313,11 @@ fn observe_with(
             .filter(|candidate| gate_mode == GateMode::Strict && *candidate != before.head)
             .map(|candidate| fetch_snapshot(repository, candidate, fetch))
             .transpose()?;
-        let (target, snapshot) = if gate_mode == GateMode::LocalValidation {
-            // test mergeの成功で固定headに実在するActions checkを隠さない。
+        let (target, snapshot) = if matches!(
+            gate_mode,
+            GateMode::LocalValidation | GateMode::GithubFreePrivate
+        ) {
+            // local/free-privateはtest mergeで固定headの証跡を隠さない。
             (before.head.clone(), head_snapshot)
         } else {
             select_target(
@@ -251,13 +332,32 @@ fn observe_with(
 
     // rules/check/statusを個別に照会した後、PRを再取得する。
     // 観測中にGitHub上のPRが変わっていたら、このsnapshotを信頼しない。
-    let after = fetch_pull_request(repository, pr, fetch)?;
+    let after = fetch_pull_request(
+        repository,
+        pr,
+        requested_mode == Some(GateMode::GithubFreePrivate),
+        fetch,
+    )?;
+    if gate_mode == GateMode::GithubFreePrivate {
+        // 観測中にprivate/merge policyが変わっていないことも確認する。
+        validate_github_free_private_repository(repository, fetch)?;
+    }
     let changed = before != after;
     let mut state = if changed {
         CiState::Stale
     } else {
         classify(&rules, &snapshot.runs, &snapshot.statuses, &target)
     };
+    if gate_mode == GateMode::GithubFreePrivate
+        && state == CiState::Success
+        && !free_private_actions_success(&snapshot, &target)
+    {
+        state = if has_only_skipped_or_neutral_checks(&snapshot, &target) {
+            CiState::Skipped
+        } else {
+            CiState::Missing
+        };
+    }
     if state == CiState::Success
         && snapshot
             .runs
@@ -313,9 +413,56 @@ fn observe_with(
     })
 }
 
+fn observe_repair_with(
+    repository: &str,
+    original_merge: &str,
+    pr: u64,
+    head: &str,
+    main: GateMode,
+    policy: GateMode,
+    fetch: &mut Fetch<'_>,
+) -> Result<Observation, String> {
+    validate_sha(original_merge).map_err(|_| "元merge SHAが不正です".to_string())?;
+    validate_sha(head).map_err(|_| "修復PR head SHAが不正です".to_string())?;
+    let original_merge = original_merge.to_ascii_lowercase();
+    let head = head.to_ascii_lowercase();
+    let observation = observe_with_policy(repository, pr, Some(main), policy, fetch)?;
+
+    if observation.head != head {
+        return Err("修復PR headが固定したchild SHAと一致しません".into());
+    }
+    if !observation.merged
+        || observation.merge_commit.as_deref() != Some(observation.target.as_str())
+        || observation.target == original_merge
+    {
+        return Err("修復PRの実mergeを確認できません".into());
+    }
+    if !observation.allows_delivery() {
+        return Err("修復mergeのCI証跡が成功していません".into());
+    }
+
+    let comparison = get(
+        fetch,
+        format!(
+            "repos/{repository}/compare/{original_merge}...{}",
+            observation.target
+        ),
+    )?;
+    if nested_sha(
+        &comparison,
+        &["merge_base_commit", "sha"],
+        "元mergeと修復mergeのmerge base",
+    )? != original_merge
+    {
+        return Err("修復mergeが元mergeの子孫ではありません".into());
+    }
+    Ok(observation)
+}
+
 fn fetch_pull_request(
     repository: &str,
     pr: u64,
+    require_same_repository: bool,
     fetch: &mut Fetch<'_>,
 ) -> Result<PullRequest, String> {
     let value = fetch(&[
@@ -324,6 +471,12 @@ fn fetch_pull_request(
         "--method".into(),
         "GET".into(),
     ])?;
+    if require_same_repository
+        && (!repository_identity_matches(value.pointer("/head/repo/full_name"), repository)
+            || !repository_identity_matches(value.pointer("/base/repo/full_name"), repository))
+    {
+        return Err("github-free-privateのPR head/base repository identityが一致しません".into());
+    }
     let base_ref = nested_text(&value, &["base", "ref"], "PR base branch")?;
     // PR payloadのbase.shaはmerge後も古いことがある。対象branchの実refを正本にする。
     let reference = get(
@@ -349,6 +502,36 @@ fn fetch_pull_request(
             .and_then(Value::as_bool)
             .ok_or_else(|| "GitHub PRのmerged状態を確認できません".to_string())?,
     })
+}
+
+fn repository_identity_matches(value: Option<&Value>, repository: &str) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|identity| identity.eq_ignore_ascii_case(repository))
+}
+
+fn validate_github_free_private_repository(
+    repository: &str,
+    fetch: &mut Fetch<'_>,
+) -> Result<(), String> {
+    let value = get(fetch, format!("repos/{repository}"))?;
+    let expected: [(&str, Value); 8] = [
+        ("full_name", Value::String(repository.to_owned())),
+        ("private", Value::Bool(true)),
+        ("visibility", Value::String("private".into())),
+        ("default_branch", Value::String("main".into())),
+        ("archived", Value::Bool(false)),
+        ("disabled", Value::Bool(false)),
+        ("allow_merge_commit", Value::Bool(true)),
+        ("allow_auto_merge", Value::Bool(false)),
+    ];
+    if expected
+        .iter()
+        .any(|(key, expected)| value.get(*key) != Some(expected))
+    {
+        return Err("github-free-privateのlive repository policyが一致しません".into());
+    }
+    Ok(())
 }
 
 fn select_target(
@@ -821,6 +1004,39 @@ fn parse_statuses(value: &Value, sha: &str) -> Result<Vec<CommitStatus>, String>
 
 fn contains_any_status(snapshot: &Snapshot) -> bool {
     !snapshot.runs.is_empty() || !snapshot.statuses.is_empty()
+}
+
+fn free_private_actions_success(snapshot: &Snapshot, target: &str) -> bool {
+    let target = target.to_ascii_lowercase();
+    snapshot.runs.iter().any(|check| {
+        check.head_sha == target
+            && check.app_slug.as_deref() == Some("github-actions")
+            && check.status == "completed"
+            && check.conclusion.as_deref() == Some("success")
+            && check.check_suite_id.is_some()
+            && check.workflow_run.as_ref().is_some_and(|run| {
+                run.head_sha.to_ascii_lowercase() == target
+                    && run.status == "completed"
+                    && run.conclusion.as_deref() == Some("success")
+                    && check.check_suite_id == Some(run.check_suite_id)
+                    && check.run_id == Some(run.id)
+                    && check.run_attempt == Some(run.run_attempt)
+            })
+    })
+}
+
+fn has_only_skipped_or_neutral_checks(snapshot: &Snapshot, target: &str) -> bool {
+    let target = target.to_ascii_lowercase();
+    let runs: Vec<_> = snapshot
+        .runs
+        .iter()
+        .filter(|run| run.head_sha == target)
+        .collect();
+    !runs.is_empty()
+        && runs.iter().all(|run| {
+            run.status == "completed"
+                && matches!(run.conclusion.as_deref(), Some("skipped" | "neutral"))
+        })
 }
 
 fn classify(
