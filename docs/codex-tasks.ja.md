@@ -28,8 +28,12 @@ OSサービスを登録せずに使えます。`run`は前景で継続し、`rec
 
 実装workerは検証・commit・push・Draft PRまで、必要な独立レビューworkerは読み取り専用、
 統合workerは既存の`codex-delivery record-review→deliver`、後処理workerは`finish`を担当します。
-low/mediumは実装時のself-review、高以上は別workerの独立レビューを使います。
+受付を担当するmainが`submit --risk low|medium|high|critical`でレビュー深度の下限を決めます。
+既定はhighです。実装workerの報告では引き下げず、必要な場合は引き上げます。
+受付時点でlow/mediumと判断できた場合は実装時のself-review、高以上は別workerの独立レビューを使います。
 統合はrepository単位で順序を管理し、merge commitのmain CI完了まで後続統合を待たせます。
+CI起動に既存の委任済み承認操作が必要な場合は、固定HEADのレビュー後に専用段階で行います。
+その操作が済んだ後のCI待ちはRustへ返し、成功確認後に統合workerを起動します。
 既存deliveryのreview receipt・固定SHA・remote gate・cleanup検証を省略しません。
 
 ## 保存場所とhost境界

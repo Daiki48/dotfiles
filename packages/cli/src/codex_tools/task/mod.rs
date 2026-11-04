@@ -46,6 +46,8 @@ enum Commands {
         depends_on: Vec<String>,
         #[arg(long)]
         resource: Vec<String>,
+        #[arg(long, default_value = "high", value_parser = ["low", "medium", "high", "critical"])]
+        risk: String,
     },
     List,
     Show {
@@ -103,6 +105,7 @@ enum Commands {
 enum Phase {
     Implementation,
     Review,
+    CiAuthorization,
     Integration,
     MainCi,
     Finish,
@@ -139,6 +142,7 @@ struct Task {
     github: String,
     branch: String,
     objective: String,
+    risk: String,
     dependencies: Vec<String>,
     resources: Vec<String>,
     phase: Phase,
@@ -153,6 +157,7 @@ struct Task {
     review: Option<worker::Report>,
     checkpoint: String,
     ci_fingerprint: String,
+    ci_state: Option<ci::CiState>,
     next_check: u64,
     failures: u32,
     pause_requested: bool,
@@ -172,6 +177,13 @@ fn valid_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn risk_rank(risk: &str) -> usize {
+    ["low", "medium", "high", "critical"]
+        .iter()
+        .position(|candidate| *candidate == risk)
+        .unwrap_or(usize::MAX)
+}
+
 impl Task {
     fn validate(&self) -> Result<()> {
         if self.version != 1
@@ -179,6 +191,7 @@ impl Task {
             || self.host.len() != 64
             || !self.repository.is_absolute()
             || !safe_text(&self.objective, 32 * 1024)
+            || risk_rank(&self.risk) == usize::MAX
             || !self.github.contains('/')
             || !self.branch.starts_with("feat/")
             || self.branch.contains(['\n', '\r', '\0'])
@@ -195,6 +208,8 @@ impl Task {
                 .is_some_and(|head| !valid_sha(head))
             || self.events.len() > 128
             || self.checkpoint.len() > 32 * 1024
+            || (matches!(self.phase, Phase::CiAuthorization | Phase::Integration)
+                && !review_ready(self))
             || self
                 .run
                 .as_ref()
@@ -283,6 +298,7 @@ fn submit(
     branch: Option<String>,
     dependencies: Vec<String>,
     resources: Vec<String>,
+    risk: String,
 ) -> Result<Value> {
     if !valid_id(&id) || !safe_text(&objective, 32 * 1024) {
         return Err("task IDまたは目的が不正です".into());
@@ -298,6 +314,7 @@ fn submit(
         if task.objective == objective
             && task.dependencies == dependencies
             && task.resources == resources
+            && task.risk == risk
             && branch.as_ref().is_none_or(|branch| branch == &task.branch)
         {
             return Ok(json!({"task_id":id,"existing":true,"phase":task.phase}));
@@ -320,6 +337,7 @@ fn submit(
         github: context.github.clone(),
         branch: branch.unwrap_or_else(|| format!("feat/{id}")),
         objective,
+        risk,
         dependencies,
         resources,
         phase: Phase::Implementation,
@@ -334,6 +352,7 @@ fn submit(
         review: None,
         checkpoint: String::new(),
         ci_fingerprint: String::new(),
+        ci_state: None,
         next_check: 0,
         failures: 0,
         pause_requested: false,
@@ -355,7 +374,14 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
     }
     let path = worker::report_path(&context.store, &task.id, run.generation)?;
     let report: worker::Report = match path.try_exists() {
-        Ok(true) => store::read_json(&path)?,
+        Ok(true) => match store::read_json(&path) {
+            Ok(report) => report,
+            Err(reason) => {
+                task.run = None;
+                task.stop(Phase::Blocked, &reason);
+                return Ok(());
+            }
+        },
         Ok(false) => {
             task.run = None;
             task.failures += 1;
@@ -378,11 +404,26 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
         Err(_) => return Err("worker報告を検査できません".into()),
     };
     if report.generation != run.generation {
-        return Err("古いworker報告を拒否しました".into());
+        task.run = None;
+        task.stop(
+            Phase::Blocked,
+            "古いworker報告を拒否しました。旧報告は保持し、再開時は新しい実行世代を使います",
+        );
+        return Ok(());
     }
-    report.validate()?;
-    if run.phase != Phase::Implementation && report.head != task.head {
-        return Err("worker報告のレビュー対象HEADが一致しません".into());
+    if let Err(reason) = report.validate() {
+        task.run = None;
+        task.stop(Phase::Blocked, &reason);
+        return Ok(());
+    }
+    if risk_rank(&report.risk) > risk_rank(&task.risk) {
+        task.risk = report.risk.clone();
+    }
+    if run.phase != Phase::Implementation && (report.head != task.head || report.pr != task.pr) {
+        task.run = None;
+        task.stop(Phase::Blocked, "worker報告のレビュー対象HEADが一致しません");
+        task.resume_phase = Phase::Implementation;
+        return Ok(());
     }
     task.run = None;
     task.checkpoint = report.summary.clone();
@@ -403,12 +444,15 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
                     .as_deref()
                     .filter(|head| valid_sha(head))
                     .ok_or("worker報告に固定HEADがありません")?;
+                if task.head.as_deref() != Some(head) {
+                    task.failures = 0;
+                }
                 task.pr = Some(pr);
                 task.head = Some(head.into());
                 task.review = None;
-                if matches!(report.risk.as_str(), "low" | "medium") {
+                if risk_rank(&task.risk) < risk_rank("high") {
                     task.review = Some(report.clone());
-                    task.phase = Phase::Integration;
+                    task.phase = Phase::CiAuthorization;
                 } else {
                     task.phase = Phase::Review;
                 }
@@ -416,6 +460,9 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
             }
             Phase::Review => {
                 task.review = Some(report.clone());
+                task.phase = Phase::CiAuthorization;
+            }
+            Phase::CiAuthorization => {
                 task.phase = Phase::Integration;
             }
             Phase::Integration => {
@@ -452,7 +499,7 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
     if task.next_check > now()
         || !matches!(
             task.phase,
-            Phase::Review | Phase::Integration | Phase::MainCi
+            Phase::Review | Phase::CiAuthorization | Phase::Integration | Phase::MainCi
         )
     {
         return Ok(());
@@ -474,11 +521,13 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
     let observation = match result {
         Ok(observation) => observation,
         Err(reason) => {
+            task.ci_state = None;
             task.event("api_wait", &reason);
             task.next_check = now() + 120;
             return Ok(());
         }
     };
+    task.ci_state = Some(observation.state);
     if task.ci_fingerprint != observation.fingerprint {
         task.ci_fingerprint = observation.fingerprint;
         task.event("ci", &format!("{:?}", observation.state));
@@ -495,11 +544,7 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
         }
     } else {
         if task.head.as_ref() != Some(&observation.head) {
-            task.review = None;
-            task.stop(
-                Phase::Blocked,
-                "PRのHEADがworker報告と異なります。作業を照合してください",
-            );
+            stale_head(task);
             return Ok(());
         }
         if task
@@ -518,6 +563,8 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
         ci::CiState::Success => {
             if task.phase == Phase::MainCi {
                 task.phase = Phase::Finish;
+            } else if task.phase == Phase::CiAuthorization {
+                task.phase = Phase::Integration;
             }
         }
         ci::CiState::Failure => {
@@ -544,17 +591,64 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
     Ok(())
 }
 
+fn stale_head(task: &mut Task) {
+    task.review = None;
+    task.stop(Phase::Blocked,"PRのHEADがworker報告と異なります。再開時に実装段階からGit・PRを照合してレビューをやり直します");
+    task.resume_phase = Phase::Implementation;
+}
+
+fn resume_task(context: &Context, task_id: &str, instruction: String) -> Result<Value> {
+    if !safe_text(&instruction, 32 * 1024) {
+        return Err("追加指示が不正です".into());
+    }
+    let _lock = context.store.lock()?;
+    let mut task = context.load(task_id)?;
+    if task.run.is_some() || Lock::try_acquire(&context.store.lease_path(task_id)?)?.is_none() {
+        return Err("workerが動作中です。停止と回収を確認するまで再割当てしません".into());
+    }
+    if task.phase == Phase::Completed {
+        return Err("完了taskへ追加作業は登録できません。別taskとして依頼してください".into());
+    }
+    task.pause_requested = false;
+    task.failures = 0;
+    task.checkpoint = instruction;
+    if matches!(
+        task.phase,
+        Phase::Blocked | Phase::AwaitingDecision | Phase::Paused
+    ) {
+        task.phase = task.resume_phase.clone();
+    }
+    task.event("resumed", "追加指示を保存しました");
+    context.store.save(&task)?;
+    Ok(json!({"task_id":task_id,"phase":task.phase}))
+}
+
 fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
     if task.run.is_some()
         || task.pause_requested
         || !matches!(
             task.phase,
-            Phase::Implementation | Phase::Review | Phase::Integration | Phase::Finish
+            Phase::Implementation
+                | Phase::Review
+                | Phase::CiAuthorization
+                | Phase::Integration
+                | Phase::Finish
         )
     {
         return Ok(false);
     }
     if task.failures >= 3 {
+        return Ok(false);
+    }
+    if matches!(task.phase, Phase::CiAuthorization | Phase::Integration) && !review_ready(task) {
+        return Ok(false);
+    }
+    if task.phase == Phase::CiAuthorization
+        && !matches!(
+            task.ci_state,
+            Some(ci::CiState::Pending | ci::CiState::Missing)
+        )
+    {
         return Ok(false);
     }
     for dependency in &task.dependencies {
@@ -600,6 +694,14 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn review_ready(task: &Task) -> bool {
+    task.head.is_some()
+        && task.pr.is_some()
+        && task.review.as_ref().is_some_and(|review| {
+            review.outcome == "ready" && review.head == task.head && review.pr == task.pr
+        })
 }
 
 fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
@@ -779,7 +881,7 @@ fn start(context: &Context) -> Result<Value> {
 fn execute(cli: Cli) -> Result<Value> {
     let context = Context::open()?;
     match cli.command {
-        Commands::Submit { task_id, objective, branch, depends_on, resource } => submit(&context, task_id, objective, branch, depends_on, resource),
+        Commands::Submit { task_id, objective, branch, depends_on, resource, risk } => submit(&context, task_id, objective, branch, depends_on, resource, risk),
         Commands::List => Ok(json!(context.store.list()?.iter().map(|task| json!({"task_id":task.id,"phase":task.phase,"running":task.run.is_some(),"updated":task.updated})).collect::<Vec<_>>())),
         Commands::Show { task_id } => Ok(json!(context.load(&task_id)?)),
         Commands::Events { task_id } => Ok(json!(context.load(&task_id)?.events)),
@@ -793,16 +895,7 @@ fn execute(cli: Cli) -> Result<Value> {
             Ok(json!({"task_id":task_id,"pause_requested":true}))
         }
         Commands::Resume { task_id, instruction } => {
-            if !safe_text(&instruction, 32 * 1024) { return Err("追加指示が不正です".into()); }
-            let _lock = context.store.lock()?;
-            let mut task = context.load(&task_id)?;
-            if task.run.is_some() || Lock::try_acquire(&context.store.lease_path(&task_id)?)?.is_none() { return Err("workerが動作中です。停止と回収を確認するまで再割当てしません".into()); }
-            if task.phase == Phase::Completed { return Err("完了taskへ追加作業は登録できません。別taskとして依頼してください".into()); }
-            task.pause_requested = false; task.failures = 0; task.checkpoint = instruction;
-            if matches!(task.phase, Phase::Blocked | Phase::AwaitingDecision | Phase::Paused) { task.phase = task.resume_phase.clone(); }
-            task.event("resumed", "追加指示を保存しました");
-            context.store.save(&task)?;
-            Ok(json!({"task_id":task_id,"phase":task.phase}))
+            resume_task(&context,&task_id,instruction)
         }
         Commands::Reconcile | Commands::Run { .. } => {
             worker::preflight(&context)?;
@@ -915,6 +1008,7 @@ pub(crate) fn invocation_reason(args: &[String]) -> Option<String> {
             branch,
             depends_on,
             resource,
+            ..
         } => (!valid_id(&task_id)
             || !safe_text(&objective, 32 * 1024)
             || branch.is_some_and(|branch| {
@@ -979,6 +1073,7 @@ mod tests {
                 None,
                 vec![],
                 vec![],
+                "high".into(),
             )
             .unwrap();
         }
@@ -1002,7 +1097,8 @@ mod tests {
                 "別の作業".into(),
                 None,
                 vec![],
-                vec![]
+                vec![],
+                "high".into()
             )
             .is_err()
         );
@@ -1019,7 +1115,8 @@ mod tests {
                 "実装".into(),
                 None,
                 vec!["task-missing".into()],
-                vec![]
+                vec![],
+                "high".into()
             )
             .is_err()
         );
@@ -1031,6 +1128,7 @@ mod tests {
             None,
             vec!["task-one".into()],
             vec![],
+            "high".into(),
         )
         .unwrap();
         assert!(
@@ -1040,7 +1138,8 @@ mod tests {
                 "実装".into(),
                 None,
                 vec!["task-two".into()],
-                vec![]
+                vec![],
+                "high".into()
             )
             .is_err()
         );
@@ -1086,6 +1185,8 @@ mod tests {
         fixture.submit("task-one");
         let mut task = fixture.0.load("task-one").unwrap();
         task.generation = 1;
+        task.failures = 2;
+        task.head = Some("a".repeat(40));
         task.run = Some(Run {
             generation: 1,
             phase: Phase::Implementation,
@@ -1112,9 +1213,11 @@ mod tests {
         assert!(task.run.is_some());
         drop(lease);
         apply_report(&fixture.0, &mut task).unwrap();
-        assert_eq!(task.phase, Phase::Integration);
+        assert_eq!(task.phase, Phase::Review);
+        assert_eq!(task.risk, "high");
         assert!(task.run.is_none());
         assert_eq!(task.pr, Some(12));
+        assert_eq!(task.failures, 0);
     }
 
     #[test]
@@ -1151,8 +1254,19 @@ mod tests {
             &report,
         )
         .unwrap();
-        assert!(apply_report(&fixture.0, &mut task).is_err());
-        assert!(task.run.is_some());
+        apply_report(&fixture.0, &mut task).unwrap();
+        assert_eq!(task.phase, Phase::Blocked);
+        assert!(task.run.is_none());
+        fixture.0.store.save(&task).unwrap();
+        resume_task(
+            &fixture.0,
+            &task.id,
+            "旧報告を保持して新しい実行世代で再開する".into(),
+        )
+        .unwrap();
+        let resumed = fixture.0.load(&task.id).unwrap();
+        assert_eq!(resumed.phase, Phase::Implementation);
+        assert_eq!(resumed.generation, 2);
     }
 
     #[test]
@@ -1170,6 +1284,107 @@ mod tests {
     }
 
     #[test]
+    fn changed_pr_head_resumes_implementation_without_reusing_the_review() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        task.phase = Phase::Integration;
+        task.head = Some("a".repeat(40));
+        task.pr = Some(12);
+        task.review = Some(worker::Report {
+            generation: 1,
+            outcome: "ready".into(),
+            summary: "旧レビュー".into(),
+            pr: task.pr,
+            head: task.head.clone(),
+            risk: "high".into(),
+        });
+        stale_head(&mut task);
+        fixture.0.store.save(&task).unwrap();
+        assert_eq!(task.phase, Phase::Blocked);
+        assert!(task.review.is_none());
+        resume_task(
+            &fixture.0,
+            &task.id,
+            "更新されたPRを照合して継続する".into(),
+        )
+        .unwrap();
+        let resumed = fixture.0.load(&task.id).unwrap();
+        assert_eq!(resumed.phase, Phase::Implementation);
+        assert!(ready(&fixture.0, &resumed, std::slice::from_ref(&resumed)).unwrap());
+    }
+
+    #[test]
+    fn trusted_low_risk_input_can_use_self_review_but_worker_cannot_lower_high_risk() {
+        let fixture = Fixture::new();
+        submit(
+            &fixture.0,
+            "task-low".into(),
+            "局所的な変更".into(),
+            None,
+            vec![],
+            vec![],
+            "low".into(),
+        )
+        .unwrap();
+        let mut task = fixture.0.load("task-low").unwrap();
+        task.generation = 1;
+        task.run = Some(Run {
+            generation: 1,
+            phase: Phase::Implementation,
+            started: now(),
+        });
+        let report = worker::Report {
+            generation: 1,
+            outcome: "ready".into(),
+            summary: "self-review済み".into(),
+            pr: Some(1),
+            head: Some("b".repeat(40)),
+            risk: "low".into(),
+        };
+        store::atomic_json(
+            &worker::report_path(&fixture.0.store, &task.id, 1).unwrap(),
+            &report,
+        )
+        .unwrap();
+        apply_report(&fixture.0, &mut task).unwrap();
+        assert_eq!(task.phase, Phase::CiAuthorization);
+        assert!(task.review.is_some());
+    }
+
+    #[test]
+    fn ci_authorization_can_run_before_ci_success_but_not_during_api_outage() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        task.phase = Phase::CiAuthorization;
+        task.pr = Some(12);
+        task.head = Some("a".repeat(40));
+        task.ci_state = Some(ci::CiState::Pending);
+        assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        task.review = Some(worker::Report {
+            generation: 1,
+            outcome: "ready".into(),
+            summary: "固定HEADのレビュー済み".into(),
+            pr: task.pr,
+            head: task.head.clone(),
+            risk: "high".into(),
+        });
+        for state in [ci::CiState::Pending, ci::CiState::Missing] {
+            task.ci_state = Some(state);
+            assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        }
+        for state in [
+            None,
+            Some(ci::CiState::Failure),
+            Some(ci::CiState::Cancelled),
+        ] {
+            task.ci_state = state;
+            assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        }
+    }
+
+    #[test]
     fn unsafe_and_foreign_state_is_not_accepted() {
         let fixture = Fixture::new();
         fixture.submit("task-one");
@@ -1182,6 +1397,13 @@ mod tests {
         store::atomic_json(&path, &task).unwrap();
         assert!(fixture.0.load("task-one").is_err());
         assert!(fixture.0.store.path("../task-one").is_err());
+        let dangling = fixture.0.store.path("task-dangling").unwrap();
+        std::os::unix::fs::symlink("/missing-task-state-fixture", &dangling).unwrap();
+        assert!(store::atomic_json(&dangling, &task).is_err());
+        assert_eq!(
+            fs::read_link(dangling).unwrap(),
+            PathBuf::from("/missing-task-state-fixture")
+        );
     }
 
     #[test]

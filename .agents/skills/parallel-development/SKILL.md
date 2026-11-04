@@ -9,6 +9,7 @@ description: 複数Issueの並列実装、進行中に別タスクを追加す�
 
 - 最初に親checkoutで`codex-task doctor --json`を確認する。未導入ならdotfilesのセットアップ状態を確認し、通常運用でtaskごとにCargo buildしない。
 - 別Issueの実装依頼は`submit --task-id issue-<番号> --objective '<許可された目的・受入条件・停止境界>'`へ変換する。Issueなしは衝突しない`task-<ID>`を使う。相談・調査・Issue化だけの依頼を実装へ変換しない。
+- 受付を担当するmainがAGENTSの基準でriskを判断し、`--risk low|medium|high|critical`へ渡す。判断できなければ既定のhighを使う。登録riskはレビュー深度の下限であり、実装workerの自己申告では下げない。
 - `submit`は登録だけで、`start`がOSタイマーなしのcoordinatorを起動する。登録後は`codex-task start --json`を呼ぶ。稼働済みなら同じcoordinatorが新taskを扱う。受付後も別依頼や相談に応じ、元workerの完了を会話の前提にしない。
 - 同じtaskへの追加指示は`show`で状態を確認する。実行中にwriterを追加しない。必要なら`pause`で停止要求を出し、`run`が空になるまで`list`／`reconcile`で回収を確認してから`resume --task-id <ID> --instruction '<追加指示>'`、`start`へ進む。対象taskを文脈から特定できない場合だけ確認する。
 - 依存taskは`--depends-on <ID>`、共有port・DB等は`--resource <衝突を避ける名前>`で登録する。各taskのbuild・DB・container等にもtask固有の名前と既存の登録済みartifact領域を使う。

@@ -109,8 +109,12 @@ pub(super) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     }
     let parent = path.parent().ok_or("状態の親directoryがありません")?;
     private_dir(parent)?;
-    if path.try_exists().map_err(|_| "保存先を確認できません")? {
-        open_private(path, false)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            open_private(path, false)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => return Err("保存先を確認できません".into()),
     }
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
