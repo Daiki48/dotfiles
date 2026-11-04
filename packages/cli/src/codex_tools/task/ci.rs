@@ -32,39 +32,62 @@ pub(super) struct Observation {
     pub fingerprint: String,
     pub merge_commit: Option<String>,
     pub merged: bool,
+    pub observed_at: u64,
+    pub required: Vec<RequiredCheck>,
+    pub snapshot: Snapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RequiredCheck {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct RequiredCheck {
     context: String,
     integration_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CheckRun {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct CheckRun {
     id: i64,
     name: String,
     head_sha: String,
     status: String,
     conclusion: Option<String>,
     app_id: Option<i64>,
+    app_slug: Option<String>,
+    check_suite_id: Option<i64>,
+    html_url: Option<String>,
+    details_url: Option<String>,
     run_id: Option<i64>,
     run_attempt: Option<i64>,
+    workflow_run: Option<WorkflowRun>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommitStatus {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct CommitStatus {
     id: i64,
     context: String,
     state: String,
     sha: String,
     updated_at: String,
+    creator_id: Option<i64>,
+    creator_login: Option<String>,
+    url: Option<String>,
+    target_url: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct Snapshot {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Snapshot {
     runs: Vec<CheckRun>,
     statuses: Vec<CommitStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkflowRun {
+    id: i64,
+    run_attempt: i64,
+    check_suite_id: i64,
+    head_sha: String,
+    status: String,
+    conclusion: Option<String>,
+    html_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +152,21 @@ pub(super) fn observe(
     } else {
         classify(&rules, &snapshot.runs, &snapshot.statuses, &target)
     };
+    if state == CiState::Success
+        && snapshot
+            .runs
+            .iter()
+            .filter_map(|run| run.workflow_run.as_ref())
+            .any(|run| {
+                run.status != "completed"
+                    || !matches!(
+                        run.conclusion.as_deref(),
+                        Some("success" | "skipped" | "neutral")
+                    )
+            })
+    {
+        return Err("checkとActions runの成功証跡が一致しません。再観測します".into());
+    }
     let fingerprint = snapshot_fingerprint(&after, &target, state == CiState::Stale, &snapshot);
     Ok(Observation {
         state,
@@ -138,6 +176,9 @@ pub(super) fn observe(
         fingerprint,
         merge_commit: after.merge_commit,
         merged: after.merged,
+        observed_at: super::store::now(),
+        required: rules,
+        snapshot,
     })
 }
 
@@ -343,7 +384,27 @@ fn fetch_snapshot(root: &Path, repository: &str, sha: &str) -> Result<Snapshot, 
             "GET".into(),
         ],
     )?;
-    let runs = parse_check_runs(&checks, sha)?;
+    let mut runs = parse_check_runs(&checks, sha)?;
+    let suites: std::collections::BTreeSet<_> = runs
+        .iter()
+        .filter(|run| run.app_slug.as_deref() == Some("github-actions"))
+        .filter_map(|run| run.check_suite_id)
+        .collect();
+    for suite in suites {
+        // check_suite.idはActions run IDではない。公式APIで対応するrunとattemptを取得する。
+        let workflows = task_gh_json(
+            root,
+            &[
+                "api".into(),
+                format!("repos/{repository}/actions/runs?check_suite_id={suite}&per_page=100"),
+                "--paginate".into(),
+                "--slurp".into(),
+                "--method".into(),
+                "GET".into(),
+            ],
+        )?;
+        attach_workflow_run(&mut runs, suite, &workflows)?;
+    }
     let statuses = task_gh_json(
         root,
         &[
@@ -357,6 +418,66 @@ fn fetch_snapshot(root: &Path, repository: &str, sha: &str) -> Result<Snapshot, 
     )?;
     let statuses = parse_statuses(&statuses, sha)?;
     Ok(Snapshot { runs, statuses })
+}
+
+fn optional_text(value: Option<&Value>, max: usize) -> Result<Option<String>, String> {
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|text| text.len() <= max && !text.chars().any(char::is_control))
+                .map(str::to_owned)
+                .ok_or_else(|| "CI証跡の文字列が不正です".into())
+        })
+        .transpose()
+}
+
+fn attach_workflow_run(runs: &mut [CheckRun], suite: i64, value: &Value) -> Result<(), String> {
+    let mut observed = Vec::new();
+    let mut expected = None;
+    for page in pages(value, "workflow runs")? {
+        let total = page
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .filter(|total| *total < 1000)
+            .ok_or("workflow run総数を確認できません")?;
+        if expected.is_some_and(|previous| previous != total) {
+            return Err("workflow run取得中に総数が変化しました".into());
+        }
+        expected = Some(total);
+        let entries = page
+            .get("workflow_runs")
+            .and_then(Value::as_array)
+            .ok_or("workflow runの形式が不正です")?;
+        for entry in entries {
+            let run: WorkflowRun = serde_json::from_value(json!({
+                "id": entry.get("id"), "run_attempt": entry.get("run_attempt"),
+                "check_suite_id": entry.get("check_suite_id"), "head_sha":entry.get("head_sha"),
+                "status":entry.get("status"), "conclusion":entry.get("conclusion"),
+                "html_url":optional_text(entry.get("html_url"), 4096)?,
+            }))
+            .map_err(|_| "workflow runの識別情報が不正です")?;
+            validate_sha(&run.head_sha)?;
+            if run.id <= 0 || run.run_attempt <= 0 || run.check_suite_id != suite {
+                return Err("workflow runの識別情報が一致しません".into());
+            }
+            observed.push(run);
+        }
+    }
+    if expected != Some(observed.len() as u64) || observed.len() != 1 {
+        return Err("workflow runを一意に確認できません".into());
+    }
+    if let Some(workflow) = observed.pop() {
+        for run in runs.iter_mut().filter(|run| {
+            run.check_suite_id == Some(suite) && run.app_slug.as_deref() == Some("github-actions")
+        }) {
+            run.run_id = Some(workflow.id);
+            run.run_attempt = Some(workflow.run_attempt);
+            run.workflow_run = Some(workflow.clone());
+        }
+    }
+    Ok(())
 }
 
 fn pages<'a>(value: &'a Value, key: &str) -> Result<Vec<&'a Value>, String> {
@@ -421,11 +542,10 @@ fn parse_check_runs(value: &Value, sha: &str) -> Result<Vec<CheckRun>, String> {
                 .get("app")
                 .and_then(|app| app.get("id"))
                 .and_then(Value::as_i64);
-            let run_id = run
+            let check_suite_id = run
                 .get("check_suite")
                 .and_then(|suite| suite.get("id"))
                 .and_then(Value::as_i64);
-            let run_attempt = run.get("run_attempt").and_then(Value::as_i64);
             parsed.push(CheckRun {
                 id,
                 name: name.to_owned(),
@@ -433,8 +553,13 @@ fn parse_check_runs(value: &Value, sha: &str) -> Result<Vec<CheckRun>, String> {
                 status: status.to_owned(),
                 conclusion,
                 app_id,
-                run_id,
-                run_attempt,
+                app_slug: optional_text(run.get("app").and_then(|app| app.get("slug")), 256)?,
+                check_suite_id,
+                html_url: optional_text(run.get("html_url"), 4096)?,
+                details_url: optional_text(run.get("details_url"), 4096)?,
+                run_id: None,
+                run_attempt: None,
+                workflow_run: None,
             });
         }
     }
@@ -489,6 +614,18 @@ fn parse_statuses(value: &Value, sha: &str) -> Result<Vec<CommitStatus>, String>
                 // 各status objectには`sha`が含まれない。
                 sha: sha.clone(),
                 updated_at: updated_at.to_owned(),
+                creator_id: status
+                    .get("creator")
+                    .and_then(|creator| creator.get("id"))
+                    .and_then(Value::as_i64),
+                creator_login: optional_text(
+                    status
+                        .get("creator")
+                        .and_then(|creator| creator.get("login")),
+                    256,
+                )?,
+                url: optional_text(status.get("url"), 4096)?,
+                target_url: optional_text(status.get("target_url"), 4096)?,
             });
         }
     }
@@ -635,23 +772,8 @@ fn snapshot_fingerprint(
         "merged": pr.merged,
         "base_ref": pr.base_ref,
         "stale": stale,
-        "check_runs": runs.iter().map(|run| json!({
-            "id": run.id,
-            "name": run.name,
-            "head_sha": run.head_sha,
-            "status": run.status,
-            "conclusion": run.conclusion,
-            "app_id": run.app_id,
-            "run_id": run.run_id,
-            "run_attempt": run.run_attempt,
-        })).collect::<Vec<_>>(),
-        "statuses": statuses.iter().map(|status| json!({
-            "id": status.id,
-            "context": status.context,
-            "state": status.state,
-            "sha": status.sha,
-            "updated_at": status.updated_at,
-        })).collect::<Vec<_>>(),
+        "check_runs": runs,
+        "statuses": statuses,
     });
     let bytes = serde_json::to_vec(&value).expect("JSON value is always serializable");
     format!("{:x}", Sha256::digest(bytes))
@@ -664,6 +786,74 @@ mod tests {
     const HEAD: &str = concat!("aaaaaaaaaa", "aaaaaaaaaa", "aaaaaaaaaa", "aaaaaaaaaa");
     const MERGE: &str = concat!("bbbbbbbbbb", "bbbbbbbbbb", "bbbbbbbbbb", "bbbbbbbbbb");
     const STALE: &str = concat!("cccccccccc", "cccccccccc", "cccccccccc", "cccccccccc");
+
+    #[test]
+    fn evidence_preserves_provider_urls_and_real_workflow_run_identity() {
+        let value = json!([{"total_count":1,"check_runs":[{
+            "id":10,"name":"ci","head_sha":MERGE,"status":"completed","conclusion":"success",
+            "app":{"id":15368,"slug":"github-actions"},"check_suite":{"id":4},
+            "html_url":"https://github.com/example/product/runs/10",
+            "details_url":"https://github.com/example/product/actions/runs/99/job/10"
+        }]}]);
+        let mut runs = parse_check_runs(&value, MERGE).unwrap();
+        assert_eq!(runs[0].check_suite_id, Some(4));
+        assert_eq!(runs[0].run_id, None);
+        let workflows = json!([{"total_count":1,"workflow_runs":[{
+            "id":99,"run_attempt":2,"check_suite_id":4,"head_sha":HEAD,
+            "status":"completed","conclusion":"success",
+            "html_url":"https://github.com/example/product/actions/runs/99"
+        }]}]);
+        attach_workflow_run(&mut runs, 4, &workflows).unwrap();
+        assert_eq!(runs[0].run_id, Some(99));
+        assert_eq!(runs[0].run_attempt, Some(2));
+        assert_eq!(runs[0].workflow_run.as_ref().unwrap().head_sha, HEAD);
+        let statuses = parse_statuses(
+            &json!([[{
+                "id":3,"context":"external","state":"success","updated_at":"2026-11-04T00:00:00Z",
+                "creator":{"id":123,"login":"ci-provider"},
+                "url":"https://api.github.com/repos/example/product/statuses/3",
+                "target_url":"https://ci.example.test/results/3"
+            }]]),
+            MERGE,
+        )
+        .unwrap();
+        assert_eq!(statuses[0].creator_id, Some(123));
+        assert_eq!(statuses[0].creator_login.as_deref(), Some("ci-provider"));
+        assert_eq!(statuses[0].sha, MERGE);
+        let observation = Observation {
+            state: CiState::Success,
+            head: HEAD.into(),
+            base: STALE.into(),
+            target: MERGE.into(),
+            fingerprint: "test".into(),
+            merge_commit: Some(MERGE.into()),
+            merged: false,
+            observed_at: 42,
+            required: vec![required("ci", Some(15368))],
+            snapshot: Snapshot { runs, statuses },
+        };
+        let saved = serde_json::to_value(&observation).unwrap();
+        assert_eq!(saved["snapshot"]["runs"][0]["run_id"], 99);
+        assert_eq!(
+            saved["snapshot"]["runs"][0]["html_url"],
+            "https://github.com/example/product/runs/10"
+        );
+        assert_eq!(
+            saved["snapshot"]["statuses"][0]["target_url"],
+            "https://ci.example.test/results/3"
+        );
+        assert_eq!(
+            serde_json::from_value::<Observation>(saved).unwrap(),
+            observation
+        );
+        let mut wrong = workflows;
+        wrong[0]["workflow_runs"][0]["check_suite_id"] = json!(5);
+        assert!(attach_workflow_run(&mut [], 4, &wrong).is_err());
+        assert!(
+            attach_workflow_run(&mut [], 4, &json!([{"total_count":1,"workflow_runs":[]}]))
+                .is_err()
+        );
+    }
 
     fn required(context: &str, integration_id: Option<i64>) -> RequiredCheck {
         RequiredCheck {
@@ -680,8 +870,13 @@ mod tests {
             status: status.into(),
             conclusion: conclusion.map(str::to_owned),
             app_id: Some(app),
+            app_slug: Some("github-actions".into()),
+            check_suite_id: Some(4),
+            html_url: None,
+            details_url: None,
             run_id: Some(7),
             run_attempt: Some(1),
+            workflow_run: None,
         }
     }
 
@@ -692,6 +887,10 @@ mod tests {
             state: state.into(),
             sha: sha.into(),
             updated_at: "2026-11-04T00:00:00Z".into(),
+            creator_id: None,
+            creator_login: None,
+            url: None,
+            target_url: None,
         }
     }
 
@@ -828,6 +1027,10 @@ mod tests {
                 state: "failure".into(),
                 sha: HEAD.into(),
                 updated_at: "2026-11-03T00:00:00Z".into(),
+                creator_id: None,
+                creator_login: None,
+                url: None,
+                target_url: None,
             },
             CommitStatus {
                 id: 2,
@@ -836,6 +1039,10 @@ mod tests {
                 sha: HEAD.into(),
                 // timestampが前後してもAPI順とIDから最新statusを選ぶ。
                 updated_at: "2026-11-02T00:00:00Z".into(),
+                creator_id: None,
+                creator_login: None,
+                url: None,
+                target_url: None,
             },
         ];
         assert_eq!(classify(&required, &[], &statuses, HEAD), CiState::Success);

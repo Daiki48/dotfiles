@@ -60,6 +60,28 @@ enum Commands {
     Events {
         #[arg(long)]
         task_id: String,
+        /// ack済みも含める。既定は未処理だけ。
+        #[arg(long)]
+        all: bool,
+    },
+    /// 確認したsequenceまでのイベントを累積ackする。
+    Ack {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long)]
+        through: u64,
+    },
+    /// 完了taskのack済みイベント・旧worker結果の保持秒数を設定する。
+    Retention {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long)]
+        seconds: u64,
+    },
+    /// 完了・全イベントack・worker停止を確認して期限超過分を回収する。
+    Collect {
+        #[arg(long)]
+        task_id: String,
     },
     /// 一度だけ照合し、実行可能なworkerを起動する。
     Reconcile,
@@ -163,6 +185,10 @@ struct Task {
     checkpoint: String,
     ci_fingerprint: String,
     ci_state: Option<ci::CiState>,
+    #[serde(default)]
+    ci_evidence: Option<ci::Observation>,
+    #[serde(default)]
+    ci_observation_error_at: Option<u64>,
     next_check: u64,
     failures: u32,
     pause_requested: bool,
@@ -170,6 +196,17 @@ struct Task {
     updated: u64,
     events: Vec<Event>,
     event_sequence: u64,
+    #[serde(default)]
+    acknowledged_sequence: u64,
+    #[serde(default = "default_retention")]
+    retention_seconds: u64,
+    // ack・保持設定とcoordinatorの楽観的更新を照合する。
+    #[serde(default)]
+    revision: u64,
+}
+
+fn default_retention() -> u64 {
+    30 * 24 * 60 * 60
 }
 
 fn valid_id(id: &str) -> bool {
@@ -212,7 +249,15 @@ impl Task {
                 .merge_commit
                 .as_deref()
                 .is_some_and(|head| !valid_sha(head))
-            || self.events.len() > 128
+            || self.acknowledged_sequence > self.event_sequence
+            || self
+                .events
+                .iter()
+                .any(|event| event.sequence == 0 || event.sequence > self.event_sequence)
+            || self
+                .events
+                .windows(2)
+                .any(|events| events[0].sequence >= events[1].sequence)
             || self.checkpoint.len() > 32 * 1024
             || self
                 .review
@@ -233,15 +278,27 @@ impl Task {
     fn event(&mut self, kind: &str, detail: &str) {
         self.event_sequence += 1;
         self.updated = now();
-        if self.events.len() == 128 {
-            self.events.remove(0);
-        }
         self.events.push(Event {
             sequence: self.event_sequence,
             at: self.updated,
             kind: kind.into(),
             detail: detail.into(),
         });
+    }
+
+    fn acknowledge(&mut self, through: u64) -> Result<()> {
+        if through < self.acknowledged_sequence || through > self.event_sequence {
+            return Err("ackのsequenceが現在の範囲外です".into());
+        }
+        self.acknowledged_sequence = through;
+        self.revision += 1;
+        Ok(())
+    }
+
+    fn invalidate_ci(&mut self) {
+        self.ci_state = None;
+        self.ci_fingerprint.clear();
+        self.ci_evidence = None;
     }
 
     fn stop(&mut self, phase: Phase, message: &str) {
@@ -368,6 +425,8 @@ fn submit(
         checkpoint: String::new(),
         ci_fingerprint: String::new(),
         ci_state: None,
+        ci_evidence: None,
+        ci_observation_error_at: None,
         next_check: 0,
         failures: 0,
         pause_requested: false,
@@ -375,6 +434,9 @@ fn submit(
         updated: now(),
         events: Vec::new(),
         event_sequence: 0,
+        acknowledged_sequence: 0,
+        retention_seconds: default_retention(),
+        revision: 0,
     };
     context.store.save(&task)?;
     Ok(json!({"task_id":id,"existing":false,"phase":task.phase}))
@@ -468,6 +530,7 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
                 if task.head.as_deref() != Some(head) {
                     task.failures = 0;
                 }
+                task.invalidate_ci();
                 task.pr = Some(pr);
                 task.head = Some(head.into());
                 task.review = None;
@@ -561,16 +624,23 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
             None
         },
     );
+    record_ci_result(task, result)
+}
+
+fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<()> {
     task.next_check = now() + 30;
     let observation = match result {
         Ok(observation) => observation,
         Err(reason) => {
-            task.ci_state = None;
+            task.invalidate_ci();
+            task.ci_observation_error_at = Some(now());
             task.event("api_wait", &reason);
             task.next_check = now() + 120;
             return Ok(());
         }
     };
+    task.ci_observation_error_at = None;
+    task.ci_evidence = Some(observation.clone());
     task.ci_state = Some(observation.state);
     if task.ci_fingerprint != observation.fingerprint {
         task.ci_fingerprint = observation.fingerprint;
@@ -596,6 +666,7 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
             .as_ref()
             .is_some_and(|base| base != &observation.base)
         {
+            task.invalidate_ci();
             task.review = None;
             task.phase = Phase::Implementation;
             task.checkpoint =
@@ -636,6 +707,7 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
 }
 
 fn stale_head(task: &mut Task) {
+    task.invalidate_ci();
     task.review = None;
     task.stop(Phase::Blocked,"PRのHEADがworker報告と異なります。再開時に実装段階からGit・PRを照合してレビューをやり直します");
     task.resume_phase = Phase::Implementation;
@@ -710,16 +782,14 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
             return Ok(false);
         }
         if task.phase == Phase::Integration {
-            // 最新のCI成功は、実際に起動する直前に取り直す。
-            let observation = ci::observe(
-                &context.repository,
-                &context.github,
-                task.pr.ok_or("PRがありません")?,
-                None,
-            )?;
-            if observation.state != ci::CiState::Success
-                || task.head.as_ref() != Some(&observation.head)
-                || task.base.as_ref() != Some(&observation.base)
+            // 起動直前の再観測もstateへ保存してから、このgateへ渡す。
+            if task.ci_state != Some(ci::CiState::Success)
+                || task.ci_observation_error_at.is_some()
+                || task.ci_evidence.as_ref().is_none_or(|observation| {
+                    observation.state != ci::CiState::Success
+                        || task.head.as_ref() != Some(&observation.head)
+                        || task.base.as_ref() != Some(&observation.base)
+                })
             {
                 return Ok(false);
             }
@@ -797,6 +867,7 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
     };
     for task in &mut tasks {
         let original_sequence = task.event_sequence;
+        let original_revision = task.revision;
         // APIとbuildの待機中にstate lockを保持しない。
         apply_report(context, task)?;
         if task.failures >= 3
@@ -817,7 +888,10 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
         let _lock = context.store.lock()?;
         let current = context.load(&task.id)?;
         task.pause_requested |= current.pause_requested;
-        if current.generation != task.generation || current.event_sequence != original_sequence {
+        if current.generation != task.generation
+            || current.event_sequence != original_sequence
+            || current.revision != original_revision
+        {
             *task = current;
             continue;
         }
@@ -829,6 +903,23 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
     for index in 0..tasks.len() {
         if running >= capacity {
             break;
+        }
+        // 実際の統合起動直前の観測も永続化する。API失敗時に旧成功を残さない。
+        if tasks[index].phase == Phase::Integration && tasks[index].run.is_none() {
+            let original = tasks[index].clone();
+            tasks[index].next_check = 0;
+            observe_ci(context, &mut tasks[index])?;
+            let _lock = context.store.lock()?;
+            let current = context.load(&original.id)?;
+            if current.event_sequence != original.event_sequence
+                || current.revision != original.revision
+                || current.generation != original.generation
+                || current.pause_requested
+            {
+                tasks[index] = current;
+                continue;
+            }
+            context.store.save(&tasks[index])?;
         }
         if !ready(context, &tasks[index], &tasks)? {
             continue;
@@ -842,6 +933,7 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
             let _lock = context.store.lock()?;
             let current = context.load(&task.id)?;
             if current.event_sequence != task.event_sequence
+                || current.revision != task.revision
                 || current.generation != task.generation
             {
                 *task = current;
@@ -858,6 +950,7 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
             let _lock = context.store.lock()?;
             let current = context.load(&task.id)?;
             if current.event_sequence != task.event_sequence
+                || current.revision != task.revision
                 || current.generation != task.generation
                 || current.pause_requested
             {
@@ -968,7 +1061,34 @@ fn execute(cli: Cli) -> Result<Value> {
         Commands::Submit { task_id, objective, branch, depends_on, resource, risk, ci_label } => submit(&context, task_id, objective, branch, depends_on, resource, risk, ci_label),
         Commands::List => Ok(json!(context.store.list()?.iter().map(|task| json!({"task_id":task.id,"phase":task.phase,"running":task.run.is_some(),"updated":task.updated})).collect::<Vec<_>>())),
         Commands::Show { task_id } => Ok(json!(context.load(&task_id)?)),
-        Commands::Events { task_id } => Ok(json!(context.load(&task_id)?.events)),
+        Commands::Events { task_id, all } => {
+            let task = context.load(&task_id)?;
+            Ok(json!({"task_id":task_id,"acknowledged_sequence":task.acknowledged_sequence,"event_sequence":task.event_sequence,
+                "events":task.events.iter().filter(|event| all || event.sequence > task.acknowledged_sequence).collect::<Vec<_>>()}))
+        }
+        Commands::Ack { task_id, through } => {
+            let _lock = context.store.lock()?;
+            let mut task = context.load(&task_id)?;
+            task.acknowledge(through)?;
+            context.store.save(&task)?;
+            Ok(json!({"task_id":task_id,"acknowledged_sequence":through}))
+        }
+        Commands::Retention { task_id, seconds } => {
+            let _lock = context.store.lock()?;
+            let mut task = context.load(&task_id)?;
+            task.retention_seconds = seconds;
+            task.revision += 1;
+            context.store.save(&task)?;
+            Ok(json!({"task_id":task_id,"retention_seconds":seconds}))
+        }
+        Commands::Collect { task_id } => {
+            let _lock = context.store.lock()?;
+            let mut task = context.load(&task_id)?;
+            let _lease = Lock::try_acquire(&context.store.lease_path(&task_id)?)?.ok_or("workerが動作中です")?;
+            let removed = context.store.collect(&mut task, now())?;
+            context.store.save(&task)?;
+            Ok(json!({"task_id":task_id,"removed_worker_generations":removed,"retained_events":task.events.len()}))
+        }
         Commands::Pause { task_id } => {
             let _lock = context.store.lock()?;
             let mut task = context.load(&task_id)?;
@@ -1103,7 +1223,12 @@ pub(crate) fn invocation_reason(args: &[String]) -> Option<String> {
             || resource.iter().any(|name| !resource_name(name))
             || !valid_ci_labels(&ci_label))
         .then(|| "codex-taskの登録内容が不正です".into()),
-        Commands::Show { task_id } | Commands::Events { task_id } | Commands::Pause { task_id } => {
+        Commands::Show { task_id }
+        | Commands::Events { task_id, .. }
+        | Commands::Pause { task_id }
+        | Commands::Ack { task_id, .. }
+        | Commands::Retention { task_id, .. }
+        | Commands::Collect { task_id } => {
             (!valid_id(&task_id)).then(|| "task IDが不正です".into())
         }
         Commands::Resume {
@@ -1169,6 +1294,183 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0.home);
         }
+    }
+
+    fn successful_observation() -> ci::Observation {
+        serde_json::from_value(json!({
+            "state":"success","head":"a".repeat(40),"base":"b".repeat(40),
+            "target":"a".repeat(40),"fingerprint":"observed","merge_commit":null,
+            "merged":false,"observed_at":now(),"required":[],
+            "snapshot":{"runs":[],"statuses":[]}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn unacknowledged_events_survive_the_old_limit_and_ack_is_explicit() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        for _ in 0..300 {
+            task.event("test", "未処理");
+        }
+        fixture.0.store.save(&task).unwrap();
+        let mut task = fixture.0.load("task-one").unwrap();
+        assert_eq!(task.events.len(), 300);
+        assert_eq!(task.events[0].sequence, 1);
+        task.acknowledge(128).unwrap();
+        assert_eq!(
+            task.events
+                .iter()
+                .filter(|event| event.sequence > task.acknowledged_sequence)
+                .count(),
+            172
+        );
+        assert!(task.acknowledge(127).is_err());
+        assert!(task.acknowledge(301).is_err());
+        // readerのackが入ったsnapshotをcoordinatorは上書きできない。
+        assert_eq!(task.revision, 1);
+    }
+
+    #[test]
+    fn old_state_defaults_to_unacknowledged_and_no_ci_evidence() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let task = fixture.0.load("task-one").unwrap();
+        let mut legacy = serde_json::to_value(&task).unwrap();
+        for field in [
+            "acknowledged_sequence",
+            "retention_seconds",
+            "revision",
+            "ci_evidence",
+            "ci_observation_error_at",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let loaded: Task = serde_json::from_value(legacy).unwrap();
+        loaded.validate().unwrap();
+        assert_eq!(loaded.acknowledged_sequence, 0);
+        assert_eq!(loaded.retention_seconds, 30 * 24 * 60 * 60);
+        assert!(loaded.ci_evidence.is_none());
+    }
+
+    #[test]
+    fn state_capacity_errors_preserve_the_previously_saved_events() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        task.event("test", "引継ぎ");
+        fixture.0.store.save(&task).unwrap();
+        task.event("test", &"x".repeat(1024 * 1024));
+        assert!(fixture.0.store.save(&task).is_err());
+        assert_eq!(fixture.0.load("task-one").unwrap().events.len(), 1);
+    }
+
+    #[test]
+    fn collection_preserves_active_unacknowledged_and_latest_handoff() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        task.generation = 3;
+        task.event("test", "最後の引継ぎ");
+        task.checkpoint = "保持する判断".into();
+        task.retention_seconds = 0;
+        for generation in 1..=2 {
+            store::atomic_json(
+                &worker::report_path(&fixture.0.store, &task.id, generation).unwrap(),
+                &json!({"handoff":generation}),
+            )
+            .unwrap();
+        }
+        let future = now() + 10;
+        assert!(fixture.0.store.collect(&mut task, future).is_err());
+        task.phase = Phase::Completed;
+        assert!(fixture.0.store.collect(&mut task, future).is_err());
+        task.acknowledge(task.event_sequence).unwrap();
+        task.run = Some(Run {
+            generation: 3,
+            phase: Phase::Finish,
+            started: now(),
+        });
+        assert!(fixture.0.store.collect(&mut task, future).is_err());
+        task.run = None;
+        task.retention_seconds = 100;
+        assert!(
+            fixture
+                .0
+                .store
+                .collect(&mut task, future)
+                .unwrap()
+                .is_empty()
+        );
+        task.retention_seconds = 0;
+        assert_eq!(fixture.0.store.collect(&mut task, future).unwrap(), vec![1]);
+        assert!(
+            worker::report_path(&fixture.0.store, &task.id, 2)
+                .unwrap()
+                .exists()
+        );
+        assert!(task.events.is_empty());
+        assert_eq!(task.checkpoint, "保持する判断");
+        fixture.0.store.save(&task).unwrap();
+        assert_eq!(
+            fixture.0.load("task-one").unwrap().checkpoint,
+            task.checkpoint
+        );
+        assert!(
+            fixture
+                .0
+                .store
+                .collect(&mut task, future)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn collection_rejects_unknown_files_before_deleting_any_generation() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        task.phase = Phase::Completed;
+        task.generation = 3;
+        task.retention_seconds = 0;
+        let first = worker::report_path(&fixture.0.store, &task.id, 1).unwrap();
+        store::atomic_json(&first, &json!({})).unwrap();
+        let second = worker::run_dir(&fixture.0.store, &task.id, 2).unwrap();
+        fs::write(second.join("unknown"), "固有data").unwrap();
+        assert!(fixture.0.store.collect(&mut task, now() + 10).is_err());
+        assert!(first.exists());
+    }
+
+    #[test]
+    fn ci_evidence_is_persisted_and_invalidated_on_api_error_head_or_base_change() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        task.head = Some("a".repeat(40));
+        task.base = Some("b".repeat(40));
+        task.phase = Phase::Review;
+        record_ci_result(&mut task, Ok(successful_observation())).unwrap();
+        fixture.0.store.save(&task).unwrap();
+        let loaded = fixture.0.load("task-one").unwrap();
+        assert_eq!(loaded.ci_evidence, task.ci_evidence);
+        record_ci_result(&mut task, Err("API unavailable".into())).unwrap();
+        assert!(task.ci_state.is_none() && task.ci_evidence.is_none());
+        assert!(task.ci_observation_error_at.is_some());
+        record_ci_result(&mut task, Ok(successful_observation())).unwrap();
+        assert!(task.ci_observation_error_at.is_none());
+        let mut changed = successful_observation();
+        changed.base = "c".repeat(40);
+        record_ci_result(&mut task, Ok(changed)).unwrap();
+        assert_eq!(task.phase, Phase::Implementation);
+        assert!(task.ci_state.is_none() && task.ci_evidence.is_none());
+        task.phase = Phase::Review;
+        let mut changed = successful_observation();
+        changed.head = "d".repeat(40);
+        record_ci_result(&mut task, Ok(changed)).unwrap();
+        assert_eq!(task.phase, Phase::Blocked);
+        assert!(task.ci_state.is_none() && task.ci_evidence.is_none());
     }
 
     #[test]

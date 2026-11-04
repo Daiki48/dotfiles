@@ -15,7 +15,7 @@ description: 複数Issueの並列実装、進行中に別タスクを追加す�
 - `submit`は登録だけで、`start`がOSタイマーなしのcoordinatorを起動する。登録後は`codex-task start --json`を呼ぶ。稼働済みなら同じcoordinatorが新taskを扱う。受付後も別依頼や相談に応じ、元workerの完了を会話の前提にしない。
 - 同じtaskへの追加指示は`show`で状態を確認する。実行中にwriterを追加しない。必要なら`pause`で停止要求を出し、`run`が空になるまで`list`／`reconcile`で回収を確認してから`resume --task-id <ID> --instruction '<追加指示>'`、`start`へ進む。対象taskを文脈から特定できない場合だけ確認する。
 - 依存taskは`--depends-on <ID>`、共有port・DB等は`--resource <衝突を避ける名前>`で登録する。各taskのbuild・DB・container等にもtask固有の名前と既存の登録済みartifact領域を使う。
-- 状況確認は`list --json`、詳細と引継ぎは`show --task-id <ID> --json`、イベントは`events --task-id <ID> --json`を使う。これらはローカル情報であり、公開Issueへ生出力を転載しない。
+- 状況確認は`list --json`、詳細・引継ぎ・個別CI証跡は`show --task-id <ID> --json`、未処理イベントは`events --task-id <ID> --json`を使う。確認して必要な対応を済ませたsequenceまで`ack --task-id <ID> --through <sequence>`で累積ackする。表示だけではackしない。`events --all`は保持中のack済み履歴も返す。保持期間は`retention --task-id <ID> --seconds <秒>`（既定30日）で指定し、`collect --task-id <ID>`で完了・全ack・worker停止を確認して期限超過の旧結果だけを回収する。task本体・checkpoint・最新結果は保持される。これらはローカル情報であり、公開Issueへ生出力を転載しない。
 - 通常のCI待ち・コード修正・レビュー・既存権限内の統合は自律的に進める。製品判断・追加権限・費用・不可逆操作は`awaiting_decision`の内容を具体化して利用者へ返す。未知の承認をworkerへ代わって与えず、guard・trust・sandboxを迂回しない。
 - FedoraとWSL2はそれぞれ実行先のpath・認証・stateを使う。SSH経由の依頼は接続先が所有host。host間の暗黙移動やfailoverを行わない。
 
