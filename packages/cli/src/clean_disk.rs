@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,7 @@ use serde::Deserialize;
 use crate::codex_tools::{process, runner_storage, trust};
 
 const CONFIG_RELATIVE: &str = ".config/clean-disk.json";
+const LOCAL_CONFIG_RELATIVE: &str = ".config/clean-disk.local.json";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_SCAN_ROOTS: usize = 16;
 const MAX_DISCOVERY_ENTRIES: usize = 100_000;
@@ -38,6 +39,13 @@ struct CleanDiskConfig {
     #[serde(default = "default_codex_retention")]
     codex_build_cache_retention_days: u64,
     runner_manifest_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalCleanDiskConfig {
+    schema_version: u64,
+    scan_roots: Vec<PathBuf>,
 }
 
 fn default_codex_retention() -> u64 {
@@ -121,21 +129,18 @@ fn validate_scan_root(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_config(explicit: Option<&Path>) -> Result<PathBuf> {
+fn resolve_config(explicit: Option<&Path>, home: &Path, current_dir: &Path) -> Result<PathBuf> {
     if let Some(path) = explicit {
         if !path.is_absolute() {
             anyhow::bail!("--config must be an absolute path");
         }
         return Ok(path.to_path_buf());
     }
-    let home = home::home_dir().context("cannot determine HOME")?;
     let home_config = home.join(CONFIG_RELATIVE);
     if home_config.exists() || home_config.is_symlink() {
         return Ok(home_config);
     }
-    let repository_config = env::current_dir()
-        .context("cannot determine current directory")?
-        .join(CONFIG_RELATIVE);
+    let repository_config = current_dir.join(CONFIG_RELATIVE);
     if repository_config.exists() || repository_config.is_symlink() {
         return Ok(repository_config);
     }
@@ -146,11 +151,24 @@ fn resolve_config(explicit: Option<&Path>) -> Result<PathBuf> {
     )
 }
 
-fn read_config(path: &Path) -> Result<CleanDiskConfig> {
+fn read_config_json<T: serde::de::DeserializeOwned>(path: &Path, local: bool) -> Result<T> {
     let resolved = fs::canonicalize(path)
         .with_context(|| format!("cannot resolve clean-disk config {}", path.display()))?;
-    let metadata = fs::symlink_metadata(&resolved)
-        .with_context(|| format!("cannot inspect clean-disk config {}", resolved.display()))?;
+    // 共有設定のmanaged symlinkは許可するが、local設定は祖先も含めlinkを辿らない。
+    if local && resolved != path {
+        anyhow::bail!("local clean-disk config must not contain symlinks or aliases");
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(&resolved)
+        .with_context(|| format!("cannot open clean-disk config {}", resolved.display()))?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_CONFIG_BYTES
     {
         anyhow::bail!("clean-disk config must be a bounded regular file");
@@ -162,17 +180,35 @@ fn read_config(path: &Path) -> Result<CleanDiskConfig> {
     {
         anyhow::bail!("clean-disk config has an unsafe owner, mode, or link count");
     }
-    let config: CleanDiskConfig = serde_json::from_slice(
-        &fs::read(&resolved).with_context(|| format!("cannot read {}", resolved.display()))?,
-    )
-    .with_context(|| format!("invalid clean-disk config {}", resolved.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        anyhow::bail!("clean-disk config exceeds the safe size limit");
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid clean-disk config {}", resolved.display()))
+}
+
+fn read_config(path: &Path) -> Result<CleanDiskConfig> {
+    let config: CleanDiskConfig = read_config_json(path, false)?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn validate_config(config: &CleanDiskConfig) -> Result<()> {
     if config.schema_version != 1 {
         anyhow::bail!("unsupported clean-disk config schema");
     }
-    if config.scan_roots.is_empty() || config.scan_roots.len() > MAX_SCAN_ROOTS {
+    if config.scan_roots.len() > MAX_SCAN_ROOTS {
         anyhow::bail!("clean-disk scan root count is invalid");
     }
     for (index, left) in config.scan_roots.iter().enumerate() {
+        if !normalized_absolute(left) {
+            anyhow::bail!(
+                "scan root must be a normalized absolute path: {}",
+                left.display()
+            );
+        }
         for right in &config.scan_roots[index + 1..] {
             if paths_overlap(left, right) {
                 anyhow::bail!(
@@ -193,6 +229,31 @@ fn read_config(path: &Path) -> Result<CleanDiskConfig> {
         && !normalized_absolute(path)
     {
         anyhow::bail!("runner_manifest_dir must be a normalized absolute path");
+    }
+    Ok(())
+}
+
+fn load_config(
+    explicit: Option<&Path>,
+    home: &Path,
+    current_dir: &Path,
+) -> Result<CleanDiskConfig> {
+    let path = resolve_config(explicit, home, current_dir)?;
+    let mut config = read_config(&path)?;
+    if explicit.is_none() {
+        let local_path = home.join(LOCAL_CONFIG_RELATIVE);
+        match fs::symlink_metadata(&local_path) {
+            Ok(_) => {
+                let local: LocalCleanDiskConfig = read_config_json(&local_path, true)?;
+                if local.schema_version != 1 {
+                    anyhow::bail!("unsupported local clean-disk config schema");
+                }
+                config.scan_roots = local.scan_roots;
+                validate_config(&config)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("cannot inspect local clean-disk config"),
+        }
     }
     Ok(config)
 }
@@ -843,8 +904,10 @@ fn codex_worktree_root() -> Option<PathBuf> {
 }
 
 pub(crate) fn run(explicit_config: Option<&Path>, dry_run: bool) -> Result<()> {
-    let config_path = resolve_config(explicit_config)?;
-    let config = read_config(&config_path)?;
+    let home = crate::codex::setup_home_dir()?;
+    let current_dir = env::current_dir().context("cannot determine current directory")?;
+    let config_path = resolve_config(explicit_config, &home, &current_dir)?;
+    let config = load_config(explicit_config, &home, &current_dir)?;
     println!("clean-disk: {} を使用します", config_path.display());
 
     let codex_root = codex_worktree_root();
@@ -1037,6 +1100,171 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn config_fixture(directory: &TestDirectory) -> PathBuf {
+        let home = fs::canonicalize(&directory.0).unwrap();
+        fs::create_dir(home.join(".config")).unwrap();
+        fs::write(
+            home.join(CONFIG_RELATIVE),
+            include_str!("../../../.config/clean-disk.json"),
+        )
+        .unwrap();
+        home
+    }
+
+    fn write_local(home: &Path, roots: serde_json::Value) {
+        fs::write(
+            home.join(LOCAL_CONFIG_RELATIVE),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1, "scan_roots": roots,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shared_defaults_have_no_host_roots_and_local_only_replaces_roots() {
+        let fixture = TestDirectory::new("local-defaults");
+        let home = config_fixture(&fixture);
+        let shared = load_config(None, &home, &home).unwrap();
+        assert!(shared.scan_roots.is_empty());
+        write_local(&home, serde_json::json!(["/example/development"]));
+        let local = load_config(None, &home, &home).unwrap();
+        assert_eq!(local.scan_roots, [PathBuf::from("/example/development")]);
+        assert_eq!(local.trash_retention_days, shared.trash_retention_days);
+        assert_eq!(
+            local.build_cache_retention_days,
+            shared.build_cache_retention_days
+        );
+        assert_eq!(
+            local.codex_build_cache_retention_days,
+            shared.codex_build_cache_retention_days
+        );
+        assert_eq!(local.runner_manifest_dir, shared.runner_manifest_dir);
+        write_local(&home, serde_json::json!([]));
+        assert!(
+            load_config(None, &home, &home)
+                .unwrap()
+                .scan_roots
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_config_is_standalone_even_with_invalid_local_override() {
+        let fixture = TestDirectory::new("explicit-config");
+        let home = config_fixture(&fixture);
+        fs::write(home.join(LOCAL_CONFIG_RELATIVE), "invalid json").unwrap();
+        assert!(load_config(None, &home, &home).is_err());
+        assert!(
+            load_config(Some(&home.join(CONFIG_RELATIVE)), &home, &home)
+                .unwrap()
+                .scan_roots
+                .is_empty()
+        );
+        assert!(load_config(Some(Path::new("relative.json")), &home, &home).is_err());
+    }
+
+    #[test]
+    fn repository_fallback_also_uses_home_local_override() {
+        let fixture = TestDirectory::new("repository-fallback");
+        let repository = config_fixture(&fixture);
+        let home = repository.join("account");
+        fs::create_dir_all(home.join(".config")).unwrap();
+        write_local(&home, serde_json::json!(["/example/projects"]));
+        assert_eq!(
+            load_config(None, &home, &repository).unwrap().scan_roots,
+            [PathBuf::from("/example/projects")]
+        );
+    }
+
+    #[test]
+    fn invalid_local_roots_and_schema_fail_closed() {
+        let fixture = TestDirectory::new("invalid-local");
+        let home = config_fixture(&fixture);
+        for roots in [
+            serde_json::json!(["relative"]),
+            serde_json::json!(["/example/../other"]),
+            serde_json::json!(["/example", "/example"]),
+            serde_json::json!(["/example", "/example/child"]),
+            serde_json::json!(vec!["/example"; MAX_SCAN_ROOTS + 1]),
+        ] {
+            write_local(&home, roots);
+            assert!(load_config(None, &home, &home).is_err());
+        }
+        for contents in [
+            r#"{"schema_version":2,"scan_roots":[]}"#,
+            r#"{"schema_version":1,"scan_roots":[],"extra":true}"#,
+            r#"{"schema_version":1}"#,
+        ] {
+            fs::write(home.join(LOCAL_CONFIG_RELATIVE), contents).unwrap();
+            assert!(load_config(None, &home, &home).is_err());
+        }
+        fs::write(
+            home.join(LOCAL_CONFIG_RELATIVE),
+            vec![b' '; MAX_CONFIG_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(load_config(None, &home, &home).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_config_rejects_unsafe_modes_links_and_foreign_owners() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = TestDirectory::new("unsafe-local");
+        let home = config_fixture(&fixture);
+        write_local(&home, serde_json::json!([]));
+        let local = home.join(LOCAL_CONFIG_RELATIVE);
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(load_config(None, &home, &home).is_err());
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&local, home.join("alias")).unwrap();
+        assert!(load_config(None, &home, &home).is_err());
+        fs::remove_file(home.join("alias")).unwrap();
+        fs::rename(&local, home.join("actual")).unwrap();
+        symlink(home.join("actual"), &local).unwrap();
+        assert!(load_config(None, &home, &home).is_err());
+        fs::remove_file(&local).unwrap();
+        symlink(home.join("missing"), &local).unwrap();
+        assert!(load_config(None, &home, &home).is_err());
+        fs::remove_file(&local).unwrap();
+        fs::create_dir(&local).unwrap();
+        assert!(load_config(None, &home, &home).is_err());
+        // owner判定は現在uid以外を持つ通常fileで確認する（fixtureのchownは不要）。
+        let foreign = Path::new("/etc/passwd");
+        if foreign.metadata().unwrap().uid() != unsafe { libc::getuid() } {
+            assert!(
+                read_config_json::<serde_json::Value>(foreign, true)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsafe owner")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_managed_symlink_remains_supported_but_local_parent_symlinks_do_not() {
+        use std::os::unix::fs::symlink;
+        let fixture = TestDirectory::new("managed-config");
+        let repository = config_fixture(&fixture);
+        let home = repository.join("account");
+        fs::create_dir_all(home.join(".config")).unwrap();
+        symlink(repository.join(CONFIG_RELATIVE), home.join(CONFIG_RELATIVE)).unwrap();
+        assert!(
+            load_config(None, &home, &repository)
+                .unwrap()
+                .scan_roots
+                .is_empty()
+        );
+        write_local(&home, serde_json::json!([]));
+        let alias = repository.join("alias");
+        fs::create_dir(&alias).unwrap();
+        symlink(home.join(".config"), alias.join(".config")).unwrap();
+        assert!(load_config(None, &alias, &repository).is_err());
     }
 
     #[test]

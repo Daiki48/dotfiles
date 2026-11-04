@@ -1,9 +1,6 @@
 {
   "schema_version": 1,
-  "scan_roots": [
-    "/media/p3plus/dev",
-    "/media/p3plus/develop"
-  ],
+  "scan_roots": [],
   "trash_retention_days": 3,
   "build_cache_retention_days": 30,
   "codex_build_cache_retention_days": 1,

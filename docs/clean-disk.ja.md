@@ -26,9 +26,34 @@ worktree rootを1回だけ走査します。daemon、常駐監視、controller�
   上限、未終端field、command失敗、warningの検査で不完全と判定した場合は削除しません。
   初回と削除直前の2回の観測を行い、全processを対象にする条件は変わりません。
 
-設定は`.config/clean-disk.json`です。`scan_roots`にはプロジェクトそのものではなく、将来のプロジェクトも
-配置される親directoryだけを指定します。Codex worktree rootは`CODEX_HOME`または`~/.codex`から自動で
-追加されます。走査root同士、またはCodex worktree rootと包含・重複する設定は拒否します。
+共有設定は`.config/clean-disk.json`で、`scan_roots`の既定値は空です。ホスト固有のrootは
+現在accountのhomeと一致する`HOME`配下の`~/.config/clean-disk.local.json`へ保存します。
+このfileはsetupの配布対象外で、再setupでも変更しません。repository内に置く場合もGitのignore対象です。
+
+```json
+{
+  "schema_version": 1,
+  "scan_roots": ["/absolute/path/to/development"]
+}
+```
+
+`scan_roots`にはプロジェクトそのものではなく、将来のプロジェクトも配置される親directoryだけを指定します。
+既定実行は`~/.config/clean-disk.json`、なければ作業directoryの`.config/clean-disk.json`を読み、
+存在すれば上記homeのlocal設定で**scan roots全体だけ**を置換します。local設定がなければ共有値のまま、
+空配列なら開発rootを走査しません。保持期間などは共有設定から変えません。`XDG_CONFIG_HOME`は使いません。
+`--config /absolute/path/to/config.json`は従来形式の単独設定を読み、homeのlocal設定を適用しません。
+
+local設定は現在user所有、group/world writableでない、単一hard linkの64KiB以下の通常fileに限定し、
+`chmod 600 ~/.config/clean-disk.local.json`を推奨します。祖先を含むsymlink、未知field、不正JSON・schema、
+相対path・`..`・重複・包含するrootは拒否し、不正なlocal設定を無視して処理を続けません。
+共有設定のmanaged symlinkは引き続き利用できます。走査時のdirectory・symlink検証も維持します。
+
+既存環境では**共有設定の更新・main同期前に**、現在有効な共有設定の`scan_roots`を上記local形式へ保存し、
+所有者・権限・内容の一致を確認してください。既存local設定を上書きしたり、実ホスト値をcommitしたりしません。
+共有設定を空配列へ更新してからでは旧値を復元できないため、先に移行します。
+
+Codex worktree rootは`CODEX_HOME`または`~/.codex`から自動で追加され、開発rootが空でも従来どおり走査します。
+走査root同士、またはCodex worktree rootと包含・重複する設定は拒否します。runner adapterの扱いも変わりません。
 
 ```bash
 cargo run -- clean-disk --dry-run

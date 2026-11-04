@@ -1,5 +1,7 @@
 /target
 /.zsh/completions/_deno.zsh
+/.zshrc.local
+/.config/clean-disk.local.json
 
 # Claude Code - excluded from version control
 .claude/.credentials.json
