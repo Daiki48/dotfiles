@@ -89,6 +89,13 @@ taskを保持し、共通Rust処理がworker・CI待機・統合順序を管理�
 root once. Old inactive rebuildable Rust caches are removed automatically, expired trash requires `y/N`, and
 paths used by a live process are never offered as an override. Project-owned runner cleanup is
 connected through validated local manifests; see [disk cleanup運用ガイド](docs/clean-disk.ja.md).
+共有の開発scan rootsは空です。ホスト固有値は`~/.config/clean-disk.local.json`へ保存し、共有設定の
+更新・main同期より前に現在の有効値を移行してください。setupはこのlocal fileを変更しません。
+
+Zshの共有rcは`HOME`が現在accountのhomeと一致することを確認します。任意のSDK pathや環境変数は
+`~/.zshrc.local`へ追加できます（Gitのignore対象、setupの配布対象外）。現在user所有、group/world
+writableでない、symlinkでない単一hard linkの通常fileだけを読みます。`chmod 600 ~/.zshrc.local`を推奨します。
+読込みは共有PATH設定後・mise有効化前なので、mise管理toolの優先順位を維持します。
 
 Ordinary editing and testing run inside the sandbox. The explicit `.git` grant is process-agnostic:
 the managed hook is an operational policy guard for recognized Git, GitHub, helper, and destructive

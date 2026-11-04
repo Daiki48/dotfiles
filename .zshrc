@@ -1,5 +1,19 @@
-# Add deno completions to search path
-if [[ ":$FPATH:" != *":/home/daiki/.zsh/completions:"* ]]; then export FPATH="/home/daiki/.zsh/completions:$FPATH"; fi
+# HOMEは現在accountのhomeと一致する場合だけ使う。
+typeset _dotfiles_passwd
+typeset -a _dotfiles_account
+if ! _dotfiles_passwd=$(/usr/bin/getent passwd "$UID"); then
+    print -u2 -- '.zshrc: 現在accountのhomeを取得できません'
+    unset _dotfiles_passwd _dotfiles_account
+    return 1
+fi
+_dotfiles_account=("${(@s.:.)_dotfiles_passwd}")
+if [[ ${#_dotfiles_account} != 7 || "${_dotfiles_account[3]}" != "$UID" || "$HOME" != /* ||
+      "$HOME" != "${_dotfiles_account[6]}" || ! -d "$HOME" || ! -O "$HOME" || -L "$HOME" ]]; then
+    print -u2 -- '.zshrc: HOMEが現在accountのhomeと一致しません'
+    unset _dotfiles_passwd _dotfiles_account
+    return 1
+fi
+unset _dotfiles_passwd _dotfiles_account
 # Base options
 setopt always_last_prompt
 setopt auto_list
@@ -143,13 +157,27 @@ export DISPLAY=:0
 export NODE_OPTIONS="--max-old-space-size=8192"
 
 # The next line updates PATH for the Google Cloud SDK.
-if [ -f '/home/daiki/google-cloud-sdk/path.zsh.inc' ]; then . '/home/daiki/google-cloud-sdk/path.zsh.inc'; fi
+if [ -f "$HOME/google-cloud-sdk/path.zsh.inc" ]; then . "$HOME/google-cloud-sdk/path.zsh.inc"; fi
 
 # The next line enables shell command completion for gcloud.
-if [ -f '/home/daiki/google-cloud-sdk/completion.zsh.inc' ]; then . '/home/daiki/google-cloud-sdk/completion.zsh.inc'; fi
+if [ -f "$HOME/google-cloud-sdk/completion.zsh.inc" ]; then . "$HOME/google-cloud-sdk/completion.zsh.inc"; fi
 
 # Added by Antigravity CLI installer
-export PATH="/home/daiki/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
+
+# ホスト固有SDK等の任意設定。現在user所有の安全な通常fileだけを読む。
+if [[ -e "$HOME/.zshrc.local" || -L "$HOME/.zshrc.local" ]]; then
+    zmodload zsh/stat
+    typeset -A _dotfiles_local_stat
+    if [[ -f "$HOME/.zshrc.local" && ! -L "$HOME/.zshrc.local" && -O "$HOME/.zshrc.local" ]] &&
+        zstat -H _dotfiles_local_stat -- "$HOME/.zshrc.local" &&
+        (( (_dotfiles_local_stat[mode] & 8#022) == 0 && _dotfiles_local_stat[nlink] == 1 )); then
+        source "$HOME/.zshrc.local"
+    else
+        print -u2 -- '.zshrc: 安全でない.zshrc.localを読み飛ばしました'
+    fi
+    unset _dotfiles_local_stat
+fi
 
 # mise（PATH設定より後で有効化し、mise管理ツールを優先する）
 if command -v mise >/dev/null 2>&1; then
