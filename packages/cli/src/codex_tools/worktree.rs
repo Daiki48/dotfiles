@@ -1936,7 +1936,7 @@ fn completed_delivery(manifest: &Manifest) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(&contents) else {
         return false;
     };
-    value["version"].as_i64() == Some(1)
+    super::delivery::supported_state_version(value["version"].as_i64())
         && value["kind"].as_str() == Some("delivery")
         && value["stage"].as_str() == Some("completed")
         && value["task_id"].as_str() == Some(&manifest.task_id)
@@ -2527,6 +2527,17 @@ where
     }
 }
 
+fn doctor_exit_code(rows: &[(String, String, String)]) -> i32 {
+    if rows
+        .iter()
+        .all(|row| matches!(row.1.as_str(), "ready" | "completed"))
+    {
+        0
+    } else {
+        1
+    }
+}
+
 fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
     let parsed = parse_args(&args).map_err(|message| (2, message))?;
     let cwd = std::env::current_dir()
@@ -2605,16 +2616,7 @@ fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
             if parsed.command == "doctor" {
                 let rows = diagnose(&cwd, parsed.task_id.as_deref(), false)
                     .map_err(|cause| (1, cause.to_string()))?;
-                return Ok(
-                    if rows
-                        .iter()
-                        .all(|row| matches!(row.1.as_str(), "ready" | "completed"))
-                    {
-                        0
-                    } else {
-                        1
-                    },
-                );
+                return Ok(doctor_exit_code(&rows));
             }
             Ok(0)
         }
@@ -4069,8 +4071,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn completed_delivery_is_normal_only_when_worktree_is_removed() {
+    fn completed_delivery_fixture() -> (TemporaryRepository, PathBuf, Value) {
         let fixture = TemporaryRepository::new();
         let target = create_worktree(
             &fixture.repository,
@@ -4083,14 +4084,20 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-        let state = fixture
-            .manifest("task-completed")
-            .with_file_name("task-completed.delivery.json");
-        let value = serde_json::json!({"version":1, "kind":"delivery", "stage":"completed",
-            "task_id":"task-completed", "repository":"test/local", "branch":"feat/completed",
-            "head_sha":head});
-        fs::write(&state, serde_json::to_vec(&value).unwrap()).unwrap();
-        fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+        // 本番と同じ生成・遷移・保存経路を使い、reader側へ形式番号を複製しない。
+        let state = super::super::delivery::new_state(
+            "test/local",
+            "task-completed",
+            24,
+            &head,
+            "feat/completed",
+            "worktree_removed",
+        );
+        let state = super::super::delivery::save_completed_state_for_test(
+            "test/local",
+            "task-completed",
+            &state,
+        );
         assert_eq!(
             diagnose(&fixture.repository, None, true).unwrap()[0].1,
             "ready"
@@ -4103,15 +4110,86 @@ mod tests {
             &fixture.repository,
             &["worktree", "remove", target.to_str().unwrap()],
         );
-        assert_eq!(
-            diagnose(&fixture.repository, None, true).unwrap()[0].1,
-            "completed"
-        );
-        fs::write(&state, "{}").unwrap();
-        assert_eq!(
-            diagnose(&fixture.repository, None, true).unwrap()[0].1,
-            "missing"
-        );
+        (fixture, target, state)
+    }
+
+    fn assert_completed_diagnosis(fixture: &TemporaryRepository, completed: bool) {
+        let rows = diagnose(&fixture.repository, Some("task-completed"), true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, if completed { "completed" } else { "missing" });
+        assert_eq!(doctor_exit_code(&rows), if completed { 0 } else { 1 });
+    }
+
+    #[test]
+    fn completed_delivery_recognizes_current_writer_and_legacy_state_after_cleanup() {
+        let (fixture, _, mut state) = completed_delivery_fixture();
+        assert_completed_diagnosis(&fixture, true);
+
+        state["version"] = Value::from(1);
+        state.as_object_mut().unwrap().remove("issue_record");
+        let path = fixture
+            .manifest("task-completed")
+            .with_file_name("task-completed.delivery.json");
+        fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_completed_diagnosis(&fixture, true);
+    }
+
+    #[test]
+    fn completed_delivery_rejects_unknown_versions_and_mismatched_records() {
+        let (fixture, _, state) = completed_delivery_fixture();
+        let path = fixture
+            .manifest("task-completed")
+            .with_file_name("task-completed.delivery.json");
+        for (key, invalid) in [
+            ("version", Value::Null),
+            ("version", Value::Bool(true)),
+            ("version", Value::from("2")),
+            ("version", Value::from(2.0)),
+            ("version", Value::from(0)),
+            ("version", Value::from(-1)),
+            (
+                "version",
+                Value::from(state["version"].as_i64().unwrap() + 1),
+            ),
+            ("kind", Value::from("other")),
+            ("stage", Value::from("cleanup_complete")),
+            ("task_id", Value::from("task-other")),
+            ("branch", Value::from("feat/other")),
+            ("repository", Value::from("other/repository")),
+            ("head_sha", Value::from("main")),
+        ] {
+            let mut invalid_state = state.clone();
+            invalid_state[key] = invalid;
+            fs::write(&path, serde_json::to_vec(&invalid_state).unwrap()).unwrap();
+            assert_completed_diagnosis(&fixture, false);
+        }
+        fs::write(path, "{}").unwrap();
+        assert_completed_diagnosis(&fixture, false);
+    }
+
+    #[test]
+    fn completed_delivery_keeps_file_and_artifact_safety_checks() {
+        let (fixture, target, _) = completed_delivery_fixture();
+        let path = fixture
+            .manifest("task-completed")
+            .with_file_name("task-completed.delivery.json");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_completed_diagnosis(&fixture, false);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let saved = path.with_extension("saved");
+        fs::hard_link(&path, &saved).unwrap();
+        assert_completed_diagnosis(&fixture, false);
+        fs::remove_file(&saved).unwrap();
+        fs::rename(&path, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &path).unwrap();
+        assert_completed_diagnosis(&fixture, false);
+        fs::remove_file(&path).unwrap();
+        fs::rename(&saved, &path).unwrap();
+        assert_completed_diagnosis(&fixture, true);
+
+        let common = fixture.repository.join(".git");
+        super::super::artifacts::create(&target, "task-completed", &common).unwrap();
+        assert_completed_diagnosis(&fixture, false);
     }
 
     #[test]

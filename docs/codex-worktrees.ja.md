@@ -222,6 +222,8 @@ source/worktree/common Gitや別taskへは触れず、symlinkの先もたどり�
 完了手順に組み込む運用です。進行中のsourceを年齢だけで消す処理はありません。
 一覧とdoctorは、delivery記録が一致しworktree・登録済み成果物がなくなったtaskを
 `completed`（正常終了）と表示します。単にpathがないだけのtaskは引き続き`missing`です。
+完了記録は旧version 1と現行delivery形式を認識し、未対応のversionは受け付けません。
+形式が対応していても、識別情報・所有・権限・成果物回収の検査は省略しません。
 
 作成処理はおおむね `creating` → `ready` の順でmanifestを更新します。作成中に失敗した
 場合は`failed`と詳細を記録します。強制終了で`creating`が残った場合は、上記の`recover`

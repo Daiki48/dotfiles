@@ -26,6 +26,10 @@ const MANIFEST_VERSION: i64 = 1;
 const LEGACY_LEDGER_RECEIPT_VERSION: i64 = 5;
 const RECEIPT_VERSION: i64 = 6;
 const STATE_VERSION: i64 = 2;
+
+pub(super) fn supported_state_version(version: Option<i64>) -> bool {
+    matches!(version, Some(1 | STATE_VERSION))
+}
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PAGES: usize = 20;
@@ -3299,6 +3303,29 @@ fn validate_receipt_evidence(
     }
     Ok(())
 }
+pub(super) fn new_state(
+    repository: &str,
+    task: &str,
+    pr: i64,
+    head: &str,
+    branch: &str,
+    stage: &str,
+) -> Value {
+    object([
+        ("version", Value::Number(STATE_VERSION.into())),
+        ("kind", string("delivery")),
+        ("issue_record", Value::Null),
+        ("task_id", string(task)),
+        ("repository", string(repository)),
+        ("pr", Value::Number(pr.into())),
+        ("head_sha", string(head)),
+        ("branch", string(branch)),
+        ("stage", string(stage)),
+        ("updated_at", string(now())),
+        ("last_error", string("")),
+    ])
+}
+
 fn save_stage(
     repository: &str,
     task: &str,
@@ -3314,12 +3341,21 @@ fn save_stage(
     atomic_json(&state_path(repository, task)?, &value)?;
     Ok(value)
 }
+
+#[cfg(test)]
+pub(super) fn save_completed_state_for_test(repository: &str, task: &str, state: &Value) -> Value {
+    save_stage(repository, task, state, "completed", "").expect("完了記録を保存できません")
+}
+
 fn load_state(repository: &str, task: &str, receipt_value: &Value, branch: &str) -> Result<Value> {
     let path = state_path(repository, task)?;
     if !path.exists() {
         return Err(error("delivery stateが存在しません"));
     }
     let mut state = read_json_file(&path, "delivery state")?;
+    if !supported_state_version(state.get("version").and_then(Value::as_i64)) {
+        return Err(error("delivery stateのversionが未対応です"));
+    }
     // v1の進行中taskも、既存fieldの厳密検証を保ったまま読み替える。
     if state.get("version").and_then(Value::as_i64) == Some(1) {
         if state.get("issue_record").is_some() {
@@ -3927,19 +3963,14 @@ fn deliver_locked(
         }
         save_stage(&repository, task, &current, "merge_started", "")?
     } else {
-        let state = object([
-            ("version", Value::Number(STATE_VERSION.into())),
-            ("kind", string("delivery")),
-            ("issue_record", Value::Null),
-            ("task_id", string(task)),
-            ("repository", string(&repository)),
-            ("pr", Value::Number(expected_pr.into())),
-            ("head_sha", string(&head)),
-            ("branch", string(str_value(&manifest_value, "branch")?)),
-            ("stage", string("merge_started")),
-            ("updated_at", string(now())),
-            ("last_error", string("")),
-        ]);
+        let state = new_state(
+            &repository,
+            task,
+            expected_pr,
+            &head,
+            &str_value(&manifest_value, "branch")?,
+            "merge_started",
+        );
         atomic_json(&path, &state)?;
         state
     };
@@ -4533,19 +4564,14 @@ fn recover_merged(root: &Path, args: &CliArgs) -> Result<Value> {
         if git(root, &["rev-parse", "HEAD"], true)?.trim() != live {
             return Err(error("復旧直前にローカルmainが変化しました"));
         }
-        let state = object([
-            ("version", Value::Number(STATE_VERSION.into())),
-            ("kind", string("delivery")),
-            ("issue_record", Value::Null),
-            ("task_id", string(&args.task)),
-            ("repository", string(&repository)),
-            ("pr", Value::Number(args.pr.into())),
-            ("head_sha", string(&args.head)),
-            ("branch", string(&branch)),
-            ("stage", string("merged")),
-            ("updated_at", string(now())),
-            ("last_error", string("")),
-        ]);
+        let state = new_state(
+            &repository,
+            &args.task,
+            args.pr,
+            &args.head,
+            &branch,
+            "merged",
+        );
         // 途中停止でreceiptだけ更新された場合も同じ証拠で再検証して再開できる。
         atomic_json(
             &receipt_path(&repository, &args.task, &args.head)?,
