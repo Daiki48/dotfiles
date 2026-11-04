@@ -245,6 +245,10 @@ base branchやrepository設定を同時変更する競合をatomicには拘束�
 不明、network/auth障害、RulesetまたはFree/private readback不一致ではdeliverしません。PR、remote/local branch、
 worktree、receiptを保持し、再開時に状態を再取得します。
 
+mergeのGitHub CLIが失敗した場合は、終了codeと固定分類だけを返します。stderr本文・URL・認証値は
+表示しません。分類は原因調査の手掛かりであり、gateを弱めたり自動再送を許可したりする判定ではありません。
+PRが実際にmergeされたかを再取得し、保存済みdelivery stateと照合してから同じhelperで再開します。
+
 ## finishとmain同期
 
 mergeがGitHubで完了した後、`finish`は次を順に検証します。
