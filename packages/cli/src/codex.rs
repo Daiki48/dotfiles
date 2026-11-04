@@ -193,6 +193,8 @@ fn trusted_directory_metadata(metadata: &fs::Metadata) -> bool {
 }
 
 fn validate_trusted_path_components(path: &Path, allow_final_symlink: bool) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let account_home = account_home_dir()?;
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
@@ -215,14 +217,55 @@ fn validate_trusted_path_components(path: &Path, allow_final_symlink: bool) -> R
             }
             continue;
         }
-        if !is_final && !trusted_directory_metadata(&metadata) {
-            anyhow::bail!(
-                "Trusted path component is not private: {}",
-                current.display()
-            );
+        if !is_final {
+            let trusted = trusted_directory_metadata(&metadata);
+            #[cfg(target_os = "linux")]
+            let trusted = trusted || trusted_account_ancestor(&current, &account_home, &metadata);
+            if !trusted {
+                anyhow::bail!(
+                    "Trusted path component is not private: {}",
+                    current.display()
+                );
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_root_is_unmapped(uid_map: &str) -> bool {
+    // 外側のUID 0は入れ子namespaceの利用者自身にもなるため、現在のnamespace側の列を見る。
+    let mappings = uid_map
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .map(str::parse::<u32>)
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .collect::<std::result::Result<Vec<_>, _>>();
+    mappings.is_ok_and(|mappings| {
+        !mappings.is_empty()
+            && mappings
+                .iter()
+                .all(|mapping| mapping.len() == 3 && mapping[2] > 0 && mapping[0] != 0)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_account_ancestor(path: &Path, home: &Path, metadata: &fs::Metadata) -> bool {
+    // namespace越しのroot表示は、検証済みaccount homeの厳格な祖先だけで扱う。
+    // home内のpackageや実行fileをoverflow UID所有として信用する範囲には広げない。
+    path != home
+        && home.starts_with(path)
+        && metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.mode() & 0o022 == 0
+        && fs::read_to_string("/proc/self/uid_map")
+            .is_ok_and(|map| namespace_root_is_unmapped(&map))
+        && fs::read_to_string("/proc/sys/kernel/overflowuid")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            == Some(metadata.uid())
 }
 
 fn trusted_user_executable(home: &Path, relative: &str, name: &str) -> Result<PathBuf> {
@@ -4430,6 +4473,64 @@ mod tests {
             trusted_user_executable(&home, ".local/bin/codex", "Codex CLI")
                 .expect("accept trusted symlink target"),
             link
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_ancestor_requires_an_unmapped_namespace_root() {
+        assert!(!super::namespace_root_is_unmapped("0 0 4294967295\n"));
+        assert!(super::namespace_root_is_unmapped("1000 0 1\n"));
+        assert!(!super::namespace_root_is_unmapped(""));
+        assert!(!super::namespace_root_is_unmapped("1000 invalid 1\n"));
+        assert!(!super::namespace_root_is_unmapped("1000 1000 0\n"));
+        assert!(super::namespace_root_is_unmapped("1000 1000 1\n"));
+        let home = super::account_home_dir().unwrap();
+        let root = fs::symlink_metadata("/").unwrap();
+        assert!(!super::trusted_account_ancestor(&home, &home, &root));
+        assert!(!super::trusted_account_ancestor(
+            &home.join("foreign-package"),
+            &home,
+            &root
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_account_path_in_current_user_namespace() {
+        const MARKER: &str = "DOTFILES_ACCOUNT_PATH_NAMESPACE_TEST";
+        let home = super::account_home_dir().unwrap();
+        super::validate_trusted_path_components(&home, false).unwrap();
+        if std::env::var(MARKER).as_deref() == Ok("1") {
+            let map = fs::read_to_string("/proc/self/uid_map").unwrap();
+            if super::namespace_root_is_unmapped(&map) {
+                assert!(super::trusted_account_ancestor(
+                    Path::new("/"),
+                    &home,
+                    &fs::symlink_metadata("/").unwrap()
+                ));
+            }
+            return;
+        }
+        if !crate::codex_tools::process::task_isolation_available() {
+            return;
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "codex::tests::trusted_account_path_in_current_user_namespace",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .env("HOME", &home);
+        let result =
+            crate::codex_tools::process::run(&mut command, std::time::Duration::from_secs(30))
+                .unwrap();
+        assert!(
+            result.status.success(),
+            "namespace内のaccount path検証に失敗: {}",
+            String::from_utf8_lossy(&result.stdout)
         );
     }
 
