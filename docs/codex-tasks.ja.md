@@ -32,8 +32,9 @@ OSサービスを登録せずに使えます。`run`は前景で継続し、`rec
 既定はhighです。実装workerの報告では引き下げず、必要な場合は引き上げます。
 受付時点でlow/mediumと判断できた場合は実装時のself-review、高以上は別workerの独立レビューを使います。
 統合はrepository単位で順序を管理し、merge commitのmain CI完了まで後続統合を待たせます。
-CI起動に既存の委任済み承認操作が必要な場合は、固定HEADのレビュー後に専用段階で行います。
-その操作が済んだ後のCI待ちはRustへ返し、成功確認後に統合workerを起動します。
+CI起動labelの付与が既存方針で明示的に委任されている場合は、受付時に`--ci-label <既存label>`を渡します。
+固定HEADのレビュー後、RustがPR・HEAD・baseとlabelの実在を照合し、登録されたlabelの追加だけを行います。
+CI起動用のAI workerは起動せず、RustがCI成功を確認してから統合workerを起動します。
 既存deliveryのreview receipt・固定SHA・remote gate・cleanup検証を省略しません。
 
 ## 保存場所とhost境界

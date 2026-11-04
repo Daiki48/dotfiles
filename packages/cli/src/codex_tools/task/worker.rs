@@ -102,6 +102,9 @@ pub(super) fn configure_environment(command: &mut Command, context: &Context) {
 }
 
 pub(super) fn spawn(context: &Context, task: &Task, lease: &Lock) -> Result<Child> {
+    if !worker_phase(&task.phase) {
+        return Err("この段階ではCodex workerを起動しません".into());
+    }
     let executable = std::env::current_exe().map_err(|_| "workerの実行fileを確認できません")?;
     let mut command = Command::new(executable);
     #[cfg(unix)]
@@ -128,6 +131,13 @@ pub(super) fn spawn(context: &Context, task: &Task, lease: &Lock) -> Result<Chil
     command
         .spawn()
         .map_err(|_| "workerを起動できません。状態を保持しました".into())
+}
+
+pub(super) fn worker_phase(phase: &Phase) -> bool {
+    matches!(
+        phase,
+        Phase::Implementation | Phase::Review | Phase::Integration | Phase::Finish
+    )
 }
 
 pub(super) fn preflight(context: &Context) -> Result<PathBuf> {
@@ -246,9 +256,6 @@ fn schema() -> Value {
 
 fn prompt(task: &Task) -> String {
     let phase = match task.phase {
-        Phase::CiAuthorization => {
-            "CI起動を確認する統合担当です。登録riskに応じた固定HEADのレビューと現在のPR head/baseを確認し、既存repository方針で明示的に委任されたCI起動label等が必要なら、その既存権限内で付与してください。新しい権限やenvironment承認は与えず、委任が不明ならawaiting_decisionにしてください。source変更・追加push・Ready化・merge・finishは行わないでください。CI完了をpollしたり待機せず、必要な起動操作が済んだ場合、または起動操作が不要で実行待ちの場合はreadyを返してください。待機はRustが担当します。"
-        }
         Phase::Implementation => {
             "実装担当です。目的・受入条件を確認し、この既存task worktreeで実装・検証・commit・push・Draft PR作成まで進めてください。今回はPRまでという停止境界です。worktreeを追加作成せず、Ready化・merge・finish・CI実行承認label付与は行わないでください。既存PRなら同じbranchへ通常pushで修正します。PR本文に自動closeキーワードを使わず、関連Issueを参照してください。readyはDraft PRと現在のHEAD SHAを検証できた場合だけ返してください。"
         }
@@ -336,7 +343,8 @@ pub(super) fn execute(
         let _lock = context.store.lock()?;
         context.load(id)?
     };
-    if task.generation != generation
+    if !worker_phase(&task.phase)
+        || task.generation != generation
         || task
             .run
             .as_ref()

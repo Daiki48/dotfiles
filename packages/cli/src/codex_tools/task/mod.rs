@@ -48,6 +48,9 @@ enum Commands {
         resource: Vec<String>,
         #[arg(long, default_value = "high", value_parser = ["low", "medium", "high", "critical"])]
         risk: String,
+        /// repositoryの既存方針で委任済みのCI起動labelだけを明示する。
+        #[arg(long)]
+        ci_label: Vec<String>,
     },
     List,
     Show {
@@ -143,6 +146,7 @@ struct Task {
     branch: String,
     objective: String,
     risk: String,
+    ci_labels: Vec<String>,
     dependencies: Vec<String>,
     resources: Vec<String>,
     phase: Phase,
@@ -155,6 +159,7 @@ struct Task {
     base: Option<String>,
     merge_commit: Option<String>,
     review: Option<worker::Report>,
+    review_independent: bool,
     checkpoint: String,
     ci_fingerprint: String,
     ci_state: Option<ci::CiState>,
@@ -192,6 +197,7 @@ impl Task {
             || !self.repository.is_absolute()
             || !safe_text(&self.objective, 32 * 1024)
             || risk_rank(&self.risk) == usize::MAX
+            || !valid_ci_labels(&self.ci_labels)
             || !self.github.contains('/')
             || !self.branch.starts_with("feat/")
             || self.branch.contains(['\n', '\r', '\0'])
@@ -208,6 +214,10 @@ impl Task {
                 .is_some_and(|head| !valid_sha(head))
             || self.events.len() > 128
             || self.checkpoint.len() > 32 * 1024
+            || self
+                .review
+                .as_ref()
+                .is_some_and(|review| review.validate().is_err())
             || (matches!(self.phase, Phase::CiAuthorization | Phase::Integration)
                 && !review_ready(self))
             || self
@@ -291,6 +301,7 @@ impl Context {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn submit(
     context: &Context,
     id: String,
@@ -299,6 +310,7 @@ fn submit(
     dependencies: Vec<String>,
     resources: Vec<String>,
     risk: String,
+    ci_labels: Vec<String>,
 ) -> Result<Value> {
     if !valid_id(&id) || !safe_text(&objective, 32 * 1024) {
         return Err("task IDまたは目的が不正です".into());
@@ -315,6 +327,7 @@ fn submit(
             && task.dependencies == dependencies
             && task.resources == resources
             && task.risk == risk
+            && task.ci_labels == ci_labels
             && branch.as_ref().is_none_or(|branch| branch == &task.branch)
         {
             return Ok(json!({"task_id":id,"existing":true,"phase":task.phase}));
@@ -338,6 +351,7 @@ fn submit(
         branch: branch.unwrap_or_else(|| format!("feat/{id}")),
         objective,
         risk,
+        ci_labels,
         dependencies,
         resources,
         phase: Phase::Implementation,
@@ -350,6 +364,7 @@ fn submit(
         base: None,
         merge_commit: None,
         review: None,
+        review_independent: false,
         checkpoint: String::new(),
         ci_fingerprint: String::new(),
         ci_state: None,
@@ -427,8 +442,14 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
     }
     task.run = None;
     task.checkpoint = report.summary.clone();
+    let review_outdated = run.phase == Phase::Integration && !review_ready(task);
     if task.pause_requested {
         task.stop(Phase::Paused, "workerの停止と回収を確認しました");
+        if review_outdated {
+            task.review = None;
+            task.review_independent = false;
+            task.resume_phase = Phase::Review;
+        }
         return Ok(());
     }
     match report.outcome.as_str() {
@@ -450,8 +471,12 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
                 task.pr = Some(pr);
                 task.head = Some(head.into());
                 task.review = None;
+                task.review_independent = false;
                 if risk_rank(&task.risk) < risk_rank("high") {
-                    task.review = Some(report.clone());
+                    task.review = Some(worker::Report {
+                        risk: task.risk.clone(),
+                        ..report.clone()
+                    });
                     task.phase = Phase::CiAuthorization;
                 } else {
                     task.phase = Phase::Review;
@@ -459,14 +484,23 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
                 task.next_check = 0;
             }
             Phase::Review => {
-                task.review = Some(report.clone());
+                task.review = Some(worker::Report {
+                    risk: task.risk.clone(),
+                    ..report.clone()
+                });
+                task.review_independent = true;
                 task.phase = Phase::CiAuthorization;
             }
-            Phase::CiAuthorization => {
-                task.phase = Phase::Integration;
-            }
             Phase::Integration => {
-                task.phase = Phase::MainCi;
+                if review_ready(task) {
+                    task.phase = Phase::MainCi;
+                } else {
+                    task.review = None;
+                    task.review_independent = false;
+                    task.phase = Phase::Review;
+                    task.checkpoint =
+                        "riskが上がりました。新しい深度の独立レビューを行います".into();
+                }
                 task.next_check = 0;
             }
             Phase::Finish => {
@@ -490,6 +524,16 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
         }
         "awaiting_decision" => task.stop(Phase::AwaitingDecision, &report.summary),
         _ => task.stop(Phase::Blocked, &report.summary),
+    }
+    if review_outdated
+        && matches!(
+            task.phase,
+            Phase::Blocked | Phase::AwaitingDecision | Phase::Paused
+        )
+    {
+        task.review = None;
+        task.review_independent = false;
+        task.resume_phase = Phase::Review;
     }
     task.event("worker_result", &report.outcome);
     Ok(())
@@ -628,11 +672,7 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
         || task.pause_requested
         || !matches!(
             task.phase,
-            Phase::Implementation
-                | Phase::Review
-                | Phase::CiAuthorization
-                | Phase::Integration
-                | Phase::Finish
+            Phase::Implementation | Phase::Review | Phase::Integration | Phase::Finish
         )
     {
         return Ok(false);
@@ -641,14 +681,6 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
         return Ok(false);
     }
     if matches!(task.phase, Phase::CiAuthorization | Phase::Integration) && !review_ready(task) {
-        return Ok(false);
-    }
-    if task.phase == Phase::CiAuthorization
-        && !matches!(
-            task.ci_state,
-            Some(ci::CiState::Pending | ci::CiState::Missing)
-        )
-    {
         return Ok(false);
     }
     for dependency in &task.dependencies {
@@ -700,8 +732,59 @@ fn review_ready(task: &Task) -> bool {
     task.head.is_some()
         && task.pr.is_some()
         && task.review.as_ref().is_some_and(|review| {
-            review.outcome == "ready" && review.head == task.head && review.pr == task.pr
+            review.outcome == "ready"
+                && review.head == task.head
+                && review.pr == task.pr
+                && risk_rank(&review.risk) >= risk_rank(&task.risk)
+                && (risk_rank(&task.risk) < risk_rank("high") || task.review_independent)
         })
+}
+
+pub(super) fn valid_ci_labels(labels: &[String]) -> bool {
+    labels.len() <= 20
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 100
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:/ ".contains(&byte))
+                && label.trim() == label
+        })
+}
+
+fn authorize_ci(context: &Context, task: &mut Task) -> Result<()> {
+    if task.phase != Phase::CiAuthorization
+        || task.pause_requested
+        || !review_ready(task)
+        || !matches!(
+            task.ci_state,
+            Some(ci::CiState::Pending | ci::CiState::Missing)
+        )
+    {
+        return Ok(());
+    }
+    if !task.ci_labels.is_empty() {
+        let result = super::delivery::task_add_ci_labels(
+            &context.repository,
+            &context.github,
+            task.pr.ok_or("PRがありません")?,
+            task.head.as_deref().ok_or("HEADがありません")?,
+            task.base.as_deref().ok_or("baseがありません")?,
+            &task.ci_labels,
+        );
+        if let Err(reason) = result {
+            task.event("ci_authorization_wait", &reason);
+            task.ci_state = None;
+            task.next_check = now() + 120;
+            return Ok(());
+        }
+    }
+    task.phase = Phase::Integration;
+    task.event(
+        "ci_authorized",
+        "受付時に明示された既存CI起動操作を確認しました。CI待機はRustが担当します",
+    );
+    Ok(())
 }
 
 fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
@@ -729,6 +812,7 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
         }
         if task.run.is_none() {
             observe_ci(context, task)?;
+            authorize_ci(context, task)?;
         }
         let _lock = context.store.lock()?;
         let current = context.load(&task.id)?;
@@ -881,7 +965,7 @@ fn start(context: &Context) -> Result<Value> {
 fn execute(cli: Cli) -> Result<Value> {
     let context = Context::open()?;
     match cli.command {
-        Commands::Submit { task_id, objective, branch, depends_on, resource, risk } => submit(&context, task_id, objective, branch, depends_on, resource, risk),
+        Commands::Submit { task_id, objective, branch, depends_on, resource, risk, ci_label } => submit(&context, task_id, objective, branch, depends_on, resource, risk, ci_label),
         Commands::List => Ok(json!(context.store.list()?.iter().map(|task| json!({"task_id":task.id,"phase":task.phase,"running":task.run.is_some(),"updated":task.updated})).collect::<Vec<_>>())),
         Commands::Show { task_id } => Ok(json!(context.load(&task_id)?)),
         Commands::Events { task_id } => Ok(json!(context.load(&task_id)?.events)),
@@ -1008,6 +1092,7 @@ pub(crate) fn invocation_reason(args: &[String]) -> Option<String> {
             branch,
             depends_on,
             resource,
+            ci_label,
             ..
         } => (!valid_id(&task_id)
             || !safe_text(&objective, 32 * 1024)
@@ -1015,7 +1100,8 @@ pub(crate) fn invocation_reason(args: &[String]) -> Option<String> {
                 !branch.starts_with("feat/") || branch.contains(['\n', '\r', '\0'])
             })
             || depends_on.iter().any(|id| !valid_id(id) || id == &task_id)
-            || resource.iter().any(|name| !resource_name(name)))
+            || resource.iter().any(|name| !resource_name(name))
+            || !valid_ci_labels(&ci_label))
         .then(|| "codex-taskの登録内容が不正です".into()),
         Commands::Show { task_id } | Commands::Events { task_id } | Commands::Pause { task_id } => {
             (!valid_id(&task_id)).then(|| "task IDが不正です".into())
@@ -1074,6 +1160,7 @@ mod tests {
                 vec![],
                 vec![],
                 "high".into(),
+                vec![],
             )
             .unwrap();
         }
@@ -1098,7 +1185,8 @@ mod tests {
                 None,
                 vec![],
                 vec![],
-                "high".into()
+                "high".into(),
+                vec![]
             )
             .is_err()
         );
@@ -1116,7 +1204,8 @@ mod tests {
                 None,
                 vec!["task-missing".into()],
                 vec![],
-                "high".into()
+                "high".into(),
+                vec![]
             )
             .is_err()
         );
@@ -1129,6 +1218,7 @@ mod tests {
             vec!["task-one".into()],
             vec![],
             "high".into(),
+            vec![],
         )
         .unwrap();
         assert!(
@@ -1139,7 +1229,8 @@ mod tests {
                 None,
                 vec!["task-two".into()],
                 vec![],
-                "high".into()
+                "high".into(),
+                vec![]
             )
             .is_err()
         );
@@ -1325,6 +1416,7 @@ mod tests {
             vec![],
             vec![],
             "low".into(),
+            vec![],
         )
         .unwrap();
         let mut task = fixture.0.load("task-low").unwrap();
@@ -1353,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn ci_authorization_can_run_before_ci_success_but_not_during_api_outage() {
+    fn ci_authorization_has_no_ai_worker_and_waits_on_api_outage() {
         let fixture = Fixture::new();
         fixture.submit("task-one");
         let mut task = fixture.0.load("task-one").unwrap();
@@ -1370,18 +1462,166 @@ mod tests {
             head: task.head.clone(),
             risk: "high".into(),
         });
+        task.review_independent = true;
+        assert!(!worker::worker_phase(&task.phase));
         for state in [ci::CiState::Pending, ci::CiState::Missing] {
+            task.phase = Phase::CiAuthorization;
             task.ci_state = Some(state);
-            assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+            assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+            authorize_ci(&fixture.0, &mut task).unwrap();
+            assert_eq!(task.phase, Phase::Integration);
         }
         for state in [
             None,
             Some(ci::CiState::Failure),
             Some(ci::CiState::Cancelled),
         ] {
+            task.phase = Phase::CiAuthorization;
             task.ci_state = state;
-            assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+            authorize_ci(&fixture.0, &mut task).unwrap();
+            assert_eq!(task.phase, Phase::CiAuthorization);
         }
+    }
+
+    #[test]
+    fn risk_increase_invalidates_self_review_before_integration_can_continue() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        task.risk = "low".into();
+        task.phase = Phase::Integration;
+        task.pr = Some(12);
+        task.head = Some("a".repeat(40));
+        task.review = Some(worker::Report {
+            generation: 1,
+            outcome: "ready".into(),
+            summary: "局所変更のself-review".into(),
+            pr: task.pr,
+            head: task.head.clone(),
+            risk: "low".into(),
+        });
+        assert!(review_ready(&task));
+        task.generation = 2;
+        task.run = Some(Run {
+            generation: 2,
+            phase: Phase::Integration,
+            started: now(),
+        });
+        let report = worker::Report {
+            generation: 2,
+            risk: "high".into(),
+            ..task.review.clone().unwrap()
+        };
+        store::atomic_json(
+            &worker::report_path(&fixture.0.store, &task.id, 2).unwrap(),
+            &report,
+        )
+        .unwrap();
+        apply_report(&fixture.0, &mut task).unwrap();
+        assert_eq!(task.phase, Phase::Review);
+        assert!(task.review.is_none());
+        assert!(!review_ready(&task));
+        assert_eq!(task.risk, "high");
+    }
+
+    #[test]
+    fn raised_risk_while_awaiting_decision_resumes_an_independent_review() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        task.risk = "low".into();
+        task.phase = Phase::Integration;
+        task.pr = Some(12);
+        task.head = Some("a".repeat(40));
+        task.review = Some(worker::Report {
+            generation: 1,
+            outcome: "ready".into(),
+            summary: "self-review".into(),
+            pr: task.pr,
+            head: task.head.clone(),
+            risk: "low".into(),
+        });
+        task.generation = 2;
+        task.run = Some(Run {
+            generation: 2,
+            phase: Phase::Integration,
+            started: now(),
+        });
+        let report = worker::Report {
+            generation: 2,
+            outcome: "awaiting_decision".into(),
+            risk: "high".into(),
+            ..task.review.clone().unwrap()
+        };
+        store::atomic_json(
+            &worker::report_path(&fixture.0.store, &task.id, 2).unwrap(),
+            &report,
+        )
+        .unwrap();
+        apply_report(&fixture.0, &mut task).unwrap();
+        assert_eq!(task.phase, Phase::AwaitingDecision);
+        assert_eq!(task.resume_phase, Phase::Review);
+        fixture.0.store.save(&task).unwrap();
+        resume_task(&fixture.0, &task.id, "判断を反映してレビューする".into()).unwrap();
+        let mut task = fixture.0.load(&task.id).unwrap();
+        assert_eq!(task.phase, Phase::Review);
+        task.generation = 3;
+        task.run = Some(Run {
+            generation: 3,
+            phase: Phase::Review,
+            started: now(),
+        });
+        let report = worker::Report {
+            generation: 3,
+            outcome: "ready".into(),
+            risk: "medium".into(),
+            ..report
+        };
+        store::atomic_json(
+            &worker::report_path(&fixture.0.store, &task.id, 3).unwrap(),
+            &report,
+        )
+        .unwrap();
+        apply_report(&fixture.0, &mut task).unwrap();
+        assert_eq!(task.phase, Phase::CiAuthorization);
+        assert!(task.review_independent);
+        assert!(review_ready(&task));
+        assert_eq!(task.risk, "high");
+    }
+
+    #[test]
+    fn ci_activation_only_constructs_add_existing_label_requests() {
+        let args = super::super::delivery::task_ci_label_args(
+            "example/product",
+            12,
+            &["ci-approved".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            [
+                "api",
+                "repos/example/product/issues/12/labels",
+                "--method",
+                "POST",
+                "-f",
+                "labels[]=ci-approved"
+            ]
+        );
+        for label in ["", "--body=overwrite", "label,other", "label\nsecret"] {
+            assert!(
+                super::super::delivery::task_ci_label_args("example/product", 12, &[label.into()])
+                    .is_err()
+            );
+        }
+        assert!(
+            super::super::delivery::task_ci_label_args(
+                "example/product/other",
+                12,
+                &["ci-approved".into()]
+            )
+            .is_err()
+        );
     }
 
     #[test]
