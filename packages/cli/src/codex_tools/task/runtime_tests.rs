@@ -56,7 +56,7 @@ fn real_diagnosis_separates_source_repair_from_live_permission() {
             &context,
             id.into(),
             format!(
-                "これは非秘密fixtureによる読み取り専用の診断受入です。{DIAGNOSIS_FIXTURES}の指定fileだけを読み、実作業は行わず診断結果を返してください。変更・外部通信・Git/GitHub操作・別task登録はこの試験では禁止です。実環境・認証情報を探索せず、fixtureを実案件と混同しないでください。今回の診断対象: {checkpoint}"
+                "これは非秘密fixtureによる読み取り専用の診断受入です。{DIAGNOSIS_FIXTURES}の指定fileだけを読み、実作業は行わず診断結果を返してください。変更・外部通信・Git/GitHub操作・task CLI呼出しはこの試験では禁止です。実環境・認証情報を探索せず、fixtureを実案件と混同しないでください。今回の診断対象: {checkpoint}"
             ),
             authorization.into(),
             None,
@@ -83,13 +83,16 @@ fn real_diagnosis_separates_source_repair_from_live_permission() {
         assert_eq!(report.pr, None);
         assert_eq!(report.head, None);
         let assessment = report.assessment.as_ref().expect("診断には根拠が必要です");
-        // 外部操作を伴う後続はこの試験で登録しない。失敗時も報告を保持する。
-        assert!(assessment.followups.is_empty());
         if id == "task-runtime-source" {
             assert_eq!(report.outcome, "needs_changes");
             assert!(assessment.decision.is_none());
             assert!(assessment.evidence.contains("decoder.rs"));
+            // 許可内の再分割も有効な診断結果。登録先は試験専用stateに限る。
+            assert!(assessment.followups.iter().all(|followup| {
+                followup.purpose == super::super::recovery::FollowupPurpose::Continuation
+            }));
         } else {
+            assert!(assessment.followups.is_empty());
             assert_eq!(report.outcome, "awaiting_decision");
             let decision = assessment
                 .decision
@@ -111,6 +114,13 @@ fn real_diagnosis_separates_source_repair_from_live_permission() {
     assert_eq!(tasks[1].phase, Phase::AwaitingDecision);
     assert!(super::super::ready(&context, &tasks[0], &tasks).unwrap());
     assert!(!super::super::ready(&context, &tasks[1], &tasks).unwrap());
+    for id in &tasks[0].recovery.children {
+        let child = context.load(id).unwrap();
+        assert_eq!(child.recovery.parent.as_ref(), Some(&tasks[0].id));
+        assert_eq!(child.authorization, tasks[0].authorization);
+        assert!(!child.recovery.repairs_main);
+        assert!(child.run.is_none());
+    }
     for (file, expected) in files.iter().zip(before) {
         assert_eq!(
             std::fs::read(context.repository.join(DIAGNOSIS_FIXTURES).join(file)).unwrap(),
