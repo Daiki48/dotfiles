@@ -617,12 +617,27 @@ fn apply_report_with(
     if risk_rank(&report.risk) > risk_rank(&task.risk) {
         task.risk = report.risk.clone();
     }
-    if run.phase != Phase::Implementation && (report.head != task.head || report.pr != task.pr) {
+    // 未統合の同じPRで観測した新HEADは診断材料であり、レビュー証拠ではない。
+    // 保存HEADの採用は、所有・Git・検証を再照合するImplementation報告だけに任せる。
+    let diagnosis_head_changed = run.phase == Phase::Diagnosis
+        && task.merge_commit.is_none()
+        && !matches!(task.effective_phase(), Phase::MainCi | Phase::Finish)
+        && task.pr.is_some()
+        && report.pr == task.pr
+        && task.head.as_deref().is_some_and(valid_sha)
+        && report.head.as_deref().is_some_and(valid_sha)
+        && report.head != task.head;
+    if run.phase != Phase::Implementation
+        && (report.pr != task.pr || report.head != task.head && !diagnosis_head_changed)
+    {
         task.run = None;
         task.diagnose("worker報告のレビュー対象HEADが一致しません");
         task.resume_phase = Phase::Implementation;
         task.recovery.origin = Some(Phase::Implementation);
         return Ok(());
+    }
+    if diagnosis_head_changed {
+        stale_head(task);
     }
     task.run = None;
     task.checkpoint = report.summary.clone();
