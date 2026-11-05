@@ -432,3 +432,253 @@ fn interrupted_main_repair_registration_reuses_its_owned_unlinked_child() {
     assert_eq!(child.recovery.parent, Some(parent.id));
     assert!(child.recovery.repairs_main);
 }
+
+fn diagnosis_report(outcome: &str, assessment: recovery::Assessment) -> worker::Report {
+    worker::Report {
+        generation: 1,
+        outcome: outcome.into(),
+        summary: "診断結果に基づく再計画".into(),
+        pr: None,
+        head: None,
+        risk: "high".into(),
+        assessment: Some(assessment),
+    }
+}
+
+fn review_and_failed_ci(task: &mut Task) {
+    task.pr = Some(18);
+    task.head = Some("a".repeat(40));
+    task.base = Some("b".repeat(40));
+    task.review = Some(worker::Report {
+        generation: task.generation,
+        outcome: "ready".into(),
+        summary: "以前の独立レビュー".into(),
+        pr: task.pr,
+        head: task.head.clone(),
+        risk: task.risk.clone(),
+        assessment: None,
+    });
+    task.review_independent = true;
+    task.ci_state = Some(ci::CiState::Failure);
+    task.ci_fingerprint = "previous-failed-ci".into();
+}
+
+#[test]
+fn needs_changes_with_reused_child_resumes_parent_without_mutating_child_or_reusing_review() {
+    for (suffix, phase) in [
+        ("pending", Phase::Implementation),
+        ("paused", Phase::Paused),
+        ("completed", Phase::Completed),
+    ] {
+        let fixture = Fixture::new();
+        let mut parent = new_parent(&fixture, &format!("resume-{suffix}"));
+        let original_objective = "親完了後にだけ開始する後続作業";
+        register_followups(
+            &fixture.0,
+            &mut parent,
+            &assessment(vec![followup(original_objective, true, None, vec![])]),
+        )
+        .unwrap();
+        let child_id = parent.recovery.children[0].clone();
+        let mut child = fixture.0.store.load(&child_id).unwrap();
+        match phase {
+            Phase::Implementation => {}
+            Phase::Paused => {
+                child.stop(Phase::Paused, "停止状態をfixtureで設定");
+                child.pause_requested = true;
+            }
+            Phase::Completed => child.phase = Phase::Completed,
+            _ => unreachable!(),
+        }
+        fixture.0.store.save(&child).unwrap();
+        let child_path = fixture.0.store.path(&child_id).unwrap();
+        let child_before = fs::read(&child_path).unwrap();
+        assert_eq!(child.dependencies, vec![parent.id.clone()]);
+
+        parent.phase = Phase::Diagnosis;
+        parent.recovery.origin = Some(Phase::Review);
+        review_and_failed_ci(&mut parent);
+        let mut next = followup(
+            "後続作業の完了条件を別の表現で整理する",
+            false,
+            Some(&child_id),
+            vec![],
+        );
+        next.authorization = "同じ元依頼から後続目的を確認した".into();
+
+        apply_diagnosis(
+            &fixture.0,
+            &mut parent,
+            &diagnosis_report("needs_changes", assessment(vec![next])),
+        )
+        .unwrap();
+
+        assert_eq!(parent.phase, Phase::Implementation);
+        assert!(parent.review.is_none());
+        assert!(!parent.review_independent);
+        assert_ne!(parent.ci_state, Some(ci::CiState::Success));
+        assert_eq!(parent.recovery.children, vec![child_id]);
+        assert_eq!(fs::read(child_path).unwrap(), child_before);
+        let tasks = vec![parent.clone(), child.clone()];
+        assert!(ready(&fixture.0, &parent, &tasks).unwrap());
+        assert!(!ready(&fixture.0, &child, &tasks).unwrap());
+    }
+}
+
+#[test]
+fn needs_changes_with_new_independent_child_returns_parent_to_implementation() {
+    let fixture = Fixture::new();
+    let mut parent = new_parent(&fixture, "resume-new-child");
+    parent.phase = Phase::Diagnosis;
+    parent.recovery.origin = Some(Phase::Review);
+    review_and_failed_ci(&mut parent);
+    let before = child_ids(&fixture);
+
+    apply_diagnosis(
+        &fixture.0,
+        &mut parent,
+        &diagnosis_report(
+            "needs_changes",
+            assessment(vec![followup(
+                "親の修正に続く独立した検証作業",
+                false,
+                None,
+                vec![],
+            )]),
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(parent.phase, Phase::Implementation);
+    assert!(parent.review.is_none());
+    assert!(!parent.review_independent);
+    assert_ne!(parent.ci_state, Some(ci::CiState::Success));
+    assert_eq!(parent.recovery.children.len(), 1);
+    let child = fixture.0.store.load(&parent.recovery.children[0]).unwrap();
+    assert_eq!(child.recovery.parent.as_deref(), Some(parent.id.as_str()));
+    assert!(child_ids(&fixture).len() > before.len());
+}
+
+#[test]
+fn ready_and_waiting_reports_with_continuations_remain_waiting() {
+    for outcome in ["ready", "waiting"] {
+        let fixture = Fixture::new();
+        let mut parent = new_parent(&fixture, &format!("keep-waiting-{outcome}"));
+        let child_id = create_child(&fixture, &mut parent, "既存の外部待機中作業");
+        parent.phase = Phase::Diagnosis;
+        parent.recovery.origin = Some(Phase::Implementation);
+
+        apply_diagnosis(
+            &fixture.0,
+            &mut parent,
+            &diagnosis_report(
+                outcome,
+                assessment(vec![followup(
+                    "同じ外部条件を待つ後続作業",
+                    false,
+                    Some(&child_id),
+                    vec![],
+                )]),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(parent.phase, Phase::Waiting, "{outcome}");
+        assert!(parent.run.is_none());
+        assert_eq!(parent.recovery.children, vec![child_id]);
+    }
+}
+
+#[test]
+fn main_ci_repair_followup_keeps_waiting_barrier_and_repair_ownership() {
+    let fixture = Fixture::new();
+    let mut parent = new_parent(&fixture, "main-ci-barrier");
+    parent.phase = Phase::Diagnosis;
+    parent.recovery.origin = Some(Phase::MainCi);
+    parent.merge_commit = Some("c".repeat(40));
+    parent.ci_state = Some(ci::CiState::Failure);
+    parent.recovery.barrier = true;
+    let mut repair = followup("失敗したmain CIを修復する", false, None, vec![]);
+    repair.purpose = recovery::FollowupPurpose::RepairMainCi;
+
+    apply_diagnosis(
+        &fixture.0,
+        &mut parent,
+        &diagnosis_report("needs_changes", assessment(vec![repair])),
+    )
+    .unwrap();
+
+    assert_eq!(parent.phase, Phase::Waiting);
+    assert!(parent.recovery.barrier);
+    let repair_id = parent.recovery.repair_task.as_ref().unwrap();
+    assert_eq!(parent.recovery.children, vec![repair_id.clone()]);
+    let child = fixture.0.store.load(repair_id).unwrap();
+    assert_eq!(child.recovery.parent.as_deref(), Some(parent.id.as_str()));
+    assert!(child.recovery.repairs_main);
+}
+
+#[test]
+fn repeated_causes_and_typed_decisions_are_not_bypassed_by_continuations() {
+    use sha2::{Digest, Sha256};
+
+    let fixture = Fixture::new();
+    let mut parent = new_parent(&fixture, "repeat-cause");
+    let child_id = create_child(&fixture, &mut parent, "繰り返し原因の既存child");
+    parent.phase = Phase::Diagnosis;
+    parent.recovery.origin = Some(Phase::Review);
+    let repeated = assessment(vec![followup(
+        "同じchildを使う反復原因",
+        false,
+        Some(&child_id),
+        vec![],
+    )]);
+    parent.recovery.evidence = format!(
+        "{:x}",
+        Sha256::digest(format!("{}\n{}", repeated.cause, repeated.evidence))
+    );
+    parent.recovery.progress_observation = format!(
+        "{:?}|{}|{:?}",
+        parent.head, parent.ci_fingerprint, parent.ci_state
+    );
+    parent.recovery.attempts = 3;
+
+    apply_diagnosis(
+        &fixture.0,
+        &mut parent,
+        &diagnosis_report("needs_changes", repeated),
+    )
+    .unwrap();
+
+    assert_eq!(parent.phase, Phase::Waiting);
+    assert_eq!(parent.recovery.attempts, 4);
+    assert_eq!(parent.recovery.children, vec![child_id]);
+
+    let decision_fixture = Fixture::new();
+    let mut awaiting = new_parent(&decision_fixture, "decision-gate");
+    awaiting.phase = Phase::Diagnosis;
+    awaiting.recovery.origin = Some(Phase::Implementation);
+    let before = child_ids(&decision_fixture);
+    let mut plan = assessment(vec![followup(
+        "製品判断待ちでは登録しない後続作業",
+        false,
+        None,
+        vec![],
+    )]);
+    plan.decision = Some(recovery::Decision {
+        kind: "product".into(),
+        question: "互換性契約を変更するか".into(),
+        impact: "既存clientへの影響がある".into(),
+        recommendation: "判断を待つ".into(),
+    });
+
+    apply_diagnosis(
+        &decision_fixture.0,
+        &mut awaiting,
+        &diagnosis_report("awaiting_decision", plan),
+    )
+    .unwrap();
+
+    assert_eq!(awaiting.phase, Phase::AwaitingDecision);
+    assert!(awaiting.recovery.children.is_empty());
+    assert_eq!(child_ids(&decision_fixture), before);
+}

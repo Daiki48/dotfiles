@@ -787,7 +787,11 @@ fn apply_diagnosis(context: &Context, task: &mut Task, report: &worker::Report) 
     register_followups(context, task, assessment)?;
     if task.recovery.attempts > 3
         || report.outcome == "waiting"
+        // 未統合sourceの修復と後続整理は併行できる。後続が親完了を待つ場合もあり、
+        // 登録・再利用しただけで親を待機させると、修復可能な作業まで進まなくなる。
+        // 統合済みsourceは元PRで修復せず、別taskとmain CI barrierを維持する。
         || !assessment.followups.is_empty()
+            && (report.outcome != "needs_changes" || task.merge_commit.is_some())
         || matches!(report.outcome.as_str(), "blocked" | "awaiting_decision")
     {
         task.monitor(&report.summary);
