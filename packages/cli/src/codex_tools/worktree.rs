@@ -18,6 +18,8 @@ use serde_json::{Map, Value};
 
 use super::{guard::GuardGhSandbox, trust};
 
+pub(crate) mod completion;
+
 pub(crate) fn valid_artifact_task_id(task: &str) -> bool {
     valid_task_id(task)
 }
@@ -2627,6 +2629,11 @@ fn doctor_exit_code(rows: &[(String, String, String)]) -> i32 {
 }
 
 fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
+    if args.first().is_some_and(|arg| arg == "completion") {
+        return completion::command(&args[1..])
+            .map(|_| 0)
+            .map_err(|e| (1, e));
+    }
     let parsed = parse_args(&args).map_err(|message| (2, message))?;
     let cwd = std::env::current_dir()
         .map_err(|cause| (1, format!("current directoryを取得できません: {cause}")))?;
@@ -2644,13 +2651,18 @@ fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
             let task_id = normalize_task_id(parsed.issue, parsed.task_id.as_deref())
                 .map_err(|cause| (2, cause.to_string()))?;
             let branch = parsed.branch.unwrap_or_else(|| format!("feat/{task_id}"));
-            create_worktree(&cwd, &branch, &task_id, false)
-                .map(|path| path.to_string_lossy().into_owned())
+            create_worktree(&cwd, &branch, &task_id, false).and_then(|path| {
+                completion::bind_current(&cwd, &task_id).map_err(error)?;
+                Ok(path.to_string_lossy().into_owned())
+            })
         }
         "resume" => {
             let task_id = normalize_task_id(None, parsed.task_id.as_deref())
                 .map_err(|cause| (2, cause.to_string()))?;
-            resume(&cwd, &task_id, false).map(|path| path.to_string_lossy().into_owned())
+            resume(&cwd, &task_id, false).and_then(|path| {
+                completion::bind_current(&cwd, &task_id).map_err(error)?;
+                Ok(path.to_string_lossy().into_owned())
+            })
         }
         "sync" => sync_worktree(
             &cwd,
@@ -2663,7 +2675,10 @@ fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
         "recover" => {
             let task_id = normalize_task_id(None, parsed.task_id.as_deref())
                 .map_err(|cause| (2, cause.to_string()))?;
-            recover(&cwd, &task_id, false).map(|path| path.to_string_lossy().into_owned())
+            recover(&cwd, &task_id, false).and_then(|path| {
+                completion::bind_current(&cwd, &task_id).map_err(error)?;
+                Ok(path.to_string_lossy().into_owned())
+            })
         }
         "retire" => retire(
             &cwd,
@@ -2906,16 +2921,16 @@ mod tests {
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    struct TemporaryRepository {
+    pub(super) struct TemporaryRepository {
         directory: PathBuf,
-        repository: PathBuf,
-        codex_home: PathBuf,
+        pub(super) repository: PathBuf,
+        pub(super) codex_home: PathBuf,
         previous_codex_home: Option<OsString>,
         _lock: MutexGuard<'static, ()>,
     }
 
     impl TemporaryRepository {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let lock = TEST_LOCK.lock().unwrap();
             let entropy = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

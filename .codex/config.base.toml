@@ -56,3 +56,11 @@ type = "command"
 command = '"$HOME/.codex/hooks/block-git-write"'
 timeout = 10
 statusMessage = "Git/GitHub操作を確認中"
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = '"$HOME/.codex/hooks/block-git-write" --completion-stop'
+timeout = 10
+statusMessage = "セッション完了を記録中"

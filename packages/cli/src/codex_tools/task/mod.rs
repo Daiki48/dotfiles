@@ -9,7 +9,7 @@ mod followup_tests;
 mod handoff_tests;
 mod recovery;
 mod resources;
-mod store;
+pub(crate) mod store;
 mod worker;
 #[cfg(test)]
 mod workflow_tests;
@@ -398,6 +398,31 @@ struct Context {
     repository: PathBuf,
     github: String,
     store: Store,
+}
+
+/// 段階workerの終了はcoordinatorが引き取る。markerだけでは免除しない。
+pub(crate) fn completion_worker_scope(task_id: &str, marker: &str) -> Result<bool> {
+    checked_completion_worker_scope(&Context::open()?, task_id, marker)
+}
+
+fn checked_completion_worker_scope(context: &Context, task_id: &str, marker: &str) -> Result<bool> {
+    let (id, generation) = marker.rsplit_once(':').ok_or("worker scopeが不正です")?;
+    if id != task_id {
+        return Err("worker scopeのtaskが一致しません".into());
+    }
+    let generation = generation
+        .parse::<u64>()
+        .map_err(|_| "worker世代が不正です")?;
+    let task = context.load(task_id)?;
+    if task
+        .run
+        .as_ref()
+        .is_none_or(|run| run.generation != generation)
+        || Lock::try_acquire(&context.store.lease_path(task_id)?)?.is_some()
+    {
+        return Err("稼働中のcoordinator workerを確認できません".into());
+    }
+    Ok(true)
 }
 
 impl Context {
@@ -2830,6 +2855,29 @@ mod tests {
         drop(lease);
         assert!(Lock::try_acquire(&first).unwrap().is_some());
         drop(other);
+    }
+
+    #[test]
+    fn completion_worker_exemption_requires_saved_generation_and_live_lease() {
+        let fixture = Fixture::new();
+        fixture.submit("task-one");
+        let mut task = fixture.0.load("task-one").unwrap();
+        task.generation = 1;
+        task.run = Some(Run {
+            generation: 1,
+            phase: Phase::Implementation,
+            started: now(),
+        });
+        fixture.0.store.save(&task).unwrap();
+        assert!(checked_completion_worker_scope(&fixture.0, "task-one", "task-one:1").is_err());
+        let lease = Lock::try_acquire(&fixture.0.store.lease_path("task-one").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(checked_completion_worker_scope(&fixture.0, "task-one", "task-one:1").unwrap());
+        assert!(checked_completion_worker_scope(&fixture.0, "task-one", "task-one:2").is_err());
+        assert!(checked_completion_worker_scope(&fixture.0, "task-one", "task-two:1").is_err());
+        drop(lease);
+        assert!(checked_completion_worker_scope(&fixture.0, "task-one", "task-one:1").is_err());
     }
 
     #[test]

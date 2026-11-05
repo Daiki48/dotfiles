@@ -95,7 +95,16 @@ where
     I: IntoIterator<Item = OsString>,
 {
     match executable.file_name().and_then(|name| name.to_str()) {
-        Some("block-git-write") => Some(codex_tools::guard::entrypoint()),
+        Some("block-git-write") => {
+            let args: Vec<_> = args.into_iter().collect();
+            Some(if args == [OsString::from("--completion-stop")] {
+                codex_tools::worktree::completion::hook_entrypoint()
+            } else if args.is_empty() {
+                codex_tools::guard::entrypoint()
+            } else {
+                2
+            })
+        }
         Some("codex-worktree") => Some(codex_tools::worktree::entrypoint(args)),
         Some("codex-delivery") => Some(codex_tools::delivery::entrypoint(args)),
         Some("codex-discussions") => Some(codex_tools::discussions::entrypoint(args)),

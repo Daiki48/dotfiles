@@ -4920,6 +4920,22 @@ fn worktree_helper_invocation_reason(tokens: &[String]) -> Option<String> {
             }
         }
         "resume" | "recover" | "artifacts" | "clean-artifacts" => helper_task_args(command, rest),
+        "completion" => {
+            if (rest.len() == 2
+                || (rest.len() == 6
+                    && rest[2] == "--boundary"
+                    && ["user-stop", "human-decision", "changes", "pr", "merge"]
+                        .contains(&rest[3].as_str())
+                    && rest[4] == "--reason"
+                    && safe_identity_text(&rest[5], 2000)))
+                && rest[0] == "--task-id"
+                && valid_task_id(&rest[1])
+            {
+                None
+            } else {
+                Some("completionは--task-id、必要な場合だけ--boundaryと--reasonを固定順で指定してください".into())
+            }
+        }
         "retire" => {
             if rest.len() == 4
                 && rest[0] == "--task-id"
@@ -5240,6 +5256,7 @@ fn has_write_operation(tokens: &[String]) -> bool {
                         "clean-artifacts",
                         "retire",
                         "sync",
+                        "completion",
                     ]
                     .contains(&v.as_str())
                 });
@@ -6554,6 +6571,19 @@ mod tests {
 
     #[test]
     fn helper_syntax_is_restricted() {
+        assert!(
+            blocked_reason("codex-worktree completion --task-id task-example", None, 0).is_none()
+        );
+        assert!(blocked_reason("codex-worktree completion --task-id task-example --boundary user-stop --reason 明示された引継ぎ停止", None, 0).is_none());
+        assert!(blocked_reason("codex-worktree completion --task-id task-example --boundary ci-wait --reason pending", None, 0).is_some());
+        assert!(
+            blocked_reason(
+                "codex-worktree completion --task-id task-example --boundary user-stop",
+                None,
+                0
+            )
+            .is_some()
+        );
         let prepare = "codex-worktree prepare --user-name Daiki48 --user-email daiki@dnfolio.me";
         assert!(blocked_reason(prepare, None, 0).is_none());
         assert!(write_context_reason(prepare, None).is_some());

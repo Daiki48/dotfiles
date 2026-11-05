@@ -133,6 +133,8 @@ const MANAGED_AGENT_KEYS: &[&str] = &[
     "default_subagent_reasoning_effort",
 ];
 const MANAGED_HOOK_COMMAND: &str = "command = '\"$HOME/.codex/hooks/block-git-write\"'";
+const MANAGED_STOP_HOOK_COMMAND: &str =
+    "command = '\"$HOME/.codex/hooks/block-git-write\" --completion-stop'";
 const PYTHON_MANAGED_HOOK_COMMAND: &str =
     "command = 'python3 \"$HOME/.codex/hooks/block_git_write.py\"'";
 const RETIRED_HOOK_COMMAND: &str =
@@ -145,6 +147,13 @@ type = "command"
 command = '"$HOME/.codex/hooks/block-git-write"'
 timeout = 10
 statusMessage = "Git/GitHub操作を確認中""#;
+const MANAGED_STOP_HOOK_CONFIG: &str = r#"[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = '"$HOME/.codex/hooks/block-git-write" --completion-stop'
+timeout = 10
+statusMessage = "セッション完了を記録中""#;
 const PRE_TOOL_USE_HEADER: &str = "[[hooks.PreToolUse]]";
 const PRE_TOOL_USE_HOOK_HEADER: &str = "[[hooks.PreToolUse.hooks]]";
 const CARGO_RELATIVE_PATH: &str = ".cargo/bin/cargo";
@@ -2101,14 +2110,25 @@ fn remove_managed_permission_profile(contents: &str) -> Result<String> {
 
 fn sync_managed_hook(template: &str, existing: &str) -> String {
     let cleaned = remove_retired_managed_hook(existing);
-    if !template.contains(MANAGED_HOOK_COMMAND)
-        || cleaned
+    let mut additions = Vec::new();
+    if template.contains(MANAGED_HOOK_COMMAND)
+        && !cleaned
             .lines()
             .any(|line| line.trim() == MANAGED_HOOK_COMMAND)
     {
+        additions.push(MANAGED_HOOK_CONFIG);
+    }
+    if template.contains(MANAGED_STOP_HOOK_COMMAND)
+        && !cleaned
+            .lines()
+            .any(|line| line.trim() == MANAGED_STOP_HOOK_COMMAND)
+    {
+        additions.push(MANAGED_STOP_HOOK_CONFIG);
+    }
+    if additions.is_empty() {
         return cleaned;
     }
-    format!("{}\n\n{MANAGED_HOOK_CONFIG}\n", cleaned.trim_end())
+    format!("{}\n\n{}\n", cleaned.trim_end(), additions.join("\n\n"))
 }
 
 fn ensure_managed_workspace_root(contents: &str, managed_root: &Path) -> Result<String> {
@@ -4276,21 +4296,21 @@ mod tests {
     use super::{
         CODEX_DIRS, LEGACY_CODEX_DELIVERY_SHA256, LEGACY_CODEX_WORKTREE_SHA256,
         MANAGED_BINARY_DESTINATIONS, MANAGED_HOOK_COMMAND, MANAGED_HOOK_DESTINATION,
-        MANAGED_PERMISSION_PROFILE, ManagedInstallMode, ManagedTransaction, ManagedTransactionKind,
-        PYTHON_MANAGED_HOOK_COMMAND, RETIRED_HOOK_COMMAND, archive_legacy_python_hook,
-        begin_managed_transaction, begin_refresh_transaction, begin_setup_transaction,
-        complete_refresh_transaction, complete_setup_transaction, contains_legacy_profile_config,
-        copy_file_exclusive, ensure_config_unchanged, ensure_managed_hook,
-        ensure_managed_hook_with_legacy_hash, ensure_managed_workspace_root,
-        ensure_private_directory, legacy_hash_for_destination, managed_hook_state_path,
-        managed_transaction_path, merge_managed_config, merge_managed_config_with_root,
-        migrate_managed_config_from_template, migrate_managed_config_from_template_with_root,
-        preflight_config_state, preflight_managed_binary_destination,
-        preflight_operation_transaction, preflight_refresh_transaction,
-        preflight_setup_transaction, preflight_shared_symlink, publish_regular_file_exclusive,
-        reject_cargo_configuration, sha256, trusted_user_executable, valid_release_binary_magic,
-        validate_managed_feature_value_types, validate_setup_home, verify_managed_symlink,
-        write_file_exclusive,
+        MANAGED_PERMISSION_PROFILE, MANAGED_STOP_HOOK_COMMAND, ManagedInstallMode,
+        ManagedTransaction, ManagedTransactionKind, PYTHON_MANAGED_HOOK_COMMAND,
+        RETIRED_HOOK_COMMAND, archive_legacy_python_hook, begin_managed_transaction,
+        begin_refresh_transaction, begin_setup_transaction, complete_refresh_transaction,
+        complete_setup_transaction, contains_legacy_profile_config, copy_file_exclusive,
+        ensure_config_unchanged, ensure_managed_hook, ensure_managed_hook_with_legacy_hash,
+        ensure_managed_workspace_root, ensure_private_directory, legacy_hash_for_destination,
+        managed_hook_state_path, managed_transaction_path, merge_managed_config,
+        merge_managed_config_with_root, migrate_managed_config_from_template,
+        migrate_managed_config_from_template_with_root, preflight_config_state,
+        preflight_managed_binary_destination, preflight_operation_transaction,
+        preflight_refresh_transaction, preflight_setup_transaction, preflight_shared_symlink,
+        publish_regular_file_exclusive, reject_cargo_configuration, sha256,
+        trusted_user_executable, valid_release_binary_magic, validate_managed_feature_value_types,
+        validate_setup_home, verify_managed_symlink, write_file_exclusive,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -6921,6 +6941,77 @@ timeout = 30
         assert!(updated.contains("command = \"echo prevent_irreversible_git.py\"\ntimeout = 30"));
         assert!(updated.contains("[hooks.state]"));
         assert_eq!(merge_managed_config(template, &updated), updated);
+    }
+
+    #[test]
+    fn installer_migration_adds_completion_stop_hook_and_preserves_local_state() {
+        let directory = TestDirectory::new("completion-stop-hook-migration");
+        let codex_dir = directory.path().join(".codex");
+        fs::create_dir(&codex_dir).expect("create Codex config directory");
+        let config_path = codex_dir.join("config.toml");
+        let template_path = directory.path().join("config.base.toml");
+        let managed_root = codex_dir.join("worktrees");
+        let existing = r#"model = "old"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '"$HOME/.codex/hooks/block-git-write"'
+timeout = 10
+statusMessage = "Git/GitHub操作を確認中"
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "local-stop"
+timeout = 30
+
+[hooks.state."local"]
+trusted_hash = "sha256:local"
+"#;
+        fs::write(&config_path, existing).expect("write existing Codex config");
+        fs::write(
+            &template_path,
+            include_str!("../../../.codex/config.base.toml"),
+        )
+        .expect("write managed Codex config template");
+
+        migrate_managed_config_from_template_with_root(
+            &codex_dir,
+            &template_path,
+            &managed_root,
+            directory.path(),
+        )
+        .expect("migrate the installed Codex config");
+
+        let migrated = fs::read_to_string(&config_path).expect("read migrated config");
+        migrated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("migrated config must remain valid TOML");
+        assert_eq!(migrated.matches(MANAGED_STOP_HOOK_COMMAND).count(), 1);
+        assert_eq!(migrated.matches(MANAGED_HOOK_COMMAND).count(), 1);
+        assert!(migrated.contains("command = \"local-stop\"\ntimeout = 30"));
+        assert!(migrated.contains("[hooks.state.\"local\"]\ntrusted_hash = \"sha256:local\""));
+        assert_eq!(migrated.matches("trusted_hash = ").count(), 1);
+
+        migrate_managed_config_from_template_with_root(
+            &codex_dir,
+            &template_path,
+            &managed_root,
+            directory.path(),
+        )
+        .expect("repeat the installer migration");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read repeat-migrated config"),
+            migrated
+        );
+
+        let template_without_stop = "model = \"new\"\n";
+        let no_stop_config = merge_managed_config(template_without_stop, "model = \"old\"\n");
+        assert!(!no_stop_config.contains("[[hooks.Stop]]"));
     }
 
     #[test]
