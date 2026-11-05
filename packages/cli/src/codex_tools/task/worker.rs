@@ -606,6 +606,12 @@ fn execute_verified_codex(
         .current_dir(workspace)
         .arg("exec")
         .arg("--json")
+        .arg("-c")
+        .arg(format!(
+            "shell_environment_policy.set.CODEX_TASK_WORKER={}",
+            serde_json::to_string(&format!("{}:{}", task.id, task.generation))
+                .map_err(|_| "worker scopeを生成できません")?
+        ))
         .arg("--cd")
         .arg(workspace)
         .arg("--output-schema")

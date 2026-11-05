@@ -4,6 +4,16 @@
 Fedora上のproductはFedora、WSL2内のproductはWSL2で実行します。SSHでFedoraへ接続した場合も、
 接続先のhome・repository・認証・状態を使います。接続元の設定値は持ち込みません。
 
+## 通常セッションの終了検査
+
+通常の実装でも`codex-worktree create/resume/recover`は`CODEX_THREAD_ID`に担当taskを結び付け、`$CODEX_HOME/worktrees/.sessions`へ0700/0600で保存する。永続coordinator taskの再登録は行わない。公式の[Stop hook](https://learn.chatgpt.com/docs/hooks)がそのsessionの担当だけを検査し、未完了なら継続promptを返す。CI開始・成功・mergeだけでは解除せず、deliveryのcompleted記録とworktree・成果物の回収、または正規retireを確認する。Stopによる再継続であることだけを理由に次回検査を省略しない。
+
+調査のみでworktreeを開始しないsession、別sessionの担当は対象外。coordinatorが起動したworkerにはtask/世代markerを渡し、保存されたrunと生存lockを照合して段階報告を妨げない。markerは権限を与えず、sandbox・approval・Git hookを変更しない。
+
+明示された途中納品や停止は`codex-worktree completion --task-id <ID> --boundary user-stop|changes|pr|merge|human-decision --reason '<具体的根拠>'`へ記録する。技術的な失敗、CI待ち、便宜的な分割は例外理由にならない。例外はtask完了を意味せず、worktreeや未統合差分を保持する。`resume`は同じsessionの停止記録を再度有効にする。利用者のInterruptをhookから取り消したり、停止したPCを起動したりはしない。
+
+既存sessionへhookを後付けできたとは扱わない。正規setupでStop定義を移行し、Codexのhook一覧で有効・信頼済みであることを確認した新規sessionから利用する。新規・変更hookのtrust確認が要求される場合は`/hooks`で対象定義を確認する。未trustや無効なhookを無人完走の証拠にしない。古い未登録worktreeは所有とwriterを照合して`resume`し、自動で一括取得しない。
+
 ## 導入と会話からの利用
 
 dotfilesで`cargo run -- codex`を実行すると、既存helperと同じ検証・更新契約で`codex-task`を導入します。

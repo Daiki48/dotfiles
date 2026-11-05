@@ -18,6 +18,8 @@ Daikiの実装依頼を許可の正本とし、目的・受け入れ条件・非
 - 親checkoutで`codex-worktree create --issue <番号> --branch <branch>`、Issueなしなら`--issue`を省略して実行する。helperがoriginのdefault branchをfetchするため、手動fetchを前提にしない。初期化済みremoteならlocalにcommitがなくても親のファイルを保持して作成する。remoteが空なら初回公開の内容と対象branchを具体化して確認する。
 - 再開は`doctor --task-id <ID>`と`resume --task-id <ID>`で照合する。作成途中の`interrupted`だけは`recover`で検証して再開する。所有不明の差分、想定外のremote/path/branchは保持して停止する。
 - 全編集とtestの実行先を専用worktreeへ固定する。Git書き込みは`git -C <worktree絶対path> ...`、環境にSSH_ASKPASSがあれば`env -u SSH_ASKPASS git -C ...`を使う。helperは親checkoutから単独commandで呼ぶ。
+- `create/resume/recover`は現在のCodex sessionに完了責任を自動記録する。Stop hookはその担当だけを検査し、CI待ち・技術的失敗では終了を継続へ戻す。`codex-worktree completion --task-id <ID>`で担当を確認できる。古いworktreeは所有を照合して通常の`resume`で接続し、別IDを作らない。
+- 利用者の明示停止、指定された途中納品、真正な人間判断で返答が必要な場合だけ、`codex-worktree completion --task-id <ID> --boundary user-stop|changes|pr|merge|human-decision --reason '<元の指示または必要判断の具体的根拠>'`を保存する。これは完了ではなく例外境界の記録であり、CI待ち・失敗回数・便宜的な終了に使わない。再開の`resume`で再び有効になる。coordinator workerは保存済み世代と生存lockを照合し、段階報告後の継続をcoordinatorへ返す。
 - branch、commit、PRの形式は最近の関連履歴に合わせる。慣例がなければ日本語、branchは一般的prefixと英語kebab-caseとし、`codex/`は使わない。
 
 操作の詳細・復旧条件が必要なら[worktreeガイド](../../../docs/codex-worktrees.ja.md)を読む。通常の調査でworktreeを作らず、`CODEX_WORKTREE_MODE=single-checkout`はDaikiが明示したrollback時だけ使う。

@@ -24,7 +24,7 @@ pub(super) fn now() -> u64 {
         .as_secs()
 }
 
-pub(super) fn private_dir(path: &Path) -> Result<()> {
+pub(crate) fn private_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         let metadata =
             fs::symlink_metadata(parent).map_err(|_| "管理directoryの親を確認できません")?;
@@ -62,7 +62,7 @@ pub(super) fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn open_private(path: &Path, create: bool) -> Result<File> {
+pub(crate) fn open_private(path: &Path, create: bool) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(create).create(create);
     #[cfg(unix)]
@@ -86,7 +86,7 @@ pub(super) fn open_private(path: &Path, create: bool) -> Result<File> {
     Ok(file)
 }
 
-pub(super) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let mut file = open_private(path, false)?;
     if file.metadata().map_err(|_| "状態を検査できません")?.len() > MAX_STATE {
         return Err("状態fileが上限を超えています".into());
@@ -102,7 +102,7 @@ pub(super) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_slice(&bytes).map_err(|_| "状態fileの形式が不正です".into())
 }
 
-pub(super) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|_| "状態を生成できません")?;
     if bytes.len() as u64 > MAX_STATE {
         return Err("状態fileが上限を超えています".into());
@@ -140,12 +140,12 @@ pub(super) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-pub(super) struct Lock {
+pub(crate) struct Lock {
     file: File,
 }
 
 impl Lock {
-    pub(super) fn acquire_short(path: &Path) -> Result<Self> {
+    pub(crate) fn acquire_short(path: &Path) -> Result<Self> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Some(lock) = Self::try_acquire(path)? {

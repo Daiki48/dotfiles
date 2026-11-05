@@ -33,6 +33,7 @@
 - riskは検証とreviewの深度を決める。riskだけを理由に確認待ちにせず、scope内の判断は自律的に進める。製品判断、追加権限・費用、不可逆性、重大な残存リスクの受容だけをDaikiへ確認する。
 - 技術的な失敗・実環境未受入・親のfile分割・失敗回数だけで対応を終了しない。危険な対象操作は保留し、元の依頼と所有権を照合して診断・修復・再計画・監視・独立した許可済みtaskを継続する。外部待機は解消条件と次回観測を保存し、変化後に再開する。同条件の無限retryや新commitだけを進展とする判定は避ける。
 - deliveryは`record-review|approve-review -> deliver -> finish`を使う。actionable=0、未解決thread=0、最新base、conflictなし、固定headの必要なcheckがsuccess/skipped/neutralであることをhelperが検証する。skipだけで実質的な検証を満たしたと扱わない。
+- managed worktreeの担当sessionはStop hookで完了を検査する。CI待ちや技術的失敗で終了せず監視・修復を続ける。明示停止・指定された途中納品・真正な人間判断の場合だけ`codex-worktree completion`へ境界と具体的根拠を保存し、未完了と報告する。hookを無効化したり状態を削除したりして終了を迂回しない。
 - CDは既存triggerと権限に従う。merge/pushで起動する既存CDは状態を報告し、manual dispatch、release、production deploy、新規environment approvalは明示依頼なしに実行しない。
 - dirty/stale/conflict、必須検証失敗、判定不能ではPR・branch・worktreeを保持し、再開点を伝える。`finish --sandbox-retry`等の復旧はhelperが示す限定条件に従い、直接mergeや削除で迂回しない。
 
