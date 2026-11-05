@@ -354,6 +354,176 @@ fn repeated_wait_observation_does_not_schedule_a_worker_but_changed_evidence_reo
 }
 
 #[test]
+fn implementation_ci_wait_observes_changes_and_reenters_diagnosis_without_resume() {
+    let fixture = Fixture::new();
+    let mut task = fixture.submit("implementation-ci-wait", "high", recovery::Boundary::Finish);
+    let run = Run {
+        generation: 1,
+        phase: Phase::Implementation,
+        started: now(),
+    };
+    task.generation = run.generation;
+    task.run = Some(run.clone());
+    let mut waiting = report(run.generation, "waiting", Some(assessment()));
+    waiting.pr = Some(18);
+    waiting.head = Some("a".repeat(40));
+    write_report(&fixture, &task, &run, &waiting);
+    apply_report(&fixture.0, &mut task).unwrap();
+    assert_eq!(task.phase, Phase::Diagnosis);
+    apply_diagnosis(&fixture.0, &mut task, &waiting).unwrap();
+    assert_eq!(task.phase, Phase::Waiting);
+    assert_eq!(task.effective_phase(), &Phase::Implementation);
+    assert!(task.run.is_none());
+    let labels = task.ci_labels.clone();
+    let requested_gate = task.requested_gate;
+    observe_ci_with(&fixture.0, &mut task, |_, _| {
+        Ok(strict_observation(ci::CiState::Pending, false))
+    })
+    .unwrap();
+    task.recovery.observation = waiting_observation(&fixture.0, &task);
+    task.recovery.next_observation = 0;
+    monitor_task(&fixture.0, &mut task);
+    assert_eq!(task.phase, Phase::Waiting);
+
+    task.next_check = 0;
+    observe_ci_with(&fixture.0, &mut task, |_, _| {
+        Ok(strict_observation(ci::CiState::Success, false))
+    })
+    .unwrap();
+    assert_eq!(task.phase, Phase::Waiting);
+    assert_eq!(task.ci_state, Some(ci::CiState::Success));
+    task.recovery.next_observation = 0;
+    monitor_task(&fixture.0, &mut task);
+    assert_eq!(task.phase, Phase::Diagnosis);
+    assert!(task.review.is_none());
+    assert!(!task.review_independent);
+    assert!(!review_ready(&task));
+    assert_eq!(task.ci_labels, labels);
+    assert_eq!(task.requested_gate, requested_gate);
+    assert_eq!(task.stop_after, recovery::Boundary::Finish);
+
+    let mut diagnosis = report(1, "ready", Some(assessment()));
+    diagnosis.pr = task.pr;
+    diagnosis.head = task.head.clone();
+    apply_diagnosis(&fixture.0, &mut task, &diagnosis).unwrap();
+    assert_eq!(task.phase, Phase::Implementation);
+    assert!(!review_ready(&task));
+}
+
+#[test]
+fn implementation_ci_wait_preserves_failure_and_invalidates_success_on_api_error() {
+    let fixture = Fixture::new();
+    for state in [
+        ci::CiState::Failure,
+        ci::CiState::Cancelled,
+        ci::CiState::TimedOut,
+    ] {
+        let mut task = fixture.submit(
+            &format!("implementation-ci-{state:?}").to_lowercase(),
+            "high",
+            recovery::Boundary::Finish,
+        );
+        task.pr = Some(18);
+        task.head = Some("a".repeat(40));
+        task.phase = Phase::Waiting;
+        task.recovery.origin = Some(Phase::Implementation);
+        observe_ci_with(&fixture.0, &mut task, |_, _| {
+            Ok(strict_observation(state, false))
+        })
+        .unwrap();
+        assert_eq!(task.phase, Phase::Waiting);
+        assert_eq!(task.ci_state, Some(state));
+        assert!(!task.ci_evidence.as_ref().unwrap().allows_delivery());
+
+        task.next_check = 0;
+        observe_ci_with(&fixture.0, &mut task, |_, _| {
+            Ok(strict_observation(ci::CiState::Success, false))
+        })
+        .unwrap();
+        task.next_check = 0;
+        observe_ci_with(&fixture.0, &mut task, |_, _| {
+            Err("temporary API error".into())
+        })
+        .unwrap();
+        assert_eq!(task.phase, Phase::Waiting);
+        assert!(task.ci_state.is_none());
+        assert!(task.ci_evidence.is_none());
+        assert!(task.ci_observation_error_at.is_some());
+        assert!(task.next_check > now());
+    }
+}
+
+#[test]
+fn implementation_ci_observation_respects_missing_identity_stop_and_backoff() {
+    let fixture = Fixture::new();
+    let mut task = fixture.submit(
+        "implementation-ci-boundaries",
+        "high",
+        recovery::Boundary::Finish,
+    );
+    task.phase = Phase::Waiting;
+    task.recovery.origin = Some(Phase::Implementation);
+    observe_ci_with(&fixture.0, &mut task, |_, _| panic!("PRなしでは観測しない")).unwrap();
+    task.pr = Some(18);
+    observe_ci_with(&fixture.0, &mut task, |_, _| {
+        panic!("HEADなしでは観測しない")
+    })
+    .unwrap();
+    task.head = Some("a".repeat(40));
+    task.next_check = now() + 120;
+    observe_ci_with(&fixture.0, &mut task, |_, _| {
+        panic!("backoff中は観測しない")
+    })
+    .unwrap();
+    task.next_check = 0;
+    task.run = Some(Run {
+        generation: task.generation,
+        phase: Phase::Implementation,
+        started: now(),
+    });
+    observe_ci_with(&fixture.0, &mut task, |_, _| {
+        panic!("worker稼働中は観測しない")
+    })
+    .unwrap();
+    task.run = None;
+    for phase in [
+        Phase::Implementation,
+        Phase::Paused,
+        Phase::AwaitingDecision,
+        Phase::BoundaryReached,
+        Phase::Completed,
+    ] {
+        task.phase = phase;
+        observe_ci_with(&fixture.0, &mut task, |_, _| {
+            panic!("外部待機以外は拡張しない")
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn implementation_ci_wait_rejects_changed_head_and_keeps_review_invalid() {
+    let fixture = Fixture::new();
+    let mut task = fixture.submit(
+        "implementation-ci-head-drift",
+        "high",
+        recovery::Boundary::Finish,
+    );
+    task.pr = Some(18);
+    task.head = Some("d".repeat(40));
+    task.phase = Phase::Waiting;
+    task.recovery.origin = Some(Phase::Implementation);
+    observe_ci_with(&fixture.0, &mut task, |_, _| {
+        Ok(strict_observation(ci::CiState::Success, false))
+    })
+    .unwrap();
+    assert_eq!(task.phase, Phase::Diagnosis);
+    assert_eq!(task.head, Some("d".repeat(40)));
+    assert!(task.ci_evidence.is_none());
+    assert!(!review_ready(&task));
+}
+
+#[test]
 fn watch_metadata_rejects_parent_traversal_and_symlinks() {
     let fixture = Fixture::new();
     let file = fixture.0.repository.join("evidence.txt");

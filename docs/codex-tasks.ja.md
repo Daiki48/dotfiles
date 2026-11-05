@@ -136,6 +136,8 @@ main CI失敗では後続mergeのbarrierを維持し、読み取り専用診断�
 固定head・元mergeからの祖先関係を再観測した証拠を別に保存してから、元taskのfinishへ進みます。
 元のreceipt、PR head CI、review、live policy、main到達性、cleanupのhelper検証は維持します。
 CI待ちにはCodexを起動せず、Rustが現在のPR・head・base・test merge commitとcheck/statusを照合します。
+実装workerが既存PRと固定headを報告して外部待機した場合もCIの変化を観測します。
+変化後は診断へ戻し、必要な実装・独立review・CI認可を経て継続します。観測だけで統合段階へ進めません。
 APIエラーはCI失敗と分けてbackoffし、check不足・cancel・timeout・skipのみを成功扱いしません。
 
 ### workflow不在repositoryのlocal gate

@@ -1043,35 +1043,53 @@ fn monitor_task(context: &Context, task: &mut Task) {
 }
 
 fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
-    if task.next_check > now()
-        || !matches!(
-            task.effective_phase(),
-            Phase::Review
-                | Phase::CiAuthorization
-                | Phase::Integration
-                | Phase::MainCi
-                | Phase::Finish
+    observe_ci_with(context, task, |context, task| {
+        ci::observe(
+            &context.repository,
+            &context.github,
+            task.pr.ok_or("CI照合対象のPRがありません")?,
+            matches!(task.effective_phase(), Phase::MainCi | Phase::Finish)
+                .then_some(task.delivery_gate()),
+            task.requested_gate,
         )
+    })
+}
+
+fn observe_ci_with(
+    context: &Context,
+    task: &mut Task,
+    observe: impl FnOnce(&Context, &Task) -> Result<ci::Observation>,
+) -> Result<()> {
+    // PRを保持して実装から外部待機したtaskも、CI変化をRustで取得する。
+    // 観測で診断・reviewを飛ばさず、未納品の実装や明示停止は起動しない。
+    let implementation_wait = matches!(task.phase, Phase::Diagnosis | Phase::Waiting)
+        && task.run.is_none()
+        && task.effective_phase() == &Phase::Implementation
+        && task.pr.is_some()
+        && task.head.as_deref().is_some_and(valid_sha);
+    if task.next_check > now()
+        || !(implementation_wait
+            || matches!(
+                task.effective_phase(),
+                Phase::Review
+                    | Phase::CiAuthorization
+                    | Phase::Integration
+                    | Phase::MainCi
+                    | Phase::Finish
+            ))
     {
         return Ok(());
     }
-    let Some(pr) = task.pr else {
+    if task.pr.is_none() {
         return Err("CI照合対象のPRがありません".into());
-    };
+    }
     if task.recovery.barrier
         && matches!(task.effective_phase(), Phase::MainCi | Phase::Finish)
         && refresh_repair(context, task)?
     {
         return Ok(());
     }
-    let result = ci::observe(
-        &context.repository,
-        &context.github,
-        pr,
-        matches!(task.effective_phase(), Phase::MainCi | Phase::Finish)
-            .then_some(task.delivery_gate()),
-        task.requested_gate,
-    );
+    let result = observe(context, task);
     record_ci_result(task, result)
 }
 
