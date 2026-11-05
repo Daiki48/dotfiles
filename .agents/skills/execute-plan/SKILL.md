@@ -56,4 +56,8 @@ CIはrepositoryの設定に従う。Utakataはopt-in先のself-hosted CIを使�
 
 strict modeはlive Ruleset gateを必要とする。明示認可されたprivate repositoryの`github-free-private`はhigh以上とし、APIエラーから自動選択しない。gateの詳細、main同期の限定復旧、sandbox retryは[deliveryガイド](../../../docs/codex-delivery.ja.md)を必要時に読む。`--sandbox-retry`はhelperが発行したtokenがある場合だけ、同一UIDで1回再試行する。
 
+finishまでの依頼を、CI起動・CI待機だけで最終回答して終了しない。固定headのCIを監視し、失敗なら原因へ戻り、成功後もreview・deliver・実mergeのmain CI・finishまで続ける。Daikiが親セッションの継続を求めた場合は、そのセッションも終了しない。
+
+親終了後の自律継続を依頼された場合は、終了前に`parallel-development`へ引き継ぐ。既存taskを`list/show`で照合して再利用し、未登録なら既存managed worktreeと同じtask ID・明示branchで登録する。旧writerの停止・非使用を確認し、既存PR・固定head・Plan/版・risk・gate・CI label許可・停止境界と残るdeliveryを目的へ保存する。同UIDの通常ホスト側で`start`した後、対象taskが既存PR/headを認識し、CI監視または次段階を担当していることまで確認する。`already_running`だけでは対象taskの引継ぎ完了と扱わない。引継ぎ記録と完了報告を区別し、CI待ちを理由にtaskをpauseしない。既存の利用者pauseは勝手に解除しない。
+
 完了はPR/commit、検証とreview、Issue記録、main同期、作業場回収の結果で報告する。未実施や残存リスクは明示する。IssueをcloseするのはそのIssue全体の完了条件が成立した場合だけとする。

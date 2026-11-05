@@ -1234,7 +1234,7 @@ fn valid_task_id(value: &str) -> bool {
     }
 }
 
-fn valid_branch(branch: &str) -> bool {
+pub(super) fn valid_branch(branch: &str) -> bool {
     if is_protected(branch) || branch.is_empty() {
         return false;
     }
