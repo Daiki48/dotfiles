@@ -354,6 +354,142 @@ fn repeated_wait_observation_does_not_schedule_a_worker_but_changed_evidence_reo
 }
 
 #[test]
+fn diagnosis_of_new_head_returns_to_implementation_without_adopting_review_evidence() {
+    let fixture = Fixture::new();
+    for (id, outcome) in [("ready", "ready"), ("repair", "needs_changes")] {
+        let mut task = ready_for_integration(&fixture, &format!("head-change-{id}"));
+        let gate = task.requested_gate;
+        let labels = task.ci_labels.clone();
+        task.diagnose("旧writer停止後に実PRのHEAD変更を診断する");
+        let run = Run {
+            generation: 1,
+            phase: Phase::Diagnosis,
+            started: now(),
+        };
+        task.generation = 1;
+        task.run = Some(run.clone());
+        let mut diagnosis = report(1, outcome, Some(assessment()));
+        diagnosis.pr = task.pr;
+        diagnosis.head = Some("d".repeat(40));
+        write_report(&fixture, &task, &run, &diagnosis);
+        apply_report(&fixture.0, &mut task).unwrap();
+        assert_eq!(task.phase, Phase::Implementation);
+        assert_eq!(task.head, Some("a".repeat(40)));
+        assert!(task.review.is_none() && !task.review_independent);
+        assert!(task.ci_evidence.is_none() && task.ci_state.is_none());
+        assert!(task.recovery.assessment.is_some());
+        assert_eq!(task.requested_gate, gate);
+        assert_eq!(task.ci_labels, labels);
+        assert_eq!(task.stop_after, recovery::Boundary::Finish);
+
+        // CI再観測で診断へ戻さず、既存Implementationだけが新HEADを確定する。
+        observe_ci_with(&fixture.0, &mut task, |_, _| panic!("実装前のCI再観測")).unwrap();
+        let run = Run {
+            generation: 2,
+            phase: Phase::Implementation,
+            started: now(),
+        };
+        task.generation = 2;
+        task.run = Some(run.clone());
+        let mut implementation = report(2, "ready", None);
+        implementation.pr = task.pr;
+        implementation.head = diagnosis.head.clone();
+        write_report(&fixture, &task, &run, &implementation);
+        apply_report(&fixture.0, &mut task).unwrap();
+        assert_eq!(task.head, diagnosis.head);
+        assert_eq!(task.phase, Phase::Review);
+        assert!(!review_ready(&task));
+    }
+}
+
+#[test]
+fn diagnosis_head_change_keeps_pause_decision_and_external_wait_boundaries() {
+    let fixture = Fixture::new();
+    for (id, outcome, paused, expected) in [
+        ("pause", "needs_changes", true, Phase::Paused),
+        ("wait", "waiting", false, Phase::Waiting),
+        ("blocked", "blocked", false, Phase::Waiting),
+        (
+            "decision",
+            "awaiting_decision",
+            false,
+            Phase::AwaitingDecision,
+        ),
+    ] {
+        let mut task = ready_for_integration(&fixture, &format!("head-{id}"));
+        task.diagnose("HEADの変更を診断する");
+        task.pause_requested = paused;
+        let run = Run {
+            generation: 1,
+            phase: Phase::Diagnosis,
+            started: now(),
+        };
+        task.generation = 1;
+        task.run = Some(run.clone());
+        let mut evidence = assessment();
+        if outcome == "awaiting_decision" {
+            evidence.decision = Some(recovery::Decision {
+                kind: "permission".into(),
+                question: "新しい権限を許可するか".into(),
+                impact: "既存権限を超える操作が必要".into(),
+                recommendation: "承認まで操作を保留する".into(),
+            });
+        }
+        let mut diagnosis = report(1, outcome, Some(evidence));
+        diagnosis.pr = task.pr;
+        diagnosis.head = Some("d".repeat(40));
+        write_report(&fixture, &task, &run, &diagnosis);
+        apply_report(&fixture.0, &mut task).unwrap();
+        assert_eq!(task.phase, expected);
+        assert_eq!(task.head, Some("a".repeat(40)));
+        assert!(task.run.is_none());
+        assert!(task.review.is_none() && task.ci_evidence.is_none());
+        assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+    }
+}
+
+#[test]
+fn changed_head_reports_cannot_bypass_fixed_identity_outside_unmerged_diagnosis() {
+    let fixture = Fixture::new();
+    for (id, phase, merged, other_pr, missing_head, generation) in [
+        ("review", Phase::Review, false, false, false, 1),
+        ("integration", Phase::Integration, false, false, false, 1),
+        ("finish", Phase::Finish, true, false, false, 1),
+        ("merged", Phase::Diagnosis, true, false, false, 1),
+        ("other-pr", Phase::Diagnosis, false, true, false, 1),
+        ("missing", Phase::Diagnosis, false, false, true, 1),
+        ("generation", Phase::Diagnosis, false, false, false, 2),
+    ] {
+        let mut task = ready_for_integration(&fixture, &format!("fixed-{id}"));
+        task.phase = phase.clone();
+        task.recovery.origin = Some(Phase::Implementation);
+        if merged {
+            task.merge_commit = Some("c".repeat(40));
+        }
+        let run = Run {
+            generation: 1,
+            phase,
+            started: now(),
+        };
+        task.generation = 1;
+        task.run = Some(run.clone());
+        let mut diagnosis = report(generation, "needs_changes", Some(assessment()));
+        diagnosis.pr = if other_pr { Some(19) } else { task.pr };
+        diagnosis.head = if missing_head {
+            None
+        } else {
+            Some("d".repeat(40))
+        };
+        write_report(&fixture, &task, &run, &diagnosis);
+        apply_report(&fixture.0, &mut task).unwrap();
+        assert_eq!(task.phase, Phase::Diagnosis, "{id}");
+        assert_eq!(task.head, Some("a".repeat(40)), "{id}");
+        assert_eq!(task.pr, Some(18), "{id}");
+        assert!(task.recovery.assessment.is_none(), "{id}");
+    }
+}
+
+#[test]
 fn implementation_ci_wait_observes_changes_and_reenters_diagnosis_without_resume() {
     let fixture = Fixture::new();
     let mut task = fixture.submit("implementation-ci-wait", "high", recovery::Boundary::Finish);
