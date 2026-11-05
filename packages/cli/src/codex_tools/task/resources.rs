@@ -490,7 +490,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reservations_reject_symlink_and_malformed_slot_metadata() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{MetadataExt, symlink};
 
         let root = test_root();
         let budget = budget(2, 2, 1, 1);
@@ -504,6 +504,10 @@ mod tests {
         let root = test_root();
         let path = slot_path(&root, 0);
         let active_lock = store::Lock::try_acquire(&path).unwrap().unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        let inherited_fd = unsafe { libc::fcntl(active_lock.fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(inherited_fd >= 3);
+        let inherited = unsafe { store::Lock::from_inherited(inherited_fd, &path) }.unwrap();
         let mut malformed = store::open_private(&path, true).unwrap();
         use std::io::Write;
         malformed.write_all(b"{not-json").unwrap();
@@ -511,10 +515,31 @@ mod tests {
         drop(malformed);
         assert!(Reservation::acquire_with_snapshot(&root, &budget, measured).is_err());
         drop(active_lock);
-        // Helper管理slotのlockが解放されれば、途中書き込みmetadataを同inodeで回復する。
-        let recovered = Reservation::acquire_with_snapshot(&root, &budget, measured)
-            .unwrap()
-            .unwrap();
+        // 同じopen file descriptionの継承FDが残る間、不正metadataを回復しない。
+        assert_eq!(
+            Reservation::acquire_with_snapshot(&root, &budget, measured).err(),
+            Some("状態fileの形式が不正です".into())
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"{not-json");
+        drop(inherited);
+        // 並列testのfork→exec間にもCLOEXECのFDが一時的に残る。
+        // 実際に解放されるまでは同じ拒否を要求し、解放後の回復だけを成功とする。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let recovered = loop {
+            match Reservation::acquire_with_snapshot(&root, &budget, measured) {
+                Ok(Some(reservation)) => break reservation,
+                Ok(None) => panic!("他の予約がないfixtureで資源不足になりました"),
+                Err(reason) => {
+                    assert_eq!(reason, "状態fileの形式が不正です");
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "slot lockが解放されません"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        };
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
         drop(recovered);
         fs::remove_dir_all(root).unwrap();
     }
