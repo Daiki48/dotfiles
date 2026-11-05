@@ -176,7 +176,11 @@ CI待ちはAI worker枠を占有しません。実行可能なtaskを段階と�
 この予約に対応しない旧helperのworker/coordinatorを停止してからhelperを更新してください。
 ここでのRAM・diskはCodex実行hostの値です。CI runnerの余力・queue・完了見込を推測して選びません。
 `list --json`の`waiting_on`はCI、依存、共有資源、host容量、統合barrier、外部観測、人間判断を区別します。
-診断の後続taskはpolicy・risk・CI label・利用者の終了境界を継承し、同じ目的の再報告を二重登録しません。
+診断の後続taskはpolicy・risk・CI label・利用者の終了境界を継承します。
+workerは既存子taskのID・目的・状態を照合し、同じ作業は`reuse_task_id`で参照します。
+再利用では既存childの内容・依存・pause・完了状態を変更しません。別作業を追加する場合は、
+`distinct_from`で既存全件との違いを明示します。不明・欠落・所有や許可の不一致は全件登録前に
+診断へ戻し、言い換えだけを新taskへ変換しません。従来の同一objective hashの再報告も冪等です。
 実装段階で後続taskの先行待ちを指定すると親sourceの完了を待ち、診断中は独立した部分作業へ分けます。
 
 ## OS起動管理と現在の対応範囲

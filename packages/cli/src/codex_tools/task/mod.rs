@@ -3,6 +3,8 @@
 #[cfg(test)]
 mod autonomy_tests;
 mod ci;
+#[cfg(test)]
+mod followup_tests;
 mod recovery;
 mod resources;
 mod store;
@@ -828,6 +830,7 @@ fn register_followups(
     assessment: &recovery::Assessment,
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
+    assessment.validate()?;
     if assessment
         .followups
         .iter()
@@ -848,9 +851,6 @@ fn register_followups(
     {
         return Err("実在するmain CI失敗に対してのみ修復専用taskを登録できます".into());
     }
-    if task.recovery.children.len() + assessment.followups.len() > 32 {
-        return Err("後続taskの登録数が上限です。既存の計画・依存関係を見直してください".into());
-    }
     let mut ancestors = std::collections::BTreeSet::from([task.id.clone()]);
     let mut parent = task.recovery.parent.clone();
     while let Some(id) = parent {
@@ -861,14 +861,38 @@ fn register_followups(
         }
         parent = context.load(&id)?.recovery.parent;
     }
+    struct PlannedFollowup {
+        id: String,
+        objective: String,
+        dependencies: Vec<String>,
+        repairs_main: bool,
+        create: bool,
+        link_parent: bool,
+    }
+    let existing_ids: std::collections::BTreeSet<_> =
+        task.recovery.children.iter().cloned().collect();
+    for id in &existing_ids {
+        let child = context.load(id)?;
+        if child.recovery.parent.as_ref() != Some(&task.id) {
+            return Err("既存後続taskの所有元が一致しません".into());
+        }
+    }
+    let mut planned_ids = std::collections::BTreeSet::new();
+    let mut plans = Vec::new();
     let mut previous = (task.phase == Phase::Implementation).then_some(task.id.clone());
+    // 全件を検証してから登録する。曖昧な後続のため先行分だけを作らない。
     for next in &assessment.followups {
-        // 同じ目的の再報告や中断後の再読込みで同じ後続taskを二重登録しない。
         let digest = format!(
             "{:x}",
             Sha256::digest(format!("{}\n{}", task.id, next.objective))
         );
-        let id = format!("task-followup-{}", &digest[..20]);
+        let id = next
+            .reuse_task_id
+            .clone()
+            .unwrap_or_else(|| format!("task-followup-{}", &digest[..20]));
+        if !planned_ids.insert(id.clone()) || ancestors.contains(&id) {
+            return Err("後続taskの参照が重複または循環しています".into());
+        }
         let repairs_main = next.purpose == recovery::FollowupPurpose::RepairMainCi;
         if repairs_main
             && task
@@ -881,6 +905,92 @@ fn register_followups(
                 "既存の修復専用taskを継続してください。別taskへbarrier例外を付与しません".into(),
             );
         }
+        let dependencies = if next.after_previous {
+            previous.clone().into_iter().collect()
+        } else {
+            vec![]
+        };
+        let objective = format!(
+            "元の許可済み依頼: {}\n\n今回の部分作業: {}\n元依頼に含まれる根拠: {}\n新規権限・費用・製品判断・不可逆操作を追加しない。",
+            task.objective, next.objective, next.authorization
+        );
+        let exists = context
+            .store
+            .path(&id)?
+            .try_exists()
+            .map_err(|_| "既存後続taskを確認できません")?;
+        let mut link_parent = true;
+        if existing_ids.contains(&id) && !exists {
+            return Err(
+                "登録済み後続taskの保存状態が欠落しています。再作成せず診断してください".into(),
+            );
+        }
+        if next.reuse_task_id.is_some() && !existing_ids.contains(&id) {
+            return Err("再利用できるのは同じ親に登録済みの後続taskだけです".into());
+        }
+        if exists {
+            let child = context.load(&id)?;
+            let explicit_reuse = next.reuse_task_id.is_some();
+            let pending_link =
+                !explicit_reuse && !existing_ids.contains(&id) && child.recovery.parent.is_none();
+            if child.authorization != task.authorization
+                || child.requested_gate != task.requested_gate
+                || child.risk != task.risk
+                || child.ci_labels != task.ci_labels
+                || child.resources != task.resources
+                || child.stop_after != task.stop_after
+                || child.recovery.repairs_main != repairs_main && !pending_link
+                || child
+                    .recovery
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| parent != &task.id)
+                || explicit_reuse && child.recovery.parent.as_ref() != Some(&task.id)
+                || explicit_reuse && repairs_main && task.recovery.repair_task.as_ref() != Some(&id)
+                || !explicit_reuse
+                    && (child.objective != objective
+                        || child.dependencies != dependencies
+                        || child.branch != format!("feat/{id}"))
+            {
+                return Err("既存後続taskの所有・許可・policy・終了境界が一致しません".into());
+            }
+            link_parent = child.recovery.parent.is_none();
+        } else {
+            if next.reuse_task_id.is_some() {
+                return Err("再利用する後続taskが存在しません".into());
+            }
+            let distinct: std::collections::BTreeSet<_> = next
+                .distinct_from
+                .iter()
+                .map(|entry| entry.task_id.clone())
+                .collect();
+            if distinct != existing_ids || distinct.len() != next.distinct_from.len() {
+                return Err("既存後続taskとの区別が未確認です。既存IDを再利用するか、全件との違いを指定してください".into());
+            }
+            if !safe_text(&objective, 32 * 1024) {
+                return Err("後続taskの目的が長すぎます。登録前に分割を見直してください".into());
+            }
+        }
+        plans.push(PlannedFollowup {
+            id: id.clone(),
+            objective,
+            dependencies,
+            repairs_main,
+            create: !exists,
+            link_parent,
+        });
+        previous = Some(id);
+    }
+    if task.recovery.children.len()
+        + plans
+            .iter()
+            .filter(|plan| !existing_ids.contains(&plan.id))
+            .count()
+        > 32
+    {
+        return Err("後続taskの登録数が上限です。既存の計画・依存関係を見直してください".into());
+    }
+    for plan in plans {
         {
             let _lock = context.store.lock()?;
             let current = context.load(&task.id)?;
@@ -894,49 +1004,43 @@ fn register_followups(
                 );
             }
         }
-        let dependencies = if next.after_previous {
-            previous.clone().into_iter().collect()
-        } else {
-            vec![]
-        };
-        let objective = format!(
-            "元の許可済み依頼: {}\n\n今回の部分作業: {}\n元依頼に含まれる根拠: {}\n新規権限・費用・製品判断・不可逆操作を追加しない。",
-            task.objective, next.objective, next.authorization
-        );
-        submit_with_policy(
-            context,
-            id.clone(),
-            objective,
-            task.authorization.clone(),
-            None,
-            dependencies,
-            task.resources.clone(),
-            task.risk.clone(),
-            task.ci_labels.clone(),
-            task.requested_gate,
-            task.stop_after.clone(),
-        )?;
-        let _lock = context.store.lock()?;
-        let mut child = context.load(&id)?;
-        if child
-            .recovery
-            .parent
-            .as_ref()
-            .is_some_and(|parent| parent != &task.id)
-        {
-            return Err("後続taskの所有元が一致しません".into());
+        if plan.create {
+            submit_with_policy(
+                context,
+                plan.id.clone(),
+                plan.objective,
+                task.authorization.clone(),
+                None,
+                plan.dependencies,
+                task.resources.clone(),
+                task.risk.clone(),
+                task.ci_labels.clone(),
+                task.requested_gate,
+                task.stop_after.clone(),
+            )?;
         }
-        child.recovery.parent = Some(task.id.clone());
-        child.recovery.repairs_main = repairs_main;
-        context.store.save(&child)?;
-        if repairs_main {
-            task.recovery.repair_task = Some(id.clone());
+        if plan.link_parent {
+            let _lock = context.store.lock()?;
+            let mut child = context.load(&plan.id)?;
+            if child
+                .recovery
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent != &task.id)
+            {
+                return Err("後続taskの所有元が一致しません".into());
+            }
+            child.recovery.parent = Some(task.id.clone());
+            child.recovery.repairs_main = plan.repairs_main;
+            context.store.save(&child)?;
         }
-        if !task.recovery.children.contains(&id) {
-            task.recovery.children.push(id.clone());
+        if plan.repairs_main {
+            task.recovery.repair_task = Some(plan.id.clone());
+        }
+        if !task.recovery.children.contains(&plan.id) {
+            task.recovery.children.push(plan.id);
             task.event("followup_registered", "元の依頼内の後続taskを登録しました");
         }
-        previous = Some(id);
     }
     Ok(())
 }

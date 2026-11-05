@@ -579,6 +579,8 @@ fn followups_are_idempotent_and_inherit_the_parent_contract_without_new_scope() 
         authorization: "元依頼は既存機能の不具合修正を許可している".into(),
         after_previous: false,
         purpose: recovery::FollowupPurpose::Continuation,
+        reuse_task_id: None,
+        distinct_from: vec![],
     });
     register_followups(&fixture.0, &mut parent, &plan).unwrap();
     register_followups(&fixture.0, &mut parent, &plan).unwrap();
@@ -620,12 +622,16 @@ fn main_ci_failure_preserves_barrier_except_for_its_repair_child() {
             authorization: "元の不具合修正".into(),
             after_previous: false,
             purpose: recovery::FollowupPurpose::RepairMainCi,
+            reuse_task_id: None,
+            distinct_from: vec![],
         },
         recovery::Followup {
             objective: "元依頼に含まれる独立した文書を更新する".into(),
             authorization: "元の文書更新".into(),
             after_previous: false,
             purpose: recovery::FollowupPurpose::Continuation,
+            reuse_task_id: None,
+            distinct_from: vec![],
         },
     ];
     register_followups(&fixture.0, &mut failed, &plan).unwrap();

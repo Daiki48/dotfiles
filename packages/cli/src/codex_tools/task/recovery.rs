@@ -30,6 +30,17 @@ pub(super) struct Followup {
     pub after_previous: bool,
     #[serde(default)]
     pub purpose: FollowupPurpose,
+    #[serde(default)]
+    pub reuse_task_id: Option<String>,
+    #[serde(default)]
+    pub distinct_from: Vec<FollowupDistinction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FollowupDistinction {
+    pub task_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +77,17 @@ impl Assessment {
             || self.watch_paths.iter().any(|path| !safe_relative(path))
             || self.followups.len() > 4
             || self.followups.iter().any(|next| {
-                !safe_text(&next.objective, 8192) || !safe_text(&next.authorization, 4096)
+                !safe_text(&next.objective, 8192)
+                    || !safe_text(&next.authorization, 4096)
+                    || next
+                        .reuse_task_id
+                        .as_deref()
+                        .is_some_and(|id| !super::valid_id(id))
+                    || next.distinct_from.len() > 32
+                    || next.distinct_from.iter().any(|entry| {
+                        !super::valid_id(&entry.task_id) || !safe_text(&entry.reason, 2048)
+                    })
+                    || next.reuse_task_id.is_some() && !next.distinct_from.is_empty()
             })
             || self.decision.as_ref().is_some_and(|decision| {
                 ![
