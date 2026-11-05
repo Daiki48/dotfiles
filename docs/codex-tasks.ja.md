@@ -36,6 +36,12 @@ live private repository policy、同repositoryのPR、固定headと実mergeのAc
 を使います。旧review/CIを無効化して実装・検証から再照合し、merge後のpolicy変更は拒否します。
 
 `submit`は登録、`start`は端末から切り離したcoordinatorの起動です。既に稼働中なら重複起動しません。
+通常実装の既存PRを引き継ぐときは、まず`list/show`で同じtaskの登録を確認します。未登録なら、
+旧writer停止・worktree非使用を確認し、managed worktreeと同じtask IDと実際の`--branch`で登録します。
+既存PR・固定head・Plan/版・CI許可と残るdeliveryを目的に保存し、`start`後の`show`で対象PR/headと
+CI監視または次段階への接続を確認します。`already_running`だけでは引継ぎ成功とはいえません。
+CI待ちを理由にpauseしたり、CI起動だけでfinishまでの依頼を完了報告したりしません。
+親終了後の継続が許可された場合だけ引継ぎを報告し、親継続の指示があれば監視を続けます。
 Codexのshell sandboxからは、既存approvalで同UIDの通常ホスト側に`start`／`run`／`reconcile`を渡します。
 子Codex runtimeはローカル設定・cache・stateへの書込みが必要で、`setsid`は親sandboxのread-only mountを解放しません。
 `doctor`の`host_launch_required=true`はこの状態を示します。子Codexのtool権限・hook・auto-reviewは設定どおり維持します。

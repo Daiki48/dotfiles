@@ -5,6 +5,8 @@ mod autonomy_tests;
 mod ci;
 #[cfg(test)]
 mod followup_tests;
+#[cfg(test)]
+mod handoff_tests;
 mod recovery;
 mod resources;
 mod store;
@@ -277,8 +279,7 @@ impl Task {
             || risk_rank(&self.risk) == usize::MAX
             || !valid_ci_labels(&self.ci_labels)
             || !self.github.contains('/')
-            || !self.branch.starts_with("feat/")
-            || self.branch.contains(['\n', '\r', '\0'])
+            || !worktree::valid_branch(&self.branch)
             || self
                 .dependencies
                 .iter()
@@ -2314,9 +2315,7 @@ pub(crate) fn invocation_reason(args: &[String]) -> Option<String> {
             ..
         } => (!valid_id(&task_id)
             || !safe_text(&objective, 32 * 1024)
-            || branch.is_some_and(|branch| {
-                !branch.starts_with("feat/") || branch.contains(['\n', '\r', '\0'])
-            })
+            || branch.is_some_and(|branch| !worktree::valid_branch(&branch))
             || depends_on.iter().any(|id| !valid_id(id) || id == &task_id)
             || resource.iter().any(|name| !resource_name(name))
             || !valid_ci_labels(&ci_label))

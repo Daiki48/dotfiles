@@ -14,6 +14,8 @@ description: 複数Issueの並列実装、進行中に別タスクを追加す�
 - 受付を担当するmainがAGENTSの基準でriskを判断し、`--risk low|medium|high|critical`へ渡す。判断できなければ既定のhighを使う。登録riskはレビュー深度の下限であり、実装workerの自己申告では下げない。
 - repositoryの既存方針で対象PRと後続pushのCI起動が明示的に委任されているlabelだけを、受付時に`--ci-label <既存label>`へ渡す。PR-wide labelは固定SHA単位の実行認可を保証しない。SHAごとの承認が必要な運用、未確認のlabel、新しい承認や権限を推測して登録しない。レビュー後のlabel追加はRustがPR・HEAD・baseとlabelの実在を照合して行い、CI起動専用のAI workerは作らない。
 - `submit`は登録だけで、`start`がOSタイマーなしのcoordinatorを起動する。登録後は`codex-task start --json`を呼ぶ。稼働済みなら同じcoordinatorが新taskを扱う。受付後も別依頼や相談に応じ、元workerの完了を会話の前提にしない。
+- 通常実装のCI待ちを引き継ぐ場合も、既存taskとmanaged worktreeを照合する。未登録の既存worktreeには同じtask IDと実際の`--branch`を指定し、既存PR・固定head・Plan/版・残るdelivery・元の終了境界を保存する。旧writer停止・非使用を確認してから引き継ぎ、別IDや既定branchで同じ作業を再登録しない。`start`成功だけでなく、対象taskが既存PR/headと次段階を認識したことを`show`で確認する。CI待ちや先行作業待ちを便宜的なpauseへ変換しない。
+- CI起動は完了ではない。finishまでの依頼は、CI後のreview・delivery・main CI・finish・物理cleanupまで担当を維持する。親終了を許可された場合だけ確認済みの自律継続を報告し、親を継続する指示があれば最終回答で終了しない。画面のWorked表示はcoordinatorの稼働やtask完了の証拠に使わない。
 - 同じtaskへの追加指示は`show`で状態を確認する。実行中にwriterを追加しない。必要なら`pause`で停止要求を出し、`run`が空になるまで`list`／`reconcile`で回収を確認してから`resume --task-id <ID> --instruction '<追加指示>'`、`start`へ進む。対象taskを文脈から特定できない場合だけ確認する。
 - 依存taskは`--depends-on <ID>`、共有port・DB等は`--resource <衝突を避ける名前>`で登録する。各taskのbuild・DB・container等にもtask固有の名前と既存の登録済みartifact領域を使う。
 - 状況確認は`list --json`、詳細・引継ぎ・個別CI証跡は`show --task-id <ID> --json`、未処理イベントは`events --task-id <ID> --json`を使う。確認して必要な対応を済ませたsequenceまで`ack --task-id <ID> --through <sequence>`で累積ackする。表示だけではackしない。`events --all`は保持中のack済み履歴も返す。保持期間は`retention --task-id <ID> --seconds <秒>`（既定30日）で指定し、`collect --task-id <ID>`で完了・全ack・worker停止を確認して期限超過の旧結果だけを回収する。task本体・checkpoint・最新結果は保持される。これらはローカル情報であり、公開Issueへ生出力を転載しない。
