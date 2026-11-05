@@ -146,6 +146,28 @@ CI待ちにはCodexを起動せず、Rustが現在のPR・head・base・test mer
 変化後は診断へ戻し、必要な実装・独立review・CI認可を経て継続します。観測だけで統合段階へ進めません。
 APIエラーはCI失敗と分けてbackoffし、check不足・cancel・timeout・skipのみを成功扱いしません。
 
+### 診断判断の実runtime検証
+
+通常のRust testは固定reportによる状態遷移を検証します。実Codexがreportを選ぶ境界は、
+同UIDの通常hostで明示実行するignored testで別に確認できます。先にinstalled helperの
+`codex-task doctor --json`がreadyであることを確認し、専用worktreeと
+`codex-worktree artifacts --task-id <ID>`の登録済み領域を使います。
+
+```sh
+CARGO_TARGET_DIR=<登録済み成果物領域>/target cargo test -p cli real_diagnosis_separates_source_repair_from_live_permission --locked -- --ignored --nocapture
+```
+
+非秘密fixtureに対して読み取り専用Diagnosisを2件実行し、実reportを保存・再読込して回収します。
+candidate/credential不足と親のfile分割があっても、許可済みのsource修復はImplementationへ戻り、
+新しい有料権限の明示承認が必要な作業はAwaitingDecisionへ進むことを確認します。
+後者の判断待ちでも独立した前者が起動可能と判定されることと、fixtureの不変も確認します。
+診断が後続への再分割を提案した場合は、試験専用stateでの登録と元依頼の継承を確認します。
+実装worker・coordinator常駐・GitHub操作・live取得は起動しません。既存taskのstateは使いません。
+
+この試験は現在のモデル・configでの診断と状態遷移の観測です。source実装完了、live受入、
+親終了後の無人delivery・cleanupや自然言語判断一般を保証しません。失敗時の報告は成果物領域に
+保持されるので、原因を確認し、必要な検証記録を残してから正規helperで回収してください。
+
 ### workflow不在repositoryのlocal gate
 
 PR payloadの`base.sha`は古い場合があるため、対象branchのlive refを観測の前後で直接照合します。
