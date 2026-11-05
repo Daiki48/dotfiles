@@ -133,6 +133,7 @@ const MANAGED_AGENT_KEYS: &[&str] = &[
     "default_subagent_reasoning_effort",
 ];
 const MANAGED_HOOK_COMMAND: &str = "command = '\"$HOME/.codex/hooks/block-git-write\"'";
+#[cfg(test)]
 const MANAGED_STOP_HOOK_COMMAND: &str =
     "command = '\"$HOME/.codex/hooks/block-git-write\" --completion-stop'";
 const PYTHON_MANAGED_HOOK_COMMAND: &str =
@@ -2118,17 +2119,39 @@ fn sync_managed_hook(template: &str, existing: &str) -> String {
     {
         additions.push(MANAGED_HOOK_CONFIG);
     }
-    if template.contains(MANAGED_STOP_HOOK_COMMAND)
-        && !cleaned
-            .lines()
-            .any(|line| line.trim() == MANAGED_STOP_HOOK_COMMAND)
-    {
+    if has_completion_stop_hook(template) && !has_completion_stop_hook(&cleaned) {
         additions.push(MANAGED_STOP_HOOK_CONFIG);
     }
     if additions.is_empty() {
         return cleaned;
     }
     format!("{}\n\n{}\n", cleaned.trim_end(), additions.join("\n\n"))
+}
+
+fn has_completion_stop_hook(contents: &str) -> bool {
+    let Ok(document) = contents.parse::<DocumentMut>() else {
+        return false;
+    };
+    document
+        .get("hooks")
+        .and_then(|hooks| hooks.get("Stop"))
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Item::as_array_of_tables)
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|hook| {
+                            hook.get("type").and_then(Item::as_str) == Some("command")
+                                && hook.get("command").and_then(Item::as_str)
+                                    == Some(
+                                        "\"$HOME/.codex/hooks/block-git-write\" --completion-stop",
+                                    )
+                        })
+                    })
+            })
+        })
 }
 
 fn ensure_managed_workspace_root(contents: &str, managed_root: &Path) -> Result<String> {
@@ -7012,6 +7035,18 @@ trusted_hash = "sha256:local"
         let template_without_stop = "model = \"new\"\n";
         let no_stop_config = merge_managed_config(template_without_stop, "model = \"old\"\n");
         assert!(!no_stop_config.contains("[[hooks.Stop]]"));
+    }
+
+    #[test]
+    fn completion_stop_migration_does_not_confuse_another_hook_event() {
+        let existing = "[[hooks.SessionEnd]]\n[[hooks.SessionEnd.hooks]]\ntype = \"command\"\ncommand = '\"$HOME/.codex/hooks/block-git-write\" --completion-stop'\n";
+        let template = include_str!("../../../.codex/config.base.toml");
+        let migrated = merge_managed_config(template, existing);
+        assert!(super::has_completion_stop_hook(&migrated));
+        assert_eq!(migrated.matches(MANAGED_STOP_HOOK_COMMAND).count(), 2);
+        assert_eq!(migrated.matches("[[hooks.Stop]]").count(), 1);
+        assert!(migrated.contains(existing));
+        assert_eq!(merge_managed_config(template, &migrated), migrated);
     }
 
     #[test]
