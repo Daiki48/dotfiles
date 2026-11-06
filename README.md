@@ -170,6 +170,14 @@ server-side強制がないためriskをhigh/criticalへ引き上げますが、d
 
 `~/.codex/AGENTS.md`, `~/.codex/rules/default.rules`,
 `~/.agents/skills`, and `~/.codex/agents` are symlinked from this repository.
+
+dotfiles自身を公開リポジトリとして扱うルールは、rootの[`AGENTS.md`](AGENTS.md)に置きます。
+これはdotfilesとそのworktree限定で、homeへ配布する`.codex/AGENTS.md`とは別です。
+更新を取り込んだcheckoutで新規Codexセッションを開始すると読み込まれます。既存セッションや
+更新前のworktreeでは最新のファイルを明示的に確認してください。これは公開前の確認を義務づける
+指示であり、任意の機密情報の完全検出を保証するものではありません。
+[OpenAI公式の読み込み仕様](https://learn.chatgpt.com/docs/agent-configuration/agents-md)を参照してください。
+
 Small, preselected excerpts prefer the local gpt-oss:20b helper for identifier-based extraction
 or a one-sentence explanation. Larger contexts and cross-file reasoning go directly to Luna
 xhigh, which also handles fallback and scoped independent review. The main agent owns
