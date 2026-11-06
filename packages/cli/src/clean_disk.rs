@@ -347,7 +347,7 @@ pub(crate) fn validate_artifact_tree(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn reject_mounted_tree(path: &Path) -> Result<()> {
+pub(crate) fn reject_mounted_tree(path: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         // bind mountは同じdeviceにも作れるため、st_devだけでは検出できない。
@@ -507,6 +507,13 @@ fn discover_under(root: &Path, codex: bool) -> Result<Vec<Candidate>> {
                     || (path.join("storage.lock").exists() && path.join("db.sql").exists()))
             {
                 println!("NativeCleanupRequired\tPodman管理領域\t{}", path.display());
+                continue;
+            }
+            if name == ".artifact-archives" {
+                println!(
+                    "RetainArchive\t復旧用の退避は自動回収しません\t{}",
+                    path.display()
+                );
                 continue;
             }
             if codex && name == ".artifacts" {
@@ -1570,6 +1577,7 @@ mod tests {
             ".codex-trash-legacy/old",
             ".podman-example/vfs/dir",
             "repo/.artifacts/task-example",
+            "repo/.artifact-archives/task-example/data/target",
         ] {
             fs::create_dir_all(fixture.0.join(relative)).unwrap();
         }
@@ -1591,6 +1599,12 @@ mod tests {
         remove_candidate(target).unwrap();
         assert!(!target.path.exists());
         assert!(fixture.0.join("repo/.artifacts/task-example").exists());
+        assert!(
+            fixture
+                .0
+                .join("repo/.artifact-archives/task-example/data/target")
+                .exists()
+        );
         assert!(fixture.0.join(".podman-example").exists());
     }
 

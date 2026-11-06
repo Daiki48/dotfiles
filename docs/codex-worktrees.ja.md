@@ -218,6 +218,18 @@ Podmanはtask専用root/runrootと`--rm`を使い、通常のhostのcontainer領
 owner marker・task・path・device/inodeが一致する登録領域では、検証で作成したGit fixtureも領域全体とともに回収します。
 source/worktree/common Gitや別taskへは触れず、symlinkの先もたどりません。通常のcache内のGit repositoryは引き続き保護します。
 
+再起動等でdevice番号だけが変わり通常cleanupが拒否される場合、ホスト上で全writer・VM・containerの停止とmount不在を確認後、
+`codex-worktree archive-artifacts --task-id <ID>`で旧領域と元markerを削除せず退避できます。
+Linux専用で、検証済みready manifestとmarkerのtask/path/common Git、所有者・private mode・同じinodeを要求します。
+worktree本体が欠損していてもmanifestが有効なら退避できますが、sourceの復旧やtaskの完了・pause解除は行いません。
+退避先は`<repo-key>/.artifact-archives/<task-id>/`です。`data/`に全内容、`owner.json`にmarkerの複写、
+`registered-owner.json`に元markerを保持します。device以外の不一致、使用中、mount、既存退避との衝突は拒否します。
+コンテナの特殊fileも同一filesystem内のrenameで保持し、copy+deleteへfallbackしません。別UIDのprocessはホスト側で確認してください。
+markerを先に移すため途中失敗時の通常create/cleanupは拒否され、同じarchive commandで再開できます。
+退避は自動cleanup対象外で、別ディスクへのroot移行時も全内容を保持してください。削除や復元は個別に所有・使用・内容を確認する別操作です。
+退避完了後は通常の`artifacts`で新しい領域を作成できます。同taskに既存退避がある間の追加退避は拒否します。
+通常の`validate`や`clean-artifacts`の安全条件は変わりません。
+
 セッション終了hookや常駐daemonによる削除ではなく、上記commandをAGENTS/execute-planの
 完了手順に組み込む運用です。進行中のsourceを年齢だけで消す処理はありません。
 一覧とdoctorは、delivery記録が一致しworktree・登録済み成果物がなくなったtaskを

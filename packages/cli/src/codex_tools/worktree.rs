@@ -2380,6 +2380,30 @@ fn sync_worktree_with_boundary(
     Ok(target)
 }
 
+fn archive_task_artifacts(
+    cwd: &Path,
+    task_id: &str,
+    allow_local_origin: bool,
+) -> Result<PathBuf, WorktreeError> {
+    if !valid_task_id(task_id) {
+        return Err(error("不正なtask IDです"));
+    }
+    let repository = inspect_repository(cwd, allow_local_origin, false)?;
+    let (target, _, lock_path) = managed_paths(&repository, task_id, false)?;
+    let _lock = ExclusiveLock::acquire(&lock_path)?;
+    let manifest = load_manifests(&repository)?
+        .into_iter()
+        .find(|(_, manifest)| manifest.task_id == task_id)
+        .map(|(_, manifest)| manifest)
+        .ok_or_else(|| error("task manifestがありません"))?;
+    // worktree欠損時もsourceを作り直さず、検証済みmanifestとmarkerの対だけを退避する。
+    if manifest.status != "ready" || manifest.worktree != target.to_string_lossy() {
+        return Err(error("退避可能なtask manifestではありません"));
+    }
+    super::artifacts::archive(&target, task_id, &repository.common_git_dir)
+        .map_err(|cause| error(cause.to_string()))
+}
+
 fn task_artifacts(
     cwd: &Path,
     task_id: &str,
@@ -2687,6 +2711,16 @@ fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
             false,
         )
         .map(|_| "未反映変更のないtaskの終了が完了しました".into()),
+        "archive-artifacts" => {
+            archive_task_artifacts(&cwd, parsed.task_id.as_deref().unwrap_or(""), false).map(
+                |path| {
+                    format!(
+                        "{} に成果物と元markerを保持しました（自動削除対象外）",
+                        path.display()
+                    )
+                },
+            )
+        }
         "artifacts" | "clean-artifacts" => {
             let task_id = parsed
                 .task_id
@@ -2761,7 +2795,7 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         .ok_or_else(|| "commandを指定してください".to_string())?;
     if matches!(command.as_str(), "-h" | "--help") {
         return Err(
-            "usage: codex-worktree <prepare|create|list|doctor|resume|sync|recover|artifacts|clean-artifacts|retire> [options]".to_string(),
+            "usage: codex-worktree <prepare|create|list|doctor|resume|sync|recover|artifacts|clean-artifacts|archive-artifacts|retire> [options]".to_string(),
         );
     }
     if !matches!(
@@ -2775,6 +2809,7 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
             | "recover"
             | "artifacts"
             | "clean-artifacts"
+            | "archive-artifacts"
             | "retire"
     ) {
         return Err(format!("unknown command: {command}"));
@@ -2861,6 +2896,7 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
                         | "recover"
                         | "artifacts"
                         | "clean-artifacts"
+                        | "archive-artifacts"
                         | "retire"
                 ) =>
             {
@@ -2884,7 +2920,7 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     }
     if matches!(
         command.as_str(),
-        "resume" | "recover" | "artifacts" | "clean-artifacts"
+        "resume" | "recover" | "artifacts" | "clean-artifacts" | "archive-artifacts"
     ) && parsed.task_id.is_none()
     {
         return Err("--task-idが必要です".to_string());
@@ -4141,6 +4177,37 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "task-list-filter");
         assert_eq!(rows[0].1, "ready");
+    }
+
+    #[test]
+    fn archive_artifacts_requires_valid_manifest_and_preserves_missing_worktree_state() {
+        let fixture = TemporaryRepository::new();
+        let task = "task-archive";
+        let target = create_worktree(&fixture.repository, "feat/archive", task, true).unwrap();
+        let artifact = task_artifacts(&fixture.repository, task, false, true).unwrap();
+        fs::write(artifact.join("evidence"), b"preserve").unwrap();
+        let marker = fixture
+            .manifest(task)
+            .with_file_name(format!("{task}.artifacts.json"));
+        let mut owner: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        owner["device"] = (owner["device"].as_u64().unwrap() + 1).into();
+        fs::write(&marker, serde_json::to_vec(&owner).unwrap()).unwrap();
+        let manifest = fixture.manifest(task);
+        let original = fs::read(&manifest).unwrap();
+        fs::write(&manifest, b"{}").unwrap();
+        assert!(archive_task_artifacts(&fixture.repository, task, true).is_err());
+        assert!(artifact.join("evidence").exists());
+        fs::write(&manifest, &original).unwrap();
+        fs::rename(&target, target.with_file_name("source-preserved")).unwrap();
+        let archived = archive_task_artifacts(&fixture.repository, task, true).unwrap();
+        assert_eq!(
+            fs::read(archived.join("data/evidence")).unwrap(),
+            b"preserve"
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), original);
+        assert!(!target.exists());
+        assert!(target.with_file_name("source-preserved").is_dir());
     }
 
     #[test]

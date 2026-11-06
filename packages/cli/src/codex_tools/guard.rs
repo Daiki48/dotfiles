@@ -4919,7 +4919,9 @@ fn worktree_helper_invocation_reason(tokens: &[String]) -> Option<String> {
                 helper_task_args("doctor", rest)
             }
         }
-        "resume" | "recover" | "artifacts" | "clean-artifacts" => helper_task_args(command, rest),
+        "resume" | "recover" | "artifacts" | "clean-artifacts" | "archive-artifacts" => {
+            helper_task_args(command, rest)
+        }
         "completion" => {
             if (rest.len() == 2
                 || (rest.len() == 6
@@ -5254,6 +5256,7 @@ fn has_write_operation(tokens: &[String]) -> bool {
                         "recover",
                         "artifacts",
                         "clean-artifacts",
+                        "archive-artifacts",
                         "retire",
                         "sync",
                         "completion",
@@ -6592,7 +6595,7 @@ mod tests {
         assert!(blocked_reason("codex-worktree list", None, 0).is_none());
         assert!(blocked_reason("codex-worktree create --task-id task-example", None, 0).is_none());
         assert!(blocked_reason("codex-worktree create --issue 0", None, 0).is_some());
-        for subcommand in ["artifacts", "clean-artifacts"] {
+        for subcommand in ["artifacts", "clean-artifacts", "archive-artifacts"] {
             let command = format!("codex-worktree {subcommand} --task-id task-example");
             assert!(blocked_reason(&command, None, 0).is_none());
             assert!(write_context_reason(&command, None).is_some());
