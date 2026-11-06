@@ -18,6 +18,7 @@ atomic installします。起動時は実行file名で処理を分岐します�
 - `~/.local/bin/codex-worktree`
 - `~/.local/bin/codex-delivery`
 - `~/.local/bin/codex-discussions`
+- `~/.local/bin/codex-gasostudy-control-plane`
 
 hookのallow/deny、worktree manifest、delivery receipt v1〜v5の読み取り互換性と再開stateは従来の
 外部契約を維持します。receipt v6とhelper CLIはlow/mediumでmain agentのself-review、high/criticalで独立review、
@@ -78,6 +79,37 @@ PATHやbuild overrideを隔離します。Codex CLIの自動npm installは行わ
 config、symlinkの全親component、Cargo config、legacy state、managed binary transactionをread-onlyでpreflightした後、
 setup全体のdurable resume journalを開始します。`packages/cli`をbounded process runnerで`--release --locked` buildし、
 managed binaryの配置先を同一hashへ更新します。途中失敗時はjournalと各file transactionを次回setupで再開します。
+
+## GasoStudyの固定control-plane入口
+
+今回承認された非sudo control-plane build/validateだけを、installed helperへ接続します。
+GasoStudyの`task-280-gasolens-ci` worktreeを明示して、次をそれぞれ独立commandで実行します。
+
+```console
+codex-gasostudy-control-plane check --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
+codex-gasostudy-control-plane control-plane-build --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
+codex-gasostudy-control-plane control-plane-validate --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
+```
+
+`check`はsource/task/executor/出力先を読み取り検査するだけです。実build前にはGasoStudy側で
+runtime/state、resource、既存artifactの保存証拠を再照合してください。このhelperはそのbuild票全体を
+代行しません。build済みartifactの全payload検査・保存・root installは別の停止境界です。
+
+hookはPATH上の名前、単一command、固定repository、固定SHA・IDを検査し、実行中hookと同じbytesのinstalled
+helperへrewriteします。helperは実行直前にもUID/GID 1000、固定repository/common Git、ready manifest、
+Git worktree登録、branch/HEAD/clean、executorのGit blobとcheckout bytes、固定出力先を照合します。
+Gitはcredentialと継承環境を除去して読み取り専用で実行し、外部実行を持つlocal configを拒否します。
+executorはSHA256検査後にsealed memfdへ固定し、7つの固定環境変数だけでBash privileged modeのstdinへ渡します。
+固定executor自身のsandbox、fresh indexによるsource差替え検査、credential/認証helper隔離、timeoutは維持します。
+
+出力は`/tmp/gasostudy-runner-control-plane/control-plane.tar.gz`だけです。build/checkは既存artifactを
+上書きせず拒否します。validateは同一UIDの通常file、0600、link数1、サイズ上限を確認します。
+このhostとsourceに限定した入口であり、別SHA・task・pathへの変更は新たなreviewを必要とします。
+任意shell file/stdin、Git pipe、wrapper、追加argv・環境指定は許可しません。
+製品artifactのJIT経路、installed Python検証4 ID、root/CD/productionのauthorityは変更しません。
+
+導入は既存の`cargo run -- codex-guardrails`で、cleanなmanaged dotfiles taskから行います。
+共有config/Skillsには触れず、hash管理されたhook/helperだけをatomic更新します。
 
 ## CIの実行環境
 

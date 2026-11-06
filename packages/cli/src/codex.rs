@@ -50,6 +50,7 @@ const MANAGED_BINARY_DESTINATIONS: &[&str] = &[
     ".local/bin/codex-delivery",
     ".local/bin/codex-discussions",
     ".local/bin/codex-task",
+    ".local/bin/codex-gasostudy-control-plane",
     ".local/bin/runner-storage-cleanup",
 ];
 const MANAGED_HOOK_STATE_SUFFIX: &str = ".managed.sha256";
@@ -4373,6 +4374,7 @@ mod tests {
                 ".local/bin/codex-delivery",
                 ".local/bin/codex-discussions",
                 ".local/bin/codex-task",
+                ".local/bin/codex-gasostudy-control-plane",
                 ".local/bin/runner-storage-cleanup",
             ]
         );
