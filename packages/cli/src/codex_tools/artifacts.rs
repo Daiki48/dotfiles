@@ -152,6 +152,163 @@ pub(crate) fn cleanup(worktree: &Path, task: &str, common: &Path) -> Result<()> 
     Ok(())
 }
 
+/// 通常cleanupで検証できない旧成果物とmarkerを、削除せず対で保持する。
+/// 呼出元はrepository lifecycle lockを保持する。移動は同じfilesystem内だけ。
+pub(crate) fn archive(worktree: &Path, task: &str, common: &Path) -> Result<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        bail!("非破壊の成果物退避はLinuxでのみ対応しています");
+    }
+    archive_with_idle_check(
+        worktree,
+        task,
+        common,
+        &crate::clean_disk::ensure_artifact_idle,
+    )
+}
+
+fn archive_with_idle_check(
+    worktree: &Path,
+    task: &str,
+    common: &Path,
+    idle: &dyn Fn(&Path) -> Result<()>,
+) -> Result<PathBuf> {
+    let (path, marker) = paths(worktree, task)?;
+    let parent = worktree.parent().context("管理rootがありません")?;
+    private_directory(parent)?;
+    private_directory(path.parent().context("artifacts rootがありません")?)?;
+    let archives = parent.join(".artifact-archives");
+    let destination = archives.join(task);
+    let snapshot = destination.join("owner.json");
+    let saved_marker = destination.join("registered-owner.json");
+    let data = destination.join("data");
+    let exists = |p: &Path| -> Result<bool> {
+        match fs::symlink_metadata(p) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    };
+    let check_owner = |owner: &Owner| -> Result<()> {
+        if owner.version != 1
+            || owner.task_id != task
+            || owner.worktree != worktree
+            || owner.common_git_dir != common
+        {
+            bail!("退避するmarkerとtask manifestが一致しません");
+        }
+        Ok(())
+    };
+    let check_data = |p: &Path, owner: &Owner| -> Result<()> {
+        private_directory(p)?;
+        let (device, inode) = identity(p)?;
+        // device番号の変化だけを扱う。異なるinodeの内容は採用しない。
+        if inode != owner.inode || device != identity(parent)?.0 {
+            bail!("退避対象のinodeまたはfilesystemが一致しません");
+        }
+        crate::clean_disk::reject_mounted_tree(p)?;
+        idle(p)
+    };
+    if exists(&archives)? {
+        private_directory(&archives)?;
+    }
+    let owner = if exists(&destination)? {
+        private_directory(&destination)?;
+        let owner = read_owner(&snapshot)?;
+        check_owner(&owner)?;
+        if exists(&saved_marker)? {
+            if exists(&marker)? || read_owner(&saved_marker)? != owner {
+                bail!("退避markerの重複または不一致があります");
+            }
+        } else if read_owner(&marker)? != owner {
+            bail!("中断した退避とmarkerが一致しません");
+        }
+        owner
+    } else {
+        let owner = read_owner(&marker)?;
+        check_owner(&owner)?;
+        check_data(&path, &owner)?;
+        if identity(&path)?.0 == owner.device {
+            bail!("device番号が変化した旧成果物だけを退避できます");
+        }
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        if !exists(&archives)? {
+            builder.create(&archives)?;
+        }
+        private_directory(&archives)?;
+        builder.create(&destination)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&snapshot)?;
+        // marker原本のbytesを保持し、既存markerを編集しない。
+        file.write_all(&fs::read(&marker)?)?;
+        file.sync_all()?;
+        sync_directory(&destination)?;
+        sync_directory(&archives)?;
+        sync_directory(parent)?;
+        owner
+    };
+    if exists(&data)? {
+        if exists(&path)? {
+            bail!("退避元と退避先が両方存在します。保持します");
+        }
+        if !exists(&saved_marker)? {
+            bail!("退避先の元markerがありません");
+        }
+        check_data(&data, &owner)?;
+    } else {
+        check_data(&path, &owner)?;
+        // markerを先に移し、中断中の通常create/cleanupを未登録directoryとして拒否させる。
+        if !exists(&saved_marker)? {
+            if read_owner(&marker)? != owner {
+                bail!("退避中にmarkerが変化しました");
+            }
+            rename_without_replace(&marker, &saved_marker)?;
+            sync_directory(marker.parent().context("state rootがありません")?)?;
+            sync_directory(&destination)?;
+        }
+        rename_without_replace(&path, &data)?;
+        sync_directory(path.parent().context("artifacts rootがありません")?)?;
+        sync_directory(&destination)?;
+    }
+    Ok(destination)
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn rename_without_replace(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+        let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (source, destination);
+        bail!("非破壊の成果物退避はLinuxでのみ対応しています")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +338,109 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn drift_fixture() -> (Fixture, PathBuf, PathBuf) {
+        let f = Fixture::new();
+        fs::set_permissions(&f.0, fs::Permissions::from_mode(0o700)).unwrap();
+        let common = f.0.join("git");
+        let path = create(&f.worktree(), "task-test", &common).unwrap();
+        let marker = paths(&f.worktree(), "task-test").unwrap().1;
+        let mut owner = read_owner(&marker).unwrap();
+        owner.device += 1;
+        fs::write(marker, serde_json::to_vec(&owner).unwrap()).unwrap();
+        (f, common, path)
+    }
+
+    #[test]
+    fn archive_preserves_drifted_data_and_original_marker_without_weakening_cleanup() {
+        let (f, common, path) = drift_fixture();
+        fs::write(path.join("evidence"), "保持する内容").unwrap();
+        let marker = paths(&f.worktree(), "task-test").unwrap().1;
+        let original_marker = fs::read(&marker).unwrap();
+        let original_inode = identity(&path).unwrap().1;
+        assert!(cleanup(&f.worktree(), "task-test", &common).is_err());
+        let archived =
+            archive_with_idle_check(&f.worktree(), "task-test", &common, &|_| Ok(())).unwrap();
+        assert!(!path.exists());
+        assert!(!marker.exists());
+        assert_eq!(
+            fs::read(archived.join("registered-owner.json")).unwrap(),
+            original_marker
+        );
+        assert_eq!(identity(&archived.join("data")).unwrap().1, original_inode);
+        assert_eq!(
+            fs::read_to_string(archived.join("data/evidence")).unwrap(),
+            "保持する内容"
+        );
+        assert_eq!(
+            archive_with_idle_check(&f.worktree(), "task-test", &common, &|_| Ok(())).unwrap(),
+            archived
+        );
+        let new_path = create(&f.worktree(), "task-test", &common).unwrap();
+        assert!(archive_with_idle_check(&f.worktree(), "task-test", &common, &|_| Ok(())).is_err());
+        cleanup(&f.worktree(), "task-test", &common).unwrap();
+        assert!(!new_path.exists());
+        assert!(archived.join("data/evidence").exists());
+        assert!(f.worktree().join("source").exists());
+    }
+
+    #[test]
+    fn archive_resumes_marker_first_interruption_and_keeps_normal_helpers_closed() {
+        let (f, common, path) = drift_fixture();
+        let marker = paths(&f.worktree(), "task-test").unwrap().1;
+        let dest = f.0.join(".artifact-archives/task-test");
+        fs::create_dir_all(&dest).unwrap();
+        for p in [dest.clone(), dest.parent().unwrap().into()] {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::copy(&marker, dest.join("owner.json")).unwrap();
+        fs::rename(&marker, dest.join("registered-owner.json")).unwrap();
+        assert!(create(&f.worktree(), "task-test", &common).is_err());
+        assert!(cleanup(&f.worktree(), "task-test", &common).is_err());
+        archive_with_idle_check(&f.worktree(), "task-test", &common, &|_| Ok(())).unwrap();
+        assert!(!path.exists());
+        assert!(dest.join("data").is_dir());
+    }
+
+    #[test]
+    fn archive_rejects_use_replacement_and_foreign_marker_without_mutation() {
+        let (f, common, path) = drift_fixture();
+        assert!(
+            archive_with_idle_check(&f.worktree(), "task-test", &common, &|_| bail!("使用中"))
+                .is_err()
+        );
+        assert!(
+            archive_with_idle_check(&f.worktree(), "task-test", Path::new("/other"), &|_| Ok(()))
+                .is_err()
+        );
+        let preserved = f.0.join("preserved");
+        fs::rename(&path, &preserved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(archive_with_idle_check(&f.worktree(), "task-test", &common, &|_| Ok(())).is_err());
+        assert!(path.is_dir() && preserved.is_dir());
+        assert!(!f.0.join(".artifact-archives").exists());
+    }
+
+    #[test]
+    fn archive_preserves_special_files_and_symlinks_without_following_them() {
+        use std::os::unix::ffi::OsStrExt;
+        let (f, common, path) = drift_fixture();
+        let fifo = std::ffi::CString::new(path.join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        symlink(f.worktree().join("source"), path.join("external-link")).unwrap();
+        let archived =
+            archive_with_idle_check(&f.worktree(), "task-test", &common, &|_| Ok(())).unwrap();
+        assert!(archived.join("data/external-link").is_symlink());
+        assert_eq!(
+            fs::symlink_metadata(archived.join("data/fifo"))
+                .unwrap()
+                .mode()
+                & libc::S_IFMT,
+            libc::S_IFIFO
+        );
+        assert!(f.worktree().join("source").exists());
     }
 
     #[test]
