@@ -3620,7 +3620,7 @@ fn validate_setup_home(configured: PathBuf, account: PathBuf) -> Result<PathBuf>
 }
 
 #[cfg(unix)]
-fn account_home_dir() -> Result<PathBuf> {
+pub(crate) fn account_home_dir() -> Result<PathBuf> {
     const DEFAULT_BUFFER: usize = 16 * 1024;
     const MAX_BUFFER: usize = 1024 * 1024;
     // SAFETY: getuid and sysconf do not dereference pointers or retain state supplied by Rust.

@@ -7721,8 +7721,8 @@ mod recovery_tests {
     #[test]
     fn gasostudy_rejects_shell_wrappers_environment_and_unpinned_inputs() {
         let direct = format!(
-            "codex-gasostudy-control-plane control-plane-build --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source {}",
-            super::super::gasostudy::SOURCE
+            "codex-gasostudy-control-plane control-plane-build --repository /fixture/worktrees/task-reviewed --source {}",
+            super::super::gasostudy::TEST_SOURCE
         );
         for command in [
             format!("env UNKNOWN=1 {direct}"),
@@ -7735,26 +7735,28 @@ mod recovery_tests {
             format!("{direct} && true"),
             format!("{direct} > /tmp/result"),
             format!("python3 /tmp/{direct}"),
-            direct.replace(super::super::gasostudy::SOURCE, "HEAD"),
-            direct.replace(super::super::gasostudy::SOURCE, "$(git rev-parse HEAD)"),
+            direct.replace(super::super::gasostudy::TEST_SOURCE, "HEAD"),
+            direct.replace(
+                super::super::gasostudy::TEST_SOURCE,
+                "$(git rev-parse HEAD)",
+            ),
             "/usr/bin/bash -p /tmp/build.sh".into(),
-            "git show HEAD:tools/python_sandbox_executor.sh | bash -s -- control-plane-build"
-                .into(),
+            "git show HEAD:tools/executor.sh | bash -s -- control-plane-build".into(),
         ] {
             assert!(
-                blocked_reason(&command, Some(super::super::gasostudy::ROOT), 0).is_some(),
+                blocked_reason(&command, Some(super::super::gasostudy::TEST_ROOT), 0).is_some(),
                 "{command}"
             );
         }
         assert!(
             blocked_reason(
-                &direct.replace(super::super::gasostudy::ROOT, "/tmp"),
+                &direct.replace(super::super::gasostudy::TEST_ROOT, "/tmp"),
                 None,
                 0
             )
             .is_some()
         );
-        assert!(blocked_reason(&direct, Some(super::super::gasostudy::ROOT), 1).is_some());
+        assert!(blocked_reason(&direct, Some(super::super::gasostudy::TEST_ROOT), 1).is_some());
     }
 
     #[test]
