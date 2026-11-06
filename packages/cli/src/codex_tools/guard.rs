@@ -5695,11 +5695,6 @@ fn blocked_reason(command: &str, cwd: Option<&str>, depth: usize) -> Option<Stri
                 Ok(value) => value,
                 Err(reason) => return Some(reason),
             };
-            if cwd != Some(super::gasostudy::ROOT) {
-                return Some(
-                    "control-plane helperは固定managed worktreeから実行してください".into(),
-                );
-            }
             if let Err(reason) = super::gasostudy::preflight(operation) {
                 return Some(reason);
             }
@@ -7726,7 +7721,7 @@ mod recovery_tests {
     #[test]
     fn gasostudy_rejects_shell_wrappers_environment_and_unpinned_inputs() {
         let direct = format!(
-            "codex-gasostudy-control-plane control-plane-build --source {}",
+            "codex-gasostudy-control-plane control-plane-build --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source {}",
             super::super::gasostudy::SOURCE
         );
         for command in [
@@ -7751,7 +7746,14 @@ mod recovery_tests {
                 "{command}"
             );
         }
-        assert!(blocked_reason(&direct, Some("/tmp"), 0).is_some());
+        assert!(
+            blocked_reason(
+                &direct.replace(super::super::gasostudy::ROOT, "/tmp"),
+                None,
+                0
+            )
+            .is_some()
+        );
         assert!(blocked_reason(&direct, Some(super::super::gasostudy::ROOT), 1).is_some());
     }
 

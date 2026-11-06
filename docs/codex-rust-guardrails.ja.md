@@ -83,19 +83,19 @@ managed binaryの配置先を同一hashへ更新します。途中失敗時はjo
 ## GasoStudyの固定control-plane入口
 
 今回承認された非sudo control-plane build/validateだけを、installed helperへ接続します。
-GasoStudyの`task-280-gasolens-ci` worktreeをcwdにして、次をそれぞれ独立commandで実行します。
+GasoStudyの`task-280-gasolens-ci` worktreeを明示して、次をそれぞれ独立commandで実行します。
 
 ```console
-codex-gasostudy-control-plane check --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
-codex-gasostudy-control-plane control-plane-build --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
-codex-gasostudy-control-plane control-plane-validate --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
+codex-gasostudy-control-plane check --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
+codex-gasostudy-control-plane control-plane-build --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
+codex-gasostudy-control-plane control-plane-validate --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
 ```
 
 `check`はsource/task/executor/出力先を読み取り検査するだけです。実build前にはGasoStudy側で
 runtime/state、resource、既存artifactの保存証拠を再照合してください。このhelperはそのbuild票全体を
 代行しません。build済みartifactの全payload検査・保存・root installは別の停止境界です。
 
-hookはPATH上の名前、単一command、cwd、固定SHA・IDを検査し、実行中hookと同じbytesのinstalled
+hookはPATH上の名前、単一command、固定repository、固定SHA・IDを検査し、実行中hookと同じbytesのinstalled
 helperへrewriteします。helperは実行直前にもUID/GID 1000、固定repository/common Git、ready manifest、
 Git worktree登録、branch/HEAD/clean、executorのGit blobとcheckout bytes、固定出力先を照合します。
 Gitはcredentialと継承環境を除去して読み取り専用で実行し、外部実行を持つlocal configを拒否します。

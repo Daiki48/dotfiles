@@ -14,12 +14,14 @@ const EXECUTOR_SHA256: &str = "be616f5c39dadc5e8bb5f6eff808e5f49df6a5d3e32fcae75
 const OUTPUT: &str = "/tmp/gasostudy-runner-control-plane";
 
 pub(crate) fn operation(args: &[String]) -> Result<&str, String> {
-    if args.len() != 3
-        || args[1] != "--source"
-        || args[2] != SOURCE
+    if args.len() != 5
+        || args[1] != "--repository"
+        || args[2] != ROOT
+        || args[3] != "--source"
+        || args[4] != SOURCE
         || !["check", "control-plane-build", "control-plane-validate"].contains(&args[0].as_str())
     {
-        return Err("固定operationと --source <review済み40桁SHA> だけを指定してください".into());
+        return Err("固定operation、--repository <固定worktree>、--source <review済み40桁SHA> だけを指定してください".into());
     }
     Ok(&args[0])
 }
@@ -314,9 +316,6 @@ mod linux {
     }
 
     pub(super) fn run(operation: &str) -> Result<(), String> {
-        if std::env::current_dir().map_err(|e| e.to_string())? != Path::new(ROOT) {
-            return Err("固定managed worktreeから実行してください".into());
-        }
         let blob = preflight(operation)?;
         if operation == "check" {
             println!("固定source/task/executor/出力先の検査成功: {SOURCE} (build未実行)");
@@ -512,18 +511,49 @@ mod tests {
     #[test]
     fn only_fixed_source_and_operations_are_accepted() {
         for id in ["check", "control-plane-build", "control-plane-validate"] {
-            assert!(operation(&[id, "--source", SOURCE].map(str::to_string)).is_ok());
+            assert!(
+                operation(&[id, "--repository", ROOT, "--source", SOURCE].map(str::to_string))
+                    .is_ok()
+            );
         }
         for args in [
-            vec!["python-policy", "--source", SOURCE],
-            vec!["control-plane-build", "--source", "HEAD"],
-            vec!["control-plane-build", "--source", "c7c40be"],
+            vec!["python-policy", "--repository", ROOT, "--source", SOURCE],
             vec![
                 "control-plane-build",
+                "--repository",
+                ROOT,
+                "--source",
+                "HEAD",
+            ],
+            vec![
+                "control-plane-build",
+                "--repository",
+                ROOT,
+                "--source",
+                "c7c40be",
+            ],
+            vec![
+                "control-plane-build",
+                "--repository",
+                "/tmp",
+                "--source",
+                SOURCE,
+            ],
+            vec![
+                "control-plane-build",
+                "--repository",
+                ROOT,
                 "--source",
                 "0000000000000000000000000000000000000000",
             ],
-            vec!["control-plane-build", "--source", SOURCE, "extra"],
+            vec![
+                "control-plane-build",
+                "--repository",
+                ROOT,
+                "--source",
+                SOURCE,
+                "extra",
+            ],
         ] {
             assert!(operation(&args.into_iter().map(str::to_string).collect::<Vec<_>>()).is_err());
         }
