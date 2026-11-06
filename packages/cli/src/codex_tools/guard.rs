@@ -115,6 +115,7 @@ const RESTRICTED_COMMANDS: &[&str] = &[
     "gh",
     "codex-worktree",
     "codex-task",
+    "codex-gasostudy-control-plane",
     "codex-delivery",
     "codex-discussions",
 ];
@@ -1039,7 +1040,7 @@ fn valid_commit_subject(message: &str) -> bool {
             .is_some_and(|character| !character.is_whitespace())
 }
 
-fn dangerous_local_git_key(key: &str) -> bool {
+pub(crate) fn dangerous_local_git_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key == "include.path"
         || key.starts_with("includeif.")
@@ -3727,6 +3728,7 @@ pub(crate) fn trusted_installed_helper(name: &str) -> Result<String, String> {
         "codex-delivery",
         "codex-discussions",
         "codex-task",
+        "codex-gasostudy-control-plane",
     ]
     .contains(&name)
     {
@@ -3832,6 +3834,7 @@ fn rewrite_helper_safety_command(command: &str) -> Result<Option<String>, String
         "codex-delivery",
         "codex-discussions",
         "codex-task",
+        "codex-gasostudy-control-plane",
     ]
     .contains(&name)
     {
@@ -4833,6 +4836,7 @@ fn python_helper_invocation_reason(tokens: &[String]) -> Option<String> {
                 "codex-delivery",
                 "codex-discussions",
                 "codex-task",
+                "codex-gasostudy-control-plane",
             ]
             .contains(&module.as_str())
                 || tokens[i..].iter().any(|value| {
@@ -4841,6 +4845,7 @@ fn python_helper_invocation_reason(tokens: &[String]) -> Option<String> {
                         "codex-delivery",
                         "codex-discussions",
                         "codex-task",
+                        "codex-gasostudy-control-plane",
                     ]
                     .contains(&basename(value))
                 })
@@ -4862,6 +4867,7 @@ fn python_helper_invocation_reason(tokens: &[String]) -> Option<String> {
             "codex-delivery",
             "codex-discussions",
             "codex-task",
+            "codex-gasostudy-control-plane",
         ]
         .contains(&basename(&tokens[i]))
         {
@@ -5676,6 +5682,25 @@ fn blocked_reason(command: &str, cwd: Option<&str>, depth: usize) -> Option<Stri
                 return Some("task helperはwrapperを使わずPATHから直接実行してください".into());
             }
             if let Some(reason) = super::task::invocation_reason(&tokens[1..]) {
+                return Some(reason);
+            }
+        }
+        if basename(&tokens[start]) == super::gasostudy::NAME {
+            if start != 0 || tokens[start] != super::gasostudy::NAME || depth > 0 {
+                return Some(
+                    "control-plane helperはwrapperなしでPATHから直接実行してください".into(),
+                );
+            }
+            let operation = match super::gasostudy::operation(&tokens[1..]) {
+                Ok(value) => value,
+                Err(reason) => return Some(reason),
+            };
+            if cwd != Some(super::gasostudy::ROOT) {
+                return Some(
+                    "control-plane helperは固定managed worktreeから実行してください".into(),
+                );
+            }
+            if let Err(reason) = super::gasostudy::preflight(operation) {
                 return Some(reason);
             }
         }
@@ -7696,6 +7721,38 @@ mod recovery_tests {
                 .is_some()
             );
         }
+    }
+
+    #[test]
+    fn gasostudy_rejects_shell_wrappers_environment_and_unpinned_inputs() {
+        let direct = format!(
+            "codex-gasostudy-control-plane control-plane-build --source {}",
+            super::super::gasostudy::SOURCE
+        );
+        for command in [
+            format!("env UNKNOWN=1 {direct}"),
+            format!("GH_TOKEN=x {direct}"),
+            format!("sudo {direct}"),
+            format!("/tmp/{direct}"),
+            format!("sh -c '{direct}'"),
+            format!("{direct} extra"),
+            format!("{direct} | cat"),
+            format!("{direct} && true"),
+            format!("{direct} > /tmp/result"),
+            format!("python3 /tmp/{direct}"),
+            direct.replace(super::super::gasostudy::SOURCE, "HEAD"),
+            direct.replace(super::super::gasostudy::SOURCE, "$(git rev-parse HEAD)"),
+            "/usr/bin/bash -p /tmp/build.sh".into(),
+            "git show HEAD:tools/python_sandbox_executor.sh | bash -s -- control-plane-build"
+                .into(),
+        ] {
+            assert!(
+                blocked_reason(&command, Some(super::super::gasostudy::ROOT), 0).is_some(),
+                "{command}"
+            );
+        }
+        assert!(blocked_reason(&direct, Some("/tmp"), 0).is_some());
+        assert!(blocked_reason(&direct, Some(super::super::gasostudy::ROOT), 1).is_some());
     }
 
     #[test]

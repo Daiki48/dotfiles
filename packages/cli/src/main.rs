@@ -108,6 +108,7 @@ where
         Some("codex-worktree") => Some(codex_tools::worktree::entrypoint(args)),
         Some("codex-delivery") => Some(codex_tools::delivery::entrypoint(args)),
         Some("codex-discussions") => Some(codex_tools::discussions::entrypoint(args)),
+        Some("codex-gasostudy-control-plane") => Some(codex_tools::gasostudy::entrypoint(args)),
         Some("codex-task") => Some(codex_tools::task::entrypoint(args)),
         Some("runner-storage-cleanup") => Some(codex_tools::runner_storage::entrypoint(args)),
         _ => None,
