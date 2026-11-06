@@ -83,17 +83,25 @@ managed binaryの配置先を同一hashへ更新します。途中失敗時はjo
 ## GasoStudyの固定control-plane入口
 
 今回承認された非sudo control-plane build/validateだけを、installed helperへ接続します。
-GasoStudyの`task-280-gasolens-ci` worktreeを明示して、次をそれぞれ独立commandで実行します。
+承認済みworktreeと40桁source SHAを、非公開の引き継ぎから転記して使います。
+以下のplaceholderは実際の固定値へ置換し、それぞれ独立commandで実行します。
 
 ```console
-codex-gasostudy-control-plane check --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
-codex-gasostudy-control-plane control-plane-build --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
-codex-gasostudy-control-plane control-plane-validate --repository /home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci --source c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf
+codex-gasostudy-control-plane check --repository <承認済みworktree絶対path> --source <承認済み40桁SHA>
+codex-gasostudy-control-plane control-plane-build --repository <承認済みworktree絶対path> --source <承認済み40桁SHA>
+codex-gasostudy-control-plane control-plane-validate --repository <承認済みworktree絶対path> --source <承認済み40桁SHA>
 ```
 
 `check`はsource/task/executor/出力先を読み取り検査するだけです。実build前にはGasoStudy側で
 runtime/state、resource、既存artifactの保存証拠を再照合してください。このhelperはそのbuild票全体を
 代行しません。build済みartifactの全payload検査・保存・root installは別の停止境界です。
+
+具体的なsource/task/path/executor識別情報は公開repositoryへ保存しません。
+OS accountのhomeにある`.codex/control-plane-approval.json`を、同一UID所有、通常file、link数1、
+group/world権限なしで配置します。設定全体のSHA256はinstalled binaryへ固定し、推測照合を避ける
+ランダム256-bit nonceも設定に含めます。欠落・digest不一致・未知field・不正schemaは拒否します。
+HOME/CODEX_HOME、argv、任意の設定fileから対象を切り替える入口はありません。
+設定とpinの更新は、対象を改めてreviewし、非公開設定の配置とbinaryの導入を一緒に行います。
 
 hookはPATH上の名前、単一command、固定repository、固定SHA・IDを検査し、実行中hookと同じbytesのinstalled
 helperへrewriteします。helperは実行直前にもUID/GID 1000、固定repository/common Git、ready manifest、
@@ -102,7 +110,7 @@ Gitはcredentialと継承環境を除去して読み取り専用で実行し、�
 executorはSHA256検査後にsealed memfdへ固定し、7つの固定環境変数だけでBash privileged modeのstdinへ渡します。
 固定executor自身のsandbox、fresh indexによるsource差替え検査、credential/認証helper隔離、timeoutは維持します。
 
-出力は`/tmp/gasostudy-runner-control-plane/control-plane.tar.gz`だけです。build/checkは既存artifactを
+出力は承認設定の固定directory内の`control-plane.tar.gz`だけです。build/checkは既存artifactを
 上書きせず拒否します。validateは同一UIDの通常file、0600、link数1、サイズ上限を確認します。
 このhostとsourceに限定した入口であり、別SHA・task・pathへの変更は新たなreviewを必要とします。
 任意shell file/stdin、Git pipe、wrapper、追加argv・環境指定は許可しません。

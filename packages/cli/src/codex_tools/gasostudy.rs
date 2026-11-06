@@ -3,22 +3,52 @@
 use std::ffi::OsString;
 
 pub(crate) const NAME: &str = "codex-gasostudy-control-plane";
-pub(crate) const SOURCE: &str = "c7c40be69cfcb0115fd2c4a8b8f2641ccb3842cf";
-pub(crate) const ROOT: &str =
-    "/home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/task-280-gasolens-ci";
-const COMMON: &str = "/media/p3plus/dev/gasostudy/.git";
-const MANIFEST: &str =
-    "/home/daiki/.codex/worktrees/7-daiki48--9-gasostudy/.state/task-280-gasolens-ci.json";
-const EXECUTOR: &str = "tools/python_sandbox_executor.sh";
-const EXECUTOR_SHA256: &str = "be616f5c39dadc5e8bb5f6eff808e5f49df6a5d3e32fcae752605e0869e42fb0";
-const OUTPUT: &str = "/tmp/gasostudy-runner-control-plane";
+// nonceを含む承認設定全体を固定する。内部識別情報は公開sourceへ入れない。
+const PROFILE_SHA256: &str = "957850bd3e30044cc14f1fb9ab59bc77bb20f842c1c1785ab19546fc20603652";
+
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(deny_unknown_fields)]
+struct Profile {
+    version: u32,
+    nonce: String,
+    source: String,
+    root: String,
+    common: String,
+    manifest: String,
+    executor: String,
+    executor_sha256: String,
+    output: String,
+    task_id: String,
+    repository: String,
+    github_name: String,
+    branch: String,
+    origin: String,
+}
+
+impl Profile {
+    fn load() -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::load_profile()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err("Linux専用入口です".into())
+        }
+    }
+}
 
 pub(crate) fn operation(args: &[String]) -> Result<&str, String> {
+    operation_for(args, &Profile::load()?)
+}
+
+fn operation_for<'a>(args: &'a [String], p: &Profile) -> Result<&'a str, String> {
     if args.len() != 5
         || args[1] != "--repository"
-        || args[2] != ROOT
+        || args[2] != p.root
         || args[3] != "--source"
-        || args[4] != SOURCE
+        || args[4] != p.source
         || !["check", "control-plane-build", "control-plane-validate"].contains(&args[0].as_str())
     {
         return Err("固定operation、--repository <固定worktree>、--source <review済み40桁SHA> だけを指定してください".into());
@@ -40,6 +70,64 @@ mod linux {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::Duration;
+
+    fn decode_profile(bytes: &[u8], expected: &str) -> Result<Profile, String> {
+        if format!("{:x}", Sha256::digest(bytes)) != expected {
+            return Err("承認設定のdigestがinstalled版と一致しません".into());
+        }
+        let p: Profile =
+            serde_json::from_slice(bytes).map_err(|_| "承認設定のschemaが不正です".to_string())?;
+        let hex = |s: &str, n| {
+            s.len() == n
+                && s.bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        };
+        let absolute = |s: &str| {
+            Path::new(s).is_absolute()
+                && Path::new(s).components().all(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                })
+        };
+        if p.version != 1
+            || !hex(&p.nonce, 64)
+            || !hex(&p.source, 40)
+            || !hex(&p.executor_sha256, 64)
+            || [&p.root, &p.common, &p.manifest, &p.output, &p.repository]
+                .iter()
+                .any(|s| !absolute(s))
+            || p.executor.is_empty()
+            || Path::new(&p.executor).is_absolute()
+            || !Path::new(&p.executor)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            || Path::new(&p.common) != Path::new(&p.repository).join(".git")
+            || Path::new(&p.root).file_name().and_then(|s| s.to_str()) != Some(p.task_id.as_str())
+            || Path::new(&p.output).parent() != Some(Path::new("/tmp"))
+        {
+            return Err("承認設定の固定identity形式が不正です".into());
+        }
+        Ok(p)
+    }
+
+    pub(super) fn load_profile() -> Result<Profile, String> {
+        identity(
+            unsafe { libc::getuid() },
+            unsafe { libc::geteuid() },
+            unsafe { libc::getgid() },
+            unsafe { libc::getegid() },
+        )?;
+        // HOME/CODEX_HOMEやargvから承認fileを選ばせない。
+        let home = crate::codex::account_home_dir().map_err(|_| "account homeを確認できません")?;
+        let bytes = read_file(&home.join(".codex/control-plane-approval.json"), true)?;
+        decode_profile(&bytes, PROFILE_SHA256)
+    }
+
+    pub(super) fn preflight(operation: &str) -> Result<Vec<u8>, String> {
+        preflight_for(&Profile::load()?, operation)
+    }
 
     fn identity(uid: u32, euid: u32, gid: u32, egid: u32) -> Result<(), String> {
         if (uid, euid, gid, egid) != (1000, 1000, 1000, 1000) {
@@ -94,11 +182,11 @@ mod linux {
         Ok(bytes)
     }
 
-    fn git(args: &[&str]) -> Result<Vec<u8>, String> {
+    fn git(p: &Profile, args: &[&str]) -> Result<Vec<u8>, String> {
         let mut command = Command::new(trust::trusted_system_binary("/usr/bin/git", "Git")?);
         process::clear_environment(&mut command);
         command
-            .current_dir(ROOT)
+            .current_dir(p.root.as_str())
             .envs([
                 ("HOME", "/dev/null"),
                 ("PATH", "/usr/bin:/bin"),
@@ -131,8 +219,8 @@ mod linux {
         Ok(output.stdout)
     }
 
-    fn git_text(args: &[&str]) -> Result<String, String> {
-        String::from_utf8(git(args)?)
+    fn git_text(p: &Profile, args: &[&str]) -> Result<String, String> {
+        String::from_utf8(git(p, args)?)
             .map(|v| v.trim().to_owned())
             .map_err(|e| e.to_string())
     }
@@ -149,24 +237,24 @@ mod linux {
         branch: String,
     }
 
-    fn binding(bytes: &[u8]) -> Result<(), String> {
+    fn binding(p: &Profile, bytes: &[u8]) -> Result<(), String> {
         let b: Binding = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if b.version != 1
             || b.status != "ready"
-            || b.task_id != "task-280-gasolens-ci"
-            || b.repository != "/media/p3plus/dev/gasostudy"
-            || b.common_git_dir != COMMON
-            || b.github_name != "Daiki48/gasostudy"
-            || b.worktree != ROOT
-            || b.branch != "fix/gasolens-ci-alignment"
+            || b.task_id != p.task_id
+            || b.repository != p.repository
+            || b.common_git_dir != p.common.as_str()
+            || b.github_name != p.github_name
+            || b.worktree != p.root.as_str()
+            || b.branch != p.branch
         {
             return Err("managed taskの固定identityが一致しません".into());
         }
         Ok(())
     }
 
-    fn executor(bytes: &[u8]) -> Result<(), String> {
-        if format!("{:x}", Sha256::digest(bytes)) != EXECUTOR_SHA256 {
+    fn executor(p: &Profile, bytes: &[u8]) -> Result<(), String> {
+        if format!("{:x}", Sha256::digest(bytes)) != p.executor_sha256 {
             return Err("review済みexecutor blobと一致しません".into());
         }
         Ok(())
@@ -215,26 +303,29 @@ mod linux {
         }
     }
 
-    pub(super) fn preflight(operation: &str) -> Result<Vec<u8>, String> {
+    fn preflight_for(p: &Profile, operation: &str) -> Result<Vec<u8>, String> {
         identity(
             unsafe { libc::getuid() },
             unsafe { libc::geteuid() },
             unsafe { libc::getgid() },
             unsafe { libc::getegid() },
         )?;
-        directories(Path::new(ROOT))?;
-        directories(Path::new(COMMON))?;
-        binding(&read_file(Path::new(MANIFEST), true)?)?;
+        directories(Path::new(p.root.as_str()))?;
+        directories(Path::new(p.common.as_str()))?;
+        binding(p, &read_file(Path::new(p.manifest.as_str()), true)?)?;
         // 実行可能なlocal configを、Gitのsource検査より先に排除する。
-        read_file(&Path::new(COMMON).join("config"), false)?;
-        let keys = git_text(&[
-            "config",
-            "--file",
-            &format!("{COMMON}/config"),
-            "--no-includes",
-            "--name-only",
-            "--list",
-        ])?;
+        read_file(&Path::new(p.common.as_str()).join("config"), false)?;
+        let keys = git_text(
+            p,
+            &[
+                "config",
+                "--file",
+                &format!("{}/config", p.common),
+                "--no-includes",
+                "--name-only",
+                "--list",
+            ],
+        )?;
         if keys.lines().any(|key| {
             guard::dangerous_local_git_key(key)
                 || key.eq_ignore_ascii_case("extensions.worktreeconfig")
@@ -242,49 +333,54 @@ mod linux {
         }) {
             return Err("実行・認証経路を持つGit configを拒否しました".into());
         }
-        if git_text(&["rev-parse", "--show-toplevel"])? != ROOT
-            || git_text(&["rev-parse", "--path-format=absolute", "--git-common-dir"])? != COMMON
-            || git_text(&["rev-parse", "HEAD"])? != SOURCE
-            || git_text(&["rev-parse", "--abbrev-ref", "HEAD"])? != "fix/gasolens-ci-alignment"
-            || git_text(&["config", "--local", "--get", "remote.origin.url"])?
-                != "https://github.com/Daiki48/gasostudy.git"
-            || !git_text(&["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty()
+        if git_text(p, &["rev-parse", "--show-toplevel"])? != p.root.as_str()
+            || git_text(
+                p,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )? != p.common.as_str()
+            || git_text(p, &["rev-parse", "HEAD"])? != p.source.as_str()
+            || git_text(p, &["rev-parse", "--abbrev-ref", "HEAD"])? != p.branch
+            || git_text(p, &["config", "--local", "--get", "remote.origin.url"])? != p.origin
+            || !git_text(p, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty()
         {
             return Err("repository/common Git/source/branch/cleanの固定条件が一致しません".into());
         }
-        let registered = git(&["worktree", "list", "--porcelain", "-z"])?;
+        let registered = git(p, &["worktree", "list", "--porcelain", "-z"])?;
         if !registered
             .split(|b| *b == 0)
-            .any(|row| row == format!("worktree {ROOT}").as_bytes())
+            .any(|row| row == format!("worktree {}", p.root).as_bytes())
         {
             return Err("Git worktree登録が一致しません".into());
         }
-        let blob = git(&["show", &format!("{SOURCE}:{EXECUTOR}")])?;
-        executor(&blob)?;
-        executor(&read_file(&Path::new(ROOT).join(EXECUTOR), false)?)?;
+        let blob = git(p, &["show", &format!("{}:{}", p.source, p.executor)])?;
+        executor(p, &blob)?;
+        executor(
+            p,
+            &read_file(&Path::new(p.root.as_str()).join(p.executor.as_str()), false)?,
+        )?;
         trust::trusted_system_binary("/usr/bin/bash", "Bash")?;
-        output(operation, Path::new(OUTPUT), 1000)?;
+        output(operation, Path::new(p.output.as_str()), 1000)?;
         Ok(blob)
     }
 
-    fn command(operation: &str) -> Command {
+    fn command(p: &Profile, operation: &str) -> Command {
         let mut command = Command::new("/usr/bin/bash");
-        configure(&mut command, operation);
+        configure(p, &mut command, operation);
         command
     }
 
-    fn configure(command: &mut Command, operation: &str) {
+    fn configure(p: &Profile, command: &mut Command, operation: &str) {
         command
             .env_clear()
-            .current_dir(ROOT)
+            .current_dir(p.root.as_str())
             .envs([
                 ("GASOSTUDY_SANDBOX_LAUNCH", "1"),
-                ("GASOSTUDY_CONTROL_PLANE_SOURCE_SHA", SOURCE),
-                ("GASOSTUDY_CONTROL_PLANE_REPOSITORY", ROOT),
+                ("GASOSTUDY_CONTROL_PLANE_SOURCE_SHA", p.source.as_str()),
+                ("GASOSTUDY_CONTROL_PLANE_REPOSITORY", p.root.as_str()),
                 ("LANG", "C"),
                 ("LC_ALL", "C"),
                 ("PATH", "/usr/bin:/bin"),
-                ("PWD", ROOT),
+                ("PWD", p.root.as_str()),
             ])
             .args(["--noprofile", "--norc", "-p", "-s", "--", operation]);
     }
@@ -316,14 +412,15 @@ mod linux {
     }
 
     pub(super) fn run(operation: &str) -> Result<(), String> {
-        let blob = preflight(operation)?;
+        let p = Profile::load()?;
+        let blob = preflight_for(&p, operation)?;
         if operation == "check" {
-            println!("固定source/task/executor/出力先の検査成功: {SOURCE} (build未実行)");
+            println!("承認済みsource/task/executor/出力先の検査成功 (build未実行)");
             return Ok(());
         }
         let input = sealed_input(&blob)?;
         // 検査済みbytesだけをstdinへ固定。executor自身がsandbox/timeout/子孫回収を担当する。
-        Err(command(operation)
+        Err(command(&p, operation)
             .stdin(Stdio::from(input))
             .exec()
             .to_string())
@@ -332,6 +429,48 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn approval_requires_pinned_bytes_and_strict_schema() {
+            let valid = serde_json::to_vec(&fixture_profile()).unwrap();
+            let pin = format!("{:x}", Sha256::digest(&valid));
+            assert!(decode_profile(&valid, &pin).is_ok());
+            assert!(decode_profile(&valid, PROFILE_SHA256).is_err());
+            let mut changed = valid.clone();
+            changed.push(b' ');
+            assert!(decode_profile(&changed, &pin).is_err());
+            assert!(
+                matches!(decode_profile(b"{}", &pin), Err(e) if e == "承認設定のdigestがinstalled版と一致しません")
+            );
+        }
+
+        #[test]
+        fn approval_rejects_unknown_duplicate_and_malformed_identity() {
+            let valid = serde_json::to_value(fixture_profile()).unwrap();
+            for (key, bad) in [
+                ("extra", serde_json::json!(true)),
+                ("version", serde_json::json!(2)),
+                ("nonce", serde_json::json!("short")),
+                ("source", serde_json::json!("HEAD")),
+                ("executor_sha256", serde_json::json!("short")),
+                ("root", serde_json::json!("relative/path")),
+                ("common", serde_json::json!("/fixture/other/.git")),
+                ("manifest", serde_json::json!("/fixture/../other")),
+                ("executor", serde_json::json!("../other.sh")),
+                ("output", serde_json::json!("/fixture/output")),
+                ("task_id", serde_json::json!("other")),
+            ] {
+                let mut value = valid.clone();
+                value[key] = bad;
+                let bytes = serde_json::to_vec(&value).unwrap();
+                let pin = format!("{:x}", Sha256::digest(&bytes));
+                assert!(decode_profile(&bytes, &pin).is_err(), "{key}");
+            }
+            let bytes = serde_json::to_string(&valid)
+                .unwrap()
+                .replacen('{', "{\"version\":1,", 1);
+            let pin = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+            assert!(decode_profile(bytes.as_bytes(), &pin).is_err());
+        }
         #[test]
         fn rejects_root_other_uid_and_setid() {
             assert!(identity(1000, 1000, 1000, 1000).is_ok());
@@ -346,11 +485,12 @@ mod linux {
         }
         #[test]
         fn rejects_replaced_blob_and_binding() {
-            assert!(executor(b"echo replaced").is_err());
-            let valid = serde_json::json!({"version":1,"status":"ready","task_id":"task-280-gasolens-ci",
-                "repository":"/media/p3plus/dev/gasostudy","common_git_dir":COMMON,"github_name":"Daiki48/gasostudy",
-                "worktree":ROOT,"branch":"fix/gasolens-ci-alignment"});
-            assert!(binding(&serde_json::to_vec(&valid).unwrap()).is_ok());
+            let p = fixture_profile();
+            assert!(executor(&p, b"echo replaced").is_err());
+            let valid = serde_json::json!({"version":1,"status":"ready","task_id":p.task_id,
+                "repository":p.repository,"common_git_dir":p.common,"github_name":p.github_name,
+                "worktree":p.root,"branch":p.branch});
+            assert!(binding(&p, &serde_json::to_vec(&valid).unwrap()).is_ok());
             for key in [
                 "status",
                 "task_id",
@@ -363,7 +503,7 @@ mod linux {
                 let mut bad = valid.clone();
                 bad[key] = "other".into();
                 assert!(
-                    binding(&serde_json::to_vec(&bad).unwrap()).is_err(),
+                    binding(&p, &serde_json::to_vec(&bad).unwrap()).is_err(),
                     "{key}"
                 );
             }
@@ -374,7 +514,7 @@ mod linux {
             c.env("GH_TOKEN", "test-only")
                 .env("BASH_ENV", "/bad")
                 .env("UNKNOWN", "bad");
-            configure(&mut c, "control-plane-build");
+            configure(&fixture_profile(), &mut c, "control-plane-build");
             assert_eq!(c.get_program(), "/usr/bin/bash");
             assert_eq!(
                 c.get_args().collect::<Vec<_>>(),
@@ -460,7 +600,18 @@ mod linux {
         #[test]
         #[ignore = "承認済みGasoStudy hostの固定sourceを読み取り検査する"]
         fn approved_host_preflight_without_build() {
-            preflight("check").unwrap();
+            let p = Profile::load().unwrap();
+            if Path::new(&p.output)
+                .join("control-plane.tar.gz")
+                .try_exists()
+                .unwrap()
+            {
+                // 既存artifactを保護したままvalidateの事前検査だけを行う。
+                assert!(preflight_for(&p, "check").is_err());
+                preflight_for(&p, "control-plane-validate").unwrap();
+            } else {
+                preflight_for(&p, "check").unwrap();
+            }
         }
     }
 }
@@ -506,14 +657,35 @@ pub(crate) fn entrypoint<I: IntoIterator<Item = OsString>>(args: I) -> i32 {
 }
 
 #[cfg(test)]
+pub(crate) const TEST_ROOT: &str = "/fixture/worktrees/task-reviewed";
+#[cfg(test)]
+pub(crate) const TEST_SOURCE: &str = "1111111111111111111111111111111111111111";
+
+#[cfg(test)]
+fn fixture_profile() -> Profile {
+    serde_json::from_value(serde_json::json!({
+        "version":1, "nonce":"a".repeat(64), "source": TEST_SOURCE, "root": TEST_ROOT,
+        "common":"/fixture/repository/.git", "manifest":"/fixture/worktrees/.state/task-reviewed.json",
+        "executor":"tools/executor.sh", "executor_sha256":"b".repeat(64), "output":"/tmp/control-plane-fixture",
+        "task_id":"task-reviewed", "repository":"/fixture/repository", "github_name":"fixture/repository",
+        "branch":"fix/reviewed", "origin":"https://github.com/fixture/repository.git"
+    })).unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    const ROOT: &str = TEST_ROOT;
+    const SOURCE: &str = TEST_SOURCE;
     #[test]
     fn only_fixed_source_and_operations_are_accepted() {
         for id in ["check", "control-plane-build", "control-plane-validate"] {
             assert!(
-                operation(&[id, "--repository", ROOT, "--source", SOURCE].map(str::to_string))
-                    .is_ok()
+                operation_for(
+                    &[id, "--repository", ROOT, "--source", SOURCE].map(str::to_string),
+                    &fixture_profile()
+                )
+                .is_ok()
             );
         }
         for args in [
@@ -530,7 +702,7 @@ mod tests {
                 "--repository",
                 ROOT,
                 "--source",
-                "c7c40be",
+                "1111111",
             ],
             vec![
                 "control-plane-build",
@@ -555,7 +727,13 @@ mod tests {
                 "extra",
             ],
         ] {
-            assert!(operation(&args.into_iter().map(str::to_string).collect::<Vec<_>>()).is_err());
+            assert!(
+                operation_for(
+                    &args.into_iter().map(str::to_string).collect::<Vec<_>>(),
+                    &fixture_profile()
+                )
+                .is_err()
+            );
         }
     }
 }
