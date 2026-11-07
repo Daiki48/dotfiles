@@ -4,7 +4,7 @@ use std::ffi::OsString;
 
 pub(crate) const NAME: &str = "codex-gasostudy-control-plane";
 // nonceを含む承認設定全体を固定する。内部識別情報は公開sourceへ入れない。
-const PROFILE_SHA256: &str = "957850bd3e30044cc14f1fb9ab59bc77bb20f842c1c1785ab19546fc20603652";
+const PROFILE_SHA256: &str = "ba38d16ebe77aa92c58eed1986922424427dba0a514cfdb8af546e2d35b5f535";
 
 #[derive(serde::Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
