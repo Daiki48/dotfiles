@@ -660,19 +660,24 @@ fn snapshot_approval(
     target: &str,
     delivery: bool,
 ) -> Result<bool> {
-    if head
-        .entries
-        .iter()
-        .chain(actual.entries.iter())
-        .any(|entry| !success(&entry.state) && !waived_state(&entry.state))
-    {
-        return Err(error("修復判断にも未知のCI状態は使用できません"));
-    }
+    known_snapshot_states(head)?;
+    known_snapshot_states(actual)?;
     if delivery {
         coverage(request, head, &request.head_sha)?;
         coverage(request, actual, target)?;
     }
     Ok(delivery)
+}
+
+fn known_snapshot_states(snapshot: &Snapshot) -> Result<()> {
+    if snapshot
+        .entries
+        .iter()
+        .any(|entry| !success(&entry.state) && !waived_state(&entry.state))
+    {
+        return Err(error("修復判断にも未知のCI状態は使用できません"));
+    }
+    Ok(())
 }
 
 fn observe_inner(
@@ -716,9 +721,24 @@ fn observe_inner(
     };
     let approved = snapshot_approval(&request, &head, &actual, &target, delivery)?;
     // 並行して統合された別変更のCIは、今回の免除対象にしない。
-    if merged && live != target {
-        check_required_ci(root, &request.repository, live)?;
-    }
+    let live_ci = if merged && live != target {
+        if delivery {
+            check_required_ci(root, &request.repository, live)?;
+            Value::Null
+        } else {
+            let observed = snapshot(
+                root,
+                &request.repository,
+                live,
+                &workflow_expectations(root, live, live, true)?,
+            )?;
+            known_snapshot_states(&observed)?;
+            serde_json::to_value(observed)
+                .map_err(|_| error("最新mainの修復観測を保存できません"))?
+        }
+    } else {
+        Value::Null
+    };
     let result = object([
         ("approved", Value::Bool(approved)),
         ("receipt_sha256", string(digest(receipt)?)),
@@ -727,6 +747,7 @@ fn observe_inner(
         ("approved_base", string(&request.base_sha)),
         ("target", string(&target)),
         ("merged", Value::Bool(merged)),
+        ("live_ci", live_ci),
         (
             "head_ci",
             serde_json::to_value(head).map_err(|_| error("CI観測を保存できません"))?,

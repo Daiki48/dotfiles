@@ -99,14 +99,7 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
     review_safety(&parent_root, &parent_repo, request.parent.pr as i64)?;
     let live = fetch_main(&parent_root, &parent_repo)?;
     let observed = emergency::observe_for_repair(&parent_root, &parent, &view, &live)?;
-    let entries = observed["target_ci"]["entries"]
-        .as_array()
-        .ok_or_else(|| error("親CI観測が不正です"))?;
-    if !entries.iter().any(|entry| {
-        entry["state"]
-            .as_str()
-            .is_some_and(|s| !matches!(s, "success" | "skipped" | "neutral"))
-    }) {
+    if !repair_needed(&observed)? {
         return Err(error("先行PRに未回復の基盤障害がありません"));
     }
     match_cli_receipt(
@@ -180,4 +173,46 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
     )?;
     lane::claim_repair(&request.parent, scope)?;
     Ok(object([("status", string("repair-admitted"))]))
+}
+
+fn repair_needed(observed: &Value) -> Result<bool> {
+    if observed["approved"] != false {
+        return Err(error("修復専用の非delivery観測が必要です"));
+    }
+    let target = observed["target_ci"]["entries"]
+        .as_array()
+        .ok_or_else(|| error("親CI観測が不正です"))?;
+    let live = if observed["live_ci"].is_null() {
+        None
+    } else {
+        Some(
+            observed["live_ci"]["entries"]
+                .as_array()
+                .ok_or_else(|| error("最新main観測が不正です"))?,
+        )
+    };
+    Ok(target
+        .iter()
+        .chain(live.into_iter().flatten())
+        .any(|entry| {
+            entry["state"]
+                .as_str()
+                .is_some_and(|s| !matches!(s, "success" | "skipped" | "neutral"))
+        }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn live_main_failure_can_request_repair_without_waiving_either_commit() {
+        let mut observed = serde_json::json!({"approved":false,"target_ci":{"entries":[{"state":"success"}]},"live_ci":{"sha":"a".repeat(40),"entries":[{"state":"failure"}]}});
+        assert!(repair_needed(&observed).unwrap());
+        observed["live_ci"]["entries"][0]["state"] = string("pending");
+        assert!(repair_needed(&observed).unwrap());
+        observed["live_ci"]["entries"][0]["state"] = string("success");
+        assert!(!repair_needed(&observed).unwrap());
+        observed["approved"] = Value::Bool(true);
+        assert!(repair_needed(&observed).is_err());
+    }
 }

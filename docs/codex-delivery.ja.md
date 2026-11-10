@@ -388,7 +388,8 @@ helperは修復内容の意味を自動証明せず、登録scopeと証拠・競
 helperは双方のreceipt、親のmerged state・実merge・障害、子のopen PR・clean head・最新base・reviewを照合し、
 private証拠を保存した後、固定した親scopeに一致する場合だけ枠を交換します。親の所有はsuspendedとして残ります。
 親の新しいCI状態が旧waiver外でも、修復のための実測は取得できます。この観測は`approved: false`であり、
-親のCI免除、receipt更新、finish許可には使いません。Codexが最新の基盤障害を分類してrequestへ根拠を記録し、
+親のCI免除、receipt更新、finish許可には使いません。Codexが最新の基盤障害を分類してrequestへ根拠を記録します。
+mainが実mergeより先へ進んでいれば、そのlive SHAのCIもAPI取得して同じ非公開観測へ束縛します。
 既知の製品test失敗やAPI不明はこの修復枠にも使いません。親の既存receipt/auditとdelivery gateは維持します。
 先行checkoutへのfetchがsandboxの書込み範囲外なら、同一UIDの通常ホストで正規helperを実行します。
 交差repositoryの修復は1段に制限し、競合・循環・別の修復中は保持します。再実行は同じ固定scopeで再照合します。
