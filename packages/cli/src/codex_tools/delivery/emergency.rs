@@ -1,4 +1,4 @@
-//! CI基盤障害に対する、固定deliveryだけの明示承認。CIの実測値は変更しない。
+//! 継続委任に基づくCI基盤障害の固定delivery証拠。CIの実測値は変更しない。
 use super::*;
 use serde::{Deserialize, Serialize};
 
@@ -149,7 +149,7 @@ fn request(value: &Value, scope: &Value) -> Result<Request> {
         || request.waivers.len() > 128
     {
         return Err(error(
-            "緊急承認には対象・理由・利用者の明示承認・成功したlocal検証・独立review・workflow起動の確認が必要です。既知のtest失敗は免除できません",
+            "緊急CI証拠には対象・理由・委任根拠・成功したlocal検証・独立review・workflow起動の確認が必要です。既知のtest失敗は免除できません",
         ));
     }
     let mut identities = HashSet::new();
@@ -201,7 +201,7 @@ fn coverage(request: &Request, snapshot: &Snapshot, sha: &str) -> Result<()> {
             })
         {
             return Err(error(
-                "未承認のCI check・提供元・状態を観測しました。新しい対象と根拠で明示承認を受け直してください",
+                "証拠にないCI check・提供元・状態を観測しました。原因・検証・reviewを再確認して固定証拠を更新してください",
             ));
         }
     }
@@ -631,7 +631,7 @@ pub(super) fn read_audit(receipt: &Value) -> Result<Value> {
 pub(super) fn note(receipt: &Value) -> Result<String> {
     let request = request(get(get(receipt, "emergency")?, "request")?, receipt)?;
     Ok(format!(
-        "<!-- codex-emergency-ci:{}:{} -->\nCI基盤障害に対する今回限りの明示承認で、固定headのlocal検証と独立reviewを根拠にCI待機を免除します。\n\n{}\n\nCIの実測値は変更していません。workflowと既存CDは既存triggerに従い起動し得ます。GitHubの保護要件とCI以外の検証は維持します。",
+        "<!-- codex-emergency-ci:{}:{} -->\n委任されたCI判断の範囲で、基盤障害の根拠・固定headのlocal検証・独立reviewを記録してCI待機を免除します。\n\n{}\n\nCIの実測値は変更していません。workflowと既存CDは既存triggerに従い起動し得ます。GitHubの保護要件とCI以外の検証は維持します。",
         request.task_id, request.head_sha, request.public_summary
     ))
 }

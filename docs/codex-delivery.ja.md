@@ -225,20 +225,40 @@ local検証で迂回せず、workflowのtrigger、`runs-on`、job、matrixとliv
 mergeやpushで自動起動する既存CDはそのworkflowへ任せて状態を報告します。manual dispatch、release、
 production deploy、新しいenvironment approvalはdelivery helperのscopeに含めません。
 
-### CI基盤障害時の一回限りの緊急承認
+### CI起動からfinishまでの直列化
 
-`--gate-mode emergency-ci`はrepositoryを限定しない例外経路です。通常のstrictを既定に保ち、CI失敗、pending、
-runner待ち、APIエラーから自動選択しません。機能の導入許可は個別PRの免除許可ではありません。
-利用者がrepository/task/PR/head/live base/Planと版、理由、免除対象と状態を明示承認した一回のdeliveryだけに適用します。
+既存のCI起動labelの選択はCodexへ継続委任されています。workflowと用途を読み、review receiptを作成してから
+親checkoutで次を実行します。新labelやdeploy承認を作成するcommandではありません。
+
+```console
+codex-delivery authorize-ci --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --base <LATEST_MAIN_SHA> --ci-label <EXISTING_CI_LABEL>
+```
+
+PR identity、cleanな固定head、review、最新mainの包含、labelの実在を照合してから付与します。
+同じlabelが他のopen PRにある場合は待ちます。coordinatorの`--ci-label`も同じ経路を使います。
+同一host/CODEX_HOME全repositoryで1 PRの枠を`worktrees/.delivery-lane/`へprivateに保存し、
+CI起動・merge・main CI・main同期・記録・cleanupを終えた`finish`だけが解放します。
+head/base更新、セッション終了、process停止、待機時間では解放しません。中断時は所有taskを再開します。
+直接のlabel操作で迂回しません。検証済みのmain CI修復taskだけは親の枠を一時的に使い、finish後に親へ戻します。
+
+自動triggerによるCIの並列実行、他hostや人間の操作をこの枠で排他できるわけではありません。
+GitHubのlabel APIもPR単位なので、照合と付与の間のpushは取り消せません。直列化は事故ゼロの保証ではなく、
+merge前の最新base・head・conflict・check・reviewの再確認とサーバー側保護を維持します。
+
+### CI基盤障害時の継続委任
+
+`--gate-mode emergency-ci`はrepositoryを限定しない例外経路です。通常のstrictを既定に保ち、CI失敗やpendingだけで
+免除しません。CI基盤障害の判断はCodexへ継続委任され、対象ごとの人間承認は不要です。
+repository/task/PR/head/live base/Planと版、理由、免除対象と状態は各deliveryの証拠へ固定します。
 workflowが存在しても利用できます。最低riskはhighで、固定headのlocal test/build、変更に該当するformat/lint/型検査、
-独立review、actionable=0、未解決thread=0を必須にします。`record-review`では作成できません。
+独立review、actionable=0、未解決thread=0を必須にし、`record-review`で作成します。
 
-基盤障害を製品testの失敗と区別し、原因調査・ローカル検証・reviewを終えてから承認を受けます。
-既知のtest失敗は対象外です。原因をログから自動証明する機能ではなく、利用者の承認、原因区分と根拠、
+基盤障害を製品testの失敗と区別し、原因調査・ローカル検証・reviewを終えてから根拠を記録します。
+既知のtest失敗は対象外です。原因をログから自動証明する機能ではなく、継続委任の根拠、原因区分と根拠、
 成功した検証command、独立reviewを構造化して保存します。CIの実測値は書き換えません。
 
 requestはGit管理外の非公開領域へ、同一UID所有・0600の通常fileとして作成します。次は合成例です。
-placeholderを承認された値へ置き換え、公開先へ貼り付けないでください。
+placeholderを検証した値へ置き換え、公開先へ貼り付けないでください。
 
 ```json
 {
@@ -251,7 +271,7 @@ placeholderを承認された値へ置き換え、公開先へ貼り付けない
   "plan_id": "<EXISTING_PLAN_ID>",
   "plan_version": 1,
   "reason": "今回CIを利用できない具体的な理由",
-  "authorization": "対象と理由を含む利用者の明示承認",
+  "authorization": "AGENTSに記録されたCI基盤障害判断の継続委任",
   "local_validation": [
     {"kind": "test", "command": "<実行済みtest command>", "result": "passed"},
     {"kind": "build", "command": "<実行済みbuildまたは構成検証command>", "result": "passed"}
@@ -293,28 +313,34 @@ workflowも観測もない場合だけ`ci`・`no-observations`・`github`・`mis
 ```console
 codex-worktree doctor --task-id <TASK_ID>
 codex-worktree resume --task-id <TASK_ID>
-codex-delivery approve-review --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --plan-id <EXISTING_PLAN_ID> --plan-version <VERSION> --risk high --tests-passed --independent-review-passed --gate-mode emergency-ci --emergency-request <PRIVATE_REQUEST_ABSOLUTE_PATH>
+codex-delivery record-review --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --plan-id <EXISTING_PLAN_ID> --plan-version <VERSION> --risk high --tests-passed --independent-review-passed --gate-mode emergency-ci --emergency-request <PRIVATE_REQUEST_ABSOLUTE_PATH>
 codex-delivery deliver --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --plan-id <EXISTING_PLAN_ID> --plan-version <VERSION> --gate-mode emergency-ci
 codex-delivery finish --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --plan-id <EXISTING_PLAN_ID> --plan-version <VERSION> --gate-mode emergency-ci --issue <ISSUE>
 ```
 
-既存receiptから移行する場合だけapprove-reviewへ`--replace-receipt`を追加します。同じrepository/task/PR/head/
+既存receiptから移行する場合だけreview commandへ`--replace-receipt`を追加します。同じrepository/task/PR/head/
 Planと版、変更file、検証範囲を保持し、riskを下げません。Plan版がない古いreceiptは移行できません。
 ledger付き旧v5は移行時にも旧証拠を検証します。merge後の移行は拒否します。
-同じrequestの再実行は同じreceiptを再利用します。理由/base/免除/証拠の変更は新しい利用者承認をrequestへ反映して
-`--replace-receipt`を明示します。task lockと既存stageで二重実行を制限し、merge済みなら同じreceiptのfinishから再開します。
+同じrequestの再実行は同じreceiptを再利用します。理由/base/免除/証拠の変更は原因・local検証・reviewを再確認して
+requestを更新し、`--replace-receipt`を明示します。head変更では新headの証拠を作ります。人間の再承認待ちは追加しません。
+task lockと既存stageで二重実行を制限し、merge済みなら同じreceiptのfinishから再開します。
+CI回復後に同じheadを通常CIへ戻す場合は、gate指定なしの`record-review --replace-receipt`を使えます。
+移行元はemergency-ciに限り、同じ対象・Plan・検証範囲と既存review証拠を保持します。既存のhuman-approved decisionも保持します。
+open PRと最新baseを照合し、merge後の移行は拒否します。移行後のdeliverでは通常のstrict gateをすべて要求します。
 stateやinstalled helperの手編集は不要です。公開記録に所有不明の編集がある場合も保持して停止します。
 
 既存coordinatorへ渡す場合は旧版coordinatorと旧writerの停止・回収を確認し、receipt作成後に新版で次を使います。
 `start`の`already_running`は旧版の更新を保証しません。重複submitはしません。
 
 ```console
-codex-task resume --task-id <TASK_ID> --instruction '既存PRと承認済みreceiptのdeliver/finishを継続' --gate-mode emergency-ci --authorization '<今回の対象と理由を含む利用者の明示承認>'
+codex-task resume --task-id <TASK_ID> --instruction '既存PRと固定証拠のdeliver/finishを継続' --gate-mode emergency-ci
 codex-task start
 ```
 
 coordinatorはreceipt digestを束縛して再観測し、CI失敗の実測を保持してIntegration/MainCi/Finishへ進みます。
-workerは承認を作成・拡大しません。後続taskには緊急承認を継承せずstrictを使います。
+coordinatorはDiagnosisから専用CiEvidence段階へ進め、private requestとreceiptを作成できます。
+証拠の失効時は実CIを通常gateで再取得し、head/base変更なら実装・検証・reviewへ戻します。API不明は通しません。
+後続taskには古い証拠を継承せずstrictから始め、必要な場合だけ新しい固定証拠を作ります。
 CI以外のidentity、最新baseのancestor、conflict、review、clean、所有、保存記録、ff-only同期とcleanupは維持します。
 `UNSTABLE`は非成功CIが全て承認範囲に入る場合だけ許可し、`BLOCKED`/`UNKNOWN`/`DIRTY`/`BEHIND`等は拒否します。
 このmodeはローカルstrict Ruleset契約の代わりに、通常のGitHub mergeでサーバー側の保護要件を適用します。
@@ -331,7 +357,7 @@ Issue記録とcleanupは既存finishを使い、API取得不能や保存確認�
 CI待機の免除はworkflowの停止ではありません。事前にbase/headのtriggerと既存CDへの影響を調べて報告し、
 `acknowledge_workflow_runs`で記録します。push/mergeの自動起動は既存設定に従います。
 manual dispatch、release、production deploy、新しいenvironment approvalは含みません。
-次の新しいtask/deliveryではgate指定を省略して通常経路を使います。このfeature自身の納品に緊急経路を使いません。
+次の新しいtask/deliveryではgate指定を省略して通常経路から始めます。新しい権限・費用・deploy承認は継続委任に含みません。
 
 ## deliver
 

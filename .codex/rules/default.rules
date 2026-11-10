@@ -14,6 +14,7 @@ prefix_rule(pattern=["codex-worktree", "recover"], decision="allow", justificati
 prefix_rule(pattern=["codex-task", ["submit", "list", "show", "events", "resume", "pause", "reconcile", "run", "start", "doctor", "launch-command"]], decision="allow", justification="hookと同一binaryのtask helperが所有host・repository・実行世代・worker排他を検証する")
 prefix_rule(pattern=["codex-discussions", ["categories", "list", "view", "comments", "replies", "create", "edit", "comment", "reply", "edit-comment", "close", "reopen", "mark-answer", "unmark-answer"]], decision="allow", justification="hookと同一binaryの専用helperがcurrent repository・対象所属・内容・結果を検証するDiscussions操作", match=["codex-discussions view --repo owner/repo --discussion 1"], not_match=["codex-discussions delete --repo owner/repo --discussion 1", "gh api graphql"])
 prefix_rule(pattern=["codex-delivery", "record-review"], decision="allow", justification="固定head SHAに対する自律判断済みreview receiptを専用helperで記録")
+prefix_rule(pattern=["codex-delivery", "authorize-ci"], decision="allow", justification="継続委任された既存CI起動labelを固定PR/head/baseとreview証拠・永続直列枠を検証する専用helperで追加")
 prefix_rule(pattern=["codex-delivery", "approve-review"], decision="prompt", justification="Daikiの意思決定が必要なdeliveryだけ確認付きreceiptを記録")
 prefix_rule(pattern=["codex-delivery", "deliver"], decision="allow", justification="review・CIと選択したremote gateを再検証する専用helperだけがReady化とmergeを実行")
 prefix_rule(pattern=["codex-delivery", "finish"], decision="allow", justification="receiptのgate modeとmerge到達性を再検証する専用helperだけがmain同期とmanaged cleanupを実行")

@@ -122,6 +122,9 @@ enum Commands {
         gate_mode: Option<String>,
         #[arg(long)]
         authorization: Option<String>,
+        /// 既存のCI起動labelをCodexが選択する。新規labelやdeploy承認には使わない。
+        #[arg(long)]
+        ci_label: Vec<String>,
     },
     /// 次のworker起動を止める。動作中workerは停止要求を受けて回収する。
     Pause {
@@ -157,6 +160,7 @@ enum Phase {
     Implementation,
     Review,
     CiAuthorization,
+    CiEvidence,
     Integration,
     MainCi,
     Finish,
@@ -223,6 +227,8 @@ struct Task {
     requested_gate: ci::GateMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     emergency_receipt_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    ci_emergency_requested: bool,
     #[serde(default)]
     stop_after: recovery::Boundary,
     #[serde(default)]
@@ -251,6 +257,10 @@ struct Task {
 
 fn default_retention() -> u64 {
     30 * 24 * 60 * 60
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn valid_id(id: &str) -> bool {
@@ -336,8 +346,12 @@ impl Task {
                 .review
                 .as_ref()
                 .is_some_and(|review| review.validate().is_err())
-            || (matches!(self.phase, Phase::CiAuthorization | Phase::Integration)
-                && !review_ready(self))
+            || self.phase == Phase::CiEvidence
+                && (!self.ci_emergency_requested || risk_rank(&self.risk) < risk_rank("high"))
+            || (matches!(
+                self.phase,
+                Phase::CiAuthorization | Phase::CiEvidence | Phase::Integration
+            ) && !review_ready(self))
             || self
                 .run
                 .as_ref()
@@ -468,6 +482,35 @@ impl Context {
     }
 }
 
+pub(crate) fn delivery_repair_parent(root: &std::path::Path, id: &str) -> Result<Option<String>> {
+    let (_, repository, key) =
+        worktree::task_repository(root).map_err(|cause| cause.to_string())?;
+    let home = crate::codex::setup_home_dir().map_err(|_| "account homeを確認できません")?;
+    let codex_home =
+        crate::codex::resolve_codex_home(&home).map_err(|_| "CODEX_HOMEを確認できません")?;
+    let store = Store::open(&codex_home, &key)?;
+    if !store.path(id)?.exists() {
+        return Ok(None);
+    }
+    let child = store.load(id)?;
+    if child.github != repository || !child.recovery.repairs_main {
+        return Ok(None);
+    }
+    let Some(parent) = &child.recovery.parent else {
+        return Ok(None);
+    };
+    let parent_task = store.load(parent)?;
+    if parent_task.github == repository
+        && parent_task.recovery.repair_task.as_deref() == Some(id)
+        && parent_task.recovery.barrier
+        && parent_task.merge_commit.is_some()
+    {
+        Ok(Some(parent.clone()))
+    } else {
+        Err("main修復taskの親子関係を確認できません".into())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn submit(
@@ -579,6 +622,7 @@ fn submit_with_policy(
         gate_mode: ci::GateMode::Strict,
         requested_gate,
         emergency_receipt_sha256: None,
+        ci_emergency_requested: false,
         stop_after,
         recovery: recovery::State::default(),
         ci_evidence: None,
@@ -751,10 +795,23 @@ fn apply_report_with(
                     ..report.clone()
                 });
                 task.review_independent = true;
-                task.phase = Phase::CiAuthorization;
+                task.phase = if task.ci_emergency_requested {
+                    Phase::CiEvidence
+                } else {
+                    Phase::CiAuthorization
+                };
                 if task.stop_after == recovery::Boundary::Pr {
                     task.phase = Phase::BoundaryReached;
                 }
+            }
+            Phase::CiEvidence => {
+                let proof = super::delivery::task_emergency_evidence(
+                    &context.repository,
+                    &task.id,
+                    task.pr.ok_or("CI証拠対象のPRがありません")?,
+                    task.head.as_deref().ok_or("CI証拠対象headがありません")?,
+                )?;
+                accept_ci_evidence(task, proof)?;
             }
             Phase::Integration => {
                 if review_ready(task) {
@@ -839,6 +896,49 @@ fn apply_diagnosis(context: &Context, task: &mut Task, report: &worker::Report) 
     }
     if assessment.decision.is_some() {
         task.monitor("意思決定と実行要求が一致しません。書込みは行わず、保存状態を監視します");
+        return Ok(());
+    }
+    if report.outcome == "ready" && assessment.next_action == "emergency-ci" {
+        if task.merge_commit.is_some()
+            || task.ci_observation_error_at.is_some()
+            || task.ci_evidence.as_ref().is_none_or(|observation| {
+                observation.merged
+                    || Some(&observation.head) != task.head.as_ref()
+                    || Some(&observation.base) != task.base.as_ref()
+                    || observation.target != observation.head
+                    || observation.observed_at > now()
+                    || !matches!(
+                        observation.state,
+                        ci::CiState::Failure
+                            | ci::CiState::Pending
+                            | ci::CiState::Missing
+                            | ci::CiState::Cancelled
+                            | ci::CiState::TimedOut
+                    )
+            })
+            || task.pr.is_none()
+            || task.head.is_none()
+            || task.base.is_none()
+        {
+            task.monitor(
+                "CI基盤障害の根拠または固定対象が不足しています。API不明をCI免除へ変換しません",
+            );
+            return Ok(());
+        }
+        task.ci_emergency_requested = true;
+        if risk_rank(&task.risk) < risk_rank("high") {
+            task.risk = "high".into();
+        }
+        task.phase = if review_ready(task) {
+            Phase::CiEvidence
+        } else {
+            Phase::Review
+        };
+        task.next_check = 0;
+        task.event(
+            "ci_evidence",
+            "継続委任の範囲でCI基盤障害の代替検証・根拠記録へ進みます",
+        );
         return Ok(());
     }
     register_followups(context, task, assessment)?;
@@ -1215,13 +1315,25 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
                 &task.id,
                 task.pr.ok_or("緊急承認対象のPRがありません")?,
                 task.head.as_deref().ok_or("緊急承認対象headがありません")?,
-            )?;
-            if evidence["receipt_sha256"].as_str() != task.emergency_receipt_sha256.as_deref() {
-                return Err(
-                    "緊急承認receiptが変更されました。明示resumeで対象を再確認してください".into(),
-                );
+            );
+            match evidence {
+                Ok(evidence) => return ci::emergency_observation(evidence),
+                Err(reason)
+                    if task.merge_commit.is_none()
+                        && !matches!(task.effective_phase(), Phase::MainCi | Phase::Finish) =>
+                {
+                    // 旧証拠が失効したら実CIを通常gateで再取得する。API不明は通さない。
+                    return ci::observe(
+                        &context.repository,
+                        &context.github,
+                        task.pr.ok_or("PRがありません")?,
+                        None,
+                        ci::GateMode::Strict,
+                    )
+                    .map_err(|_| reason);
+                }
+                Err(reason) => return Err(reason),
             }
-            return ci::emergency_observation(evidence);
         }
         ci::observe(
             &context.repository,
@@ -1379,6 +1491,21 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
         }
     };
     task.ci_observation_error_at = None;
+    if task.requested_gate == ci::GateMode::EmergencyCi {
+        if observation.gate_mode != ci::GateMode::EmergencyCi {
+            reset_emergency_scope(task);
+            task.event(
+                "ci_revalidation",
+                "旧CI証拠を再利用せず、通常CIの実測から再検証します",
+            );
+        } else if observation.allows_delivery() {
+            task.emergency_receipt_sha256 = observation
+                .emergency
+                .as_ref()
+                .and_then(|proof| proof["receipt_sha256"].as_str())
+                .map(str::to_string);
+        }
+    }
     let eligible = observation.allows_delivery();
     task.ci_evidence = Some(observation.clone());
     task.ci_state = Some(observation.state);
@@ -1433,6 +1560,7 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
             .as_ref()
             .is_some_and(|base| base != &observation.base)
         {
+            reset_emergency_scope(task);
             task.invalidate_ci();
             task.review = None;
             task.review_independent = false;
@@ -1475,6 +1603,9 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
             if matches!(task.phase, Phase::MainCi | Phase::Finish) {
                 task.recovery.barrier = true;
                 task.diagnose("merge commitのmain CIが失敗しました。後続mergeを保留し、原因調査・許可内の修復PR・再検証を進めてください");
+            } else if review_ready(task) {
+                task.diagnose("固定headのCI失敗を製品test失敗と基盤障害へ分類してください。既知のtest失敗は修復し、基盤障害を根拠で確認できる場合だけ継続委任のemergency-ci代替検証へ進みます");
+                task.recovery.origin = Some(Phase::CiAuthorization);
             } else {
                 task.phase = Phase::Implementation;
                 task.review = None;
@@ -1503,6 +1634,7 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
 }
 
 fn stale_head(task: &mut Task) {
+    reset_emergency_scope(task);
     task.invalidate_ci();
     task.review = None;
     task.review_independent = false;
@@ -1511,17 +1643,71 @@ fn stale_head(task: &mut Task) {
     task.recovery.origin = Some(Phase::Implementation);
 }
 
+fn reset_emergency_scope(task: &mut Task) {
+    if task.requested_gate == ci::GateMode::EmergencyCi {
+        task.requested_gate = ci::GateMode::Strict;
+        task.gate_mode = ci::GateMode::Strict;
+        task.emergency_receipt_sha256 = None;
+    }
+    task.ci_emergency_requested = false;
+}
+
+fn accept_ci_evidence(task: &mut Task, proof: Value) -> Result<()> {
+    let observation = ci::emergency_observation(proof)?;
+    if !task.ci_emergency_requested
+        || !review_ready(task)
+        || risk_rank(&task.risk) < risk_rank("high")
+        || !observation.allows_delivery()
+        || observation.merged
+        || task.head.as_ref() != Some(&observation.head)
+        || task.base.as_ref() != Some(&observation.base)
+    {
+        return Err("固定head/baseのlocal検証と独立reviewの証拠が不一致です".into());
+    }
+    task.emergency_receipt_sha256 = observation
+        .emergency
+        .as_ref()
+        .and_then(|proof| proof["receipt_sha256"].as_str())
+        .map(str::to_string);
+    task.requested_gate = ci::GateMode::EmergencyCi;
+    task.gate_mode = ci::GateMode::EmergencyCi;
+    task.ci_emergency_requested = false;
+    task.phase = Phase::Integration;
+    task.invalidate_ci();
+    task.next_check = 0;
+    Ok(())
+}
+
 #[cfg(test)]
 fn resume_task(context: &Context, task_id: &str, instruction: String) -> Result<Value> {
     resume_with_options(context, task_id, instruction, None, None)
 }
 
+#[cfg(test)]
 fn resume_with_options(
     context: &Context,
     task_id: &str,
     instruction: String,
     gate_mode: Option<String>,
     authorization: Option<String>,
+) -> Result<Value> {
+    resume_with_ci_labels(
+        context,
+        task_id,
+        instruction,
+        gate_mode,
+        authorization,
+        vec![],
+    )
+}
+
+fn resume_with_ci_labels(
+    context: &Context,
+    task_id: &str,
+    instruction: String,
+    gate_mode: Option<String>,
+    authorization: Option<String>,
+    ci_labels: Vec<String>,
 ) -> Result<Value> {
     if !safe_text(&instruction, 32 * 1024) {
         return Err("追加指示が不正です".into());
@@ -1534,9 +1720,12 @@ fn resume_with_options(
     if matches!(task.phase, Phase::Completed | Phase::BoundaryReached) {
         return Err("完了taskへ追加作業は登録できません。別taskとして依頼してください".into());
     }
-    let explicit_authorization = authorization
-        .as_ref()
-        .is_some_and(|value| safe_text(value, 32 * 1024));
+    if !valid_ci_labels(&ci_labels) {
+        return Err("既存CI labelの形式が不正です".into());
+    }
+    if !ci_labels.is_empty() {
+        task.ci_labels = ci_labels;
+    }
     if let Some(authorization) = authorization {
         if !safe_text(&authorization, 32 * 1024) {
             return Err("元の利用者依頼が不正です".into());
@@ -1551,9 +1740,6 @@ fn resume_with_options(
             _ => return Err("受付policyが不正です".into()),
         };
         if gate == ci::GateMode::EmergencyCi {
-            if !explicit_authorization {
-                return Err("緊急経路への移行には対象と理由の--authorizationが必要です".into());
-            }
             let evidence = super::delivery::task_emergency_evidence(
                 &context.repository,
                 &task.id,
@@ -1631,6 +1817,7 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
             task.phase,
             Phase::Implementation
                 | Phase::Review
+                | Phase::CiEvidence
                 | Phase::Integration
                 | Phase::Finish
                 | Phase::Diagnosis
@@ -1648,7 +1835,7 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
     }
     if matches!(
         task.phase,
-        Phase::CiAuthorization | Phase::Integration | Phase::Finish
+        Phase::CiAuthorization | Phase::CiEvidence | Phase::Integration | Phase::Finish
     ) && !review_ready(task)
     {
         return Ok(false);
@@ -1676,6 +1863,15 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
         return Ok(false);
     }
     if matches!(task.phase, Phase::Integration | Phase::Finish) {
+        if !super::delivery::task_delivery_lane_available(
+            &context.repository,
+            &context.codex_home,
+            &task.github,
+            &task.id,
+            task.pr.ok_or("統合対象PRがありません")?,
+        )? {
+            return Ok(false);
+        }
         if tasks.iter().any(|other| {
             other.id != task.id
                 && (integration_barrier(other) && !repair_exempt(task, other, tasks)
@@ -1777,6 +1973,7 @@ fn add_ci_labels(context: &Context, task: &Task) -> Result<()> {
     super::delivery::task_add_ci_labels(
         &context.repository,
         &context.github,
+        &task.id,
         task.pr.ok_or("PRがありません")?,
         task.head.as_deref().ok_or("HEADがありません")?,
         task.base.as_deref().ok_or("baseがありません")?,
@@ -1796,9 +1993,20 @@ fn authorize_ci_with(
     {
         return Ok(());
     }
-    if !task.ci_labels.is_empty() {
+    {
         let result = add_labels(task);
         if let Err(reason) = result {
+            if reason == super::delivery::CI_LANE_BUSY {
+                task.next_check = now() + 30;
+                if !task
+                    .events
+                    .last()
+                    .is_some_and(|event| event.kind == "ci_queue_wait")
+                {
+                    task.event("ci_queue_wait", &reason);
+                }
+                return Ok(());
+            }
             task.event("ci_authorization_wait", &reason);
             task.ci_state = None;
             task.next_check = now() + 120;
@@ -1817,7 +2025,7 @@ fn authorize_ci_with(
     task.next_check = 0;
     task.event(
         "ci_authorized",
-        "受付時に明示された既存CI起動操作を確認しました。CI待機はRustが担当します",
+        "Codexが選択した既存CI起動操作と直列枠を確認しました。CI待機はRustが担当します",
     );
     Ok(())
 }
@@ -1849,6 +2057,10 @@ fn retry_ci_authorization_with(
             );
         }
         Err(reason) => {
+            if reason == super::delivery::CI_LANE_BUSY {
+                task.recovery.next_authorization = now() + 30;
+                return Ok(());
+            }
             task.recovery.authorization_attempts =
                 task.recovery.authorization_attempts.saturating_add(1);
             task.recovery.next_authorization =
@@ -2253,7 +2465,15 @@ fn execute(cli: Cli) -> Result<Value> {
             instruction,
             gate_mode,
             authorization,
-        } => resume_with_options(&context, &task_id, instruction, gate_mode, authorization),
+            ci_label,
+        } => resume_with_ci_labels(
+            &context,
+            &task_id,
+            instruction,
+            gate_mode,
+            authorization,
+            ci_label,
+        ),
         Commands::Reconcile | Commands::Run { .. } => {
             worker::preflight(&context)?;
             let mut coordinator = Some(
@@ -2470,14 +2690,17 @@ pub(crate) fn invocation_reason(args: &[String]) -> Option<String> {
             task_id,
             instruction,
             authorization,
+            ci_label,
             ..
-        } => (!valid_id(&task_id) || !safe_text(&instruction, 32 * 1024))
-            .then(|| "再開指示が不正です".into())
-            .or_else(|| {
-                authorization
-                    .is_some_and(|text| !safe_text(&text, 32 * 1024))
-                    .then(|| "元の利用者依頼が不正です".into())
-            }),
+        } => (!valid_id(&task_id)
+            || !safe_text(&instruction, 32 * 1024)
+            || !valid_ci_labels(&ci_label))
+        .then(|| "再開指示が不正です".into())
+        .or_else(|| {
+            authorization
+                .is_some_and(|text| !safe_text(&text, 32 * 1024))
+                .then(|| "元の利用者依頼が不正です".into())
+        }),
         _ => None,
     }
 }
@@ -2764,6 +2987,133 @@ mod tests {
         .unwrap()
     }
 
+    fn infrastructure_diagnosis(task: &Task) -> worker::Report {
+        worker::Report {
+            generation: task.generation,
+            outcome: "ready".into(),
+            summary: "基盤障害を確認。代替検証へ進む".into(),
+            pr: task.pr,
+            head: task.head.clone(),
+            risk: "high".into(),
+            assessment: Some(recovery::Assessment {
+                cause: "runner-unavailable".into(),
+                evidence: "合成fixtureでrunner未起動を観測".into(),
+                next_action: "emergency-ci".into(),
+                resume_when: "local test/buildと独立reviewの証拠を保存後".into(),
+                decision: None,
+                watch_paths: vec![],
+                followups: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    fn infrastructure_diagnosis_reaches_bound_evidence_without_a_human_decision() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        task.phase = Phase::Integration;
+        let mut observation = successful_observation();
+        observation.state = ci::CiState::Failure;
+        record_ci_result(&mut task, Ok(observation)).unwrap();
+        assert_eq!(task.phase, Phase::Diagnosis);
+        assert!(review_ready(&task));
+        let diagnosis = infrastructure_diagnosis(&task);
+        apply_diagnosis(&fixture.0, &mut task, &diagnosis).unwrap();
+        assert_eq!(task.phase, Phase::CiEvidence);
+        task.validate().unwrap();
+        assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        let proof = emergency_observation(false).emergency.unwrap();
+        let mut changed = proof.clone();
+        changed["base"] = json!("d".repeat(40));
+        assert!(accept_ci_evidence(&mut task, changed).is_err());
+        accept_ci_evidence(&mut task, proof).unwrap();
+        assert_eq!(task.phase, Phase::Integration);
+        assert_eq!(task.requested_gate, ci::GateMode::EmergencyCi);
+        assert!(task.ci_evidence.is_none()); // receiptだけでは実CIの再観測を省略できない。
+        assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        record_ci_result(&mut task, Ok(emergency_observation(false))).unwrap();
+        assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+    }
+
+    #[test]
+    fn autonomous_evidence_refuses_unknown_api_stale_scope_and_requires_high_review() {
+        let fixture = Fixture::new();
+        let original = reviewed_task(&fixture);
+        for case in 0..5 {
+            let mut task = original.clone();
+            task.phase = Phase::Diagnosis;
+            let mut observation = successful_observation();
+            observation.state = ci::CiState::Pending;
+            match case {
+                0 => task.ci_observation_error_at = Some(now()),
+                1 => observation.head = "c".repeat(40),
+                2 => observation.base = "c".repeat(40),
+                3 => observation.merged = true,
+                _ => observation.state = ci::CiState::Success,
+            }
+            task.ci_evidence = Some(observation);
+            let diagnosis = infrastructure_diagnosis(&task);
+            apply_diagnosis(&fixture.0, &mut task, &diagnosis).unwrap();
+            assert_eq!(task.phase, Phase::Waiting, "{case}");
+            assert!(!task.ci_emergency_requested);
+        }
+        let mut task = original;
+        task.risk = "low".into();
+        task.review.as_mut().unwrap().risk = "low".into();
+        task.review_independent = false;
+        let mut observation = successful_observation();
+        observation.state = ci::CiState::Missing;
+        task.ci_evidence = Some(observation);
+        let diagnosis = infrastructure_diagnosis(&task);
+        apply_diagnosis(&fixture.0, &mut task, &diagnosis).unwrap();
+        assert_eq!(task.risk, "high");
+        assert_eq!(task.phase, Phase::Review);
+        assert!(task.ci_emergency_requested);
+    }
+
+    #[test]
+    fn busy_ci_lane_waits_without_ai_diagnosis_or_losing_review() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        task.ci_labels = vec!["ci-approved".into()];
+        for _ in 0..2 {
+            task.next_check = 0;
+            authorize_ci_with(&mut task, |_| {
+                Err(super::super::delivery::CI_LANE_BUSY.into())
+            })
+            .unwrap();
+            assert_eq!(task.phase, Phase::CiAuthorization);
+            assert!(review_ready(&task));
+            assert!(!worker::worker_phase(&task.phase));
+            assert!(task.next_check > now());
+        }
+        assert_eq!(
+            task.events
+                .iter()
+                .filter(|event| event.kind == "ci_queue_wait")
+                .count(),
+            1
+        );
+        task.next_check = 0;
+        authorize_ci_with(&mut task, |_| Ok(())).unwrap();
+        assert_eq!(task.phase, Phase::Integration);
+    }
+
+    #[test]
+    fn new_base_discards_emergency_receipt_and_review_without_requesting_approval() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        task.requested_gate = ci::GateMode::EmergencyCi;
+        task.emergency_receipt_sha256 = Some("f".repeat(64));
+        let mut observation = successful_observation();
+        observation.base = "d".repeat(40);
+        record_ci_result(&mut task, Ok(observation)).unwrap();
+        assert_eq!(task.phase, Phase::Implementation);
+        assert_eq!(task.requested_gate, ci::GateMode::Strict);
+        assert!(task.emergency_receipt_sha256.is_none());
+        assert!(task.review.is_none() && task.ci_evidence.is_none());
+    }
+
     #[test]
     fn emergency_coordinator_keeps_failure_evidence_and_reaches_integration_and_finish() {
         let fixture = Fixture::new();
@@ -2780,7 +3130,7 @@ mod tests {
         assert_eq!(task.followup_gate(), ci::GateMode::Strict);
         let prompt = worker::prompt(&task);
         assert!(prompt.contains("--gate-mode emergency-ci"));
-        assert!(prompt.contains("新しいrequest作成"));
+        assert!(prompt.contains("人間の再承認だけを理由に停止しません"));
         task.phase = Phase::MainCi;
         record_ci_result(&mut task, Ok(emergency_observation(true))).unwrap();
         assert_eq!(task.phase, Phase::Finish);
@@ -3317,7 +3667,8 @@ mod tests {
             task.phase = Phase::CiAuthorization;
             task.ci_state = Some(state);
             assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
-            authorize_ci(&fixture.0, &mut task).unwrap();
+            task.next_check = 0;
+            authorize_ci_with(&mut task, |_| Ok(())).unwrap();
             assert_eq!(task.phase, Phase::Integration);
         }
         for state in [
@@ -3327,7 +3678,8 @@ mod tests {
         ] {
             task.phase = Phase::CiAuthorization;
             task.ci_state = state;
-            authorize_ci(&fixture.0, &mut task).unwrap();
+            task.next_check = 0;
+            authorize_ci_with(&mut task, |_| Ok(())).unwrap();
             assert_eq!(task.phase, Phase::Integration);
         }
     }

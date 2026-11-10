@@ -27,13 +27,13 @@
 ## 検証とdelivery
 
 - workflowのtrigger、`runs-on`、job、matrix、Ruleset・branch protectionを正本とする。Utakata Runnerはrepository単位のopt-in。導入済みself-hosted CIを利用し、開発端末がLinuxかWSL2かでCIを切り替えない。local path・install・稼働をdotfiles全体へ強制しない。
-- workflowがある場合は固定headの該当Actions checkを待つ。失敗・pending・runner unavailableをGitHub-hostedやlocal検証へ黙ってfallbackしない。CI起動label等の実行承認はrepository固有の既存権限に従う。
-- CI基盤障害の緊急時だけ、利用者がrepository・task・PR・head・base・理由・免除対象を明示承認した一回のdeliveryへ`emergency-ci`を使える。high以上、固定headのlocal test/buildと独立review、private requestによる`approve-review`を必須とし、既存receiptの移行は`--replace-receipt`で明示する。詳細は`docs/codex-delivery.ja.md`を正本にする。承認外の状態・head/base/理由の変化、既知のtest失敗、API不明、conflict、未解決reviewは免除しない。workerは既存承認を再利用するだけで新規承認を与えない。CI状態・guard・Rulesetを変更せず、workflow/CDは既存triggerに従う。
+- workflowがある場合は固定headの該当Actions checkを待つ。既存のCI起動labelはworkflowと用途を確認してCodexが選択・付与でき、対象ごとの人間承認を追加しない。coordinatorの`--ci-label`、単独sessionは`codex-delivery authorize-ci`を使い、同一host/CODEX_HOMEでCI起動からmerge・main同期・cleanupまで1 PRずつ進める。先行PRの枠はfinishまで保持し、他host・人間との競合はlive状態で再確認する。新label・追加権限や費用・deploy承認は含まない。
+- CI基盤障害の判断と`emergency-ci`の利用はCodexへ継続委任する。対象ごとの人間承認は不要だが、repository・task・PR・head・base・理由・免除対象に束縛した証拠を毎回記録する。high以上、固定headのlocal test/buildと独立review、private requestによる`record-review`を必須とし、既存receiptの移行は`--replace-receipt`で明示する。詳細は`docs/codex-delivery.ja.md`を正本にする。head/baseや根拠が変われば検証・review・receiptを更新し、既知のtest失敗、API不明、conflict、未解決reviewは免除しない。通常CIを既定とし、CI状態・guard・Rulesetを変更せず、workflow/CDは既存triggerに従う。
 - live baseと固定headの双方にworkflowがなければ`local-validation`を使い、README等から該当local検証を選ぶ。固定headにActions checkがあれば完了も必須。固定job名を全repositoryへ要求しない。
 - low/mediumはmainのself-review、highは独立reviewを1件、criticalは実在する別の高リスク境界がある場合だけ専門reviewを追加する。CI/workflow、Ruleset、hook、rules、AGENTS、Skills、helper、installer、auth/secrets、billing、production、不可逆migration、breaking changeはhigh以上。
 - riskは検証とreviewの深度を決める。riskだけを理由に確認待ちにせず、scope内の判断は自律的に進める。製品判断、追加権限・費用、不可逆性、重大な残存リスクの受容だけをDaikiへ確認する。
 - 技術的な失敗・実環境未受入・親のfile分割・失敗回数だけで対応を終了しない。危険な対象操作は保留し、元の依頼と所有権を照合して診断・修復・再計画・監視・独立した許可済みtaskを継続する。外部待機は解消条件と次回観測を保存し、変化後に再開する。同条件の無限retryや新commitだけを進展とする判定は避ける。
-- deliveryは`record-review|approve-review -> deliver -> finish`を使う。actionable=0、未解決thread=0、最新base、conflictなし、固定headの必要なcheckがsuccess/skipped/neutral、または対象別に明示承認された緊急CI免除に合致することをhelperが検証する。skipや免除だけで実質的な検証を満たしたと扱わない。
+- deliveryは`record-review|approve-review -> deliver -> finish`を使う。actionable=0、未解決thread=0、最新base、conflictなし、固定headの必要なcheckがsuccess/skipped/neutral、または継続委任に基づく対象別の緊急CI証拠に合致することをhelperが検証する。skipや免除だけで実質的な検証を満たしたと扱わない。
 - managed worktreeの担当sessionはStop hookで完了を検査する。CI待ちや技術的失敗で終了せず監視・修復を続ける。明示停止・指定された途中納品・真正な人間判断の場合だけ`codex-worktree completion`へ境界と具体的根拠を保存し、未完了と報告する。hookを無効化したり状態を削除したりして終了を迂回しない。
 - CDは既存triggerと権限に従う。merge/pushで起動する既存CDは状態を報告し、manual dispatch、release、production deploy、新規environment approvalは明示依頼なしに実行しない。
 - dirty/stale/conflict、必須検証失敗、判定不能ではPR・branch・worktreeを保持し、再開点を伝える。`finish --sandbox-retry`等の復旧はhelperが示す限定条件に従い、直接mergeや削除で迂回しない。

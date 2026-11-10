@@ -65,9 +65,11 @@ OSサービスを登録せずに使えます。`run`は前景で継続し、`rec
 受付を担当するmainが`submit --risk low|medium|high|critical`でレビュー深度の下限を決めます。
 既定はhighです。実装workerの報告では引き下げず、必要な場合は引き上げます。
 受付時点でlow/mediumと判断できた場合は実装時のself-review、高以上は別workerの独立レビューを使います。
-統合はrepository単位で順序を管理し、merge commitのmain側gate確認まで後続統合を待たせます。
-対象PRと後続pushのCI起動が既存方針で明示的に委任されているlabelだけを、受付時に`--ci-label <既存label>`へ渡します。
-固定HEADのレビュー後、RustがPR・HEAD・baseとlabelの実在を照合し、登録されたlabelの追加だけを行います。
+CI起動から統合・main同期・cleanupまで、同一host/CODEX_HOME全repositoryで1 PRずつ進めます。
+Codexがworkflowと用途を確認して既存CI起動labelを選び、`submit`または停止回収後の`resume`へ`--ci-label <既存label>`を渡します。
+固定HEADのレビュー後、RustがPR・HEAD・最新baseとlabelの実在を照合し、永続的な直列枠を取得して追加します。
+先行PRの`finish`完了までは次のPRのlabel付与を待ちます。セッション終了や時間経過では枠を解放しません。
+単独sessionの`codex-delivery authorize-ci`も同じ枠を使います。詳細は[deliveryガイド](codex-delivery.ja.md#ci起動からfinishまでの直列化)に従います。
 CI起動用のAI workerは起動せず、RustがCI成功または後述のlocal gate条件を確認してから統合workerを起動します。
 GitHubの[label API](https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue)はPR単位です。
 照合と追加の間にpushが入る可能性があり、後から検知してもCI起動を取り消せません。
@@ -178,20 +180,21 @@ candidate/credential不足と親のfile分割があっても、許可済みのso
 親終了後の無人delivery・cleanupや自然言語判断一般を保証しません。失敗時の報告は成果物領域に
 保持されるので、原因を確認し、必要な検証記録を残してから正規helperで回収してください。
 
-### 固定deliveryへの緊急CI承認
+### 継続委任による緊急CI検証
 
-CI基盤障害の一回限りの例外は[deliveryガイド](codex-delivery.ja.md#ci基盤障害時の一回限りの緊急承認)に従います。
-既存task/PR/head/base/Planのlocal test/buildと独立reviewを揃え、利用者の対象別明示承認で
-`codex-delivery approve-review --gate-mode emergency-ci --emergency-request <private絶対path>`を実行します。
-既存receiptの移行は`--replace-receipt`を明示し、既存Planと版を維持します。
-旧workerの停止・回収後、同じtaskを`resume --gate-mode emergency-ci --authorization '<対象と理由の明示承認>'`
-で再開します。新規submitによる包括許可は受け付けません。既存receiptのdigestをtaskへ束縛するため、
-別task/head/baseや承認内容変更では再利用できません。
+CI基盤障害の判断はCodexへ継続委任されています。[deliveryガイド](codex-delivery.ja.md#ci基盤障害時の継続委任)に従い、
+人間の対象別再承認は求めません。読み取り専用Diagnosisが観測済みCIと原因を確認し、API不明や既知test失敗がなければ
+`outcome=ready`、`assessment.next_action=emergency-ci`でCiEvidence段階へ進めます。
+必要ならriskをhighへ上げて独立reviewを先に行います。CiEvidenceはsource・Gitの変更やPRの直接編集を行わず、固定head/baseの
+local test/buildとreviewを確認し、private requestと`record-review --gate-mode emergency-ci`で根拠を保存します。
+正規helperによる公開用要約のPR記録だけはこの段階で行います。
+既存receiptの移行は`--replace-receipt`を明示し、既存Planと版を維持します。ready報告後もRustがreceiptと実CIを再検証します。
+手動で引き継ぐ場合は旧workerを停止回収し、同じIDを`resume --gate-mode emergency-ci`で再開します。
 
 CIのfailure/pending/missingは実測のまま保持し、承認された範囲に一致する場合だけIntegration/MainCi/Finishへ進みます。
-workerには`deliver`/`finish --gate-mode emergency-ci`と既存receiptの再利用だけを委任し、新規承認は委任しません。
-API不明、review未完了、conflict、承認外CI状態では進めません。main側は承認base/headを親に持つ同じtreeの実mergeを
-検証し、それ以外のmain更新へ免除を広げません。後続taskはstrictへ戻します。通常taskの既定とCI起動labelの許可範囲は維持します。
+head/baseや根拠の変更では検証・review・receiptを更新し、古い証拠を使いません。
+API不明、review未完了、conflict、証拠にないCI状態では進めません。main側は固定base/headを親に持つ同じtreeの実mergeを
+検証し、それ以外のmain更新へ免除を広げません。後続taskはstrictから始めます。
 workflow/CDの自動起動は停止せず、manual deploy/release/保護解除は含みません。
 
 ### workflow不在repositoryのlocal gate
@@ -255,7 +258,7 @@ doctorはこのprocfsの作成も確認し、通常の短時間commandの隔離�
 macOSのhost identity・process監督・launchd adapterは将来対応です。
 
 main CIが存在するrepositoryと、前述の一次情報でworkflow不在を確認できるrepositoryを対象とします。
-CI起動に独自承認labelが必要なrepositoryは、既存の委任と運用を守り、未知の承認を自動付与しません。
+CI起動に独自labelが必要なrepositoryは、Codexが既存workflowと用途を確認して選択します。新label・deploy承認・追加権限や費用は含みません。
 OS起動adapterの導入は今回の対応範囲に含みません。
 
 ## 未処理イベントと保持・回収
