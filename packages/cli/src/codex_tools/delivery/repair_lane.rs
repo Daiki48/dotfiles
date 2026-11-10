@@ -121,7 +121,7 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
     validate_receipt_evidence(&path, &manifest, &child)?;
     validate_receipt_review_history(&root, &child)?;
     review_safety(&root, &child_repo, request.child_pr)?;
-    assert_recovery_pr_open(
+    assert_child_open(
         &pr_view(&root, &child_repo, request.child_pr)?,
         &child_repo,
         &str_value(&manifest, "branch")?,
@@ -175,6 +175,26 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
     Ok(object([("status", string("repair-admitted"))]))
 }
 
+/// CI起動の枠を借りる段階ではrequired checks未完了のBLOCKEDを許可する。merge許可ではない。
+fn assert_child_open(view: &Value, repository: &str, branch: &str, head: &str) -> Result<()> {
+    let draft = bool_value(view, "isDraft")?;
+    let status = str_value(view, "mergeStateStatus")?;
+    if str_value(view, "state")? != "OPEN"
+        || str_value(view, "headRefOid")? != head
+        || str_value(view, "headRefName")? != branch
+        || str_value(view, "baseRefName")? != "main"
+        || view.get("isCrossRepository") != Some(&Value::Bool(false))
+        || !same_head_repository(view, repository)
+        || !view.get("autoMergeRequest").is_some_and(Value::is_null)
+        || str_value(view, "mergeable")? != "MERGEABLE"
+        || !(matches!(status.as_str(), "CLEAN" | "UNSTABLE" | "BLOCKED")
+            || draft && status == "DRAFT")
+    {
+        return Err(error("修復PRの固定identity/conflict/stateを確認できません"));
+    }
+    Ok(())
+}
+
 fn repair_needed(observed: &Value) -> Result<bool> {
     if observed["approved"] != false {
         return Err(error("修復専用の非delivery観測が必要です"));
@@ -204,6 +224,40 @@ fn repair_needed(observed: &Value) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repair_can_start_ci_while_required_checks_are_blocked_but_cannot_merge() {
+        let mut view = serde_json::json!({"state":"OPEN","headRefOid":"a".repeat(40),"headRefName":"fix/infra","baseRefName":"main","isCrossRepository":false,"headRepository":{"nameWithOwner":"example/infrastructure"},"headRepositoryOwner":{"login":"example"},"autoMergeRequest":null,"mergeable":"MERGEABLE","isDraft":true,"mergeStateStatus":"BLOCKED"});
+        assert!(
+            assert_child_open(
+                &view,
+                "example/infrastructure",
+                "fix/infra",
+                &"a".repeat(40)
+            )
+            .is_ok()
+        );
+        assert!(
+            assert_recovery_pr_open(
+                &view,
+                "example/infrastructure",
+                "fix/infra",
+                &"a".repeat(40)
+            )
+            .is_err()
+        );
+        for state in ["CONFLICTING", "UNKNOWN"] {
+            view["mergeable"] = string(state);
+            assert!(
+                assert_child_open(
+                    &view,
+                    "example/infrastructure",
+                    "fix/infra",
+                    &"a".repeat(40)
+                )
+                .is_err()
+            );
+        }
+    }
     #[test]
     fn live_main_failure_can_request_repair_without_waiving_either_commit() {
         let mut observed = serde_json::json!({"approved":false,"target_ci":{"entries":[{"state":"success"}]},"live_ci":{"sha":"a".repeat(40),"entries":[{"state":"failure"}]}});

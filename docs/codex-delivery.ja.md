@@ -392,6 +392,8 @@ private証拠を保存した後、固定した親scopeに一致する場合だ�
 mainが実mergeより先へ進んでいれば、そのlive SHAのCIもAPI取得して同じ非公開観測へ束縛します。
 既知の製品test失敗やAPI不明はこの修復枠にも使いません。親の既存receipt/auditとdelivery gateは維持します。
 先行checkoutへのfetchがsandboxの書込み範囲外なら、同一UIDの通常ホストで正規helperを実行します。
+修復PRのCI起動前にはrequired checks待ちの`BLOCKED`を枠認可だけに許容します。conflict/UNKNOWNは保持し、
+merge時のCI・Ruleset gateは通常のdeliverで再検証します。CI起動labelを必要とする修復PRも先行枠との相互待ちにしません。
 交差repositoryの修復は1段に制限し、競合・循環・別の修復中は保持します。再実行は同じ固定scopeで再照合します。
 修復PRは通常のauthorize-ci/deliver/finishを使い、finish完了時だけ親scopeへ戻ります。親のfinishを再開して
 CI回復または更新済みの限定証拠を確認します。無条件release、state手編集、旧helperへの退避を使いません。
