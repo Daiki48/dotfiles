@@ -65,11 +65,11 @@ OSサービスを登録せずに使えます。`run`は前景で継続し、`rec
 受付を担当するmainが`submit --risk low|medium|high|critical`でレビュー深度の下限を決めます。
 既定はhighです。実装workerの報告では引き下げず、必要な場合は引き上げます。
 受付時点でlow/mediumと判断できた場合は実装時のself-review、高以上は別workerの独立レビューを使います。
-通常CIを起動するtaskはCI起動から統合・main同期・cleanupまで、同一host/CODEX_HOME全repositoryで1 PRずつ進めます。
+通常CIの同時実行を共有枠で制御するtaskは、CI起動から統合・main同期・cleanupまで同一host/CODEX_HOME全repositoryで1 PRずつ進めます。
 Codexがworkflowと用途を確認して既存CI起動labelを選び、`submit`または停止回収後の`resume`へ`--ci-label <既存label>`を渡します。
 固定HEADのレビュー後、RustがPR・HEAD・最新baseとlabelの実在を照合し、永続的な直列枠を取得して追加します。
 先行PRの`finish`完了までは次のPRのlabel付与を待ちます。セッション終了や時間経過では枠を解放しません。
-workflow policyを検証したlocal gate、またはCI非稼働を最新観測で確認した有効なemergency-ci証拠は、共有CI枠を使わず同一repositoryの納品予約だけで進めます。単なるlabel不在やgate名だけでは省略しません。単独sessionの`codex-delivery authorize-ci`も同じ証拠検証を使います。詳細は[deliveryガイド](codex-delivery.ja.md#ci予約と納品予約)に従います。
+labelなし通常CIのhosted exemptionと、workflow policyを検証したlocal gate・CI非稼働を最新観測で確認した有効なemergency-ci証拠の条件は[deliveryガイド](codex-delivery.ja.md#ci予約と納品予約)に従います。self-hosted、動的な`runs-on`、job-level `uses`、不明なAPI・runner継承では共有枠を維持します。どの経路もrepository単位の納品予約、同一repositoryの排他、CI checkとfinish条件を維持し、単なるlabel不在やgate名だけでは省略しません。
 CI起動用のAI workerは起動せず、RustがCI成功または後述のlocal gate条件を確認してから統合workerを起動します。
 GitHubの[label API](https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue)はPR単位です。
 照合と追加の間にpushが入る可能性があり、後から検知してもCI起動を取り消せません。

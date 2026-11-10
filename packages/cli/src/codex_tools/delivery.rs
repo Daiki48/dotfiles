@@ -21,6 +21,7 @@ mod actions_artifacts;
 mod emergency;
 mod lane;
 mod repair_lane;
+mod runner_policy;
 mod work_log;
 
 #[cfg(unix)]
@@ -778,15 +779,26 @@ pub(crate) fn task_delivery_lane_available(
 }
 
 /// 検証済みreceiptと最新gate観測の後にだけ呼ぶ。旧証拠は予約を要求する。
-fn delivery_ci_required(receipt: &Value) -> Result<bool> {
+fn delivery_ci_required(
+    root: &Path,
+    receipt: &Value,
+    base: &str,
+    merged: Option<&str>,
+) -> Result<bool> {
     match receipt_gate_mode(receipt)?.as_str() {
         LOCAL_VALIDATION_GATE_MODE | FREE_PRIVATE_LOCAL_GATE_MODE => Ok(false),
         emergency::GATE => Ok(emergency::read_audit(receipt)?["ci_reservation_required"] != false),
-        _ => Ok(true),
+        _ => Ok(!runner_policy::hosted_only(
+            root,
+            &str_value(receipt, "repository")?,
+            base,
+            &str_value(receipt, "head_sha")?,
+            merged,
+        )),
     }
 }
 
-fn admit_delivery(root: &Path, receipt: &Value, base: &str) -> Result<()> {
+fn admit_delivery(root: &Path, receipt: &Value, base: &str, merged: Option<&str>) -> Result<()> {
     let task = str_value(receipt, "task_id")?;
     let parent = super::task::delivery_repair_parent(root, &task).map_err(error)?;
     lane::admit(
@@ -799,8 +811,18 @@ fn admit_delivery(root: &Path, receipt: &Value, base: &str) -> Result<()> {
             labels: vec![],
         },
         parent.as_deref(),
-        delivery_ci_required(receipt)?,
+        delivery_ci_required(root, receipt, base, merged)?,
     )
+}
+
+pub(crate) fn task_hosted_ci_only(
+    root: &Path,
+    repository: &str,
+    base: &str,
+    head: &str,
+    merged: Option<&str>,
+) -> bool {
+    runner_policy::hosted_only_for_scheduler(root, repository, base, head, merged)
 }
 
 /// 既存CI labelを確認し、永続的な直列枠の取得後だけ追加する。
@@ -872,7 +894,9 @@ pub(crate) fn task_add_ci_labels(
         worktree_clean_head(&path, head).map_err(|cause| cause.to_string())?;
         validate_receipt_evidence(&path, &manifest, &receipt).map_err(|cause| cause.to_string())?;
         validate_delivery(cwd, &receipt, true, None, None).map_err(|cause| cause.to_string())?;
-        admit_delivery(cwd, &receipt, base).map_err(|cause| cause.to_string())?;
+    }
+    if labels.is_empty() {
+        admit_delivery(cwd, &receipt, base, None).map_err(|cause| cause.to_string())?;
     } else {
         claim_delivery_lane(cwd, repository, task, pr, head, base, labels)
             .map_err(|cause| cause.to_string())?;
@@ -4557,7 +4581,7 @@ fn assert_finish_main_synced(
         {
             emergency::observe(root, receipt, view, &current)?;
         }
-        admit_delivery(root, receipt, &current)?;
+        admit_delivery(root, receipt, &current, None)?;
     }
     Ok(())
 }
@@ -4620,6 +4644,7 @@ fn deliver_locked(
         inspected
             .last()
             .ok_or_else(|| error("検査済みbaseがありません"))?,
+        None,
     )?;
     let initial = pr_view(root, &repository, expected_pr)?;
     if bool_value(&initial, "isDraft")? {
@@ -4680,6 +4705,7 @@ fn deliver_locked(
         inspected
             .last()
             .ok_or_else(|| error("検査済みbaseがありません"))?,
+        None,
     )?;
     let path = state_path(&repository, task)?;
     let state = if path.exists() || path.is_symlink() {
@@ -4851,7 +4877,8 @@ fn finish_locked(
         } else {
             ruleset(root, &repository)?;
         }
-        admit_delivery(root, &receipt_value, &live)?;
+        let merge = oid(&str_value(get(&view, "mergeCommit")?, "oid")?, "実merge")?;
+        admit_delivery(root, &receipt_value, &live, Some(&merge))?;
     }
     if stage == "merge_started" {
         state = save_stage(&repository, task, &state, "merged", "")?;
@@ -4895,7 +4922,7 @@ fn finish_locked(
         let remote_main = fetch_main(root, &repository)?;
         if gate == emergency::GATE {
             emergency::observe(root, &receipt_value, &view, &remote_main)?;
-            admit_delivery(root, &receipt_value, &remote_main)?;
+            admit_delivery(root, &receipt_value, &remote_main, None)?;
         }
         let sync_from = git(
             root,
@@ -4967,7 +4994,7 @@ fn finish_locked(
     if gate == emergency::GATE {
         let live = fetch_main(root, &repository)?;
         emergency::observe(root, &receipt_value, &view, &live)?;
-        admit_delivery(root, &receipt_value, &live)?;
+        admit_delivery(root, &receipt_value, &live, None)?;
     }
     // main同期が終わっても、記録の保存を確認するまでは何も削除しない。
     work_log::sync(root, &state, false)?;

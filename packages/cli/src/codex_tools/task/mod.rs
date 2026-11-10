@@ -1823,6 +1823,23 @@ fn resume_with_ci_labels(
 }
 
 fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
+    ready_with_hosted_policy(context, task, tasks, |base, head| {
+        super::delivery::task_hosted_ci_only(
+            &context.repository,
+            &task.github,
+            base,
+            head,
+            task.merge_commit.as_deref(),
+        )
+    })
+}
+
+fn ready_with_hosted_policy(
+    context: &Context,
+    task: &Task,
+    tasks: &[Task],
+    hosted_only: impl FnOnce(&str, &str) -> bool,
+) -> Result<bool> {
     if task.run.is_some()
         || task.pause_requested
         || !matches!(
@@ -1886,7 +1903,8 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
             return Ok(false);
         }
         // 起動直前の再観測もstateへ保存してから、このgateへ渡す。
-        if !(task.phase == Phase::Finish && repair_ready(task))
+        let repair_finish = task.phase == Phase::Finish && repair_ready(task);
+        if !repair_finish
             && (task.ci_observation_error_at.is_some()
                 || task.ci_evidence.as_ref().is_none_or(|observation| {
                     !observation.allows_delivery()
@@ -1911,26 +1929,43 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
         {
             return Ok(false);
         }
-        let ci = task
-            .ci_evidence
-            .as_ref()
-            .is_none_or(ci::Observation::requires_ci_reservation);
-        if !super::delivery::task_delivery_lane_available(
-            &context.codex_home,
-            &task.github,
-            &task.id,
-            task.pr.ok_or("統合対象PRがありません")?,
-            task.head.as_deref().ok_or("統合対象headがありません")?,
-            task.base.as_deref().ok_or("統合対象baseがありません")?,
-            ci,
-            tasks
-                .iter()
-                .find(|parent| {
-                    task.recovery.parent.as_ref() == Some(&parent.id)
-                        && repair_exempt(task, parent, tasks)
-                })
-                .map(|parent| parent.id.as_str()),
-        )? {
+        let observation = task.ci_evidence.as_ref().filter(|_| !repair_finish);
+        let needs_ci_lane = observation.is_none_or(ci::Observation::requires_ci_reservation);
+        let head = task.head.as_deref().ok_or("統合対象headがありません")?;
+        let base = observation
+            .map(|ci| ci.base.as_str())
+            .or(task.base.as_deref())
+            .ok_or("統合対象baseがありません")?;
+        let pr = task.pr.ok_or("統合対象PRがありません")?;
+        let repair_parent = tasks
+            .iter()
+            .find(|parent| {
+                task.recovery.parent.as_ref() == Some(&parent.id)
+                    && repair_exempt(task, parent, tasks)
+            })
+            .map(|parent| parent.id.as_str());
+        let available = |ci| {
+            super::delivery::task_delivery_lane_available(
+                &context.codex_home,
+                &task.github,
+                &task.id,
+                pr,
+                head,
+                base,
+                ci,
+                repair_parent,
+            )
+        };
+        if !available(needs_ci_lane)?
+            && (!needs_ci_lane
+                || repair_finish
+                || !matches!(
+                    task.delivery_gate(),
+                    ci::GateMode::Strict | ci::GateMode::GithubFreePrivate
+                )
+                || !hosted_only(base, head)
+                || !available(false)?)
+        {
             return Ok(false);
         }
     }
@@ -3206,6 +3241,37 @@ mod tests {
         let mut ordinary = reviewed_task(&fixture);
         record_ci_result(&mut ordinary, Ok(successful_observation())).unwrap();
         assert!(!ready(&fixture.0, &ordinary, std::slice::from_ref(&ordinary)).unwrap());
+        for merged in [false, true] {
+            if merged {
+                ordinary.phase = Phase::MainCi;
+                let mut proof = successful_observation();
+                proof.merged = true;
+                proof.target = "c".repeat(40);
+                proof.base = proof.target.clone();
+                proof.merge_commit = Some(proof.target.clone());
+                record_ci_result(&mut ordinary, Ok(proof)).unwrap();
+            }
+            assert!(
+                ready_with_hosted_policy(
+                    &fixture.0,
+                    &ordinary,
+                    std::slice::from_ref(&ordinary),
+                    |base, head| {
+                        assert_eq!(
+                            base,
+                            if merged {
+                                "c".repeat(40)
+                            } else {
+                                "b".repeat(40)
+                            }
+                        );
+                        assert_eq!(head, "a".repeat(40));
+                        true
+                    }
+                )
+                .unwrap()
+            );
+        }
         assert_eq!(std::fs::read(file).unwrap(), before);
     }
 
