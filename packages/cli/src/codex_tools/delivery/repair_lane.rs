@@ -128,15 +128,27 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
         &str_value(&manifest, "branch")?,
         &request.child_head,
     )?;
-    let child_ci_wait = if str_value(&child_view, "mergeStateStatus")? == "BLOCKED" {
-        blocked_ci_evidence(&root, &child_repo, &request.child_head)?
-    } else {
-        Value::Null
-    };
     let base = fetch_main(&root, &child_repo)?;
     if !emergency::git_ancestor(&root, &base, &request.child_head)? {
         return Err(error("修復headが最新baseを含んでいません"));
     }
+    default_branch(&root, &child_repo)?;
+    let gate = receipt_gate_mode(&child)?;
+    if free_private_gate(&gate) {
+        free_private_repository(&root, &child_repo)?;
+    } else if gate == LOCAL_VALIDATION_GATE_MODE {
+        validate_local_gate_workflow_policy(&path, &base, &request.child_head, &gate)?;
+    } else if gate == emergency::GATE {
+        emergency::observe(&root, &child, &child_view, &base)?;
+    } else {
+        ruleset(&root, &child_repo)?;
+    }
+    let child_ci_wait = child_ci_evidence(
+        &root,
+        &child_repo,
+        &request.child_head,
+        str_value(&child_view, "mergeStateStatus")? == "BLOCKED",
+    )?;
     let scope = lane::Scope {
         repository: child_repo.clone(),
         task: request.child_task.clone(),
@@ -182,7 +194,12 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
     Ok(object([("status", string("repair-admitted"))]))
 }
 
-fn blocked_ci_evidence(root: &Path, repository: &str, head: &str) -> Result<Value> {
+fn child_ci_evidence(
+    root: &Path,
+    repository: &str,
+    head: &str,
+    require_wait: bool,
+) -> Result<Value> {
     let data = graphql(
         root,
         repository,
@@ -212,9 +229,10 @@ fn blocked_ci_evidence(root: &Path, repository: &str, head: &str) -> Result<Valu
             "--slurp".into(),
         ],
     )?;
-    blocked_ci_only(protection, &rules, &checks, head)?;
+    child_ci_only(protection, &rules, &checks, head, require_wait)?;
     Ok(object([
         ("head", string(head)),
+        ("require_wait", Value::Bool(require_wait)),
         ("observed_at", string(now())),
         ("protection", protection.clone()),
         ("rules", rules),
@@ -223,11 +241,12 @@ fn blocked_ci_evidence(root: &Path, repository: &str, head: &str) -> Result<Valu
 }
 
 /// BLOCKEDの理由をCI待ちへ限定する。配備・approval・未知ruleは枠取得前に保持する。
-fn blocked_ci_only(
+fn child_ci_only(
     protection: &Value,
     rule_pages: &Value,
     check_pages: &Value,
     head: &str,
+    require_wait: bool,
 ) -> Result<()> {
     if !protection.is_null() {
         return Err(error("classic protectionのBLOCKED理由を確定できません"));
@@ -301,14 +320,14 @@ fn blocked_ci_only(
             }
         }
     }
-    if required.is_empty() {
+    if require_wait && required.is_empty() {
         return Err(error("未完了required CIを確認できません"));
     }
     let pages = check_pages
         .as_array()
         .filter(|pages| pages.len() <= MAX_PAGES)
         .ok_or_else(|| error("CI一覧が不完全です"))?;
-    let mut count = 0;
+    let mut ids = HashSet::new();
     let mut total = None;
     let mut passed = HashSet::new();
     let mut waiting = false;
@@ -322,7 +341,10 @@ fn blocked_ci_only(
             .as_array()
             .ok_or_else(|| error("CI一覧が不正です"))?
         {
-            count += 1;
+            let id = int_value(check, "id")?;
+            if id <= 0 || !ids.insert(id) {
+                return Err(error("CI一覧に不正または重複したIDがあります"));
+            }
             if str_value(check, "head_sha")? != head {
                 return Err(error("CI対象headが一致しません"));
             }
@@ -351,10 +373,10 @@ fn blocked_ci_only(
             }
         }
     }
-    if total != Some(count) {
+    if total != Some(ids.len() as i64) {
         return Err(error("CI一覧が不完全です"));
     }
-    if waiting || required.iter().any(|name| !passed.contains(name)) {
+    if !require_wait || waiting || required.iter().any(|name| !passed.contains(name)) {
         Ok(())
     } else {
         Err(error("BLOCKED理由をrequired CI待ちと確認できません"))
@@ -373,8 +395,7 @@ fn assert_child_open(view: &Value, repository: &str, branch: &str, head: &str) -
         || !same_head_repository(view, repository)
         || !view.get("autoMergeRequest").is_some_and(Value::is_null)
         || str_value(view, "mergeable")? != "MERGEABLE"
-        || !(matches!(status.as_str(), "CLEAN" | "UNSTABLE" | "BLOCKED")
-            || draft && status == "DRAFT")
+        || !(matches!(status.as_str(), "CLEAN" | "BLOCKED") || draft && status == "DRAFT")
     {
         return Err(error("修復PRの固定identity/conflict/stateを確認できません"));
     }
@@ -410,12 +431,28 @@ fn repair_needed(observed: &Value) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn blocked_ci_only(
+        protection: &Value,
+        rules: &Value,
+        checks: &Value,
+        head: &str,
+    ) -> Result<()> {
+        child_ci_only(protection, rules, checks, head, true)
+    }
     #[test]
     fn blocked_admission_requires_only_ruleset_ci_wait_and_rejects_deployment_or_unknown_blockers()
     {
         let rules = serde_json::json!([[{"type":"pull_request","parameters":{"required_approving_review_count":0,"require_code_owner_review":false,"require_last_push_approval":false,"required_review_thread_resolution":true,"allowed_merge_methods":["merge"]}},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"required_status_checks":[{"context":"unit","integration_id":15368}]}}]]);
-        let checks = serde_json::json!([{"total_count":1,"check_runs":[{"name":"unit","head_sha":"a".repeat(40),"status":"queued","conclusion":null,"app":{"id":15368}}]}]);
+        let checks = serde_json::json!([{"total_count":1,"check_runs":[{"id":101,"name":"unit","head_sha":"a".repeat(40),"status":"queued","conclusion":null,"app":{"id":15368}}]}]);
         assert!(blocked_ci_only(&Value::Null, &rules, &checks, &"a".repeat(40)).is_ok());
+        let mut duplicate = checks.clone();
+        let check = duplicate[0]["check_runs"][0].clone();
+        duplicate[0]["check_runs"]
+            .as_array_mut()
+            .unwrap()
+            .push(check);
+        duplicate[0]["total_count"] = Value::from(2);
+        assert!(blocked_ci_only(&Value::Null, &rules, &duplicate, &"a".repeat(40)).is_err());
         assert!(
             blocked_ci_only(
                 &Value::Null,
@@ -428,6 +465,7 @@ mod tests {
         let mut deployment = rules.clone();
         deployment[0].as_array_mut().unwrap().push(serde_json::json!({"type":"required_deployments","parameters":{"required_deployment_environments":["production"]}}));
         assert!(blocked_ci_only(&Value::Null, &deployment, &checks, &"a".repeat(40)).is_err());
+        assert!(child_ci_only(&Value::Null, &deployment, &checks, &"a".repeat(40), false).is_err());
         assert!(
             blocked_ci_only(
                 &serde_json::json!({"id":"synthetic-protection"}),
@@ -483,6 +521,17 @@ mod tests {
             )
             .is_err()
         );
+        view["mergeStateStatus"] = string("UNSTABLE");
+        assert!(
+            assert_child_open(
+                &view,
+                "example/infrastructure",
+                "fix/infra",
+                &"a".repeat(40)
+            )
+            .is_err()
+        );
+        view["mergeStateStatus"] = string("BLOCKED");
         for state in ["CONFLICTING", "UNKNOWN"] {
             view["mergeable"] = string(state);
             assert!(

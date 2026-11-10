@@ -396,6 +396,8 @@ mainが実mergeより先へ進んでいれば、そのlive SHAのCIもAPI取得�
 CI以外のrule、配備・review承認、classic protectionなどの判定不能な阻害条件がなく、未完了required Actionsだけが
 残っていることを確認してprivate証拠へ保存します。API不明や、全required CI成功後も理由不明のBLOCKEDなら保持します。conflict/UNKNOWNも保持し、
 merge時のCI・Ruleset gateは通常のdeliverで再検証します。CI起動labelを必要とする修復PRも先行枠との相互待ちにしません。
+枠取得前にもchildの通常deliveryに必要な非CI契約を確認します。strictは既存の完全なRuleset契約を使い、
+default Ruleset不足・bypass・配備条件などを枠取得後へ持ち越しません。UNSTABLEのchildは保持し、修復・再検証へ戻します。
 交差repositoryの修復は1段に制限し、競合・循環・別の修復中は保持します。再実行は同じ固定scopeで再照合します。
 修復PRは通常のauthorize-ci/deliver/finishを使い、finish完了時だけ親scopeへ戻ります。親のfinishを再開して
 CI回復または更新済みの限定証拠を確認します。無条件release、state手編集、旧helperへの退避を使いません。
