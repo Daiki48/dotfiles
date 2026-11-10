@@ -140,6 +140,10 @@ job name. Each workflow's `runs-on` selects GitHub-hosted or self-hosted executi
 private repository may explicitly use `--gate-mode github-free-private` while retaining the live
 repository identity and fixed-head checks.
 
+The explicit, single-delivery `--gate-mode emergency-ci` records a user-approved CI infrastructure exception,
+fixed head/base, local tests/build, independent review, and exact waived CI identities/states. It preserves normal
+defaults and GitHub protections. See the [emergency delivery guide](docs/codex-delivery.ja.md#ci基盤障害時の一回限りの緊急承認).
+
 When neither the live PR base nor the fixed head contains `.github/workflows/*.yml|*.yaml`,
 `--gate-mode local-validation` uses the fixed-head local format, lint, type, test, and build evidence
 that applies to the product. Missing CI alone does not require human approval. If GitHub Actions

@@ -225,6 +225,109 @@ local検証で迂回せず、workflowのtrigger、`runs-on`、job、matrixとliv
 mergeやpushで自動起動する既存CDはそのworkflowへ任せて状態を報告します。manual dispatch、release、
 production deploy、新しいenvironment approvalはdelivery helperのscopeに含めません。
 
+### CI基盤障害時の一回限りの緊急承認
+
+`--gate-mode emergency-ci`はrepositoryを限定しない例外経路です。通常のstrictを既定に保ち、CI失敗、pending、
+runner待ち、APIエラーから自動選択しません。機能の導入許可は個別PRの免除許可ではありません。
+利用者がrepository/task/PR/head/live base/Planと版、理由、免除対象と状態を明示承認した一回のdeliveryだけに適用します。
+workflowが存在しても利用できます。最低riskはhighで、固定headのlocal test/build、変更に該当するformat/lint/型検査、
+独立review、actionable=0、未解決thread=0を必須にします。`record-review`では作成できません。
+
+基盤障害を製品testの失敗と区別し、原因調査・ローカル検証・reviewを終えてから承認を受けます。
+既知のtest失敗は対象外です。原因をログから自動証明する機能ではなく、利用者の承認、原因区分と根拠、
+成功した検証command、独立reviewを構造化して保存します。CIの実測値は書き換えません。
+
+requestはGit管理外の非公開領域へ、同一UID所有・0600の通常fileとして作成します。次は合成例です。
+placeholderを承認された値へ置き換え、公開先へ貼り付けないでください。
+
+```json
+{
+  "version": 1,
+  "repository": "<OWNER>/<REPO>",
+  "task_id": "<TASK_ID>",
+  "pr": 7,
+  "head_sha": "<HEAD_SHA>",
+  "base_sha": "<BASE_SHA>",
+  "plan_id": "<EXISTING_PLAN_ID>",
+  "plan_version": 1,
+  "reason": "今回CIを利用できない具体的な理由",
+  "authorization": "対象と理由を含む利用者の明示承認",
+  "local_validation": [
+    {"kind": "test", "command": "<実行済みtest command>", "result": "passed"},
+    {"kind": "build", "command": "<実行済みbuildまたは構成検証command>", "result": "passed"}
+  ],
+  "independent_review": "固定headの独立reviewの確認範囲と結果",
+  "known_test_failures": false,
+  "acknowledge_workflow_runs": true,
+  "public_summary": "公開してよい障害理由・免除対象・検証/review結果・CI未検証の限界",
+  "waivers": [
+    {"kind": "check-run", "name": "<CHECK_NAME>", "source": "app:<APP_ID>",
+     "states": ["failure", "queued", "in_progress"], "cause": "admission-failure", "evidence": "基盤障害の根拠"},
+    {"kind": "workflow", "name": ".github/workflows/ci.yml", "source": "actions:pull_request",
+     "states": ["failure", "queued", "in_progress"], "cause": "service-outage", "evidence": "PR実行の障害根拠"},
+    {"kind": "workflow", "name": ".github/workflows/ci.yml", "source": "actions:push",
+     "states": ["failure", "queued", "in_progress"], "cause": "service-outage", "evidence": "同じdeliveryの実mergeにも適用する障害根拠"},
+    {"kind": "workflow", "name": ".github/workflows/ci.yml", "source": "actions",
+     "states": ["missing"], "cause": "runner-unavailable", "evidence": "実行が作成されない場合の根拠"}
+  ]
+}
+```
+
+`local_validation.kind`は`test`/`build`/`lint`/`format`/`typecheck`で、testとbuildを必須にします。
+buildがないrepositoryでは構文検証等の実行可能性の検証を記録します。全resultは`passed`を要求します。
+`cause`は`admission-failure`/`runner-unavailable`/`service-outage`だけです。
+免除可能な`states`は`failure`/`error`/`startup_failure`/`cancelled`/`timed_out`/`queued`/`in_progress`/
+`pending`/`requested`/`waiting`/`missing`です。`action_required`や未知状態は免除できません。
+checkは`check-run`と`app:<ID>`、commit statusは`commit-status`と`user:<CREATOR_ID>`、
+workflow runは`workflow`、workflow pathと`actions:<EVENT>`で識別します。全て完全一致でwildcardはありません。
+workflow run不在は同じpath・source=`actions`・state=`missing`を別に承認します。
+workflowも観測もない場合だけ`ci`・`no-observations`・`github`・`missing`を使います。
+別のcheck/提供元/状態は自動免除しません。check/status/run IDと実際の状態を保存し、生ログを取り込みません。
+
+親checkoutから既存taskを照合し、それぞれ独立commandとして実行します。
+
+```console
+codex-worktree doctor --task-id <TASK_ID>
+codex-worktree resume --task-id <TASK_ID>
+codex-delivery approve-review --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --plan-id <EXISTING_PLAN_ID> --plan-version <VERSION> --risk high --tests-passed --independent-review-passed --gate-mode emergency-ci --emergency-request <PRIVATE_REQUEST_ABSOLUTE_PATH>
+codex-delivery deliver --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --plan-id <EXISTING_PLAN_ID> --plan-version <VERSION> --gate-mode emergency-ci
+codex-delivery finish --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --plan-id <EXISTING_PLAN_ID> --plan-version <VERSION> --gate-mode emergency-ci --issue <ISSUE>
+```
+
+既存receiptから移行する場合だけapprove-reviewへ`--replace-receipt`を追加します。同じrepository/task/PR/head/
+Planと版、変更file、検証範囲を保持し、riskを下げません。Plan版がない古いreceiptは移行できません。
+ledger付き旧v5は移行時にも旧証拠を検証します。merge後の移行は拒否します。
+同じrequestの再実行は同じreceiptを再利用します。理由/base/免除/証拠の変更は新しい利用者承認をrequestへ反映して
+`--replace-receipt`を明示します。task lockと既存stageで二重実行を制限し、merge済みなら同じreceiptのfinishから再開します。
+stateやinstalled helperの手編集は不要です。公開記録に所有不明の編集がある場合も保持して停止します。
+
+既存coordinatorへ渡す場合は旧writerの停止・回収を確認し、receipt作成後に次を使います。重複submitはしません。
+
+```console
+codex-task resume --task-id <TASK_ID> --instruction '既存PRと承認済みreceiptのdeliver/finishを継続' --gate-mode emergency-ci --authorization '<今回の対象と理由を含む利用者の明示承認>'
+codex-task start
+```
+
+coordinatorはreceipt digestを束縛して再観測し、CI失敗の実測を保持してIntegration/MainCi/Finishへ進みます。
+workerは承認を作成・拡大しません。後続taskには緊急承認を継承せずstrictを使います。
+CI以外のidentity、最新baseのancestor、conflict、review、clean、所有、保存記録、ff-only同期とcleanupは維持します。
+`UNSTABLE`は非成功CIが全て承認範囲に入る場合だけ許可し、`BLOCKED`/`UNKNOWN`/`DIRTY`/`BEHIND`等は拒否します。
+このmodeはローカルstrict Ruleset契約の代わりに、通常のGitHub mergeでサーバー側の保護要件を適用します。
+GitHubが拒否した場合は停止し、Ruleset変更、admin merge、保護branch直pushへ広げません。
+[GitHubの状態定義](https://docs.github.com/en/graphql/reference/pulls#mergestatestatus)と
+[保護checkの扱い](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)が外部の正本です。
+
+finishは実mergeが承認base/headを順番通りの親に持ち、treeがlocal検証済みheadと同じでmainへ到達したことを検証します。
+CI免除はこの実mergeだけです。mainがさらに進んだ場合は最新SHAの通常Actions成功を別途要求します。
+承認と初回観測はprivate receipt v7、最新実測は同じheadの`.emergency.json`へ分離保存します。
+PRには`public_summary`と免除の限界だけを保存確認し、requestや生の監査JSONを公開しません。
+Issue記録とcleanupは既存finishを使い、API取得不能や保存確認失敗では削除しません。
+
+CI待機の免除はworkflowの停止ではありません。事前にbase/headのtriggerと既存CDへの影響を調べて報告し、
+`acknowledge_workflow_runs`で記録します。push/mergeの自動起動は既存設定に従います。
+manual dispatch、release、production deploy、新しいenvironment approvalは含みません。
+次の新しいtask/deliveryではgate指定を省略して通常経路を使います。このfeature自身の納品に緊急経路を使いません。
+
 ## deliver
 
 `deliver`はreceiptとlive状態をもう一度読み取り、上記の全条件を満たした同一SHAだけを対象にします。

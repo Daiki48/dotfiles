@@ -380,7 +380,13 @@ pub(super) fn prompt(task: &Task) -> String {
     let phase = format!(
         "{phase}\n既存receiptがある場合は、そこに束縛されたPlan IDと版を維持してください。taskデータのplan_id/plan_versionはreceipt未作成時の既定値です。"
     );
-    let phase = if matches!(task.phase, Phase::Integration | Phase::Finish) {
+    let phase = if matches!(task.phase, Phase::Integration | Phase::Finish)
+        && task.delivery_gate() == super::ci::GateMode::EmergencyCi
+    {
+        format!(
+            "{phase}\n今回だけのemergency-ci承認をcoordinatorが既存receiptとdigestで照合済みです。冒頭の通常record-reviewの手順に代えて、承認済みreceiptを再利用し、deliver・finishには --gate-mode emergency-ci を明示してください。approve-review、新しいrequest作成、receipt移行、CI免除の追加はworkerへ委任されていません。既存receiptのPR/head/base/Planと版、CI免除対象・状態、local検証と独立reviewを保持してください。承認外の失敗、head/base/理由の変化は新しい利用者判断が必要です。CIをsuccessへ書き換えず、通常CI待機への無条件fallbackもせず、対象操作を保留して具体的な失効理由を返してください。GitHubの保護要件、review/conflict/clean/所有・記録・cleanupの条件はhelperが再検証します。main側免除は承認済みbase/headを親に持つ同じtreeの実mergeだけへ適用し、別main更新は通常CIを要求します。workflow/CDは既存triggerに従います。manual deploy/release/保護解除/--adminは対象外です。"
+        )
+    } else if matches!(task.phase, Phase::Integration | Phase::Finish) {
         let gate_argument = match task.delivery_gate() {
             super::ci::GateMode::Strict => {
                 "record-review・deliver・finishでは --gate-mode を省略してください。strict-rulesetは既存parserの省略時の既定値です。strictやstrict-rulesetを明示指定しないでください。"
@@ -391,6 +397,7 @@ pub(super) fn prompt(task: &Task) -> String {
             super::ci::GateMode::GithubFreePrivate => {
                 "record-review・deliver・finishにはすべて --gate-mode github-free-private を明示し、既存のlive private repository policy・固定headのActionsとreviewをhelperで検証してください。API失敗から別modeを推測しないでください。"
             }
+            super::ci::GateMode::EmergencyCi => unreachable!("emergency prompt is handled above"),
         };
         format!(
             "{phase}\ncoordinatorが観測したgate-modeは{}です。{gate_argument}local-validationはCI成功の代用ではありません。固定headに比例したlocal検証の結果とriskに必要なレビューを確認し、review receiptへtests-passedを記録してください。実在Actions check・head/base一致・最新base・未解決thread等の既存delivery gateはhelperで再検証し、省略しないでください。API不明やworkflow存在をlocalへ読み替えないでください。Finishでは既存receiptのgate-modeと一致を確認してください。",

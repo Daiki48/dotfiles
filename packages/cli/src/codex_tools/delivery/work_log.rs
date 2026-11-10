@@ -205,7 +205,7 @@ fn sync_with(
     Ok(())
 }
 
-fn api(root: &Path, method: &str, endpoint: &str, body: Option<&str>) -> Result<Value> {
+pub(super) fn api(root: &Path, method: &str, endpoint: &str, body: Option<&str>) -> Result<Value> {
     let sandbox = GhSandbox::create(root)?;
     let mut command = vec![
         trusted_binary(GH_BINARY, "GitHub CLI")?,

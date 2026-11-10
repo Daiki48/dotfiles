@@ -36,6 +36,7 @@ pub(super) enum GateMode {
     Strict,
     LocalValidation,
     GithubFreePrivate,
+    EmergencyCi,
 }
 
 impl GateMode {
@@ -44,6 +45,7 @@ impl GateMode {
             Self::Strict => "strict",
             Self::LocalValidation => "local-validation",
             Self::GithubFreePrivate => "github-free-private",
+            Self::EmergencyCi => "emergency-ci",
         }
     }
 }
@@ -78,10 +80,30 @@ pub(super) struct Observation {
     pub gate_mode: GateMode,
     #[serde(default)]
     pub workflows: Option<WorkflowEvidence>,
+    #[serde(default)]
+    pub emergency: Option<Value>,
 }
 
 impl Observation {
     pub fn allows_delivery(&self) -> bool {
+        if self.gate_mode == GateMode::EmergencyCi {
+            return self.state != CiState::Stale
+                && self.emergency.as_ref().is_some_and(|proof| {
+                    proof["approved"] == true
+                        && proof["head"] == self.head
+                        && proof["base"] == self.base
+                        && proof["target"] == self.target
+                        && proof["merged"] == self.merged
+                        && proof["receipt_sha256"].as_str().is_some_and(|digest| {
+                            digest.len() == 64 && digest.bytes().all(|c| c.is_ascii_hexdigit())
+                        })
+                        && if self.merged {
+                            self.merge_commit.as_ref() == Some(&self.target)
+                        } else {
+                            proof["approved_base"] == self.base && self.target == self.head
+                        }
+                });
+        }
         match (self.gate_mode, self.state) {
             (GateMode::Strict, CiState::Success) => true,
             (GateMode::GithubFreePrivate, CiState::Success) => {
@@ -105,6 +127,75 @@ impl Observation {
             _ => false,
         }
     }
+}
+
+pub(super) fn emergency_observation(proof: Value) -> Result<Observation, String> {
+    let field = |key: &str| {
+        proof[key]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "緊急CI観測が不正です".to_string())
+    };
+    let head = field("head")?;
+    let base = field("base")?;
+    let target = field("target")?;
+    for sha in [&head, &base, &target] {
+        validate_sha(sha)?;
+    }
+    let merged = proof["merged"].as_bool().ok_or("緊急CI観測が不正です")?;
+    let entries = proof["target_ci"]["entries"]
+        .as_array()
+        .ok_or("緊急CI観測が不正です")?;
+    // failure/pending/missingを成功へ変換せず、承認証拠を別fieldへ保持する。
+    let states: Vec<_> = entries
+        .iter()
+        .map(|entry| entry["state"].as_str().unwrap_or(""))
+        .collect();
+    let state = if states
+        .iter()
+        .any(|state| matches!(*state, "failure" | "error" | "startup_failure"))
+    {
+        CiState::Failure
+    } else if states.contains(&"timed_out") {
+        CiState::TimedOut
+    } else if states.contains(&"cancelled") {
+        CiState::Cancelled
+    } else if states.contains(&"missing") {
+        CiState::Missing
+    } else if states
+        .iter()
+        .all(|state| matches!(*state, "success" | "skipped" | "neutral"))
+    {
+        CiState::Success
+    } else {
+        CiState::Pending
+    };
+    let fingerprint = format!(
+        "emergency:{:x}",
+        Sha256::digest(serde_json::to_vec(&proof).map_err(|_| "緊急CI観測が不正です")?)
+    );
+    let observation = Observation {
+        state,
+        head,
+        base,
+        target: target.clone(),
+        fingerprint,
+        merge_commit: merged.then_some(target),
+        merged,
+        observed_at: super::store::now(),
+        required: vec![],
+        snapshot: Snapshot {
+            runs: vec![],
+            statuses: vec![],
+        },
+        gate_mode: GateMode::EmergencyCi,
+        workflows: None,
+        emergency: Some(proof),
+    };
+    if !observation.allows_delivery() {
+        return Err("固定deliveryの緊急承認が不足しています".into());
+    }
+    Ok(observation)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +315,9 @@ fn observe_with_policy(
     policy: GateMode,
     fetch: &mut Fetch<'_>,
 ) -> Result<Observation, String> {
+    if policy == GateMode::EmergencyCi || main == Some(GateMode::EmergencyCi) {
+        return Err("緊急CI観測には対象taskの承認receiptが必要です".into());
+    }
     // Strict is the default policy: workflow-free repositories retain the local gate.
     // Preserve an existing local receipt, but never reinterpret a FreePrivate receipt.
     let selection = if policy == GateMode::Strict {
@@ -410,6 +504,7 @@ fn observe_with_selection(
         snapshot,
         gate_mode,
         workflows: Some(workflows),
+        emergency: None,
     })
 }
 
@@ -1236,6 +1331,7 @@ mod tests {
             snapshot: Snapshot { runs, statuses },
             gate_mode: GateMode::Strict,
             workflows: None,
+            emergency: None,
         };
         let saved = serde_json::to_value(&observation).unwrap();
         assert_eq!(saved["snapshot"]["runs"][0]["run_id"], 99);

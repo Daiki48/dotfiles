@@ -178,6 +178,22 @@ candidate/credential不足と親のfile分割があっても、許可済みのso
 親終了後の無人delivery・cleanupや自然言語判断一般を保証しません。失敗時の報告は成果物領域に
 保持されるので、原因を確認し、必要な検証記録を残してから正規helperで回収してください。
 
+### 固定deliveryへの緊急CI承認
+
+CI基盤障害の一回限りの例外は[deliveryガイド](codex-delivery.ja.md#ci基盤障害時の一回限りの緊急承認)に従います。
+既存task/PR/head/base/Planのlocal test/buildと独立reviewを揃え、利用者の対象別明示承認で
+`codex-delivery approve-review --gate-mode emergency-ci --emergency-request <private絶対path>`を実行します。
+既存receiptの移行は`--replace-receipt`を明示し、既存Planと版を維持します。
+旧workerの停止・回収後、同じtaskを`resume --gate-mode emergency-ci --authorization '<対象と理由の明示承認>'`
+で再開します。新規submitによる包括許可は受け付けません。既存receiptのdigestをtaskへ束縛するため、
+別task/head/baseや承認内容変更では再利用できません。
+
+CIのfailure/pending/missingは実測のまま保持し、承認された範囲に一致する場合だけIntegration/MainCi/Finishへ進みます。
+workerには`deliver`/`finish --gate-mode emergency-ci`と既存receiptの再利用だけを委任し、新規承認は委任しません。
+API不明、review未完了、conflict、承認外CI状態では進めません。main側は承認base/headを親に持つ同じtreeの実mergeを
+検証し、それ以外のmain更新へ免除を広げません。後続taskはstrictへ戻します。通常taskの既定とCI起動labelの許可範囲は維持します。
+workflow/CDの自動起動は停止せず、manual deploy/release/保護解除は含みません。
+
 ### workflow不在repositoryのlocal gate
 
 PR payloadの`base.sha`は古い場合があるため、対象branchのlive refを観測の前後で直接照合します。

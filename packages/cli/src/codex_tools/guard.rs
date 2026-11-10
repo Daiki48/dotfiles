@@ -5069,6 +5069,7 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         "--recover-main-sync-from",
         "--recover-main-sync-to",
         "--issue",
+        "--emergency-request",
     ];
     let switches = [
         "--tests-passed",
@@ -5077,6 +5078,7 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         "--sandbox-retry",
         "--recover-main-sync",
         "--recover-merged",
+        "--replace-receipt",
     ];
     let mut values = HashMap::new();
     let mut seen = Vec::new();
@@ -5172,12 +5174,34 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
     let local_gate = values
         .get("--gate-mode")
         .is_some_and(|v| v == "github-free-private-local");
+    let emergency_gate = values
+        .get("--gate-mode")
+        .is_some_and(|v| v == "emergency-ci");
+    let emergency_request = values.get("--emergency-request");
+    let replace_receipt = seen.iter().any(|v| v == "--replace-receipt");
+    if emergency_gate {
+        if command == "record-review"
+            || command == "approve-review"
+                && (emergency_request.is_none_or(|path| !Path::new(path).is_absolute())
+                    || !["high", "critical"]
+                        .contains(&values.get("--risk").map(String::as_str).unwrap_or("")))
+            || command != "approve-review" && (emergency_request.is_some() || replace_receipt)
+        {
+            return Some(
+                "緊急経路は対象別approve-reviewとprivateな絶対pathのrequestで承認してください"
+                    .into(),
+            );
+        }
+    } else if emergency_request.is_some() || replace_receipt {
+        return Some("緊急承認optionはemergency-ci専用です".into());
+    }
     let review_command = command == "record-review" || command == "approve-review";
     if values.get("--gate-mode").is_some_and(|v| {
         ![
             "github-free-private",
             "github-free-private-local",
             "local-validation",
+            "emergency-ci",
         ]
         .contains(&v.as_str())
     }) || values
@@ -5196,6 +5220,62 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         return Some("delivery helperの値が許可形式ではありません".into());
     }
     None
+}
+
+#[cfg(test)]
+mod emergency_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn guard_and_parser_require_the_same_explicit_emergency_commands() {
+        let base = format!(
+            "--task-id task-example --pr 7 --head {} --plan-id example-plan-v1 --plan-version 1",
+            "a".repeat(40)
+        );
+        let evidence = "--risk high --tests-passed --independent-review-passed";
+        for command in [
+            format!(
+                "codex-delivery approve-review {base} {evidence} --gate-mode emergency-ci --emergency-request /tmp/private.json --replace-receipt"
+            ),
+            format!("codex-delivery deliver {base} --gate-mode emergency-ci"),
+            format!("codex-delivery finish {base} --gate-mode emergency-ci --issue 3"),
+        ] {
+            assert!(
+                delivery_helper_invocation_reason(
+                    &command
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                )
+                .is_none(),
+                "{command}"
+            );
+        }
+        for command in [
+            format!(
+                "codex-delivery record-review {base} {evidence} --gate-mode emergency-ci --emergency-request /tmp/private.json"
+            ),
+            format!("codex-delivery approve-review {base} {evidence} --gate-mode emergency-ci"),
+            format!(
+                "codex-delivery approve-review {base} {evidence} --gate-mode emergency-ci --emergency-request relative.json"
+            ),
+            format!(
+                "codex-delivery approve-review {base} {evidence} --emergency-request /tmp/private.json"
+            ),
+            format!("codex-delivery finish {base} --gate-mode emergency-ci --replace-receipt"),
+        ] {
+            assert!(
+                delivery_helper_invocation_reason(
+                    &command
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                )
+                .is_some(),
+                "{command}"
+            );
+        }
+    }
 }
 
 fn nested_shell_commands(tokens: &[String]) -> Vec<String> {

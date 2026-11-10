@@ -24,6 +24,11 @@ hookのallow/deny、worktree manifest、delivery receipt v1〜v5の読み取り�
 外部契約を維持します。receipt v6とhelper CLIはlow/mediumでmain agentのself-review、high/criticalで独立review、
 criticalで必要な場合だけ専門reviewを要求します。v6 receiptはprivateなmanaged stateへ保存し、PR commentへ内部監査用JSONを投稿しません。既存v5 receiptのledger証拠は進行中taskの再開時だけ読み取り専用で検証します。設定移行では旧Python hookの定義を取り除き、Rust binaryを直接実行する定義へ置き換えます。
 
+対象別に明示承認された`emergency-ci`だけはprivate receipt v7を使い、CI実測と免除根拠を分けて保存します。
+通常のv6経路、guard、taskの既定は維持します。同じmulti-call binaryの正規installerでhelperとhookをまとめて更新します。
+旧版の常駐coordinatorは既存taskを増やさず終了・回収を確認し、新版で再開してから使います。
+導入後はCodexを再起動して更新されたAGENTS/Skill/hookを読み込みます。
+
 ## エラー処理と停止
 
 入力、path、schema、repository identityを検証できない場合は処理を続行せず、hookはdeny、helperは非0で
