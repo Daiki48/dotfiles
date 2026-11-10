@@ -5968,7 +5968,7 @@ mod tests {
         ])
     }
 
-    fn receipt_v6(risk_value: &str, specialist: bool) -> Value {
+    pub(super) fn receipt_v6(risk_value: &str, specialist: bool) -> Value {
         receipt_v6_with_review(risk_value, true, specialist)
     }
 
@@ -5995,7 +5995,7 @@ mod tests {
     }
 
     #[test]
-    fn emergency_schema_accepts_delegation_but_requires_tests_and_independent_review() {
+    fn emergency_schema_requires_explicit_approval_local_tests_and_independent_review() {
         let mut value = receipt_v6("high", false);
         let mut request = emergency::tests::sample_request();
         for key in [
@@ -6023,9 +6023,8 @@ mod tests {
             )
         };
         assert!(normalize(&value).is_ok());
-        value["decision"] = string("autonomous");
-        assert!(normalize(&value).is_ok());
         for field in [
+            "decision",
             "risk",
             "tests_passed",
             "independent_review_passed",
@@ -6034,6 +6033,7 @@ mod tests {
         ] {
             let mut invalid = value.clone();
             match field {
+                "decision" => invalid[field] = string("invalid-decision"),
                 "risk" => invalid[field] = string("medium"),
                 "tests_passed" | "independent_review_passed" => invalid[field] = Value::Bool(false),
                 "version" => invalid[field] = Value::from(RECEIPT_VERSION),

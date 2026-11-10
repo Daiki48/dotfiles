@@ -187,7 +187,7 @@ CI基盤障害の判断はCodexへ継続委任されています。[deliveryガ�
 `outcome=ready`、`assessment.next_action=emergency-ci`でCiEvidence段階へ進めます。
 必要ならriskをhighへ上げて独立reviewを先に行います。CiEvidenceはsource・Gitの変更やPRの直接編集を行わず、固定head/baseの
 local test/buildとreviewを確認し、private requestと`record-review --gate-mode emergency-ci`で根拠を保存します。
-正規helperによる公開用要約のPR記録だけはこの段階で行います。
+公開記録は正規helperが定型文と検証済み原因区分だけを投稿し、private requestの自由記述は転載しません。
 既存receiptの移行は`--replace-receipt`を明示し、既存Planと版を維持します。ready報告後もRustがreceiptと実CIを再検証します。
 手動で引き継ぐ場合は旧workerを停止回収し、同じIDを`resume --gate-mode emergency-ci`で再開します。
 

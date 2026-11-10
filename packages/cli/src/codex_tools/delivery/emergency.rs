@@ -630,9 +630,22 @@ pub(super) fn read_audit(receipt: &Value) -> Result<Value> {
 
 pub(super) fn note(receipt: &Value) -> Result<String> {
     let request = request(get(get(receipt, "emergency")?, "request")?, receipt)?;
+    // 自由記述・task名・path・command・check名を公開本文へ流さない。
+    let causes: std::collections::BTreeSet<_> = request
+        .waivers
+        .iter()
+        .map(|waiver| match waiver.cause.as_str() {
+            "admission-failure" => "CI実行受付の障害",
+            "runner-unavailable" => "runner利用不能",
+            "service-outage" => "CIサービス障害",
+            _ => unreachable!("requestで検証済みの原因区分"),
+        })
+        .collect();
     Ok(format!(
-        "<!-- codex-emergency-ci:{}:{} -->\n委任されたCI判断の範囲で、基盤障害の根拠・固定headのlocal検証・独立reviewを記録してCI待機を免除します。\n\n{}\n\nCIの実測値は変更していません。workflowと既存CDは既存triggerに従い起動し得ます。GitHubの保護要件とCI以外の検証は維持します。",
-        request.task_id, request.head_sha, request.public_summary
+        "<!-- codex-emergency-ci:v2:{}:{} -->\n委任されたCI判断の範囲で、固定headのlocal test/buildと独立reviewを確認し、CI待機を免除します。\n\n基盤障害区分: {}。対象と根拠の詳細は非公開の検証記録に保存しています。CIでの検証完了を示すものではありません。\n\nCIの実測値は変更していません。workflowと既存CDは既存triggerに従い起動し得ます。GitHubの保護要件とCI以外の検証は維持します。",
+        request.pr,
+        request.head_sha,
+        causes.into_iter().collect::<Vec<_>>().join("、")
     ))
 }
 
@@ -644,6 +657,12 @@ pub(super) fn publish_note(root: &Path, receipt: &Value) -> Result<()> {
     let issue_url = format!("https://api.github.com/repos/{repo}/issues/{pr}");
     let login = str_value(&work_log::api(root, "GET", "user", None)?, "login")?;
     let marker = body.lines().next().unwrap_or("");
+    let request = request(get(get(receipt, "emergency")?, "request")?, receipt)?;
+    // 旧形式は検索だけに用い、確認済みの自分の記録だけを新しい定型文へ移行する。
+    let legacy_marker = format!(
+        "<!-- codex-emergency-ci:{}:{} -->",
+        request.task_id, request.head_sha
+    );
     let record_path = audit_path(receipt)?.with_extension("note.json");
     let previous = if record_path.exists() {
         Some(read_json_file(&record_path, "緊急CI公開記録")?)
@@ -664,7 +683,8 @@ pub(super) fn publish_note(root: &Path, receipt: &Value) -> Result<()> {
     )?;
     let mut found = None;
     for comment in comments {
-        if str_value(&comment, "body")?.starts_with(marker) {
+        let comment_body = str_value(&comment, "body")?;
+        if comment_body.starts_with(marker) || comment_body.starts_with(&legacy_marker) {
             work_log::validate_comment(&comment, &issue_url, &login)?;
             if found.is_some() {
                 return Err(error("緊急CI記録の所有者または一意性を確認できません"));

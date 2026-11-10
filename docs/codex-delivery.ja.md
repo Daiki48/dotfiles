@@ -279,7 +279,7 @@ placeholderを検証した値へ置き換え、公開先へ貼り付けないで
   "independent_review": "固定headの独立reviewの確認範囲と結果",
   "known_test_failures": false,
   "acknowledge_workflow_runs": true,
-  "public_summary": "公開してよい障害理由・免除対象・検証/review結果・CI未検証の限界",
+  "public_summary": "互換fieldの非公開検証メモ。公開本文は定型文だけ。",
   "waivers": [
     {"kind": "check-run", "name": "<CHECK_NAME>", "source": "app:<APP_ID>",
      "states": ["failure", "queued", "in_progress"], "cause": "admission-failure", "evidence": "基盤障害の根拠"},
@@ -351,7 +351,9 @@ GitHubが拒否した場合は停止し、Ruleset変更、admin merge、保護br
 finishは実mergeが承認base/headを順番通りの親に持ち、treeがlocal検証済みheadと同じでmainへ到達したことを検証します。
 CI免除はこの実mergeだけです。mainがさらに進んだ場合は最新SHAの通常Actions成功を別途要求します。
 承認と初回観測はprivate receipt v7、最新実測は同じheadの`.emergency.json`へ分離保存します。
-PRには`public_summary`と免除の限界だけを保存確認し、requestや生の監査JSONを公開しません。
+PRには定型の検証結果・免除の限界と、検証済みの原因区分だけを保存確認します。
+`public_summary`はrequest v1の互換fieldとして非公開に保持し、自由記述・task名・path・command・check名は投稿しません。
+旧形式の公開記録は、privateな保存記録と一致する自分のcommentだけを定型文へ移行します。所有不明の編集は保持します。
 Issue記録とcleanupは既存finishを使い、API取得不能や保存確認失敗では削除しません。
 
 CI待機の免除はworkflowの停止ではありません。事前にbase/headのtriggerと既存CDへの影響を調べて報告し、

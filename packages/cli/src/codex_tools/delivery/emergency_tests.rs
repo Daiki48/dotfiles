@@ -13,11 +13,11 @@ pub(crate) fn sample_request() -> Value {
     json!({
         "version":1,"repository":"example/product","task_id":"task-example","pr":7,
         "head_sha":HEAD,"base_sha":BASE,"plan_id":"example-plan-v1","plan_version":1,
-        "reason":"CI service outage","authorization":"利用者がこのPR/head/baseのCI免除を指示",
+        "reason":"CI service outage","authorization":"CI基盤障害の判断を継続委任する作業規約",
         "local_validation":[{"kind":"test","command":"cargo test --locked","result":"passed"},{"kind":"build","command":"cargo build --locked","result":"passed"}],
         "independent_review":"固定headを独立review済み。actionable=0",
         "known_test_failures":false,"acknowledge_workflow_runs":true,
-        "public_summary":"CI基盤障害のため今回だけCI待機を免除。local test/buildと独立review済み。CIでの検証は未実施。",
+        "public_summary":"互換fieldの非公開検証メモ。公開本文は定型文だけ。",
         "waivers":[
             {"kind":"check-run","name":"unit","source":"app:42","states":["failure","queued","in_progress"],"cause":"admission-failure","evidence":"jobが開始前に拒否されたことを確認"},
             {"kind":"workflow","name":WORKFLOW,"source":"actions:pull_request","states":["failure","queued","in_progress","missing"],"cause":"service-outage","evidence":"基盤障害を確認"},
@@ -185,12 +185,52 @@ fn unstable_is_ci_only_and_never_allows_blocked_unknown_or_conflicts() {
 #[test]
 fn public_note_excludes_private_approval_and_raw_ci() {
     let mut receipt = scope();
-    receipt["emergency"] = json!({"request":sample_request()});
+    let private = "synthetic-private-marker /private-fixture/runtime";
+    let mut request = sample_request();
+    for key in [
+        "reason",
+        "authorization",
+        "independent_review",
+        "public_summary",
+    ] {
+        request[key] = json!(private);
+    }
+    request["local_validation"][0]["command"] = json!(private);
+    request["waivers"][0]["name"] = json!(private);
+    request["waivers"][0]["evidence"] = json!(private);
+    receipt["task_id"] = json!("task-private-fixture");
+    request["task_id"] = receipt["task_id"].clone();
+    receipt["emergency"] = json!({"request":request});
     let note = note(&receipt).unwrap();
     assert!(note.contains("local test/build"));
+    assert!(!note.contains("synthetic-private-marker"));
+    assert!(!note.contains("/private-fixture/runtime"));
+    assert!(!note.contains("task-private-fixture"));
     assert!(!note.contains("authorization"));
     assert!(!note.contains("jobが開始前"));
     assert!(!note.contains("app:42"));
+}
+
+#[test]
+fn current_emergency_receipt_accepts_autonomous_delegation_with_full_evidence() {
+    let mut value = super::super::tests::receipt_v6("high", false);
+    for (key, entry) in scope().as_object().unwrap() {
+        value[key] = entry.clone();
+    }
+    value["version"] = json!(VERSION);
+    value["gate_mode"] = json!(GATE);
+    value["decision"] = json!("autonomous");
+    value["emergency"] = json!({"request":sample_request(), "observed_ci":snapshot("failure")});
+    assert!(
+        super::super::receipt(
+            &value,
+            Path::new("/unused"),
+            "task-example",
+            HEAD,
+            Some("example/product")
+        )
+        .is_ok()
+    );
 }
 
 #[test]
