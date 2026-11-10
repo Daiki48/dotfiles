@@ -54,7 +54,9 @@ CI/workflow、Ruleset、hook、AGENTS、Skills、helper、installer等の安全�
 6. merge後に同じ指定で`codex-delivery finish`する。`issue-N` taskはIssue Nへ自動記録する。通常の`task-*`へ関連Issueを付ける場合は`finish --issue <番号>`も指定する。helperはPR本文と固定headをIssueへ保存確認してから、main同期済みのworktreeと成果物を物理削除し、同じ記録へ結果を反映する。PR本文は削除後も理解できる作業記録にしておく。
 7. Issue更新やcleanupが失敗したら同じ指定で再開する。削除前のIssue API失敗なら作業場を保持し、削除後の更新失敗なら物理回収済み・記録更新待ちを区別する。直接`gh pr merge`、`rm`、`worktree remove/prune`で迂回しない。
 
-CIはrepositoryの設定に従う。Utakataはopt-in先のself-hosted CIを使い、WSL2や他repositoryへ強制しない。既存のCI実行承認labelはrepositoryの権限内で扱う。workflowの待機・失敗からhosted/localへfallbackしない。live baseと固定headの双方にworkflowがない場合だけ`--gate-mode local-validation`を各delivery commandへ付ける。存在するActions checkは完了と成功系conclusionが必要で、skipだけで実質検証を省略しない。
+CIはrepositoryの設定に従う。Utakataはopt-in先のself-hosted CIを使い、WSL2や他repositoryへ強制しない。既存のCI実行承認labelはrepositoryの権限内で扱う。workflowの待機・失敗からhosted/localへfallbackしない。live baseと固定headの双方にworkflowがない場合だけ`--gate-mode local-validation`を各delivery commandへ付ける。通常は存在するActions checkの完了と成功系conclusionが必要で、skipだけで実質検証を省略しない。
+
+利用者が対象と理由を明示した今回限りのCI基盤障害の例外は、[deliveryガイド](../../../docs/codex-delivery.ja.md)の`emergency-ci`で扱う。具体的なrepository/task/PR/head/base/Plan・免除対象・local test/build・独立review・workflow/CDの影響を揃え、利用者の明示承認後だけprivateなrequestで`approve-review --gate-mode emergency-ci --emergency-request <絶対path>`を実行する。既存receiptからは同一対象・Planを保持して`--replace-receipt`を明示する。機能の追加許可を個別deliveryの免除許可へ流用しない。CIの実測と承認は別に保存し、公開PRへは公開用要約だけを記録する。head/base/理由/免除対象の変更は新規承認が必要。workerは承認を作成・拡大せず既存receiptで`deliver -> finish`する。既知のtest失敗、API不明、CI以外のgate、GitHubの保護要件は迂回しない。未承認のmain更新には免除を広げない。
 
 strict modeはlive Ruleset gateを必要とする。明示認可されたprivate repositoryの`github-free-private`はhigh以上とし、APIエラーから自動選択しない。gateの詳細、main同期の限定復旧、sandbox retryは[deliveryガイド](../../../docs/codex-delivery.ja.md)を必要時に読む。`--sandbox-retry`はhelperが発行したtokenがある場合だけ、同一UIDで1回再試行する。
 

@@ -118,7 +118,7 @@ enum Commands {
         task_id: String,
         #[arg(long)]
         instruction: String,
-        #[arg(long, value_parser = ["strict", "github-free-private"])]
+        #[arg(long, value_parser = ["strict", "github-free-private", "emergency-ci"])]
         gate_mode: Option<String>,
         #[arg(long)]
         authorization: Option<String>,
@@ -221,6 +221,8 @@ struct Task {
     gate_mode: ci::GateMode,
     #[serde(default)]
     requested_gate: ci::GateMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    emergency_receipt_sha256: Option<String>,
     #[serde(default)]
     stop_after: recovery::Boundary,
     #[serde(default)]
@@ -323,6 +325,11 @@ impl Task {
                 .as_ref()
                 .is_some_and(|assessment| assessment.validate().is_err())
             || self.requested_gate == ci::GateMode::LocalValidation
+            || self.requested_gate == ci::GateMode::EmergencyCi
+                && (risk_rank(&self.risk) < risk_rank("high")
+                    || self.emergency_receipt_sha256.as_ref().is_none_or(|value| {
+                        value.len() != 64 || !value.bytes().all(|c| c.is_ascii_hexdigit())
+                    }))
             || self.requested_gate == ci::GateMode::GithubFreePrivate
                 && risk_rank(&self.risk) < risk_rank("high")
             || self
@@ -369,6 +376,14 @@ impl Task {
 
     fn delivery_gate(&self) -> ci::GateMode {
         self.gate_mode
+    }
+
+    fn followup_gate(&self) -> ci::GateMode {
+        if self.requested_gate == ci::GateMode::EmergencyCi {
+            ci::GateMode::Strict
+        } else {
+            self.requested_gate
+        }
     }
 
     fn stop(&mut self, phase: Phase, message: &str) {
@@ -563,6 +578,7 @@ fn submit_with_policy(
         ci_state: None,
         gate_mode: ci::GateMode::Strict,
         requested_gate,
+        emergency_receipt_sha256: None,
         stop_after,
         recovery: recovery::State::default(),
         ci_evidence: None,
@@ -979,7 +995,7 @@ fn register_followups(
             let pending_link =
                 !explicit_reuse && !existing_ids.contains(&id) && child.recovery.parent.is_none();
             if child.authorization != task.authorization
-                || child.requested_gate != task.requested_gate
+                || child.requested_gate != task.followup_gate()
                 || child.risk != task.risk
                 || child.ci_labels != task.ci_labels
                 || child.resources != task.resources
@@ -1060,7 +1076,7 @@ fn register_followups(
                 task.resources.clone(),
                 task.risk.clone(),
                 task.ci_labels.clone(),
-                task.requested_gate,
+                task.followup_gate(),
                 task.stop_after.clone(),
             )?;
         }
@@ -1193,6 +1209,20 @@ fn monitor_task(context: &Context, task: &mut Task) {
 
 fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
     observe_ci_with(context, task, |context, task| {
+        if task.requested_gate == ci::GateMode::EmergencyCi {
+            let evidence = super::delivery::task_emergency_evidence(
+                &context.repository,
+                &task.id,
+                task.pr.ok_or("緊急承認対象のPRがありません")?,
+                task.head.as_deref().ok_or("緊急承認対象headがありません")?,
+            )?;
+            if evidence["receipt_sha256"].as_str() != task.emergency_receipt_sha256.as_deref() {
+                return Err(
+                    "緊急承認receiptが変更されました。明示resumeで対象を再確認してください".into(),
+                );
+            }
+            return ci::emergency_observation(evidence);
+        }
         ci::observe(
             &context.repository,
             &context.github,
@@ -1422,18 +1452,22 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
     ) {
         return Ok(());
     }
-    if task.phase == Phase::CiAuthorization && !task.ci_labels.is_empty() {
+    if task.phase == Phase::CiAuthorization
+        && !task.ci_labels.is_empty()
+        && task.requested_gate != ci::GateMode::EmergencyCi
+    {
         // 初回base観測がreview後になっても、admission failureより認可を先に行う。
         return Ok(());
     }
-    match observation.state {
-        ci::CiState::Success | ci::CiState::LocalValidation if eligible => {
-            if task.phase == Phase::MainCi {
-                task.phase = Phase::Finish;
-            } else if task.phase == Phase::CiAuthorization {
-                task.phase = Phase::Integration;
-            }
+    if eligible {
+        if task.phase == Phase::MainCi {
+            task.phase = Phase::Finish;
+        } else if task.phase == Phase::CiAuthorization {
+            task.phase = Phase::Integration;
         }
+        return Ok(());
+    }
+    match observation.state {
         ci::CiState::Failure => {
             if task.ci_activation_until > now() && task.phase == Phase::Integration {
                 return Ok(());
@@ -1500,6 +1534,9 @@ fn resume_with_options(
     if matches!(task.phase, Phase::Completed | Phase::BoundaryReached) {
         return Err("完了taskへ追加作業は登録できません。別taskとして依頼してください".into());
     }
+    let explicit_authorization = authorization
+        .as_ref()
+        .is_some_and(|value| safe_text(value, 32 * 1024));
     if let Some(authorization) = authorization {
         if !safe_text(&authorization, 32 * 1024) {
             return Err("元の利用者依頼が不正です".into());
@@ -1510,13 +1547,39 @@ fn resume_with_options(
         let gate = match gate.as_str() {
             "strict" => ci::GateMode::Strict,
             "github-free-private" => ci::GateMode::GithubFreePrivate,
+            "emergency-ci" => ci::GateMode::EmergencyCi,
             _ => return Err("受付policyが不正です".into()),
         };
-        if gate != task.requested_gate {
+        if gate == ci::GateMode::EmergencyCi {
+            if !explicit_authorization {
+                return Err("緊急経路への移行には対象と理由の--authorizationが必要です".into());
+            }
+            let evidence = super::delivery::task_emergency_evidence(
+                &context.repository,
+                &task.id,
+                task.pr.ok_or("既存PRが必要です")?,
+                task.head.as_deref().ok_or("固定headが必要です")?,
+            )?;
+            task.emergency_receipt_sha256 = Some(
+                evidence["receipt_sha256"]
+                    .as_str()
+                    .ok_or("緊急承認digestが不正です")?
+                    .into(),
+            );
+            task.requested_gate = gate;
+            task.gate_mode = gate;
+            if risk_rank(&task.risk) < risk_rank("high") {
+                task.risk = "high".into();
+            }
+            task.invalidate_ci();
+            task.ci_activation_until = 0;
+            task.phase = emergency_resume_phase(&mut task, &evidence)?;
+        } else if gate != task.requested_gate {
             if task.merge_commit.is_some() {
                 return Err("merge後のreceipt policyは変更できません".into());
             }
             task.requested_gate = gate;
+            task.emergency_receipt_sha256 = None;
             task.gate_mode = gate;
             if gate == ci::GateMode::GithubFreePrivate && risk_rank(&task.risk) < risk_rank("high")
             {
@@ -1629,6 +1692,12 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
                 || task.ci_evidence.as_ref().is_none_or(|observation| {
                     !observation.allows_delivery()
                         || task.delivery_gate() != observation.gate_mode
+                        || task.requested_gate == ci::GateMode::EmergencyCi
+                            && observation
+                                .emergency
+                                .as_ref()
+                                .and_then(|value| value["receipt_sha256"].as_str())
+                                != task.emergency_receipt_sha256.as_deref()
                         || task.ci_state != Some(observation.state)
                         || task.head.as_ref() != Some(&observation.head)
                         || observation.observed_at > now()
@@ -1645,6 +1714,35 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn emergency_resume_phase(task: &mut Task, evidence: &Value) -> Result<Phase> {
+    if evidence["merged"]
+        .as_bool()
+        .ok_or("緊急承認のmerge観測が不正です")?
+    {
+        let target = evidence["target"]
+            .as_str()
+            .filter(|sha| valid_sha(sha))
+            .ok_or("実mergeのSHAが不正です")?;
+        if task
+            .merge_commit
+            .as_deref()
+            .is_some_and(|old| old != target)
+        {
+            return Err("保存済みmergeと緊急承認の実mergeが異なります".into());
+        }
+        task.merge_commit = Some(target.into());
+        task.recovery.barrier = true;
+        task.recovery.origin = Some(Phase::MainCi);
+        Ok(Phase::MainCi)
+    } else if task.merge_commit.is_some() {
+        Err("保存済みのmergeを再確認できません".into())
+    } else if review_ready(task) {
+        Ok(Phase::CiAuthorization)
+    } else {
+        Ok(Phase::Review)
+    }
 }
 
 fn review_ready(task: &Task) -> bool {
@@ -2654,6 +2752,120 @@ mod tests {
         });
         task.review_independent = true;
         task
+    }
+
+    fn emergency_observation(merged: bool) -> ci::Observation {
+        ci::emergency_observation(json!({
+            "approved":true,"receipt_sha256":"f".repeat(64),"head":"a".repeat(40),
+            "base":if merged {"c".repeat(40)} else {"b".repeat(40)},"approved_base":"b".repeat(40),
+            "target":if merged {"c".repeat(40)} else {"a".repeat(40)},"merged":merged,
+            "target_ci":{"entries":[{"state":"failure"}]}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn emergency_coordinator_keeps_failure_evidence_and_reaches_integration_and_finish() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        task.requested_gate = ci::GateMode::EmergencyCi;
+        task.emergency_receipt_sha256 = Some("f".repeat(64));
+        task.ci_labels.push("existing-ci-admission".into());
+        record_ci_result(&mut task, Ok(emergency_observation(false))).unwrap();
+        assert_eq!(task.phase, Phase::Integration);
+        assert_eq!(task.ci_state, Some(ci::CiState::Failure));
+        assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        fixture.0.store.save(&task).unwrap();
+        task = fixture.0.load(&task.id).unwrap();
+        assert_eq!(task.followup_gate(), ci::GateMode::Strict);
+        let prompt = worker::prompt(&task);
+        assert!(prompt.contains("--gate-mode emergency-ci"));
+        assert!(prompt.contains("新しいrequest作成"));
+        task.phase = Phase::MainCi;
+        record_ci_result(&mut task, Ok(emergency_observation(true))).unwrap();
+        assert_eq!(task.phase, Phase::Finish);
+        assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        record_ci_result(&mut task, Err("API unavailable".into())).unwrap();
+        assert!(task.ci_evidence.is_none());
+    }
+
+    #[test]
+    fn emergency_delivery_still_requires_independent_review_and_matching_approval() {
+        let fixture = Fixture::new();
+        let mut original = reviewed_task(&fixture);
+        original.requested_gate = ci::GateMode::EmergencyCi;
+        original.emergency_receipt_sha256 = Some("f".repeat(64));
+        record_ci_result(&mut original, Ok(emergency_observation(false))).unwrap();
+        for case in 0..5 {
+            let mut task = original.clone();
+            match case {
+                0 => task.review = None,
+                1 => task.review_independent = false,
+                2 => task.ci_evidence.as_mut().unwrap().emergency = None,
+                3 => task.ci_evidence.as_mut().unwrap().head = "d".repeat(40),
+                _ => task.ci_evidence.as_mut().unwrap().base = "d".repeat(40),
+            }
+            assert!(
+                !ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap(),
+                "{case}"
+            );
+        }
+        assert!(
+            resume_with_options(
+                &fixture.0,
+                &original.id,
+                "緊急経路".into(),
+                Some("emergency-ci".into()),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn emergency_resume_recovers_a_merge_that_completed_before_worker_reporting() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        task.requested_gate = ci::GateMode::EmergencyCi;
+        task.gate_mode = ci::GateMode::EmergencyCi;
+        task.emergency_receipt_sha256 = Some("f".repeat(64));
+        task.phase = Phase::Integration;
+        let observation = emergency_observation(true);
+        task.phase =
+            emergency_resume_phase(&mut task, observation.emergency.as_ref().unwrap()).unwrap();
+        assert_eq!(task.phase, Phase::MainCi);
+        assert_eq!(task.merge_commit, observation.merge_commit);
+        assert!(task.recovery.barrier);
+        record_ci_result(&mut task, Ok(observation.clone())).unwrap();
+        assert_eq!(task.phase, Phase::Finish);
+        assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        task.merge_commit = Some("d".repeat(40));
+        assert!(
+            emergency_resume_phase(&mut task, observation.emergency.as_ref().unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn ordinary_tasks_omit_emergency_fields_for_running_old_coordinators() {
+        let fixture = Fixture::new();
+        let task = reviewed_task(&fixture);
+        assert!(
+            serde_json::to_value(&task)
+                .unwrap()
+                .get("emergency_receipt_sha256")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn emergency_observation_preserves_skipped_and_rejects_empty_evidence() {
+        let mut proof = emergency_observation(false).emergency.unwrap();
+        proof["target_ci"]["entries"] = json!([{"state":"skipped"}]);
+        let observation = ci::emergency_observation(proof.clone()).unwrap();
+        assert_eq!(observation.state, ci::CiState::Skipped);
+        assert!(observation.allows_delivery());
+        proof["target_ci"]["entries"] = json!([]);
+        assert!(ci::emergency_observation(proof).is_err());
     }
 
     #[test]

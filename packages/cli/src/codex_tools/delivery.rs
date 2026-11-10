@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{process, trust};
+mod emergency;
 mod work_log;
 
 #[cfg(unix)]
@@ -243,6 +244,7 @@ fn gate_mode(value: &str) -> Result<&'static str> {
         FREE_PRIVATE_GATE_MODE => Ok(FREE_PRIVATE_GATE_MODE),
         FREE_PRIVATE_LOCAL_GATE_MODE => Ok(FREE_PRIVATE_LOCAL_GATE_MODE),
         LOCAL_VALIDATION_GATE_MODE => Ok(LOCAL_VALIDATION_GATE_MODE),
+        emergency::GATE => Ok(emergency::GATE),
         _ => Err(error("gate modeが不正です")),
     }
 }
@@ -2403,16 +2405,21 @@ fn validate_gate_review_profile(gate: &str, risk_value: &str, decision_value: &s
     gate_mode(gate)?;
     risk(risk_value)?;
     decision(decision_value)?;
-    if [FREE_PRIVATE_GATE_MODE, FREE_PRIVATE_LOCAL_GATE_MODE].contains(&gate)
+    if [
+        FREE_PRIVATE_GATE_MODE,
+        FREE_PRIVATE_LOCAL_GATE_MODE,
+        emergency::GATE,
+    ]
+    .contains(&gate)
         && !["high", "critical"].contains(&risk_value)
     {
-        return Err(error(
-            "GitHub Free/private receiptにはhigh/critical riskが必要です",
-        ));
+        return Err(error("このgateのreceiptにはhigh/critical riskが必要です"));
     }
-    if gate == FREE_PRIVATE_LOCAL_GATE_MODE && decision_value != "human-approved" {
+    if [FREE_PRIVATE_LOCAL_GATE_MODE, emergency::GATE].contains(&gate)
+        && decision_value != "human-approved"
+    {
         return Err(error(
-            "github-free-private-local receiptには明示的なhuman approvalが必要です",
+            "このgateのreceiptには明示的なhuman approvalが必要です",
         ));
     }
     Ok(())
@@ -2455,8 +2462,10 @@ fn validate_local_gate_workflow_policy(
     Ok(())
 }
 fn receipt_has_current_plan_version(payload: &Value) -> bool {
-    payload.get("version").and_then(Value::as_i64) == Some(RECEIPT_VERSION)
-        && payload.get("plan_version").is_some()
+    matches!(
+        payload.get("version").and_then(Value::as_i64),
+        Some(RECEIPT_VERSION | emergency::VERSION)
+    ) && payload.get("plan_version").is_some()
 }
 fn receipt_has_legacy_ledger(payload: &Value) -> bool {
     payload.get("version").and_then(Value::as_i64) == Some(LEGACY_LEDGER_RECEIPT_VERSION)
@@ -2560,7 +2569,7 @@ fn receipt(
         } else {
             expected_keys(payload, &keys, "legacy v5 receipt")?;
         }
-    } else if version == RECEIPT_VERSION {
+    } else if [RECEIPT_VERSION, emergency::VERSION].contains(&version) {
         let mut keys = common.to_vec();
         keys.extend([
             "decision",
@@ -2569,6 +2578,9 @@ fn receipt(
             "specialist_review_passed",
             "plan_version",
         ]);
+        if version == emergency::VERSION {
+            keys.push("emergency");
+        }
         expected_keys(payload, &keys, "receipt")?;
     } else {
         return Err(error("receipt schemaが一致しません"));
@@ -2581,6 +2593,12 @@ fn receipt(
         return Err(error("receipt task/repositoryが一致しません"));
     }
     let gate = receipt_gate_mode(&normalized)?;
+    if (gate == emergency::GATE) != (version == emergency::VERSION) {
+        return Err(error("緊急gateには専用schemaの承認receiptが必要です"));
+    }
+    if gate == emergency::GATE {
+        emergency::validate_receipt(&normalized)?;
+    }
     validate_gate_repository(&current_repository, &gate)?;
     let pr = int_value(&normalized, "pr")?;
     if !(1..=999_999_999).contains(&pr) {
@@ -2624,7 +2642,9 @@ fn receipt(
     {
         return Err(error("receiptのloop ledger証拠が不正です"));
     }
-    if version == RECEIPT_VERSION && int_value(&normalized, "plan_version")? < 1 {
+    if [RECEIPT_VERSION, emergency::VERSION].contains(&version)
+        && int_value(&normalized, "plan_version")? < 1
+    {
         return Err(error("receiptのPlan versionが不正です"));
     }
     let changed = get(&normalized, "changed_files")?
@@ -2700,7 +2720,14 @@ fn review_receipt_scope_matches(existing: &Value, proposed: &Value) -> bool {
     }
     let existing_gate = existing.get("gate_mode").and_then(Value::as_str);
     let proposed_gate = proposed.get("gate_mode").and_then(Value::as_str);
-    existing_gate == proposed_gate
+    (existing_gate == proposed_gate
+        && (existing_gate != Some(emergency::GATE)
+            || existing
+                .get("emergency")
+                .and_then(|value| value.get("request"))
+                == proposed
+                    .get("emergency")
+                    .and_then(|value| value.get("request"))))
         || existing_gate == Some(FREE_PRIVATE_GATE_MODE)
             && proposed_gate == Some(FREE_PRIVATE_LOCAL_GATE_MODE)
             && receipt_decision(proposed).as_deref() == Ok("human-approved")
@@ -2736,6 +2763,41 @@ fn write_review_locked(
     independent: bool,
     specialist: bool,
     gate: &str,
+) -> Result<Value> {
+    write_review_request_locked(
+        root,
+        task,
+        pr,
+        head_value,
+        risk_value,
+        plan,
+        plan_version,
+        approved,
+        tests,
+        independent,
+        specialist,
+        gate,
+        None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_review_request_locked(
+    root: &Path,
+    task: &str,
+    pr: i64,
+    head_value: &str,
+    risk_value: &str,
+    plan: &str,
+    plan_version: i64,
+    approved: bool,
+    tests: bool,
+    independent: bool,
+    specialist: bool,
+    gate: &str,
+    emergency_request: Option<&Path>,
+    replace_receipt: bool,
 ) -> Result<Value> {
     gate_mode(gate)?;
     risk(risk_value)?;
@@ -2775,7 +2837,7 @@ fn write_review_locked(
         "autonomous"
     };
     validate_gate_review_profile(gate, risk_value, decision_value)?;
-    let payload = object([
+    let mut payload = object([
         ("version", Value::Number(RECEIPT_VERSION.into())),
         ("kind", string("review")),
         ("task_id", string(task)),
@@ -2797,10 +2859,32 @@ fn write_review_locked(
         ("gate_mode", string(gate)),
         ("plan_version", Value::Number(plan_version.into())),
     ]);
+    if gate == emergency::GATE {
+        let path = emergency_request.ok_or_else(|| error("--emergency-requestが必要です"))?;
+        if !approved {
+            return Err(error("緊急経路はapprove-reviewで明示承認してください"));
+        }
+        let view = pr_view(root, &repository, pr)?;
+        assert_recovery_pr_open(
+            &view,
+            &repository,
+            &str_value(&manifest_value, "branch")?,
+            &head,
+        )?;
+        if !emergency::git_ancestor(root, &live, &head)? {
+            return Err(error("緊急承認headが最新baseを含んでいません"));
+        }
+        assert_main_clean(root)?;
+        review_safety(root, &repository, pr)?;
+        payload["version"] = Value::from(emergency::VERSION);
+        payload["emergency"] = emergency::prepare(root, &payload, path, &live)?;
+    } else if emergency_request.is_some() || replace_receipt {
+        return Err(error("緊急承認optionはemergency-ciだけに指定してください"));
+    }
     let path = receipt_path(&repository, task, &head)?;
     if path.exists() || path.is_symlink() {
         let existing = load_receipt(root, task, &head, Some(&repository))?;
-        if !review_receipt_scope_matches(&existing, &payload) {
+        if !review_receipt_scope_matches(&existing, &payload) && !replace_receipt {
             return Err(error(
                 "同じheadのreceiptのfield/mode/Plan/evidenceが異なります",
             ));
@@ -2808,12 +2892,37 @@ fn write_review_locked(
         let old_risk = str_value(&existing, "risk")?;
         let old_decision = receipt_decision(&existing)?;
         let old_gate = receipt_gate_mode(&existing)?;
+        if replace_receipt {
+            validate_receipt_review_history(root, &existing)?;
+            emergency::replacement_scope(&existing, &payload)?;
+            let state_path = state_path(&repository, task)?;
+            if state_path.exists() {
+                let state = load_state(
+                    &repository,
+                    task,
+                    &existing,
+                    &str_value(&manifest_value, "branch")?,
+                )?;
+                if str_value(&state, "stage")? != "merge_started" {
+                    return Err(error("merge後の緊急承認移行はできません"));
+                }
+            }
+        }
+        let emergency_unchanged = gate != emergency::GATE
+            || existing.get("emergency").and_then(|v| v.get("request"))
+                == payload.get("emergency").and_then(|v| v.get("request"));
+        if !emergency_unchanged && !replace_receipt {
+            return Err(error(
+                "理由・base・免除・証拠の変更には新しい明示承認と--replace-receiptが必要です",
+            ));
+        }
         if risk_level(risk_value) < risk_level(&old_risk)
             || (!approved && old_decision == "human-approved")
         {
             return Err(error("同じheadのreceiptをdowngradeできません"));
         }
         if receipt_has_current_plan_version(&existing)
+            && emergency_unchanged
             && review_request_is_idempotent(
                 &old_risk,
                 risk_value,
@@ -2828,9 +2937,96 @@ fn write_review_locked(
         atomic_json(&path, &payload)?;
         Ok(payload)
     } else {
+        if replace_receipt {
+            return Err(error("移行対象receiptがありません"));
+        }
         atomic_json(&path, &payload)?;
         Ok(payload)
     }
+}
+
+fn write_emergency_review(root: &Path, args: &CliArgs) -> Result<Value> {
+    let repository = repository(root)?;
+    let _lock = task_lock(&repository, &args.task)?;
+    write_review_request_locked(
+        root,
+        &args.task,
+        args.pr,
+        &args.head,
+        args.risk.as_deref().unwrap_or(""),
+        &args.plan,
+        args.plan_version,
+        true,
+        args.tests,
+        args.independent,
+        args.specialist,
+        &args.gate,
+        args.emergency_request.as_deref(),
+        args.replace_receipt,
+    )
+}
+
+fn assert_recovery_pr_open(view: &Value, repository: &str, branch: &str, head: &str) -> Result<()> {
+    if str_value(view, "state")? != "OPEN"
+        || str_value(view, "headRefOid")? != head
+        || str_value(view, "headRefName")? != branch
+        || str_value(view, "baseRefName")? != "main"
+        || view.get("isCrossRepository") != Some(&Value::Bool(false))
+        || !same_head_repository(view, repository)
+        || !view.get("autoMergeRequest").is_some_and(Value::is_null)
+        || str_value(view, "mergeable")? != "MERGEABLE"
+        || !emergency::merge_status(
+            &str_value(view, "mergeStateStatus")?,
+            bool_value(view, "isDraft")?,
+            true,
+            true,
+        )
+    {
+        return Err(error("緊急承認PRのidentity/conflict/stateを確認できません"));
+    }
+    Ok(())
+}
+
+/// coordinatorは既存の承認receiptを再検証する。workerへ新規承認を委任しない。
+pub(super) fn task_emergency_evidence(
+    root: &Path,
+    task: &str,
+    pr: u64,
+    head: &str,
+) -> std::result::Result<Value, String> {
+    (|| -> Result<Value> {
+        let repository = repository(root)?;
+        let _lock = task_lock(&repository, task)?;
+        let receipt = load_receipt(root, task, head, Some(&repository))?;
+        if receipt_gate_mode(&receipt)? != emergency::GATE
+            || int_value(&receipt, "pr")? as u64 != pr
+        {
+            return Err(error("対象task/PR/headの緊急承認receiptがありません"));
+        }
+        let (manifest, worktree_path) = manifest(root, task, &repository)?;
+        let view = pr_view(root, &repository, pr as i64)?;
+        if str_value(&view, "state")? == "OPEN" {
+            worktree(root, &manifest, &worktree_path)?;
+            worktree_clean_head(&worktree_path, head)?;
+            validate_receipt_evidence(&worktree_path, &manifest, &receipt)?;
+            validate_delivery(
+                root,
+                &receipt,
+                true,
+                Some(&str_value(&manifest, "branch")?),
+                None,
+            )?;
+            emergency::read_audit(&receipt)
+        } else {
+            assert_recovery_pr(&view, &repository, &str_value(&manifest, "branch")?, head)?;
+            default_branch(root, &repository)?;
+            validate_receipt_review_history(root, &receipt)?;
+            review_safety(root, &repository, pr as i64)?;
+            let live = fetch_main(root, &repository)?;
+            emergency::observe(root, &receipt, &view, &live)
+        }
+    })()
+    .map_err(|cause| cause.to_string())
 }
 #[allow(clippy::too_many_arguments)]
 fn write_review(
@@ -2867,7 +3063,7 @@ fn write_review(
 }
 
 fn pr_view(root: &Path, repository: &str, pr: i64) -> Result<Value> {
-    let args = vec!["pr".into(), "view".into(), pr.to_string(), "--repo".into(), repository.into(), "--json".into(), "number,state,isDraft,headRefOid,headRefName,baseRefName,mergeable,mergeStateStatus,mergedAt,headRepository,headRepositoryOwner,isCrossRepository,autoMergeRequest".into()];
+    let args = vec!["pr".into(), "view".into(), pr.to_string(), "--repo".into(), repository.into(), "--json".into(), "number,state,isDraft,headRefOid,headRefName,baseRefName,mergeable,mergeStateStatus,mergedAt,mergeCommit,headRepository,headRepositoryOwner,isCrossRepository,autoMergeRequest".into()];
     let value = gh_json(root, &args)?;
     let object = object_ref(&value)?;
     for key in [
@@ -3407,16 +3603,12 @@ fn validate_delivery(
     validate_gate_repository(&repository, &gate)?;
     let view = pr_view(root, &repository, pr)?;
     let draft = bool_value(&view, "isDraft")?;
-    let status_ok = if allow_draft && draft {
-        ["DRAFT", "CLEAN"].contains(
-            &view
-                .get("mergeStateStatus")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-        )
-    } else {
-        view.get("mergeStateStatus").and_then(Value::as_str) == Some("CLEAN")
-    };
+    let status_ok = emergency::merge_status(
+        &str_value(&view, "mergeStateStatus")?,
+        draft,
+        allow_draft,
+        gate == emergency::GATE,
+    );
     if str_value(&view, "state")? != "OPEN"
         || (draft && !allow_draft)
         || oid(&str_value(&view, "headRefOid")?, "PR head")? != oid(&head, "SHA")?
@@ -3455,14 +3647,17 @@ fn validate_delivery(
             "live origin/mainがreceipt headのancestorではありません",
         ));
     }
-    if remote_ci_required(&gate) {
+    if gate == emergency::GATE {
+        assert_main_clean(root)?;
+        emergency::observe(root, receipt_value, &view, &live)?;
+    } else if remote_ci_required(&gate) {
         check_required_ci(root, &repository, &head)?;
     } else {
         check_local_validation_ci(root, &repository, &head)?;
     }
     review_safety(root, &repository, pr)?;
-    if gate == LOCAL_VALIDATION_GATE_MODE {
-        // workflow不在時は固定SHAのlocal validation receiptとPR stateを正本にする。
+    if [LOCAL_VALIDATION_GATE_MODE, emergency::GATE].contains(&gate.as_str()) {
+        // local検証または対象別緊急承認のreceiptとPR stateを正本にする。
     } else if free_private_gate(&gate) {
         free_private_repository(root, &repository)?;
     } else {
@@ -4083,6 +4278,25 @@ fn assert_main_synced(root: &Path, repository: &str) -> Result<()> {
     }
     Ok(())
 }
+fn assert_finish_main_synced(
+    root: &Path,
+    repository: &str,
+    receipt: &Value,
+    view: &Value,
+) -> Result<()> {
+    assert_main_synced(root, repository)?;
+    if receipt_gate_mode(receipt)? == emergency::GATE {
+        let current = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
+        if emergency::read_audit(receipt)?
+            .get("base")
+            .and_then(Value::as_str)
+            != Some(current.as_str())
+        {
+            emergency::observe(root, receipt, view, &current)?;
+        }
+    }
+    Ok(())
+}
 fn assert_merge_base_unchanged(root: &Path, repository: &str, inspected: &[String]) -> Result<()> {
     let last = inspected
         .last()
@@ -4120,6 +4334,11 @@ fn deliver_locked(
         return Err(error("baseと同じheadはdeliveryできません"));
     }
     let _lock = task_lock(&repository, task)?;
+    if expected_gate == emergency::GATE
+        && load_receipt(root, task, &head, Some(&repository))? != receipt_value
+    {
+        return Err(error("lock取得前に緊急承認receiptが変更されました"));
+    }
     worktree(root, &manifest_value, &worktree_path)?;
     worktree_clean_head(&worktree_path, &head)?;
     validate_receipt_evidence(&worktree_path, &manifest_value, &receipt_value)?;
@@ -4162,7 +4381,12 @@ fn deliver_locked(
         || !same_head_repository(&latest, &repository)
         || !latest.get("autoMergeRequest").is_some_and(Value::is_null)
         || str_value(&latest, "mergeable")? != "MERGEABLE"
-        || str_value(&latest, "mergeStateStatus")? != "CLEAN"
+        || !emergency::merge_status(
+            &str_value(&latest, "mergeStateStatus")?,
+            false,
+            false,
+            expected_gate == emergency::GATE,
+        )
     {
         return Err(error("merge直前にPR identity/mergeabilityが変化しました"));
     }
@@ -4176,6 +4400,9 @@ fn deliver_locked(
         Some(&str_value(&manifest_value, "branch")?),
         Some(&mut inspected),
     )?;
+    if expected_gate == emergency::GATE {
+        emergency::publish_note(root, &receipt_value)?;
+    }
     let path = state_path(&repository, task)?;
     let state = if path.exists() || path.is_symlink() {
         let current = load_state(
@@ -4255,7 +4482,21 @@ fn finish_locked(
         &str_value(&manifest_value, "branch")?,
     )?;
     let _lock = task_lock(&repository, task)?;
-    let bound = work_log::bind(root, &state, issue)?;
+    if expected_gate == emergency::GATE
+        && load_receipt(root, task, &head, Some(&repository))? != receipt_value
+    {
+        return Err(error("lock取得前に緊急承認receiptが変更されました"));
+    }
+    let mut bound = work_log::bind(root, &state, issue)?;
+    if expected_gate == emergency::GATE && bound != state && !bound["issue_record"].is_null() {
+        let body = format!(
+            "{}\n\n{}",
+            str_value(&bound["issue_record"], "body")?,
+            emergency::note(&receipt_value)?
+        );
+        bound["issue_record"]["body"] = string(body);
+        work_log::validate_record(task, &bound["issue_record"])?;
+    }
     if bound != state {
         atomic_json(&state_path(&repository, task)?, &bound)?;
         state = bound;
@@ -4316,14 +4557,17 @@ fn finish_locked(
     if finish_requires_live_delivery_gate(&stage) {
         let live = fetch_main(root, &repository)?;
         validate_local_gate_workflow_policy(root, &live, &head, &gate)?;
-        if remote_ci_required(&gate) {
+        if gate == emergency::GATE {
+            emergency::observe(root, &receipt_value, &view, &live)?;
+            emergency::publish_note(root, &receipt_value)?;
+        } else if remote_ci_required(&gate) {
             check_required_ci(root, &repository, &head)?;
         } else {
             check_local_validation_ci(root, &repository, &head)?;
         }
         review_safety(root, &repository, expected_pr)?;
-        if gate == LOCAL_VALIDATION_GATE_MODE {
-            // workflow不在時は固定SHAのlocal validation receiptとPR stateを正本にする。
+        if [LOCAL_VALIDATION_GATE_MODE, emergency::GATE].contains(&gate.as_str()) {
+            // local検証または対象別緊急承認のreceiptとPR stateを正本にする。
         } else if free_private_gate(&gate) {
             free_private_repository(root, &repository)?;
         } else {
@@ -4370,6 +4614,9 @@ fn finish_locked(
     }
     if stage == "merged" {
         let remote_main = fetch_main(root, &repository)?;
+        if gate == emergency::GATE {
+            emergency::observe(root, &receipt_value, &view, &remote_main)?;
+        }
         let sync_from = git(
             root,
             &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
@@ -4432,16 +4679,20 @@ fn finish_locked(
             }
             return Err(error("人間用mainをff-only syncできません"));
         }
-        assert_main_synced(root, &repository)?;
+        assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
         state = save_stage(&repository, task, &state, "main_synced", "")?;
     } else {
-        assert_main_synced(root, &repository)?;
+        assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
+    }
+    if gate == emergency::GATE {
+        let live = fetch_main(root, &repository)?;
+        emergency::observe(root, &receipt_value, &view, &live)?;
     }
     // main同期が終わっても、記録の保存を確認するまでは何も削除しない。
     work_log::sync(root, &state, false)?;
     let stage = str_value(&state, "stage")?;
     if ["main_synced", "remote_delete_started"].contains(&stage.as_str()) {
-        assert_main_synced(root, &repository)?;
+        assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
         let branch = str_value(&manifest_value, "branch")?;
         let remote = remote_branch(root, &repository, &branch)?;
         if remote.as_deref().is_some_and(|v| v != head) {
@@ -4493,7 +4744,7 @@ fn finish_locked(
     }
     let stage = str_value(&state, "stage")?;
     if ["remote_deleted", "worktree_unlock_started"].contains(&stage.as_str()) {
-        assert_main_synced(root, &repository)?;
+        assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
         let branch = str_value(&manifest_value, "branch")?;
         if remote_branch(root, &repository, &branch)?.is_some() {
             return Err(error("remote task branchがcleanup中に再出現しました"));
@@ -4544,11 +4795,11 @@ fn finish_locked(
                 if unlocked.get("locked").is_some() {
                     return Err(error("worktree unlock後のlock状態を確認できません"));
                 }
-                assert_main_synced(root, &repository)?;
+                assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
                 worktree(root, &manifest_value, &worktree_path)?;
                 worktree_clean_head(&worktree_path, &head)?;
             }
-            assert_main_synced(root, &repository)?;
+            assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
             worktree(root, &manifest_value, &worktree_path)?;
             worktree_clean_head(&worktree_path, &head)?;
             crate::clean_disk::ensure_artifact_idle(&worktree_path)
@@ -4905,6 +5156,8 @@ struct CliArgs {
     recover_merged: bool,
     gate: String,
     issue: Option<i64>,
+    emergency_request: Option<PathBuf>,
+    replace_receipt: bool,
 }
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
     let mut iter = args.into_iter();
@@ -4934,6 +5187,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             "sandbox-retry",
             "recover-main-sync",
             "recover-merged",
+            "replace-receipt",
         ];
         let value_options = [
             "task-id",
@@ -4946,6 +5200,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             "recover-main-sync-from",
             "recover-main-sync-to",
             "issue",
+            "emergency-request",
         ];
         if flag_options.contains(&normalized.as_str()) {
             if !flags.insert(normalized) {
@@ -5003,6 +5258,23 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
         .unwrap_or(STRICT_GATE_MODE)
         .to_string();
     gate_mode(&gate)?;
+    let emergency_request = values.get("emergency-request").map(PathBuf::from);
+    let replace_receipt = flags.remove("replace-receipt");
+    if gate == emergency::GATE {
+        if command == "record-review"
+            || (command == "approve-review" && emergency_request.is_none())
+            || (command != "approve-review" && (emergency_request.is_some() || replace_receipt))
+            || flags.contains("recover-merged")
+        {
+            return Err(error(
+                "emergency-ciは対象別のapprove-review --emergency-requestで承認してください。移行は--replace-receiptを明示します",
+            ));
+        }
+    } else if emergency_request.is_some() || replace_receipt {
+        return Err(error(
+            "緊急承認optionには--gate-mode emergency-ciが必要です",
+        ));
+    }
     let issue = values
         .get("issue")
         .map(|v| v.parse::<i64>())
@@ -5073,6 +5345,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             recover_merged,
             gate,
             issue,
+            emergency_request,
+            replace_receipt,
         })
     } else {
         let sandbox_retry = flags.remove("sandbox-retry");
@@ -5123,6 +5397,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             recover_merged: false,
             gate,
             issue,
+            emergency_request,
+            replace_receipt,
         })
     }
 }
@@ -5152,6 +5428,9 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 &parsed.gate,
             ),
             "approve-review" if parsed.recover_merged => recover_merged(&root, &parsed),
+            "approve-review" if parsed.gate == emergency::GATE => {
+                write_emergency_review(&root, &parsed)
+            }
             "approve-review" => write_review(
                 &root,
                 &parsed.task,
@@ -5191,7 +5470,20 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
         }
     })();
     match result {
-        Ok(value) => match serde_json::to_string(&value) {
+        Ok(value) => match serde_json::to_string(&if value.get("gate_mode").and_then(Value::as_str)
+            == Some(emergency::GATE)
+        {
+            object([
+                (
+                    "task_id",
+                    get(&value, "task_id").cloned().unwrap_or(Value::Null),
+                ),
+                ("gate_mode", string(emergency::GATE)),
+                ("approved", Value::Bool(true)),
+            ])
+        } else {
+            value
+        }) {
             Ok(text) => {
                 println!("{text}");
                 0
@@ -5428,6 +5720,136 @@ mod tests {
             ("gate_mode", string(STRICT_GATE_MODE)),
             ("plan_version", Value::Number(2.into())),
         ])
+    }
+
+    #[test]
+    fn emergency_schema_requires_explicit_approval_local_tests_and_independent_review() {
+        let mut value = receipt_v6("high", false);
+        let mut request = emergency::tests::sample_request();
+        for key in [
+            "repository",
+            "task_id",
+            "pr",
+            "head_sha",
+            "plan_id",
+            "plan_version",
+        ] {
+            request[key] = value[key].clone();
+        }
+        request["waivers"].as_array_mut().unwrap().push(serde_json::json!({"kind":"ci","name":"no-observations","source":"github","states":["missing"],"cause":"service-outage","evidence":"no run admitted"}));
+        value["version"] = Value::from(emergency::VERSION);
+        value["gate_mode"] = string(emergency::GATE);
+        value["decision"] = string("human-approved");
+        value["emergency"] = serde_json::json!({"request":request,"observed_ci":{"sha":"b".repeat(40),"entries":[{"kind":"ci","name":"no-observations","source":"github","state":"missing","id":0}]}});
+        let normalize = |value: &Value| {
+            receipt(
+                value,
+                Path::new("/unused"),
+                "issue-24",
+                &"b".repeat(40),
+                Some("owner/repo"),
+            )
+        };
+        assert!(normalize(&value).is_ok());
+        for field in [
+            "decision",
+            "risk",
+            "tests_passed",
+            "independent_review_passed",
+            "version",
+            "request",
+        ] {
+            let mut invalid = value.clone();
+            match field {
+                "decision" => invalid[field] = string("autonomous"),
+                "risk" => invalid[field] = string("medium"),
+                "tests_passed" | "independent_review_passed" => invalid[field] = Value::Bool(false),
+                "version" => invalid[field] = Value::from(RECEIPT_VERSION),
+                _ => invalid["emergency"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("request")
+                    .map(|_| ())
+                    .unwrap(),
+            }
+            assert!(normalize(&invalid).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn emergency_parser_rejects_implicit_approval_and_unrelated_options() {
+        let base = format!(
+            "--task-id task-example --pr 7 --head {} --plan-id example-plan-v1 --plan-version 1",
+            "a".repeat(40)
+        );
+        let evidence = "--risk high --tests-passed --independent-review-passed";
+        for command in [
+            format!(
+                "record-review {base} {evidence} --gate-mode emergency-ci --emergency-request /tmp/private.json"
+            ),
+            format!("approve-review {base} {evidence} --gate-mode emergency-ci"),
+            format!("approve-review {base} {evidence} --emergency-request /tmp/private.json"),
+            format!("finish {base} --gate-mode emergency-ci --replace-receipt"),
+        ] {
+            assert!(
+                parse_args(command.split_whitespace().map(OsString::from)).is_err(),
+                "{command}"
+            );
+        }
+        for command in [
+            format!(
+                "approve-review {base} {evidence} --gate-mode emergency-ci --emergency-request /tmp/private.json --replace-receipt"
+            ),
+            format!("deliver {base} --gate-mode emergency-ci"),
+            format!("finish {base} --gate-mode emergency-ci --issue 3"),
+        ] {
+            assert!(
+                parse_args(command.split_whitespace().map(OsString::from)).is_ok(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn emergency_receipt_migration_requires_explicit_replacement_of_the_same_scope() {
+        let existing = receipt_v6("high", false);
+        let mut proposed = existing.clone();
+        proposed["gate_mode"] = string(emergency::GATE);
+        proposed["decision"] = string("human-approved");
+        proposed["emergency"] = serde_json::json!({"request":emergency::tests::sample_request()});
+        assert!(!review_receipt_scope_matches(&existing, &proposed));
+        assert!(emergency::replacement_scope(&existing, &proposed).is_ok());
+        assert!(review_receipt_scope_matches(&proposed, &proposed));
+        for field in ["reason", "base_sha", "waivers", "authorization"] {
+            let mut updated = proposed.clone();
+            updated["emergency"]["request"][field] = string("changed");
+            assert!(!review_receipt_scope_matches(&proposed, &updated));
+        }
+        for field in [
+            "repository",
+            "task_id",
+            "pr",
+            "head_sha",
+            "plan_id",
+            "plan_version",
+            "changed_files",
+        ] {
+            let mut updated = proposed.clone();
+            updated[field] = Value::Null;
+            assert!(
+                emergency::replacement_scope(&existing, &updated).is_err(),
+                "{field}"
+            );
+        }
+        for stage in [
+            "merge_started",
+            "merged",
+            "main_synced",
+            "remote_deleted",
+            "worktree_removed",
+        ] {
+            assert!(finish_requires_live_delivery_gate(stage));
+        }
     }
 
     fn manual_recovery_args() -> CliArgs {
