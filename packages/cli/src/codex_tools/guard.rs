@@ -5051,6 +5051,9 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         return None;
     }
     let command = &args[0];
+    if command == "authorize-ci" {
+        return super::delivery::ci_authorization_invocation_reason(args);
+    }
     if !["record-review", "approve-review", "deliver", "finish"].contains(&command.as_str()) {
         return Some("許可されていないdelivery helper操作です".into());
     }
@@ -5180,20 +5183,26 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
     let emergency_request = values.get("--emergency-request");
     let replace_receipt = seen.iter().any(|v| v == "--replace-receipt");
     if emergency_gate {
-        if command == "record-review"
-            || command == "approve-review"
-                && (emergency_request.is_none_or(|path| !Path::new(path).is_absolute())
-                    || !["high", "critical"]
-                        .contains(&values.get("--risk").map(String::as_str).unwrap_or("")))
-            || command != "approve-review" && (emergency_request.is_some() || replace_receipt)
+        if ["record-review", "approve-review"].contains(&command.as_str())
+            && (emergency_request.is_none_or(|path| !Path::new(path).is_absolute())
+                || !["high", "critical"]
+                    .contains(&values.get("--risk").map(String::as_str).unwrap_or("")))
+            || !["record-review", "approve-review"].contains(&command.as_str())
+                && (emergency_request.is_some() || replace_receipt)
         {
             return Some(
-                "緊急経路は対象別approve-reviewとprivateな絶対pathのrequestで承認してください"
+                "緊急経路はreview commandとprivateな絶対pathのrequestで根拠を記録してください"
                     .into(),
             );
         }
-    } else if emergency_request.is_some() || replace_receipt {
-        return Some("緊急承認optionはemergency-ci専用です".into());
+    } else if emergency_request.is_some()
+        || replace_receipt
+            && (values.contains_key("--gate-mode")
+                || !["record-review", "approve-review"].contains(&command.as_str()))
+    {
+        return Some(
+            "通常CIへの復帰はgate指定なしのreview --replace-receiptを使ってください".into(),
+        );
     }
     let review_command = command == "record-review" || command == "approve-review";
     if values.get("--gate-mode").is_some_and(|v| {
@@ -5227,13 +5236,17 @@ mod emergency_delivery_tests {
     use super::*;
 
     #[test]
-    fn guard_and_parser_require_the_same_explicit_emergency_commands() {
+    fn guard_and_parser_require_the_same_emergency_evidence() {
         let base = format!(
             "--task-id task-example --pr 7 --head {} --plan-id example-plan-v1 --plan-version 1",
             "a".repeat(40)
         );
         let evidence = "--risk high --tests-passed --independent-review-passed";
         for command in [
+            format!("codex-delivery record-review {base} {evidence} --replace-receipt"),
+            format!(
+                "codex-delivery record-review {base} {evidence} --gate-mode emergency-ci --emergency-request /tmp/private.json"
+            ),
             format!(
                 "codex-delivery approve-review {base} {evidence} --gate-mode emergency-ci --emergency-request /tmp/private.json --replace-receipt"
             ),
@@ -5252,9 +5265,7 @@ mod emergency_delivery_tests {
             );
         }
         for command in [
-            format!(
-                "codex-delivery record-review {base} {evidence} --gate-mode emergency-ci --emergency-request /tmp/private.json"
-            ),
+            format!("codex-delivery record-review {base} {evidence} --gate-mode emergency-ci"),
             format!("codex-delivery approve-review {base} {evidence} --gate-mode emergency-ci"),
             format!(
                 "codex-delivery approve-review {base} {evidence} --gate-mode emergency-ci --emergency-request relative.json"

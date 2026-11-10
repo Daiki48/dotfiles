@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{process, trust};
 mod emergency;
+mod lane;
 mod work_log;
 
 #[cfg(unix)]
@@ -714,16 +715,62 @@ pub(crate) fn task_ci_label_args(
     Ok(args)
 }
 
-/// 受付時に委任された既存labelの追加だけを行う。任意のPR編集・Git操作は受け付けない。
+pub(crate) const CI_LANE_BUSY: &str = lane::BUSY;
+
+#[allow(clippy::too_many_arguments)]
+fn claim_delivery_lane(
+    root: &Path,
+    repository: &str,
+    task: &str,
+    pr: u64,
+    head: &str,
+    base: &str,
+    labels: &[String],
+) -> Result<()> {
+    let parent = super::task::delivery_repair_parent(root, task).map_err(error)?;
+    lane::claim(
+        lane::Scope {
+            repository: repository.into(),
+            task: task.into(),
+            pr,
+            head: oid(head, "CI直列枠head")?,
+            base: oid(base, "CI直列枠base")?,
+            labels: labels.to_vec(),
+        },
+        parent.as_deref(),
+    )
+}
+
+pub(crate) fn task_delivery_lane_available(
+    root: &Path,
+    home: &Path,
+    repository: &str,
+    task: &str,
+    pr: u64,
+) -> std::result::Result<bool, String> {
+    if lane::available(home, repository, task, pr, None).map_err(|cause| cause.to_string())? {
+        return Ok(true);
+    }
+    let parent = super::task::delivery_repair_parent(root, task)?;
+    lane::available(home, repository, task, pr, parent.as_deref())
+        .map_err(|cause| cause.to_string())
+}
+
+/// 既存CI labelを確認し、永続的な直列枠の取得後だけ追加する。
 pub(crate) fn task_add_ci_labels(
     cwd: &Path,
     repository: &str,
+    task: &str,
     pr: u64,
     head: &str,
     base: &str,
     labels: &[String],
 ) -> std::result::Result<(), String> {
-    let args = task_ci_label_args(repository, pr, labels)?;
+    let args = if labels.is_empty() {
+        None
+    } else {
+        Some(task_ci_label_args(repository, pr, labels)?)
+    };
     let read_pr = vec!["api".into(), format!("repos/{repository}/pulls/{pr}")];
     let matches = |value: &Value| {
         value.get("number").and_then(Value::as_u64) == Some(pr)
@@ -742,6 +789,13 @@ pub(crate) fn task_add_ci_labels(
     if !matches(&task_gh_json(cwd, &read_pr)?) {
         return Err("CI起動直前にPRのidentity・HEAD・baseが変化しました".into());
     }
+    if fetch_main(cwd, repository).map_err(|cause| cause.to_string())? != base
+        || !emergency::git_ancestor(cwd, base, head).map_err(|cause| cause.to_string())?
+    {
+        return Err(
+            "CI起動headが最新mainを含んでいません。更新・検証・reviewをやり直します".into(),
+        );
+    }
     for label in labels {
         let encoded = label
             .bytes()
@@ -755,10 +809,57 @@ pub(crate) fn task_add_ci_labels(
             return Err("委任された既存CI起動labelを確認できません".into());
         }
     }
-    gh_json(cwd, &args)
-        .map_err(|_| "CI起動labelを付与できません。状態を再照合してから再試行します".to_string())?;
+    if args.is_some() {
+        reject_other_ci_labels(cwd, repository, pr, labels)?;
+    }
+    claim_delivery_lane(cwd, repository, task, pr, head, base, labels)
+        .map_err(|cause| cause.to_string())?;
+    if let Some(args) = args {
+        gh_json(cwd, &args).map_err(|_| {
+            "CI起動labelを付与できません。状態を再照合してから再試行します".to_string()
+        })?;
+    }
     if !matches(&task_gh_json(cwd, &read_pr)?) {
         return Err("CI起動後にPRのidentity・HEAD・baseが変化しました".into());
+    }
+    Ok(())
+}
+
+fn reject_other_ci_labels(
+    cwd: &Path,
+    repository: &str,
+    pr: u64,
+    labels: &[String],
+) -> std::result::Result<(), String> {
+    let value = task_gh_json(
+        cwd,
+        &[
+            "api".into(),
+            format!("repos/{repository}/pulls?state=open&per_page=100"),
+            "--paginate".into(),
+            "--slurp".into(),
+        ],
+    )?;
+    let pages = value
+        .as_array()
+        .filter(|pages| !pages.is_empty() && pages.len() < MAX_PAGES)
+        .ok_or("PRのCI label一覧を完全取得できません")?;
+    for page in pages {
+        for candidate in page.as_array().ok_or("PR一覧の形式が不正です")? {
+            let number = candidate["number"]
+                .as_u64()
+                .filter(|number| *number > 0)
+                .ok_or("PR番号が不正です")?;
+            let attached = candidate["labels"]
+                .as_array()
+                .ok_or("PR labelの形式が不正です")?;
+            for label in attached {
+                let name = label["name"].as_str().ok_or("PR labelの形式が不正です")?;
+                if number != pr && labels.iter().any(|label| label == name) {
+                    return Err(CI_LANE_BUSY.into());
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2415,9 +2516,7 @@ fn validate_gate_review_profile(gate: &str, risk_value: &str, decision_value: &s
     {
         return Err(error("このgateのreceiptにはhigh/critical riskが必要です"));
     }
-    if [FREE_PRIVATE_LOCAL_GATE_MODE, emergency::GATE].contains(&gate)
-        && decision_value != "human-approved"
-    {
+    if gate == FREE_PRIVATE_LOCAL_GATE_MODE && decision_value != "human-approved" {
         return Err(error(
             "このgateのreceiptには明示的なhuman approvalが必要です",
         ));
@@ -2749,6 +2848,23 @@ fn review_request_is_idempotent(
         && existing_decision == requested_decision
         && existing_gate == requested_gate
 }
+
+fn ci_receipt_replacement(existing: &Value, proposed: &Value) -> Result<bool> {
+    let restoring_strict = receipt_gate_mode(existing)? == emergency::GATE
+        && receipt_gate_mode(proposed)? == STRICT_GATE_MODE;
+    if receipt_gate_mode(proposed)? != emergency::GATE && !restoring_strict {
+        return Err(error(
+            "通常CIへの復帰は既存emergency-ci receiptだけが対象です",
+        ));
+    }
+    emergency::replacement_scope(existing, proposed)?;
+    for flag in ["independent_review_passed", "specialist_review_passed"] {
+        if existing[flag] == true && proposed[flag] != true {
+            return Err(error("receipt移行で既存review証拠は弱められません"));
+        }
+    }
+    Ok(restoring_strict)
+}
 #[allow(clippy::too_many_arguments)]
 fn write_review_locked(
     root: &Path,
@@ -2861,9 +2977,6 @@ fn write_review_request_locked(
     ]);
     if gate == emergency::GATE {
         let path = emergency_request.ok_or_else(|| error("--emergency-requestが必要です"))?;
-        if !approved {
-            return Err(error("緊急経路はapprove-reviewで明示承認してください"));
-        }
         let view = pr_view(root, &repository, pr)?;
         assert_recovery_pr_open(
             &view,
@@ -2878,8 +2991,10 @@ fn write_review_request_locked(
         review_safety(root, &repository, pr)?;
         payload["version"] = Value::from(emergency::VERSION);
         payload["emergency"] = emergency::prepare(root, &payload, path, &live)?;
-    } else if emergency_request.is_some() || replace_receipt {
-        return Err(error("緊急承認optionはemergency-ciだけに指定してください"));
+    } else if emergency_request.is_some() || replace_receipt && gate != STRICT_GATE_MODE {
+        return Err(error(
+            "requestはemergency-ci、receipt移行は緊急経路と通常CIへの復帰だけに指定してください",
+        ));
     }
     let path = receipt_path(&repository, task, &head)?;
     if path.exists() || path.is_symlink() {
@@ -2892,9 +3007,20 @@ fn write_review_request_locked(
         let old_risk = str_value(&existing, "risk")?;
         let old_decision = receipt_decision(&existing)?;
         let old_gate = receipt_gate_mode(&existing)?;
+        let restoring_strict = replace_receipt && ci_receipt_replacement(&existing, &payload)?;
         if replace_receipt {
             validate_receipt_review_history(root, &existing)?;
-            emergency::replacement_scope(&existing, &payload)?;
+            if restoring_strict {
+                assert_recovery_pr_open(
+                    &pr_view(root, &repository, pr)?,
+                    &repository,
+                    &str_value(&manifest_value, "branch")?,
+                    &head,
+                )?;
+                if !emergency::git_ancestor(root, &live, &head)? {
+                    return Err(error("通常CIへの復帰headが最新baseを含んでいません"));
+                }
+            }
             let state_path = state_path(&repository, task)?;
             if state_path.exists() {
                 let state = load_state(
@@ -2913,13 +3039,18 @@ fn write_review_request_locked(
                 == payload.get("emergency").and_then(|v| v.get("request"));
         if !emergency_unchanged && !replace_receipt {
             return Err(error(
-                "理由・base・免除・証拠の変更には新しい明示承認と--replace-receiptが必要です",
+                "理由・base・免除・証拠の変更には再検証と--replace-receiptが必要です",
             ));
         }
         if risk_level(risk_value) < risk_level(&old_risk)
-            || (!approved && old_decision == "human-approved")
+            || (!approved
+                && old_decision == "human-approved"
+                && !(gate == emergency::GATE && replace_receipt || restoring_strict))
         {
             return Err(error("同じheadのreceiptをdowngradeできません"));
+        }
+        if restoring_strict && old_decision == "human-approved" {
+            payload["decision"] = string("human-approved");
         }
         if receipt_has_current_plan_version(&existing)
             && emergency_unchanged
@@ -2956,7 +3087,7 @@ fn write_emergency_review(root: &Path, args: &CliArgs) -> Result<Value> {
         args.risk.as_deref().unwrap_or(""),
         &args.plan,
         args.plan_version,
-        true,
+        args.command == "approve-review",
         args.tests,
         args.independent,
         args.specialist,
@@ -2987,7 +3118,7 @@ fn assert_recovery_pr_open(view: &Value, repository: &str, branch: &str, head: &
     Ok(())
 }
 
-/// coordinatorは既存の承認receiptを再検証する。workerへ新規承認を委任しない。
+/// coordinatorは固定対象の検証receiptと実CIを再検証する。
 pub(super) fn task_emergency_evidence(
     root: &Path,
     task: &str,
@@ -4350,6 +4481,17 @@ fn deliver_locked(
         Some(&str_value(&manifest_value, "branch")?),
         Some(&mut inspected),
     )?;
+    claim_delivery_lane(
+        root,
+        &repository,
+        task,
+        expected_pr as u64,
+        &head,
+        inspected
+            .last()
+            .ok_or_else(|| error("検査済みbaseがありません"))?,
+        &[],
+    )?;
     let initial = pr_view(root, &repository, expected_pr)?;
     if bool_value(&initial, "isDraft")? {
         gh(
@@ -4487,6 +4629,16 @@ fn finish_locked(
     {
         return Err(error("lock取得前に緊急承認receiptが変更されました"));
     }
+    let live = fetch_main(root, &repository)?;
+    claim_delivery_lane(
+        root,
+        &repository,
+        task,
+        expected_pr as u64,
+        &head,
+        &live,
+        &[],
+    )?;
     let mut bound = work_log::bind(root, &state, issue)?;
     if expected_gate == emergency::GATE && bound != state && !bound["issue_record"].is_null() {
         let body = format!(
@@ -4899,7 +5051,7 @@ fn finish(
     with_deadline(|| {
         let repository = repository(root)?;
         let _lock = task_lock(&repository, task)?;
-        finish_locked(
+        let result = finish_locked(
             root,
             task,
             pr,
@@ -4910,7 +5062,11 @@ fn finish(
             sandbox_retry,
             recover_main_sync,
             issue,
-        )
+        )?;
+        if result.get("stage").and_then(Value::as_str) == Some("completed") {
+            lane::release(&repository, task, pr as u64)?;
+        }
+        Ok(result)
     })
 }
 
@@ -5140,6 +5296,99 @@ fn require_canonical_invocation() -> Result<()> {
     Ok(())
 }
 #[derive(Debug)]
+struct CiAuthorization {
+    task: String,
+    pr: u64,
+    head: String,
+    base: String,
+    labels: Vec<String>,
+}
+
+fn parse_ci_authorization(args: &[String]) -> Result<CiAuthorization> {
+    if args.first().map(String::as_str) != Some("authorize-ci") {
+        return Err(error("CI承認commandが不正です"));
+    }
+    let mut values = BTreeMap::new();
+    let mut labels = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        let key = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| error("CI承認optionの値が不足しています"))?;
+        if key == "--ci-label" {
+            labels.push(value.clone());
+        } else if ["--task-id", "--pr", "--head", "--base"].contains(&key)
+            && values.insert(key, value).is_none()
+        {
+        } else {
+            return Err(error(
+                "CI承認optionは対象と既存labelだけを正規形で指定してください",
+            ));
+        }
+        index += 2;
+    }
+    let required = |key| {
+        values
+            .get(key)
+            .copied()
+            .ok_or_else(|| error("CI承認のtask/PR/head/baseが必要です"))
+    };
+    let pr = required("--pr")?
+        .parse::<u64>()
+        .map_err(|_| error("CI承認PR番号が不正です"))?;
+    if pr == 0 || pr > 999_999_999 || labels.is_empty() || !super::task::valid_ci_labels(&labels) {
+        return Err(error("CI承認PRまたはlabelが不正です"));
+    }
+    Ok(CiAuthorization {
+        task: task_id(required("--task-id")?)?,
+        pr,
+        head: oid(required("--head")?, "CI承認head")?,
+        base: oid(required("--base")?, "CI承認base")?,
+        labels,
+    })
+}
+
+pub(crate) fn ci_authorization_invocation_reason(args: &[String]) -> Option<String> {
+    parse_ci_authorization(args)
+        .err()
+        .map(|cause| cause.to_string())
+}
+
+fn authorize_ci(root: &Path, args: &CiAuthorization) -> Result<Value> {
+    let repository = repository(root)?;
+    let _lock = task_lock(&repository, &args.task)?;
+    let (manifest_value, path) = manifest(root, &args.task, &repository)?;
+    worktree(root, &manifest_value, &path)?;
+    worktree_clean_head(&path, &args.head)?;
+    let receipt = load_receipt(root, &args.task, &args.head, Some(&repository))?;
+    if int_value(&receipt, "pr")? as u64 != args.pr {
+        return Err(error("CI承認PRとreview receiptが不一致です"));
+    }
+    validate_receipt_evidence(&path, &manifest_value, &receipt)?;
+    review_safety(root, &repository, args.pr as i64)?;
+    if fetch_main(root, &repository)? != args.base
+        || !emergency::git_ancestor(root, &args.base, &args.head)?
+    {
+        return Err(error("CI承認baseが最新ではありません"));
+    }
+    task_add_ci_labels(
+        root,
+        &repository,
+        &args.task,
+        args.pr,
+        &args.head,
+        &args.base,
+        &args.labels,
+    )
+    .map_err(error)?;
+    Ok(object([
+        ("task_id", string(&args.task)),
+        ("ci_authorized", Value::Bool(true)),
+    ]))
+}
+
+#[derive(Debug)]
 struct CliArgs {
     command: String,
     task: String,
@@ -5261,18 +5510,22 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
     let emergency_request = values.get("emergency-request").map(PathBuf::from);
     let replace_receipt = flags.remove("replace-receipt");
     if gate == emergency::GATE {
-        if command == "record-review"
-            || (command == "approve-review" && emergency_request.is_none())
-            || (command != "approve-review" && (emergency_request.is_some() || replace_receipt))
+        let review = ["record-review", "approve-review"].contains(&command.as_str());
+        if (review && emergency_request.is_none())
+            || (!review && (emergency_request.is_some() || replace_receipt))
             || flags.contains("recover-merged")
         {
             return Err(error(
-                "emergency-ciは対象別のapprove-review --emergency-requestで承認してください。移行は--replace-receiptを明示します",
+                "emergency-ciはreview commandへ--emergency-requestで根拠を記録してください。移行は--replace-receiptを明示します",
             ));
         }
-    } else if emergency_request.is_some() || replace_receipt {
+    } else if emergency_request.is_some()
+        || replace_receipt
+            && (!matches!(command.as_str(), "record-review" | "approve-review")
+                || gate != STRICT_GATE_MODE)
+    {
         return Err(error(
-            "緊急承認optionには--gate-mode emergency-ciが必要です",
+            "requestはemergency-ci、通常CIへの復帰はreview commandの--replace-receiptを使ってください",
         ));
     }
     let issue = values
@@ -5408,11 +5661,30 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
     let result = (|| -> Result<Value> {
         require_canonical_invocation()?;
         // 呼び出し側が argv[0] を除いた引数列を渡す契約。
+        let args: Vec<_> = args.into_iter().collect();
+        if args.first().and_then(|value| value.to_str()) == Some("authorize-ci") {
+            let args = args
+                .iter()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| error("CI承認引数がUTF-8ではありません"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return authorize_ci(
+                &env::current_dir().map_err(|_| error("checkoutを確認できません"))?,
+                &parse_ci_authorization(&args)?,
+            );
+        }
         let parsed = parse_args(args);
         let parsed = parsed?;
         let root =
             env::current_dir().map_err(|_| error("current checkout rootを確認できません"))?;
         match parsed.command.as_str() {
+            "record-review" if parsed.gate == emergency::GATE || parsed.replace_receipt => {
+                write_emergency_review(&root, &parsed)
+            }
             "record-review" => write_review(
                 &root,
                 &parsed.task,
@@ -5428,7 +5700,7 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 &parsed.gate,
             ),
             "approve-review" if parsed.recover_merged => recover_merged(&root, &parsed),
-            "approve-review" if parsed.gate == emergency::GATE => {
+            "approve-review" if parsed.gate == emergency::GATE || parsed.replace_receipt => {
                 write_emergency_review(&root, &parsed)
             }
             "approve-review" => write_review(
@@ -5696,7 +5968,7 @@ mod tests {
         ])
     }
 
-    fn receipt_v6(risk_value: &str, specialist: bool) -> Value {
+    pub(super) fn receipt_v6(risk_value: &str, specialist: bool) -> Value {
         receipt_v6_with_review(risk_value, true, specialist)
     }
 
@@ -5770,7 +6042,7 @@ mod tests {
         ] {
             let mut invalid = value.clone();
             match field {
-                "decision" => invalid[field] = string("autonomous"),
+                "decision" => invalid[field] = string("invalid-decision"),
                 "risk" => invalid[field] = string("medium"),
                 "tests_passed" | "independent_review_passed" => invalid[field] = Value::Bool(false),
                 "version" => invalid[field] = Value::from(RECEIPT_VERSION),
@@ -5828,16 +6100,58 @@ mod tests {
     }
 
     #[test]
-    fn emergency_parser_rejects_implicit_approval_and_unrelated_options() {
+    fn ci_authorization_parser_requires_a_fixed_target_and_existing_label_names() {
+        let base = format!(
+            "authorize-ci --task-id task-example --pr 7 --head {} --base {}",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        let parse = |value: &str| {
+            parse_ci_authorization(
+                &value
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(parse(&format!("{base} --ci-label ci-approved")).is_ok());
+        for invalid in [
+            base.clone(),
+            format!("{base} --ci-label ci-approved --pr 8"),
+            format!("{base} --ci-label ci-approved --admin"),
+            format!("{base} --ci-label @unsafe"),
+        ] {
+            assert!(parse(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn returning_to_strict_keeps_the_same_scope_and_existing_review_evidence() {
+        let ordinary = receipt_v6("high", false);
+        let mut emergency = ordinary.clone();
+        emergency["gate_mode"] = string(emergency::GATE);
+        assert!(ci_receipt_replacement(&emergency, &ordinary).unwrap());
+        assert!(!ci_receipt_replacement(&ordinary, &emergency).unwrap());
+        assert!(ci_receipt_replacement(&ordinary, &ordinary).is_err());
+        for key in ["head_sha", "plan_id", "pr", "independent_review_passed"] {
+            let mut changed = ordinary.clone();
+            changed[key] = Value::Null;
+            assert!(
+                ci_receipt_replacement(&emergency, &changed).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn emergency_parser_requires_evidence_for_either_review_command() {
         let base = format!(
             "--task-id task-example --pr 7 --head {} --plan-id example-plan-v1 --plan-version 1",
             "a".repeat(40)
         );
         let evidence = "--risk high --tests-passed --independent-review-passed";
         for command in [
-            format!(
-                "record-review {base} {evidence} --gate-mode emergency-ci --emergency-request /tmp/private.json"
-            ),
+            format!("record-review {base} {evidence} --gate-mode emergency-ci"),
             format!("approve-review {base} {evidence} --gate-mode emergency-ci"),
             format!("approve-review {base} {evidence} --emergency-request /tmp/private.json"),
             format!("finish {base} --gate-mode emergency-ci --replace-receipt"),
@@ -5848,6 +6162,10 @@ mod tests {
             );
         }
         for command in [
+            format!("record-review {base} {evidence} --replace-receipt"),
+            format!(
+                "record-review {base} {evidence} --gate-mode emergency-ci --emergency-request /tmp/private.json --replace-receipt"
+            ),
             format!(
                 "approve-review {base} {evidence} --gate-mode emergency-ci --emergency-request /tmp/private.json --replace-receipt"
             ),

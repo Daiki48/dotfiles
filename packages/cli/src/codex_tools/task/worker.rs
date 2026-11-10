@@ -160,6 +160,7 @@ pub(super) fn worker_phase(phase: &Phase) -> bool {
         phase,
         Phase::Implementation
             | Phase::Review
+            | Phase::CiEvidence
             | Phase::Integration
             | Phase::Finish
             | Phase::Diagnosis
@@ -351,6 +352,9 @@ pub(super) fn prompt(task: &Task) -> String {
         Phase::Review => {
             "独立レビュー担当です。ソース・Git・GitHub・設定・receiptを書き換えないでください。固定headの差分・受入条件・影響経路・local検証結果を読み取り専用で監査し、riskと結論を返してください。actionableがあればneeds_changes、製品判断が必要ならawaiting_decision、actionable=0かつ比例したlocal検証を確認できた場合はreadyにしてください。CI承認label付与・CI実行と成功の確認はこのコードレビューの後にcoordinatorが行います。CI未起動・admission failure・runner待ちだけを理由にreviewをblockedへしないでください。レビュー対象HEADが変わっていればblockedにしてください。"
         }
+        Phase::CiEvidence => {
+            "CI基盤障害の代替検証担当です。source・Git・task stateの変更やPRの直接編集は行わないでください。固定head/base、既存の独立review、失敗原因の根拠を照合し、変更に比例したlocal test/buildと該当lint等を実行してください。既知のtest失敗やAPI不明は免除せず診断へ返します。継続的なCI判断の委任に基づき、Git外のprivateな0600 requestを作り、codex-delivery record-review --gate-mode emergency-ci --emergency-request <絶対path>で根拠を記録します。公開記録は正規helperによる定型文と検証済み原因区分だけとし、requestの自由記述・内部path等を転載しません。既存receiptの移行には--replace-receiptを明示し、Plan/版・riskを維持します。対象ごとに人間の再承認を求めません。receiptを同じ固定headで検証できた場合だけreadyを返し、deliver/merge/finish/label付与は行わないでください。"
+        }
         Phase::Diagnosis => {
             "元の依頼を解釈して自律継続を組み立て直す読み取り専用の診断担当です。ソース・Git・GitHub・設定・receipt・task stateを書き換えず、旧writerの成果を保存したまま原因を調べてください。assessmentを必ず返し、cause/evidence/next_action/resume_whenを具体化します。親が便宜的に定めたfile分割とユーザーの明示した製品・権限・終了境界を区別し、前者だけなら元の仕様内で再分割してください。実値・credential・candidate不足でも取得コード・fake API検証など安全な残作業を見つけてください。riskや失敗回数だけで人間へ返してはいけません。readyは既存段階を安全に再試行できる場合、needs_changesは実装修復へ戻す場合です。main CIのsource修正や元依頼内の後続作業はfollowupsへobjectiveと元依頼に含まれるauthorizationの根拠を記載し、after_previousで順序を示してください。未許可の目的や新権限をfollowupsで追加しないでください。main CI失敗の元PRを追加pushせず、新しい修復PRへ分けます。製品/実質scope/新権限/費用/不可逆/重大リスクの意思決定だけawaiting_decisionとdecisionを返し、question/impact/recommendationを整理します。他の技術的保留はwaitingとし、解消条件を示してください。CI・Git状態・子task・host資源はRustが監視します。必要なら非秘密の受入証拠等のworkspace相対pathをwatch_pathsへ指定できます（.git・絶対path・親参照は禁止）。同じ証拠で無限retryせず、進展を示すevidenceと対応方法を見直してください。未知dirtyやsecret、所有不明、helperのretry制限・承認拒否を迂回する操作は保留し、独立した許可内作業を先に進めてください。"
         }
@@ -380,11 +384,27 @@ pub(super) fn prompt(task: &Task) -> String {
     let phase = format!(
         "{phase}\n既存receiptがある場合は、そこに束縛されたPlan IDと版を維持してください。taskデータのplan_id/plan_versionはreceipt未作成時の既定値です。"
     );
+    let phase = if task.phase == Phase::Integration
+        && task.delivery_gate() == super::ci::GateMode::Strict
+    {
+        format!(
+            "{phase}\n通常CIへ復帰した同じheadに旧emergency-ci receiptがある場合は、gate指定なしのrecord-review --replace-receiptで同じ対象・Plan・review証拠を保持して移行します。既存のhuman-approved decisionは保持されるため、作成済みの有効receiptを再利用してdeliverし、承認の再取得やautonomousへの書換えは行いません。"
+        )
+    } else {
+        phase
+    };
+    let phase = if task.phase == Phase::Diagnosis {
+        format!(
+            "{phase}\nCI判断と既存CI起動labelの選択は継続的に委任されています。対象ごとの承認待ちを追加しないでください。固定headの独立reviewと、観測済みCIの基盤障害を根拠で確認でき、既知のtest失敗・API不明がない場合はoutcome=ready、assessment.next_action=emergency-ci、decision=nullで代替検証を提案できます。request/receiptの作成は次のCiEvidence担当へ任せ、この読み取り専用診断では書き換えません。実際のtest失敗はneeds_changesで修復へ戻します。"
+        )
+    } else {
+        phase
+    };
     let phase = if matches!(task.phase, Phase::Integration | Phase::Finish)
         && task.delivery_gate() == super::ci::GateMode::EmergencyCi
     {
         format!(
-            "{phase}\n今回だけのemergency-ci承認をcoordinatorが既存receiptとdigestで照合済みです。冒頭の通常record-reviewの手順に代えて、承認済みreceiptを再利用し、deliver・finishには --gate-mode emergency-ci を明示してください。approve-review、新しいrequest作成、receipt移行、CI免除の追加はworkerへ委任されていません。既存receiptのPR/head/base/Planと版、CI免除対象・状態、local検証と独立reviewを保持してください。承認外の失敗、head/base/理由の変化は新しい利用者判断が必要です。CIをsuccessへ書き換えず、通常CI待機への無条件fallbackもせず、対象操作を保留して具体的な失効理由を返してください。GitHubの保護要件、review/conflict/clean/所有・記録・cleanupの条件はhelperが再検証します。main側免除は承認済みbase/headを親に持つ同じtreeの実mergeだけへ適用し、別main更新は通常CIを要求します。workflow/CDは既存triggerに従います。manual deploy/release/保護解除/--adminは対象外です。"
+            "{phase}\n継続委任の範囲で作成したemergency-ciの固定証拠をcoordinatorがreceiptとdigestで照合済みです。既存receiptを再利用し、deliver・finishには --gate-mode emergency-ci を明示してください。対象PR/head/base/Planと版、CI免除対象・状態、local検証と独立reviewを保持します。head/base変更はneeds_changes、CI根拠の失効は診断へ返し、次段階で再検証・review・record-review --replace-receiptへ戻します。人間の再承認だけを理由に停止しません。CIをsuccessへ書き換えず、API不明・既知のtest失敗やCI以外のgateを免除しません。main側免除は固定base/headを親に持つ同じtreeの実mergeだけです。別main更新は通常CIを要求します。CI判断の委任はmanual deploy/release/保護解除/追加費用や権限を含みません。"
         )
     } else if matches!(task.phase, Phase::Integration | Phase::Finish) {
         let gate_argument = match task.delivery_gate() {
