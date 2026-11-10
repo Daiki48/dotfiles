@@ -326,17 +326,18 @@ fn classify(
     }
 }
 
+/// suffixはAPI対象に使わず、run/head/attemptで所属を照合する。ref文字種を独自制限しない。
 fn normalized_workflow_path(raw: &str) -> Result<&str> {
-    let mut parts = raw.split('@');
-    let path = parts.next().unwrap_or("");
+    let (path, reference) = raw
+        .split_once('@')
+        .map_or((raw, None), |(path, reference)| (path, Some(reference)));
     if !workflow_yaml_path(path)
-        || parts.next().is_some_and(|reference| {
+        || reference.is_some_and(|reference| {
             reference.is_empty()
-                || !reference
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"-/_.".contains(&c))
+                || reference
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace())
         })
-        || parts.next().is_some()
     {
         return Err(error("workflow pathまたはref suffixを確認できません"));
     }
@@ -1723,10 +1724,20 @@ mod tests {
         );
         for raw in [
             ".github/workflows/ci.yml@",
-            ".github/workflows/ci.yml@main@other",
+            ".github/workflows/ci.yml@main\nother",
             "../ci.yml@main",
         ] {
             assert!(normalized_workflow_path(raw).is_err());
+        }
+        for reference in [
+            "refs/heads/feature/retry+storage",
+            "feature/main@other",
+            "日本語",
+        ] {
+            assert_eq!(
+                normalized_workflow_path(&format!(".github/workflows/ci.yml@{reference}")).unwrap(),
+                ".github/workflows/ci.yml"
+            );
         }
         // 公式responseの構造を使うが、識別子とheadはすべて合成値。
         let payload = serde_json::json!({"total_count":1,"jobs":[{"id":101,"run_id":202,"head_sha":"a".repeat(40),"status":"completed","conclusion":"failure","name":"unit-tests"}]});
