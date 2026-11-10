@@ -243,6 +243,49 @@ head/base更新、gate変更、セッション終了、process停止、待機時
 中断時は所有taskを再開します。CIなしで進めるtaskもrepository単位の納品予約を保持するため、
 同一repositoryのmerge・main同期・cleanupは競合しません。
 
+### Self-hosted CI枠の容量設定
+
+必要なrunner容量を実測した場合に限り、privateな
+`$CODEX_HOME/worktrees/.delivery-lane/capacity.json`で共有枠を最大3 jobまで設定できます。
+設定例は合成値です。`workflow_tree`は固定SHAに対する
+`git rev-parse <SHA>:.github/workflows`の結果を記録します。
+
+```json
+{
+  "version": 1,
+  "max_jobs": 3,
+  "disk_path": "/srv/runner-work",
+  "cpu_per_job": 2,
+  "memory_mib_per_job": 4096,
+  "disk_mib_per_job": 8192,
+  "reserve_cpus": 1,
+  "reserve_memory_mib": 2048,
+  "reserve_disk_mib": 16384,
+  "repositories": [
+    {"repository": "synthetic-org/build-a", "workflow_tree": "1111111111111111111111111111111111111111", "jobs": 2},
+    {"repository": "synthetic-org/build-b", "workflow_tree": "2222222222222222222222222222222222222222", "jobs": 1}
+  ]
+}
+```
+
+`capacity.json`は同一ユーザー所有の通常file（0600）にします。`disk_path`はrunnerの実ストレージを
+指す絶対canonical pathにします。登録するjob数には、同じ予約中にPR CI、main CI、再実行が
+重なる場合の最大同時実行数を使います。workflow変更後は容量設定を編集する前に
+head/base双方の最大同時実行数を再検証します。開始時の固定headとbaseのworkflow treeが
+登録値に一致する場合だけ重み付き予約を使います。未登録、tree不一致、構成不明は従来の
+排他予約です。既存のv1 stateも排他として扱います。
+
+判定は使用可能CPU数とload average、利用可能RAM、`disk_path`上の`statvfs`を参照し、
+稼働中予約の合計と設定reserveを保守的に差し引きます。容量不足なら新規開始を待たせますが、
+既存予約の`finish`は妨げません。同一repositoryの納品排他は維持します。修復taskは他の
+重み付き予約が解放されるまで待ち、その後に排他枠を取得します。ホスト計測は外部triggerを
+制御しないため、実際のrunner設定とhard limitを別途合わせてください。計測なしに有効化・増枠しません。
+
+初回は既存のmanaged refreshでhelperを更新し、新規Codex sessionから読み取り専用の
+`codex-delivery ci-capacity`で確認します。容量設定は受付ごとに読み直します。
+重み付きstateを読めない旧helperはfail closedし、
+設定なし・空stateの予約は従来のv1動作です。binaryを戻す前にcanonicalな`finish`で予約をdrainします。
+
 ### GitHub-hostedの通常CIで共有枠を省く条件
 
 明示的な`--ci-label`で起動する場合は、通常CIでも従来どおり共有枠を取得しfinishまで保持します。

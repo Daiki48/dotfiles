@@ -72,14 +72,14 @@ impl Budget {
 const MAX_SLOTS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ResourceSnapshot {
-    cpus: usize,
-    memory_mib: u64,
-    disk_mib: u64,
+pub(in crate::codex_tools) struct ResourceSnapshot {
+    pub cpus: usize,
+    pub memory_mib: u64,
+    pub disk_mib: u64,
 }
 
 impl ResourceSnapshot {
-    fn measure(root: &Path) -> Result<Self> {
+    pub(in crate::codex_tools) fn measure(root: &Path) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::ffi::OsStrExt;

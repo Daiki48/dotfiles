@@ -8,7 +8,7 @@ mod followup_tests;
 #[cfg(test)]
 mod handoff_tests;
 mod recovery;
-mod resources;
+pub(super) mod resources;
 pub(crate) mod store;
 mod worker;
 #[cfg(test)]
@@ -1946,6 +1946,7 @@ fn ready_with_hosted_policy(
             .map(|parent| parent.id.as_str());
         let available = |ci| {
             super::delivery::task_delivery_lane_available(
+                &context.repository,
                 &context.codex_home,
                 &task.github,
                 &task.id,
@@ -1953,6 +1954,7 @@ fn ready_with_hosted_policy(
                 head,
                 base,
                 ci,
+                task.phase == Phase::Finish,
                 repair_parent,
             )
         };
