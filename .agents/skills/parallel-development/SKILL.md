@@ -26,4 +26,6 @@ description: 複数Issueの並列実装、進行中に別タスクを追加す�
 - Finishでmainが最初cleanかつmanaged Skill等の更新を含む場合は、同一UIDの通常ホスト側でexecの`require_escalated`/既存auto-reviewを通して正規helperを実行する。permission設定を変更しない。通常sandboxで失敗しhelperが`sandbox-retry-ready`を発行した場合だけ、同じhostで1回の`--sandbox-retry`を使う。消費後の追加復旧には人間の明示承認が必要で、他taskの承認を流用しない。未知dirtyは保持する。
 - FedoraとWSL2はそれぞれ実行先のpath・認証・stateを使う。SSH経由の依頼は接続先が所有host。host間の暗黙移動やfailoverを行わない。
 
+容量障害は[artifact運用](../../../docs/codex-actions-artifacts.ja.md)の棚卸し・明示登録内の整理・反映待ち・対象jobの回復確認を使う。merge後も同じPR/head/base/Planと実mergeの親/tree/main到達を検証して固定証拠を更新し、既存taskのfinishへ戻せる。別repositoryの基盤修復との相互待ちは[deliveryガイド](../../../docs/codex-delivery.ja.md)の`repair-lane --request`で親の所有を保持して一時移譲する。修復finish後は親へ戻る。新taskの無断登録、state手編集、旧helperや無条件の枠解放で回避しない。
+
 起動・停止・復旧・現在の対応範囲は[タスク運用ガイド](../../../docs/codex-tasks.ja.md)を必要時に読む。
