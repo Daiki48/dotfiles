@@ -532,7 +532,7 @@ pub(super) fn prepare_merged(
     let mut proposed = payload.clone();
     proposed["emergency"] = evidence.clone();
     // 書換え前の全gateを確認する。旧auditの更新はreceipt確定後のfinishへ任せる。
-    observe_inner(root, &proposed, view, live, false)?;
+    observe_inner(root, &proposed, view, live, false, true)?;
     Ok(evidence)
 }
 
@@ -637,7 +637,42 @@ fn verify_merge(root: &Path, request: &Request, merge: &str) -> Result<()> {
 }
 
 pub(super) fn observe(root: &Path, receipt: &Value, view: &Value, live: &str) -> Result<Value> {
-    observe_inner(root, receipt, view, live, true)
+    observe_inner(root, receipt, view, live, true, true)
+}
+
+/// 修復枠の判断用に実測を返す。CI免除を認可せず、親のreceipt/auditも変更しない。
+pub(super) fn observe_for_repair(
+    root: &Path,
+    receipt: &Value,
+    view: &Value,
+    live: &str,
+) -> Result<Value> {
+    if str_value(view, "state")? != "MERGED" {
+        return Err(error("修復枠の親は実merge済みである必要があります"));
+    }
+    observe_inner(root, receipt, view, live, false, false)
+}
+
+fn snapshot_approval(
+    request: &Request,
+    head: &Snapshot,
+    actual: &Snapshot,
+    target: &str,
+    delivery: bool,
+) -> Result<bool> {
+    if head
+        .entries
+        .iter()
+        .chain(actual.entries.iter())
+        .any(|entry| !success(&entry.state) && !waived_state(&entry.state))
+    {
+        return Err(error("修復判断にも未知のCI状態は使用できません"));
+    }
+    if delivery {
+        coverage(request, head, &request.head_sha)?;
+        coverage(request, actual, target)?;
+    }
+    Ok(delivery)
 }
 
 fn observe_inner(
@@ -646,7 +681,11 @@ fn observe_inner(
     view: &Value,
     live: &str,
     persist: bool,
+    delivery: bool,
 ) -> Result<Value> {
+    if persist && !delivery {
+        return Err(error("修復枠の観測で親auditは更新できません"));
+    }
     validate_receipt(receipt)?;
     let request = request(get(get(receipt, "emergency")?, "request")?, receipt)?;
     let merged = str_value(view, "state")? == "MERGED";
@@ -665,7 +704,6 @@ fn observe_inner(
     };
     let expected = workflow_expectations(root, &request.base_sha, &request.head_sha, false)?;
     let head = snapshot(root, &request.repository, &request.head_sha, &expected)?;
-    coverage(&request, &head, &request.head_sha)?;
     let actual = if merged {
         snapshot(
             root,
@@ -676,13 +714,13 @@ fn observe_inner(
     } else {
         head.clone()
     };
-    coverage(&request, &actual, &target)?;
+    let approved = snapshot_approval(&request, &head, &actual, &target, delivery)?;
     // 並行して統合された別変更のCIは、今回の免除対象にしない。
     if merged && live != target {
         check_required_ci(root, &request.repository, live)?;
     }
     let result = object([
-        ("approved", Value::Bool(true)),
+        ("approved", Value::Bool(approved)),
         ("receipt_sha256", string(digest(receipt)?)),
         ("head", string(&request.head_sha)),
         ("base", string(live)),

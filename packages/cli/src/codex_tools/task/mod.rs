@@ -3274,6 +3274,9 @@ mod tests {
 
     #[test]
     fn emergency_observation_preserves_skipped_and_rejects_empty_evidence() {
+        let mut repair_only = emergency_observation(true).emergency.unwrap();
+        repair_only["approved"] = json!(false);
+        assert!(ci::emergency_observation(repair_only).is_err());
         let mut proof = emergency_observation(false).emergency.unwrap();
         proof["target_ci"]["entries"] = json!([{"state":"skipped"}]);
         let observation = ci::emergency_observation(proof.clone()).unwrap();

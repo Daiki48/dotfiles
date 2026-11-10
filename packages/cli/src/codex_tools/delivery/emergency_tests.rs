@@ -55,6 +55,18 @@ fn workflow_admission_failure_and_pending_are_observed_then_explicitly_waived() 
 }
 
 #[test]
+fn uncovered_new_failure_can_be_observed_for_repair_without_approving_delivery() {
+    let approval = request(&sample_request(), &scope()).unwrap();
+    let head = snapshot("failure");
+    let mut actual = head.clone();
+    actual.entries[0].name = "new-main-ci-check".into();
+    assert!(snapshot_approval(&approval, &head, &actual, HEAD, true).is_err());
+    assert!(!snapshot_approval(&approval, &head, &actual, HEAD, false).unwrap());
+    actual.entries[0].state = "unknown-status".into();
+    assert!(snapshot_approval(&approval, &head, &actual, HEAD, false).is_err());
+}
+
+#[test]
 fn missing_workflow_run_needs_a_separate_explicit_waiver() {
     let observed = snapshot_with(
         "example/product",

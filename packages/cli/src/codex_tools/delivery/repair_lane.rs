@@ -18,6 +18,8 @@ struct Request {
     child_receipt_sha256: String,
     purpose: String,
     authorization: String,
+    product_test_failures: bool,
+    parent_failure_evidence: String,
     reason: String,
 }
 
@@ -32,6 +34,9 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
         || request.purpose != "repair-ci-infrastructure"
         || request.authorization.trim().is_empty()
         || request.authorization.len() > 8192
+        || request.product_test_failures
+        || request.parent_failure_evidence.trim().is_empty()
+        || request.parent_failure_evidence.len() > 8192
         || request.reason.trim().is_empty()
         || request.reason.len() > 4096
     {
@@ -93,7 +98,7 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
     validate_receipt_review_history(&parent_root, &parent)?;
     review_safety(&parent_root, &parent_repo, request.parent.pr as i64)?;
     let live = fetch_main(&parent_root, &parent_repo)?;
-    let observed = emergency::observe(&parent_root, &parent, &view, &live)?;
+    let observed = emergency::observe_for_repair(&parent_root, &parent, &view, &live)?;
     let entries = observed["target_ci"]["entries"]
         .as_array()
         .ok_or_else(|| error("親CI観測が不正です"))?;
@@ -160,6 +165,11 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
             ("child_receipt_sha256", string(request.child_receipt_sha256)),
             ("purpose", string(request.purpose)),
             ("authorization", string(request.authorization)),
+            ("product_test_failures", Value::Bool(false)),
+            (
+                "parent_failure_evidence",
+                string(request.parent_failure_evidence),
+            ),
             ("observed", observed),
             ("reason", string(request.reason)),
             (
