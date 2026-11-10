@@ -399,6 +399,17 @@ fn replacement_history_keeps_old_receipt_and_audit_on_retry() {
     ));
     fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     let receipt_path = path.join("head.json");
+    let other = path.join("other-checkout");
+    fs::create_dir(&other).unwrap();
+    fs::create_dir(other.join(".git")).unwrap();
+    assert_eq!(
+        git_common_at(&other, ".git").unwrap(),
+        fs::canonicalize(other.join(".git")).unwrap()
+    );
+    assert_eq!(
+        git_common_at(&other, other.join(".git").to_str().unwrap()).unwrap(),
+        fs::canonicalize(other.join(".git")).unwrap()
+    );
     let old = json!({"version":6,"scope":"synthetic"});
     let new = json!({"version":7,"scope":"synthetic"});
     let audit = json!({"state":"synthetic-failure"});

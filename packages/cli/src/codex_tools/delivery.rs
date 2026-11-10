@@ -2226,6 +2226,13 @@ fn canonical_remote_url(root: &Path, expected_repository: &str) -> Result<String
     Ok(format!("https://github.com/{expected_repository}.git"))
 }
 
+fn git_common_at(root: &Path, reported: &str) -> Result<PathBuf> {
+    if reported.is_empty() {
+        return Err(error("Git common directoryが空です"));
+    }
+    fs::canonicalize(root.join(reported)).map_err(|_| error("Git common directoryを解決できません"))
+}
+
 fn manifest(root: &Path, task: &str, repository_name_value: &str) -> Result<(Value, PathBuf)> {
     let path = snapshot_path(repository_name_value, task)?;
     let payload = read_json_file(&path, "worktree manifest")?;
@@ -2270,7 +2277,7 @@ fn manifest(root: &Path, task: &str, repository_name_value: &str) -> Result<(Val
         .trim()
         .to_string();
     if common.is_empty()
-        || fs::canonicalize(&common).ok()
+        || git_common_at(root, &common).ok()
             != fs::canonicalize(str_value(&payload, "common_git_dir")?).ok()
     {
         return Err(error("manifest common git directoryが一致しません"));
@@ -2288,7 +2295,7 @@ fn worktree(root: &Path, manifest: &Value, expected: &Path) -> Result<()> {
         .trim()
         .to_string();
     if fs::canonicalize(&top).ok() != fs::canonicalize(expected).ok()
-        || fs::canonicalize(&common).ok()
+        || git_common_at(expected, &common).ok()
             != fs::canonicalize(str_value(manifest, "common_git_dir")?).ok()
         || git(expected, &["rev-parse", "--abbrev-ref", "HEAD"], true)?.trim()
             != str_value(manifest, "branch")?
