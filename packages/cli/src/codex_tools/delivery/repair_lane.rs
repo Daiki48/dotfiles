@@ -270,6 +270,7 @@ fn child_ci_only(
                         "required_review_thread_resolution",
                         "allowed_merge_methods",
                         "require_extra_approval_for_unattributed_changes",
+                        "required_reviewers",
                     ];
                     if object_ref(p)?
                         .keys()
@@ -278,7 +279,10 @@ fn child_ci_only(
                         || bool_value(p, "require_code_owner_review")?
                         || bool_value(p, "require_last_push_approval")?
                         || p.get("require_extra_approval_for_unattributed_changes")
-                            .is_some_and(|value| value != false)
+                            .is_some_and(|value| value.as_bool().is_none())
+                        || p.get("required_reviewers").is_some_and(|value| {
+                            value.as_array().is_none_or(|items| !items.is_empty())
+                        })
                         || p["allowed_merge_methods"] != serde_json::json!(["merge"])
                     {
                         return Err(error("修復PRにCI以外のreview/merge条件があります"));
@@ -442,9 +446,17 @@ mod tests {
     #[test]
     fn blocked_admission_requires_only_ruleset_ci_wait_and_rejects_deployment_or_unknown_blockers()
     {
-        let rules = serde_json::json!([[{"type":"pull_request","parameters":{"required_approving_review_count":0,"require_code_owner_review":false,"require_last_push_approval":false,"required_review_thread_resolution":true,"allowed_merge_methods":["merge"]}},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"required_status_checks":[{"context":"unit","integration_id":15368}]}}]]);
+        // 現行RESTの追加flagは承認数0では承認を要求しない。IDやrepository参照は含めない。
+        let rules = serde_json::json!([[{"type":"pull_request","parameters":{"required_approving_review_count":0,"require_code_owner_review":false,"require_last_push_approval":false,"required_review_thread_resolution":true,"require_extra_approval_for_unattributed_changes":true,"required_reviewers":[],"allowed_merge_methods":["merge"]}},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"required_status_checks":[{"context":"unit","integration_id":15368}]}}]]);
         let checks = serde_json::json!([{"total_count":1,"check_runs":[{"id":101,"name":"unit","head_sha":"a".repeat(40),"status":"queued","conclusion":null,"app":{"id":15368}}]}]);
         assert!(blocked_ci_only(&Value::Null, &rules, &checks, &"a".repeat(40)).is_ok());
+        let mut reviewers = rules.clone();
+        reviewers[0][0]["parameters"]["required_reviewers"] =
+            serde_json::json!([{"synthetic":true}]);
+        assert!(blocked_ci_only(&Value::Null, &reviewers, &checks, &"a".repeat(40)).is_err());
+        reviewers[0][0]["parameters"]["required_reviewers"] = serde_json::json!([]);
+        reviewers[0][0]["parameters"]["required_approving_review_count"] = Value::from(1);
+        assert!(blocked_ci_only(&Value::Null, &reviewers, &checks, &"a".repeat(40)).is_err());
         let mut duplicate = checks.clone();
         let check = duplicate[0]["check_runs"][0].clone();
         duplicate[0]["check_runs"]
