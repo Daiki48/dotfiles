@@ -462,15 +462,14 @@ fn admit_at(
     let path = repository_root(root, &scope.repository)?;
     let mut delivery = read(&path)?;
     claim_state(&mut delivery, scope.clone(), parent)?;
-    // 中途失敗も予約を保持して再開する。CI不要時は共有ownerを書き換えない。
-    atomic_json(
-        &path.join("state.json"),
-        &serde_json::to_value(delivery).map_err(|_| error("納品予約を保存できません"))?,
-    )?;
+    // 中断時に共有枠の計上が欠けないよう、納品予約より先に永続化する。
     if ci.is_some() {
         shared.save(root)?;
     }
-    Ok(())
+    atomic_json(
+        &path.join("state.json"),
+        &serde_json::to_value(delivery).map_err(|_| error("納品予約を保存できません"))?,
+    )
 }
 
 fn repair_state(state: &mut State, parent: &Scope, child: Scope) -> Result<()> {
@@ -519,11 +518,11 @@ fn claim_repair_at(root: &Path, parent: &Scope, child: Scope) -> Result<()> {
     let path = repository_root(root, &child.repository)?;
     let mut delivery = read(&path)?;
     claim_state(&mut delivery, child, None)?;
+    shared.save(root)?;
     atomic_json(
         &path.join("state.json"),
         &serde_json::to_value(delivery).map_err(|_| error("修復納品予約を保存できません"))?,
-    )?;
-    shared.save(root)
+    )
 }
 
 pub(super) fn release(repository: &str, task: &str, pr: u64) -> Result<()> {
@@ -672,17 +671,29 @@ mod tests {
         reserve(&mut shared, &second, 1, 3).unwrap();
         reserve(&mut shared, &first, 1, 3).unwrap();
         assert!(reserve(&mut shared, &third, 1, 3).is_err());
+        // 共有予約を保存した直後、repository予約の書込前に停止した状態。
         shared.save(&root).unwrap();
+        let delivery = repository_root(&root, &first.repository).unwrap();
+        assert!(!delivery.join("state.json").exists());
         let mut loaded = Shared::read(&root).unwrap();
         assert_eq!(loaded.reservations[0].demand, Demand::Jobs(2));
         assert_eq!(loaded.reservations[1].demand, Demand::Jobs(1));
-        let finishing = Admission {
-            policy: None,
-            demand: Demand::Exclusive,
-            finishing: true,
-        };
-        loaded.admit(&first, None, Some(&finishing)).unwrap();
-        assert_eq!(loaded.reservations[0].demand, Demand::Jobs(2));
+        assert!(reserve(&mut loaded, &third, 1, 3).is_err());
+        super::admit_at(
+            &root,
+            first.clone(),
+            None,
+            Some(CiRequest {
+                checkout: None,
+                finishing: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(read(&delivery).unwrap().owner, Some(first.clone()));
+        assert_eq!(
+            Shared::read(&root).unwrap().reservations[0].demand,
+            Demand::Jobs(2)
+        );
         release_at(&root, &first.repository, &first.task, 99).unwrap();
         assert_eq!(Shared::read(&root).unwrap().reservations.len(), 2);
         release_at(&root, &first.repository, &first.task, first.pr).unwrap();
@@ -690,6 +701,9 @@ mod tests {
         assert_eq!(loaded.reservations.len(), 1);
         assert_eq!(loaded.reservations[0].lane.owner.as_ref(), Some(&second));
         reserve(&mut loaded, &third, 2, 3).unwrap();
+        // repository予約が未保存でも、照合できる共有予約だけを回収できる。
+        release_at(&root, &second.repository, &second.task, second.pr).unwrap();
+        assert!(Shared::read(&root).unwrap().reservations.is_empty());
         fs::remove_dir_all(home).unwrap();
     }
 
