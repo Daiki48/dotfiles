@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{process, trust};
 mod actions_artifacts;
+mod ci_capacity;
 mod emergency;
 mod lane;
 mod repair_lane;
@@ -743,7 +744,7 @@ fn claim_delivery_lane(
     labels: &[String],
 ) -> Result<()> {
     let parent = super::task::delivery_repair_parent(root, task).map_err(error)?;
-    lane::claim(
+    lane::admit(
         lane::Scope {
             repository: repository.into(),
             task: task.into(),
@@ -753,11 +754,16 @@ fn claim_delivery_lane(
             labels: labels.to_vec(),
         },
         parent.as_deref(),
+        Some(lane::CiRequest {
+            checkout: Some(root),
+            finishing: false,
+        }),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn task_delivery_lane_available(
+    checkout: &Path,
     home: &Path,
     repository: &str,
     task: &str,
@@ -765,6 +771,7 @@ pub(crate) fn task_delivery_lane_available(
     head: &str,
     base: &str,
     ci: bool,
+    finishing: bool,
     repair_parent: Option<&str>,
 ) -> std::result::Result<bool, String> {
     let scope = lane::Scope {
@@ -775,7 +782,16 @@ pub(crate) fn task_delivery_lane_available(
         base: base.into(),
         labels: vec![],
     };
-    lane::admission_available(home, &scope, repair_parent, ci).map_err(|cause| cause.to_string())
+    lane::admission_available(
+        home,
+        &scope,
+        repair_parent,
+        ci.then_some(lane::CiRequest {
+            checkout: Some(checkout),
+            finishing,
+        }),
+    )
+    .map_err(|cause| cause.to_string())
 }
 
 /// 検証済みreceiptと最新gate観測の後にだけ呼ぶ。旧証拠は予約を要求する。
@@ -798,7 +814,13 @@ fn delivery_ci_required(
     }
 }
 
-fn admit_delivery(root: &Path, receipt: &Value, base: &str, merged: Option<&str>) -> Result<()> {
+fn admit_delivery(
+    root: &Path,
+    receipt: &Value,
+    base: &str,
+    merged: Option<&str>,
+    finishing: bool,
+) -> Result<()> {
     let task = str_value(receipt, "task_id")?;
     let parent = super::task::delivery_repair_parent(root, &task).map_err(error)?;
     lane::admit(
@@ -811,7 +833,10 @@ fn admit_delivery(root: &Path, receipt: &Value, base: &str, merged: Option<&str>
             labels: vec![],
         },
         parent.as_deref(),
-        delivery_ci_required(root, receipt, base, merged)?,
+        delivery_ci_required(root, receipt, base, merged)?.then_some(lane::CiRequest {
+            checkout: Some(root),
+            finishing,
+        }),
     )
 }
 
@@ -896,7 +921,7 @@ pub(crate) fn task_add_ci_labels(
         validate_delivery(cwd, &receipt, true, None, None).map_err(|cause| cause.to_string())?;
     }
     if labels.is_empty() {
-        admit_delivery(cwd, &receipt, base, None).map_err(|cause| cause.to_string())?;
+        admit_delivery(cwd, &receipt, base, None, false).map_err(|cause| cause.to_string())?;
     } else {
         claim_delivery_lane(cwd, repository, task, pr, head, base, labels)
             .map_err(|cause| cause.to_string())?;
@@ -4581,7 +4606,7 @@ fn assert_finish_main_synced(
         {
             emergency::observe(root, receipt, view, &current)?;
         }
-        admit_delivery(root, receipt, &current, None)?;
+        admit_delivery(root, receipt, &current, None, true)?;
     }
     Ok(())
 }
@@ -4645,6 +4670,7 @@ fn deliver_locked(
             .last()
             .ok_or_else(|| error("検査済みbaseがありません"))?,
         None,
+        false,
     )?;
     let initial = pr_view(root, &repository, expected_pr)?;
     if bool_value(&initial, "isDraft")? {
@@ -4706,6 +4732,7 @@ fn deliver_locked(
             .last()
             .ok_or_else(|| error("検査済みbaseがありません"))?,
         None,
+        false,
     )?;
     let path = state_path(&repository, task)?;
     let state = if path.exists() || path.is_symlink() {
@@ -4878,7 +4905,7 @@ fn finish_locked(
             ruleset(root, &repository)?;
         }
         let merge = oid(&str_value(get(&view, "mergeCommit")?, "oid")?, "実merge")?;
-        admit_delivery(root, &receipt_value, &live, Some(&merge))?;
+        admit_delivery(root, &receipt_value, &live, Some(&merge), true)?;
     }
     if stage == "merge_started" {
         state = save_stage(&repository, task, &state, "merged", "")?;
@@ -4922,7 +4949,7 @@ fn finish_locked(
         let remote_main = fetch_main(root, &repository)?;
         if gate == emergency::GATE {
             emergency::observe(root, &receipt_value, &view, &remote_main)?;
-            admit_delivery(root, &receipt_value, &remote_main, None)?;
+            admit_delivery(root, &receipt_value, &remote_main, None, true)?;
         }
         let sync_from = git(
             root,
@@ -4994,7 +5021,7 @@ fn finish_locked(
     if gate == emergency::GATE {
         let live = fetch_main(root, &repository)?;
         emergency::observe(root, &receipt_value, &view, &live)?;
-        admit_delivery(root, &receipt_value, &live, None)?;
+        admit_delivery(root, &receipt_value, &live, None, true)?;
     }
     // main同期が終わっても、記録の保存を確認するまでは何も削除しない。
     work_log::sync(root, &state, false)?;
@@ -5818,6 +5845,12 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
         require_canonical_invocation()?;
         // 呼び出し側が argv[0] を除いた引数列を渡す契約。
         let args: Vec<_> = args.into_iter().collect();
+        if args.first().and_then(|value| value.to_str()) == Some("ci-capacity") {
+            if args.len() != 1 {
+                return Err(error("ci-capacityに引数は指定できません"));
+            }
+            return lane::capacity_status();
+        }
         if matches!(
             args.first().and_then(|value| value.to_str()),
             Some("actions-artifacts" | "repair-lane")
