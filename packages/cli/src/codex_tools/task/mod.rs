@@ -899,13 +899,17 @@ fn apply_diagnosis(context: &Context, task: &mut Task, report: &worker::Report) 
         return Ok(());
     }
     if report.outcome == "ready" && assessment.next_action == "emergency-ci" {
-        if task.merge_commit.is_some()
-            || task.ci_observation_error_at.is_some()
+        if task.ci_observation_error_at.is_some()
             || task.ci_evidence.as_ref().is_none_or(|observation| {
-                observation.merged
-                    || Some(&observation.head) != task.head.as_ref()
-                    || Some(&observation.base) != task.base.as_ref()
-                    || observation.target != observation.head
+                Some(&observation.head) != task.head.as_ref()
+                    || if observation.merged {
+                        task.merge_commit.as_ref() != Some(&observation.target)
+                            || observation.merge_commit.as_ref() != Some(&observation.target)
+                    } else {
+                        task.merge_commit.is_some()
+                            || Some(&observation.base) != task.base.as_ref()
+                            || observation.target != observation.head
+                    }
                     || observation.observed_at > now()
                     || !matches!(
                         observation.state,
@@ -1318,21 +1322,17 @@ fn observe_ci(context: &Context, task: &mut Task) -> Result<()> {
             );
             match evidence {
                 Ok(evidence) => return ci::emergency_observation(evidence),
-                Err(reason)
-                    if task.merge_commit.is_none()
-                        && !matches!(task.effective_phase(), Phase::MainCi | Phase::Finish) =>
-                {
+                Err(reason) => {
                     // 旧証拠が失効したら実CIを通常gateで再取得する。API不明は通さない。
                     return ci::observe(
                         &context.repository,
                         &context.github,
                         task.pr.ok_or("PRがありません")?,
-                        None,
+                        task.merge_commit.is_some().then_some(ci::GateMode::Strict),
                         ci::GateMode::Strict,
                     )
                     .map_err(|_| reason);
                 }
-                Err(reason) => return Err(reason),
             }
         }
         ci::observe(
@@ -1658,9 +1658,17 @@ fn accept_ci_evidence(task: &mut Task, proof: Value) -> Result<()> {
         || !review_ready(task)
         || risk_rank(&task.risk) < risk_rank("high")
         || !observation.allows_delivery()
-        || observation.merged
         || task.head.as_ref() != Some(&observation.head)
-        || task.base.as_ref() != Some(&observation.base)
+        || if observation.merged {
+            task.merge_commit.as_ref() != Some(&observation.target)
+                || observation
+                    .emergency
+                    .as_ref()
+                    .and_then(|v| v["approved_base"].as_str())
+                    != task.base.as_deref()
+        } else {
+            task.merge_commit.is_some() || task.base.as_ref() != Some(&observation.base)
+        }
     {
         return Err("固定head/baseのlocal検証と独立reviewの証拠が不一致です".into());
     }
@@ -1672,7 +1680,11 @@ fn accept_ci_evidence(task: &mut Task, proof: Value) -> Result<()> {
     task.requested_gate = ci::GateMode::EmergencyCi;
     task.gate_mode = ci::GateMode::EmergencyCi;
     task.ci_emergency_requested = false;
-    task.phase = Phase::Integration;
+    task.phase = if observation.merged {
+        Phase::MainCi
+    } else {
+        Phase::Integration
+    };
     task.invalidate_ci();
     task.next_check = 0;
     Ok(())
@@ -3069,6 +3081,59 @@ mod tests {
         assert_eq!(task.risk, "high");
         assert_eq!(task.phase, Phase::Review);
         assert!(task.ci_emergency_requested);
+    }
+
+    #[test]
+    fn post_merge_infrastructure_evidence_resumes_main_ci_without_remerging() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        task.merge_commit = Some("c".repeat(40));
+        task.recovery.barrier = true;
+        task.phase = Phase::Diagnosis;
+        let mut observed = emergency_observation(true);
+        observed.emergency = None;
+        observed.state = ci::CiState::Failure;
+        task.ci_evidence = Some(observed);
+        let diagnosis = infrastructure_diagnosis(&task);
+        apply_diagnosis(&fixture.0, &mut task, &diagnosis).unwrap();
+        assert_eq!(task.phase, Phase::CiEvidence);
+        let proof = emergency_observation(true).emergency.unwrap();
+        let mut changed = proof.clone();
+        changed["approved_base"] = json!("d".repeat(40));
+        assert!(accept_ci_evidence(&mut task, changed).is_err());
+        let mut changed = proof.clone();
+        changed["target"] = json!("e".repeat(40));
+        assert!(accept_ci_evidence(&mut task, changed).is_err());
+        accept_ci_evidence(&mut task, proof).unwrap();
+        assert_eq!(task.phase, Phase::MainCi);
+        assert!(task.ci_evidence.is_none());
+        record_ci_result(&mut task, Ok(emergency_observation(true))).unwrap();
+        assert_eq!(task.phase, Phase::Finish);
+        assert_eq!(task.merge_commit, Some("c".repeat(40)));
+    }
+
+    #[test]
+    fn changed_post_merge_waiver_uses_fresh_failure_but_keeps_api_errors_blocked() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        task.phase = Phase::MainCi;
+        task.merge_commit = Some("c".repeat(40));
+        task.requested_gate = ci::GateMode::EmergencyCi;
+        task.emergency_receipt_sha256 = Some("f".repeat(64));
+        record_ci_result(&mut task, Err("synthetic API unavailable".into())).unwrap();
+        let diagnosis = infrastructure_diagnosis(&task);
+        apply_diagnosis(&fixture.0, &mut task, &diagnosis).unwrap();
+        assert_eq!(task.phase, Phase::Waiting);
+        let mut observed = emergency_observation(true);
+        observed.gate_mode = ci::GateMode::Strict;
+        observed.emergency = None;
+        observed.state = ci::CiState::Failure;
+        record_ci_result(&mut task, Ok(observed)).unwrap();
+        assert!(task.ci_observation_error_at.is_none());
+        let diagnosis = infrastructure_diagnosis(&task);
+        apply_diagnosis(&fixture.0, &mut task, &diagnosis).unwrap();
+        assert_eq!(task.phase, Phase::CiEvidence);
+        assert_eq!(task.merge_commit, Some("c".repeat(40)));
     }
 
     #[test]

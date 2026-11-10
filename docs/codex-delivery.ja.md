@@ -351,6 +351,46 @@ GitHubが拒否した場合は停止し、Ruleset変更、admin merge、保護br
 finishは実mergeが承認base/headを順番通りの親に持ち、treeがlocal検証済みheadと同じでmainへ到達したことを検証します。
 CI免除はこの実mergeだけです。mainがさらに進んだ場合は最新SHAの通常Actions成功を別途要求します。
 承認と初回観測はprivate receipt v7、最新実測は同じheadの`.emergency.json`へ分離保存します。
+
+### merge後に判明した基盤障害の証拠更新
+
+通常receiptでmergeした後の容量不足やrunner障害も、同じ`record-review`へ
+`--replace-receipt --gate-mode emergency-ci --emergency-request <PRIVATE_REQUEST_ABSOLUTE_PATH>`を付けて更新できます。
+request schemaは上記と共通です。`base_sha`は現在のmainではなく、実mergeの第1親です。
+PR/head/Planと版、変更範囲、local test/build、独立reviewを固定し、既知の製品test失敗は免除しません。
+merge済みPR identity、2親の順序、検証済みheadと同じtree、live mainへの到達、headと実merge双方のCIを再照合します。
+旧emergencyの承認baseも変更できません。別のmain更新には通常CIが必要です。
+
+対象stageは`merge_started`、`merged`、`main_synced`までです。cleanup開始後は更新せず保持します。
+元receiptと旧観測を`.history-<digest>.json`へ、次の証拠を`.transition-<digest>.json`へ非公開保存してから
+receiptをatomic更新します。同じrequestの再実行は既存receiptを再利用します。途中停止時も元履歴を消しません。
+更新後は同じtask/PR/head/Planの`finish --gate-mode emergency-ci`を使います。state手編集や再mergeは不要です。
+回復後の実CI成功はfinishで再観測し、免除範囲を拡張せず通常の同期・記録・cleanupへ戻ります。
+
+### 別repositoryの基盤修復へ共有枠を一時移譲する
+
+同一host/CODEX_HOMEで先行PRがmerge後の基盤障害に止まり、別repositoryの修復PRがその枠を待つ場合は、
+修復repositoryの親checkoutから`codex-delivery repair-lane --request <PRIVATE_REQUEST_ABSOLUTE_PATH>`を使います。
+先行PRは対象別emergency receiptと未回復の実CI観測、修復PRはhigh以上・独立review済みの固定receiptが必要です。
+API不明や製品test失敗を修復の根拠へ読み替えません。修復PRの新規作成は元の依頼scopeに従います。
+
+request v1は次のfieldを持つ0600のGit管理外JSONです。実値は公開しません。
+
+- `version: 1`、`parent_checkout`、`reason`（今回の基盤修復との関係）
+- `purpose: "repair-ci-infrastructure"`、`authorization`（元依頼に含まれる修復の根拠）
+- `parent`: 非公開枠の固定`repository/task/pr/head/base/labels`のobject
+- `parent_receipt_sha256`、`parent_merge`: 先行receiptと実mergeの固定値
+- `child_task`、`child_pr`、`child_head`、`child_plan`、`child_plan_version`、`child_receipt_sha256`
+
+このrequestが交差repositoryの固定親子関係の明示登録です。Codexは元依頼と原因を照合して作成します。
+helperは修復内容の意味を自動証明せず、登録scopeと証拠・競合を検証します。無関係な待機PRを自動選択しません。
+helperは双方のreceipt、親のmerged state・実merge・障害、子のopen PR・clean head・最新base・reviewを照合し、
+private証拠を保存した後、固定した親scopeに一致する場合だけ枠を交換します。親の所有はsuspendedとして残ります。
+交差repositoryの修復は1段に制限し、競合・循環・別の修復中は保持します。再実行は同じ固定scopeで再照合します。
+修復PRは通常のauthorize-ci/deliver/finishを使い、finish完了時だけ親scopeへ戻ります。親のfinishを再開して
+CI回復または更新済みの限定証拠を確認します。無条件release、state手編集、旧helperへの退避を使いません。
+
+Actionsの容量棚卸し・保持方針・回復確認は[artifact運用](codex-actions-artifacts.ja.md)を参照してください。
 PRには定型の検証結果・免除の限界と、検証済みの原因区分だけを保存確認します。
 `public_summary`はrequest v1の互換fieldとして非公開に保持し、自由記述・task名・path・command・check名は投稿しません。
 旧形式の公開記録は、privateな保存記録と一致する自分のcommentだけを定型文へ移行します。所有不明の編集は保持します。

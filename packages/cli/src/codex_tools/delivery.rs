@@ -17,8 +17,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{process, trust};
+mod actions_artifacts;
 mod emergency;
 mod lane;
+mod repair_lane;
 mod work_log;
 
 #[cfg(unix)]
@@ -716,6 +718,18 @@ pub(crate) fn task_ci_label_args(
 }
 
 pub(crate) const CI_LANE_BUSY: &str = lane::BUSY;
+
+pub(crate) fn recovery_invocation_reason(args: &[String]) -> Option<String> {
+    match args.first().map(String::as_str) {
+        Some("actions-artifacts") => actions_artifacts::invocation_reason(&args[1..]),
+        Some("repair-lane")
+            if args.len() == 3 && args[1] == "--request" && Path::new(&args[2]).is_absolute() =>
+        {
+            None
+        }
+        _ => Some("復旧helperの引数が許可形式ではありません".into()),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn claim_delivery_lane(
@@ -1807,6 +1821,42 @@ fn read_private_text(path: &Path, label: &str) -> Result<String> {
 fn read_json_file(path: &Path, label: &str) -> Result<Value> {
     let text = read_private_text(path, label)?;
     parse_json(&text, label)
+}
+
+/// 外部入力の実運用値をcheckoutやsymlink経由の公開領域へ置かせない。
+fn external_private_json(path: &Path, label: &str) -> Result<Value> {
+    validate_absolute_path(path, label)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| error("private入力の親がありません"))?;
+    safe_directory(parent)?;
+    #[cfg(unix)]
+    if open_private_regular(path, label)?
+        .metadata()
+        .map_err(|_| error("private入力を検査できません"))?
+        .nlink()
+        != 1
+    {
+        return Err(error("private入力のhardlinkを拒否しました"));
+    }
+    for directory in parent.ancestors() {
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|_| error("private入力の祖先を確認できません"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(error("private入力のsymlink祖先を拒否しました"));
+        }
+        match fs::symlink_metadata(directory.join(".git")) {
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => (),
+            Ok(metadata)
+                if metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && fs::read_dir(directory.join(".git"))
+                        .ok()
+                        .is_some_and(|mut entries| entries.next().is_none()) => {}
+            _ => return Err(error("実運用のprivate入力はGit checkout外へ置いてください")),
+        }
+    }
+    read_json_file(path, label)
 }
 
 #[cfg(unix)]
@@ -2978,19 +3028,43 @@ fn write_review_request_locked(
     if gate == emergency::GATE {
         let path = emergency_request.ok_or_else(|| error("--emergency-requestが必要です"))?;
         let view = pr_view(root, &repository, pr)?;
-        assert_recovery_pr_open(
-            &view,
-            &repository,
-            &str_value(&manifest_value, "branch")?,
-            &head,
-        )?;
-        if !emergency::git_ancestor(root, &live, &head)? {
-            return Err(error("緊急承認headが最新baseを含んでいません"));
+        let merged = str_value(&view, "state")? == "MERGED";
+        payload["version"] = Value::from(emergency::VERSION);
+        if merged {
+            if !replace_receipt {
+                return Err(error("merge後のCI証拠更新には--replace-receiptが必要です"));
+            }
+            assert_recovery_pr(
+                &view,
+                &repository,
+                &str_value(&manifest_value, "branch")?,
+                &head,
+            )?;
+            let existing = load_receipt(root, task, &head, Some(&repository))?;
+            emergency::replacement_scope(&existing, &payload)?;
+            let state = load_state(
+                &repository,
+                task,
+                &existing,
+                &str_value(&manifest_value, "branch")?,
+            )?;
+            emergency::replacement_stage(&state, true)?;
+            payload["emergency"] =
+                emergency::prepare_merged(root, &payload, path, &live, &view, &existing)?;
+        } else {
+            assert_recovery_pr_open(
+                &view,
+                &repository,
+                &str_value(&manifest_value, "branch")?,
+                &head,
+            )?;
+            if !emergency::git_ancestor(root, &live, &head)? {
+                return Err(error("緊急承認headが最新baseを含んでいません"));
+            }
+            payload["emergency"] = emergency::prepare(root, &payload, path, &live)?;
         }
         assert_main_clean(root)?;
         review_safety(root, &repository, pr)?;
-        payload["version"] = Value::from(emergency::VERSION);
-        payload["emergency"] = emergency::prepare(root, &payload, path, &live)?;
     } else if emergency_request.is_some() || replace_receipt && gate != STRICT_GATE_MODE {
         return Err(error(
             "requestはemergency-ci、receipt移行は緊急経路と通常CIへの復帰だけに指定してください",
@@ -3029,9 +3103,8 @@ fn write_review_request_locked(
                     &existing,
                     &str_value(&manifest_value, "branch")?,
                 )?;
-                if str_value(&state, "stage")? != "merge_started" {
-                    return Err(error("merge後の緊急承認移行はできません"));
-                }
+                let merged = str_value(&pr_view(root, &repository, pr)?, "state")? == "MERGED";
+                emergency::replacement_stage(&state, merged)?;
             }
         }
         let emergency_unchanged = gate != emergency::GATE
@@ -3064,6 +3137,9 @@ fn write_review_request_locked(
             )
         {
             return Ok(existing);
+        }
+        if replace_receipt {
+            emergency::archive_replacement(&path, &existing, &payload)?;
         }
         atomic_json(&path, &payload)?;
         Ok(payload)
@@ -5662,6 +5738,26 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
         require_canonical_invocation()?;
         // 呼び出し側が argv[0] を除いた引数列を渡す契約。
         let args: Vec<_> = args.into_iter().collect();
+        if matches!(
+            args.first().and_then(|value| value.to_str()),
+            Some("actions-artifacts" | "repair-lane")
+        ) {
+            let values = args
+                .iter()
+                .map(|v| {
+                    v.to_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| error("引数がUTF-8ではありません"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return with_deadline(|| {
+                if values[0] == "actions-artifacts" {
+                    actions_artifacts::entry(&values[1..])
+                } else {
+                    repair_lane::entry(&values[1..])
+                }
+            });
+        }
         if args.first().and_then(|value| value.to_str()) == Some("authorize-ci") {
             let args = args
                 .iter()

@@ -354,6 +354,82 @@ fn only_exact_merge_parents_and_tested_tree_are_eligible() {
     .trim()
     .to_string();
     assert!(verify_merge(root, &approval, &wrong).is_err());
+    assert!(git_ancestor(root, &merge, &head).is_ok_and(|v| !v));
+    assert!(git_ancestor(root, &head, &merge).unwrap());
+    approval.base_sha = head.clone();
+    assert!(verify_merge(root, &approval, &merge).is_err());
+}
+
+#[test]
+fn merged_evidence_replacement_stops_before_cleanup_and_keeps_original_scope() {
+    for stage in ["merge_started", "merged", "main_synced"] {
+        assert!(replacement_stage(&json!({"stage":stage}), true).is_ok());
+    }
+    for stage in [
+        "remote_delete_started",
+        "remote_deleted",
+        "worktree_removed",
+        "completed",
+        "unknown",
+    ] {
+        assert!(replacement_stage(&json!({"stage":stage}), true).is_err());
+    }
+    assert!(replacement_stage(&json!({"stage":"merged"}), false).is_err());
+    let original = scope();
+    for key in [
+        "repository",
+        "task_id",
+        "pr",
+        "head_sha",
+        "plan_id",
+        "plan_version",
+    ] {
+        let mut changed = original.clone();
+        changed[key] = json!("different");
+        assert!(replacement_scope(&original, &changed).is_err());
+    }
+}
+
+#[test]
+fn replacement_history_keeps_old_receipt_and_audit_on_retry() {
+    let path = env::temp_dir().join(format!(
+        "codex-ci-history-{}-{}",
+        std::process::id(),
+        now().replace(':', "-")
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    let receipt_path = path.join("head.json");
+    let old = json!({"version":6,"scope":"synthetic"});
+    let new = json!({"version":7,"scope":"synthetic"});
+    let audit = json!({"state":"synthetic-failure"});
+    atomic_json(&receipt_path, &old).unwrap();
+    assert_eq!(
+        external_private_json(&receipt_path, "fixture").unwrap(),
+        old
+    );
+    fs::write(path.join(".git"), "gitdir: synthetic").unwrap();
+    assert!(external_private_json(&receipt_path, "fixture").is_err());
+    fs::remove_file(path.join(".git")).unwrap();
+    fs::hard_link(&receipt_path, path.join("alias.json")).unwrap();
+    assert!(external_private_json(&receipt_path, "fixture").is_err());
+    fs::remove_file(path.join("alias.json")).unwrap();
+    atomic_json(&receipt_path.with_extension("emergency.json"), &audit).unwrap();
+    archive_replacement(&receipt_path, &old, &new).unwrap();
+    atomic_json(&receipt_path, &new).unwrap();
+    atomic_json(
+        &receipt_path.with_extension("emergency.json"),
+        &json!({"state":"recovered"}),
+    )
+    .unwrap();
+    archive_replacement(&receipt_path, &old, &new).unwrap();
+    let history = read_json_file(
+        &receipt_path.with_extension(format!("history-{}.json", digest(&old).unwrap())),
+        "history",
+    )
+    .unwrap();
+    assert_eq!(history["receipt"], old);
+    assert_eq!(history["audit"], audit);
+    fs::remove_dir_all(path).unwrap();
 }
 
 #[test]

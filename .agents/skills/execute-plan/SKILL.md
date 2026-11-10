@@ -42,6 +42,10 @@ riskと人間判断を分ける。
 
 CI/workflow、Ruleset、hook、AGENTS、Skills、helper、installer等の安全境界はhigh以上。必要な検証が通ったら目的外の改善へ広げない。PR/Issueには人間向けの目的、判断、変更、検証、残存事項を残し、機械監査JSONやdigestを投稿しない。
 
+Actionsの容量不足では[artifact運用](../../../docs/codex-actions-artifacts.ja.md)を読み、明示登録された通常CI artifactだけを棚卸し・整理する。共通保持既定7日とrepository/用途上書き、保護・参照・再生成性の証拠を照合し、API不明なら保持する。非公開の反映待ちと回復確認を記録し、対象jobだけを制限付きで再実行する。削除成功をCI回復と見なさず、通常のdelivery gateへ戻す。
+
+merge後の新たな基盤障害では[deliveryガイド](../../../docs/codex-delivery.ja.md)のmerge後証拠更新を使う。同じPR/head/base/Plan・実mergeの親/tree/main到達、固定headのlocal test/buildと独立reviewを再確認し、旧履歴を保存した`record-review --replace-receipt --gate-mode emergency-ci`から既存finishへ戻る。共有枠と別repositoryの修復が相互待ちなら、固定親子のprivate requestによる`repair-lane`で一時移譲し、修復finishで親へ戻す。state手編集、旧helper、guard解除、無条件の枠解放を使わない。
+
 ## commit・PR・delivery
 
 明示的な変更のみ依頼なら、比例した検証とself-review後、成果物を`clean-artifacts`で回収して差分を報告し、sourceは保持する。PRまでの依頼ならmergeせず停止する。以下は通常のGitHub実装に適用する。

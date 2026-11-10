@@ -288,5 +288,6 @@ Config for CorvusSKK.
 - [docker](https://github.com/Daiki48/dotfiles/blob/main/docs/setup-docker.md)
 - [Codex worktree運用](docs/codex-worktrees.ja.md)
 - [Codex delivery運用](docs/codex-delivery.ja.md)
+- [GitHub Actions artifact容量管理と復旧](docs/codex-actions-artifacts.ja.md)
 - [Codex guardrailのRust実装](docs/codex-rust-guardrails.ja.md)
 - [disk cleanup運用](docs/clean-disk.ja.md)

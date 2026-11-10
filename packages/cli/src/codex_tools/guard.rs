@@ -5051,6 +5051,9 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         return None;
     }
     let command = &args[0];
+    if ["actions-artifacts", "repair-lane"].contains(&command.as_str()) {
+        return super::delivery::recovery_invocation_reason(args);
+    }
     if command == "authorize-ci" {
         return super::delivery::ci_authorization_invocation_reason(args);
     }
@@ -7752,6 +7755,40 @@ mod tests {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+    #[test]
+    fn recovery_commands_require_private_paths_and_narrow_arguments() {
+        for command in [
+            "codex-delivery repair-lane --request /private-fixture/request.json",
+            "codex-delivery actions-artifacts inventory --policy /private-fixture/policy.json",
+            "codex-delivery actions-artifacts cleanup --policy /private-fixture/policy.json",
+        ] {
+            assert!(
+                delivery_helper_invocation_reason(
+                    &command
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                )
+                .is_none()
+            );
+        }
+        for command in [
+            "codex-delivery repair-lane --request relative.json",
+            "codex-delivery repair-lane --request /private-fixture/request.json --force",
+            "codex-delivery actions-artifacts cleanup --policy relative.json",
+            "codex-delivery actions-artifacts delete-run --policy /private-fixture/policy.json",
+        ] {
+            assert!(
+                delivery_helper_invocation_reason(
+                    &command
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                )
+                .is_some()
+            );
+        }
+    }
     #[test]
     fn manual_merge_recovery_requires_explicit_approval_and_private_mode() {
         let base = "--task-id issue-24 --pr 24 --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --plan-id MANUAL-RECOVERY-v1 --plan-version 1 --risk high --tests-passed --independent-review-passed --recover-merged";

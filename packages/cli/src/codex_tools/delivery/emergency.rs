@@ -467,7 +467,7 @@ pub(super) fn prepare(root: &Path, payload: &Value, path: &Path, live: &str) -> 
             "緊急承認requestはprivateな絶対pathで指定してください",
         ));
     }
-    let value = read_json_file(path, "緊急承認request")?;
+    let value = external_private_json(path, "緊急承認request")?;
     let request = request(&value, payload)?;
     if request.base_sha != live {
         return Err(error("緊急承認baseがlive mainと一致しません"));
@@ -482,6 +482,97 @@ pub(super) fn prepare(root: &Path, payload: &Value, path: &Path, live: &str) -> 
             serde_json::to_value(observed).map_err(|_| error("CI観測を保存できません"))?,
         ),
     ]))
+}
+
+pub(super) fn replacement_stage(state: &Value, merged: bool) -> Result<()> {
+    let stage = str_value(state, "stage")?;
+    if stage == "merge_started" || merged && ["merged", "main_synced"].contains(&stage.as_str()) {
+        Ok(())
+    } else {
+        Err(error(
+            "cleanup開始後または不明なdelivery段階のCI証拠は変更できません",
+        ))
+    }
+}
+
+/// merge後も元のbase/head/Planを維持し、免除は実mergeだけへ限定する。
+pub(super) fn prepare_merged(
+    root: &Path,
+    payload: &Value,
+    path: &Path,
+    live: &str,
+    view: &Value,
+    existing: &Value,
+) -> Result<Value> {
+    if !path.is_absolute() {
+        return Err(error("privateな絶対request pathが必要です"));
+    }
+    let value = external_private_json(path, "merge後の緊急承認request")?;
+    let request = request(&value, payload)?;
+    if receipt_gate_mode(existing)? == GATE
+        && existing["emergency"]["request"]["base_sha"] != value["base_sha"]
+    {
+        return Err(error("merge後の更新で承認済みbaseは変更できません"));
+    }
+    let merge = oid(&str_value(get(view, "mergeCommit")?, "oid")?, "実merge")?;
+    verify_merge(root, &request, &merge)?;
+    if !git_ancestor(root, &merge, live)? {
+        return Err(error("実mergeがmainへ到達していません"));
+    }
+    let expected = workflow_expectations(root, &request.base_sha, &request.head_sha, false)?;
+    let observed = snapshot(root, &request.repository, &request.head_sha, &expected)?;
+    coverage(&request, &observed, &request.head_sha)?;
+    let evidence = object([
+        ("request", value),
+        (
+            "observed_ci",
+            serde_json::to_value(observed).map_err(|_| error("CI証拠を保存できません"))?,
+        ),
+    ]);
+    let mut proposed = payload.clone();
+    proposed["emergency"] = evidence.clone();
+    // 書換え前の全gateを確認する。旧auditの更新はreceipt確定後のfinishへ任せる。
+    observe_inner(root, &proposed, view, live, false)?;
+    Ok(evidence)
+}
+
+pub(super) fn archive_replacement(path: &Path, existing: &Value, proposed: &Value) -> Result<()> {
+    let history = path.with_extension(format!("history-{}.json", digest(existing)?));
+    if history.exists() || history.is_symlink() {
+        if read_json_file(&history, "旧receipt履歴")?["receipt"] != *existing {
+            return Err(error("旧receipt履歴が一致しません"));
+        }
+    } else {
+        let audit = path.with_extension("emergency.json");
+        let observed = if audit.exists() || audit.is_symlink() {
+            read_json_file(&audit, "旧CI観測")?
+        } else {
+            Value::Null
+        };
+        let matches = observed.get("receipt_sha256").and_then(Value::as_str)
+            == Some(digest(existing)?.as_str());
+        atomic_json(
+            &history,
+            &object([
+                ("receipt", existing.clone()),
+                ("audit_matches_receipt", Value::Bool(matches)),
+                ("audit", observed),
+            ]),
+        )?;
+    }
+    let transition = path.with_extension(format!("transition-{}.json", digest(proposed)?));
+    let record = object([
+        ("previous", string(digest(existing)?)),
+        ("next", proposed.clone()),
+    ]);
+    if transition.exists() || transition.is_symlink() {
+        if read_json_file(&transition, "CI証拠移行")? != record {
+            return Err(error("移行履歴が一致しません"));
+        }
+        Ok(())
+    } else {
+        atomic_json(&transition, &record)
+    }
 }
 
 pub(super) fn merge_status(status: &str, draft: bool, allow_draft: bool, emergency: bool) -> bool {
@@ -546,6 +637,16 @@ fn verify_merge(root: &Path, request: &Request, merge: &str) -> Result<()> {
 }
 
 pub(super) fn observe(root: &Path, receipt: &Value, view: &Value, live: &str) -> Result<Value> {
+    observe_inner(root, receipt, view, live, true)
+}
+
+fn observe_inner(
+    root: &Path,
+    receipt: &Value,
+    view: &Value,
+    live: &str,
+    persist: bool,
+) -> Result<Value> {
     validate_receipt(receipt)?;
     let request = request(get(get(receipt, "emergency")?, "request")?, receipt)?;
     let merged = str_value(view, "state")? == "MERGED";
@@ -597,7 +698,9 @@ pub(super) fn observe(root: &Path, receipt: &Value, view: &Value, live: &str) ->
             serde_json::to_value(actual).map_err(|_| error("CI観測を保存できません"))?,
         ),
     ]);
-    atomic_json(&audit_path(receipt)?, &result)?;
+    if persist {
+        atomic_json(&audit_path(receipt)?, &result)?;
+    }
     Ok(result)
 }
 

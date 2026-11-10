@@ -155,6 +155,29 @@ pub(super) fn claim(scope: Scope, repair_parent: Option<&str>) -> Result<()> {
     update(&root()?, |state| claim_state(state, scope, repair_parent))
 }
 
+fn repair_state(state: &mut State, parent: &Scope, child: Scope) -> Result<()> {
+    validate(state)?;
+    child.validate()?;
+    if state.owner.as_ref() == Some(&child) && state.suspended.last() == Some(parent) {
+        return Ok(());
+    }
+    if state.owner.as_ref() != Some(parent)
+        || !state.suspended.is_empty()
+        || parent.repository == child.repository
+        || parent.same_pr(&child)
+    {
+        return Err(error("修復枠の親が変化したか、別の修復が進行中です"));
+    }
+    state.suspended.push(parent.clone());
+    state.owner = Some(child);
+    validate(state)
+}
+
+/// APIとreceipt検証を終えた固定scopeだけをCASで交換する。親を解放しない。
+pub(super) fn claim_repair(parent: &Scope, child: Scope) -> Result<()> {
+    update(&root()?, |state| repair_state(state, parent, child))
+}
+
 pub(super) fn release(repository: &str, task: &str, pr: u64) -> Result<()> {
     update(&root()?, |state| {
         // completed済みfinishの再実行で、後続PRの所有を変更しない。
@@ -306,5 +329,26 @@ mod tests {
         assert_eq!(state.owner.as_ref().unwrap().task, "task-parent");
         release_state(&mut state, "example/product", "task-parent", 1).unwrap();
         assert!(state.owner.is_none());
+    }
+
+    #[test]
+    fn cross_repository_repair_compares_fixed_parent_and_restores_it() {
+        let mut state = State::default();
+        let parent = scope("task-parent", 1);
+        claim_state(&mut state, parent.clone(), None).unwrap();
+        let mut child = scope("task-repair", 2);
+        child.repository = "example/infrastructure".into();
+        let mut stale = parent.clone();
+        stale.head = "d".repeat(40);
+        assert!(repair_state(&mut state, &stale, child.clone()).is_err());
+        repair_state(&mut state, &parent, child.clone()).unwrap();
+        repair_state(&mut state, &parent, child.clone()).unwrap();
+        let mut nested = scope("task-nested", 3);
+        nested.repository = "example/tools".into();
+        assert!(repair_state(&mut state, &child, nested).is_err());
+        assert!(release_state(&mut state, &parent.repository, &parent.task, parent.pr).is_err());
+        state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        release_state(&mut state, &child.repository, &child.task, child.pr).unwrap();
+        assert_eq!(state.owner, Some(parent));
     }
 }

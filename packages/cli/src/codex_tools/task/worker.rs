@@ -366,13 +366,20 @@ pub(super) fn prompt(task: &Task) -> String {
         }
         _ => "このphaseはworker実行対象ではありません。blockedを返してください。",
     };
+    let phase = if task.phase == Phase::CiEvidence && task.merge_commit.is_some() {
+        format!(
+            "{phase}\nmerge後の障害です。同じPR/head/Plan/版と保存済みbase（実mergeの第1親）、実mergeの親/tree/main到達を照合し、--replace-receiptで旧履歴を保持して証拠を更新してください。新たなmergeやsource変更をせず、既存MainCi/finishへ戻します。容量障害はdocs/codex-actions-artifacts.ja.mdの反映待ちと回復確認を使い、削除や再試行の成功だけを回復扱いしません。別repository修復の枠待ちは固定親子requestのrepair-lane経路で処理し、無条件に枠を解放しません。"
+        )
+    } else {
+        phase.into()
+    };
     let phase = if task.phase == Phase::Implementation && task.pr.is_some() {
         format!(
             "{phase}\nbase更新が必要なら、既存PRの通常のgh pr update-branch（rebase・forceは使わない）でremoteを更新し、親checkoutからcodex-worktree sync --task-id {} --expected-head <更新前local SHA> --expected-remote-head <更新後remote SHA>で照合して取り込みます。conflictや所有不明の差分は保持してblockedにしてください。",
             task.id
         )
     } else {
-        phase.into()
+        phase
     };
     let phase = format!(
         "{phase}\n元の利用者依頼と明示境界はauthorization、親が分割した今回の作業はobjectiveです。旧taskでauthorizationが空の場合はobjectiveと既存の引継ぎから許可範囲を照合し、許可を推測で追加しないでください。上位依頼に含まれる後続作業があればassessment.followupsへ根拠付きで提案し、task CLIを直接呼んで二重登録しないでください。purposeは通常continuationです。実在するmain CI失敗の修復だけrepair-main-ciを1件に限定し、その他の独立作業へbarrier例外を与えないでください。実装段階では最初のafter_previous=trueで本source完了を待ち、続くtrueで前の後続taskを待ちます。診断段階では保留中の親に依存させず、独立部分だけを分けます。\n受付時のリスク下限は{}です。workerの自己申告で下げず、変更内容から必要なら引き上げてください。CI/workflow・hook・rules・AGENTS・Skills・helper・installer・auth/secrets・billing・production・不可逆migration・breaking changeはhigh以上です。",
