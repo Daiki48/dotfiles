@@ -66,6 +66,19 @@ struct Snapshot {
     entries: Vec<Entry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedWorkflow {
+    path: String,
+    source: String,
+}
+
+fn expected(path: &str, event: &str) -> ExpectedWorkflow {
+    ExpectedWorkflow {
+        path: path.into(),
+        source: format!("actions:{event}"),
+    }
+}
+
 fn text_valid(value: &str, max: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= max
@@ -215,6 +228,43 @@ fn workflow_paths(root: &Path, sha: &str) -> Result<Vec<String>> {
     .collect())
 }
 
+fn workflow_expectations(
+    root: &Path,
+    base: &str,
+    head: &str,
+    merged_target: bool,
+) -> Result<Vec<ExpectedWorkflow>> {
+    let mut paths: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for reference in [base, head] {
+        for path in workflow_paths(root, reference)? {
+            let source = git(root, &["show", &format!("{reference}:{path}")], true)?;
+            let events = super::super::workflow_policy::trigger_events(&source).map_err(error)?;
+            let expected = paths.entry(path).or_default();
+            expected.extend(events.into_iter().filter(|event| {
+                event == "push"
+                    || !merged_target
+                        && ["pull_request", "pull_request_target"].contains(&event.as_str())
+            }));
+        }
+    }
+    Ok(paths
+        .into_iter()
+        .flat_map(|(path, events)| {
+            if events.is_empty() {
+                vec![ExpectedWorkflow {
+                    path,
+                    source: "actions".into(),
+                }]
+            } else {
+                events
+                    .into_iter()
+                    .map(|event| expected(&path, &event))
+                    .collect()
+            }
+        })
+        .collect())
+}
+
 fn pages(value: &Value, field: Option<&str>) -> Result<Vec<Value>> {
     let pages = value
         .as_array()
@@ -252,7 +302,7 @@ type Fetch<'a> = dyn FnMut(&str) -> Result<Value> + 'a;
 fn snapshot_with(
     repository: &str,
     sha: &str,
-    workflows: &[String],
+    workflows: &[ExpectedWorkflow],
     fetch: &mut Fetch<'_>,
 ) -> Result<Snapshot> {
     let checks = pages(
@@ -352,17 +402,22 @@ fn snapshot_with(
             id: int_value(&run, "id")?,
         })?;
     }
-    for path in workflows {
-        if !entries
-            .values()
-            .any(|entry| entry.kind == "workflow" && entry.name == *path)
-        {
+    for workflow in workflows {
+        if !entries.values().any(|entry| {
+            entry.kind == "workflow"
+                && entry.name == workflow.path
+                && entry.source == workflow.source
+        }) {
             entries.insert(
-                ("workflow".into(), path.clone(), "actions".into()),
+                (
+                    "workflow".into(),
+                    workflow.path.clone(),
+                    workflow.source.clone(),
+                ),
                 Entry {
                     kind: "workflow".into(),
-                    name: path.clone(),
-                    source: "actions".into(),
+                    name: workflow.path.clone(),
+                    source: workflow.source.clone(),
                     state: "missing".into(),
                     id: 0,
                 },
@@ -387,23 +442,23 @@ fn snapshot_with(
     })
 }
 
-fn snapshot(root: &Path, repository: &str, sha: &str) -> Result<Snapshot> {
-    snapshot_with(
-        repository,
-        sha,
-        &workflow_paths(root, sha)?,
-        &mut |endpoint| {
-            gh_json(
-                root,
-                &[
-                    "api".into(),
-                    endpoint.into(),
-                    "--paginate".into(),
-                    "--slurp".into(),
-                ],
-            )
-        },
-    )
+fn snapshot(
+    root: &Path,
+    repository: &str,
+    sha: &str,
+    workflows: &[ExpectedWorkflow],
+) -> Result<Snapshot> {
+    snapshot_with(repository, sha, workflows, &mut |endpoint| {
+        gh_json(
+            root,
+            &[
+                "api".into(),
+                endpoint.into(),
+                "--paginate".into(),
+                "--slurp".into(),
+            ],
+        )
+    })
 }
 
 pub(super) fn prepare(root: &Path, payload: &Value, path: &Path, live: &str) -> Result<Value> {
@@ -417,7 +472,8 @@ pub(super) fn prepare(root: &Path, payload: &Value, path: &Path, live: &str) -> 
     if request.base_sha != live {
         return Err(error("緊急承認baseがlive mainと一致しません"));
     }
-    let observed = snapshot(root, &request.repository, &request.head_sha)?;
+    let expected = workflow_expectations(root, &request.base_sha, &request.head_sha, false)?;
+    let observed = snapshot(root, &request.repository, &request.head_sha, &expected)?;
     coverage(&request, &observed, &request.head_sha)?;
     Ok(object([
         ("request", value),
@@ -506,10 +562,16 @@ pub(super) fn observe(root: &Path, receipt: &Value, view: &Value, live: &str) ->
         }
         request.head_sha.clone()
     };
-    let head = snapshot(root, &request.repository, &request.head_sha)?;
+    let expected = workflow_expectations(root, &request.base_sha, &request.head_sha, false)?;
+    let head = snapshot(root, &request.repository, &request.head_sha, &expected)?;
     coverage(&request, &head, &request.head_sha)?;
     let actual = if merged {
-        snapshot(root, &request.repository, &target)?
+        snapshot(
+            root,
+            &request.repository,
+            &target,
+            &workflow_expectations(root, &request.base_sha, &request.head_sha, true)?,
+        )?
     } else {
         head.clone()
     };
@@ -579,6 +641,7 @@ pub(super) fn publish_note(root: &Path, receipt: &Value) -> Result<()> {
     let repo = str_value(receipt, "repository")?;
     let pr = int_value(receipt, "pr")?;
     let endpoint = format!("repos/{repo}/issues/{pr}/comments");
+    let issue_url = format!("https://api.github.com/repos/{repo}/issues/{pr}");
     let login = str_value(&work_log::api(root, "GET", "user", None)?, "login")?;
     let marker = body.lines().next().unwrap_or("");
     let record_path = audit_path(receipt)?.with_extension("note.json");
@@ -602,7 +665,8 @@ pub(super) fn publish_note(root: &Path, receipt: &Value) -> Result<()> {
     let mut found = None;
     for comment in comments {
         if str_value(&comment, "body")?.starts_with(marker) {
-            if str_value(get(&comment, "user")?, "login")? != login || found.is_some() {
+            work_log::validate_comment(&comment, &issue_url, &login)?;
+            if found.is_some() {
                 return Err(error("緊急CI記録の所有者または一意性を確認できません"));
             }
             found = Some(comment);
@@ -628,7 +692,11 @@ pub(super) fn publish_note(root: &Path, receipt: &Value) -> Result<()> {
             }
             int_value(&comment, "id")?
         }
-        None => int_value(&work_log::api(root, "POST", &endpoint, Some(&body))?, "id")?,
+        None => work_log::validate_comment(
+            &work_log::api(root, "POST", &endpoint, Some(&body))?,
+            &issue_url,
+            &login,
+        )?,
     };
     let saved = work_log::api(
         root,
@@ -636,7 +704,9 @@ pub(super) fn publish_note(root: &Path, receipt: &Value) -> Result<()> {
         &format!("repos/{repo}/issues/comments/{id}"),
         None,
     )?;
-    if str_value(&saved, "body")? != body || str_value(get(&saved, "user")?, "login")? != login {
+    if work_log::validate_comment(&saved, &issue_url, &login)? != id
+        || str_value(&saved, "body")? != body
+    {
         return Err(error("緊急CI公開記録の保存を確認できません"));
     }
     atomic_json(

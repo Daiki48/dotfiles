@@ -221,7 +221,7 @@ struct Task {
     gate_mode: ci::GateMode,
     #[serde(default)]
     requested_gate: ci::GateMode,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     emergency_receipt_sha256: Option<String>,
     #[serde(default)]
     stop_after: recovery::Boundary,
@@ -1573,13 +1573,7 @@ fn resume_with_options(
             }
             task.invalidate_ci();
             task.ci_activation_until = 0;
-            task.phase = if task.merge_commit.is_some() {
-                Phase::MainCi
-            } else if review_ready(&task) {
-                Phase::CiAuthorization
-            } else {
-                Phase::Review
-            };
+            task.phase = emergency_resume_phase(&mut task, &evidence)?;
         } else if gate != task.requested_gate {
             if task.merge_commit.is_some() {
                 return Err("merge後のreceipt policyは変更できません".into());
@@ -1720,6 +1714,35 @@ fn ready(context: &Context, task: &Task, tasks: &[Task]) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn emergency_resume_phase(task: &mut Task, evidence: &Value) -> Result<Phase> {
+    if evidence["merged"]
+        .as_bool()
+        .ok_or("緊急承認のmerge観測が不正です")?
+    {
+        let target = evidence["target"]
+            .as_str()
+            .filter(|sha| valid_sha(sha))
+            .ok_or("実mergeのSHAが不正です")?;
+        if task
+            .merge_commit
+            .as_deref()
+            .is_some_and(|old| old != target)
+        {
+            return Err("保存済みmergeと緊急承認の実mergeが異なります".into());
+        }
+        task.merge_commit = Some(target.into());
+        task.recovery.barrier = true;
+        task.recovery.origin = Some(Phase::MainCi);
+        Ok(Phase::MainCi)
+    } else if task.merge_commit.is_some() {
+        Err("保存済みのmergeを再確認できません".into())
+    } else if review_ready(task) {
+        Ok(Phase::CiAuthorization)
+    } else {
+        Ok(Phase::Review)
+    }
 }
 
 fn review_ready(task: &Task) -> bool {
@@ -2797,6 +2820,52 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn emergency_resume_recovers_a_merge_that_completed_before_worker_reporting() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        task.requested_gate = ci::GateMode::EmergencyCi;
+        task.gate_mode = ci::GateMode::EmergencyCi;
+        task.emergency_receipt_sha256 = Some("f".repeat(64));
+        task.phase = Phase::Integration;
+        let observation = emergency_observation(true);
+        task.phase =
+            emergency_resume_phase(&mut task, observation.emergency.as_ref().unwrap()).unwrap();
+        assert_eq!(task.phase, Phase::MainCi);
+        assert_eq!(task.merge_commit, observation.merge_commit);
+        assert!(task.recovery.barrier);
+        record_ci_result(&mut task, Ok(observation.clone())).unwrap();
+        assert_eq!(task.phase, Phase::Finish);
+        assert!(ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
+        task.merge_commit = Some("d".repeat(40));
+        assert!(
+            emergency_resume_phase(&mut task, observation.emergency.as_ref().unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn ordinary_tasks_omit_emergency_fields_for_running_old_coordinators() {
+        let fixture = Fixture::new();
+        let task = reviewed_task(&fixture);
+        assert!(
+            serde_json::to_value(&task)
+                .unwrap()
+                .get("emergency_receipt_sha256")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn emergency_observation_preserves_skipped_and_rejects_empty_evidence() {
+        let mut proof = emergency_observation(false).emergency.unwrap();
+        proof["target_ci"]["entries"] = json!([{"state":"skipped"}]);
+        let observation = ci::emergency_observation(proof.clone()).unwrap();
+        assert_eq!(observation.state, ci::CiState::Skipped);
+        assert!(observation.allows_delivery());
+        proof["target_ci"]["entries"] = json!([]);
+        assert!(ci::emergency_observation(proof).is_err());
     }
 
     #[test]

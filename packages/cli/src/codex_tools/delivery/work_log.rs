@@ -112,7 +112,7 @@ fn body(state: &Value, complete: bool) -> Result<String> {
     ))
 }
 
-fn validate_comment(value: &Value, issue_url: &str, login: &str) -> Result<i64> {
+pub(super) fn validate_comment(value: &Value, issue_url: &str, login: &str) -> Result<i64> {
     let id = int_value(value, "id")?;
     if id < 1
         || str_value(value, "issue_url")? != issue_url

@@ -20,15 +20,15 @@ pub(crate) fn sample_request() -> Value {
         "public_summary":"CI基盤障害のため今回だけCI待機を免除。local test/buildと独立review済み。CIでの検証は未実施。",
         "waivers":[
             {"kind":"check-run","name":"unit","source":"app:42","states":["failure","queued","in_progress"],"cause":"admission-failure","evidence":"jobが開始前に拒否されたことを確認"},
-            {"kind":"workflow","name":WORKFLOW,"source":"actions:pull_request","states":["failure","queued","in_progress"],"cause":"service-outage","evidence":"基盤障害を確認"},
-            {"kind":"workflow","name":WORKFLOW,"source":"actions:push","states":["failure","queued","in_progress"],"cause":"service-outage","evidence":"同じ基盤のmain実行にも適用"},
+            {"kind":"workflow","name":WORKFLOW,"source":"actions:pull_request","states":["failure","queued","in_progress","missing"],"cause":"service-outage","evidence":"基盤障害を確認"},
+            {"kind":"workflow","name":WORKFLOW,"source":"actions:push","states":["failure","queued","in_progress","missing"],"cause":"service-outage","evidence":"同じ基盤のmain実行にも適用"},
             {"kind":"workflow","name":WORKFLOW,"source":"actions","states":["missing"],"cause":"runner-unavailable","evidence":"実行が作成されない状態を確認"}
         ]
     })
 }
 
 fn snapshot(state: &str) -> Snapshot {
-    snapshot_with("example/product", HEAD, &[WORKFLOW.into()], &mut |endpoint| {
+    snapshot_with("example/product", HEAD, &[expected(WORKFLOW, "pull_request")], &mut |endpoint| {
         if endpoint.contains("check-runs?") {
             Ok(json!([{"total_count":1,"check_runs":[{"id":1,"head_sha":HEAD,"name":"unit","app":{"id":42},"status":if matches!(state,"queued"|"in_progress") {state} else {"completed"},"conclusion":if matches!(state,"queued"|"in_progress") {Value::Null} else {json!(state)}}]}]))
         } else if endpoint.contains("/statuses?") { Ok(json!([[]])) }
@@ -59,7 +59,10 @@ fn missing_workflow_run_needs_a_separate_explicit_waiver() {
     let observed = snapshot_with(
         "example/product",
         HEAD,
-        &[WORKFLOW.into()],
+        &[
+            expected(WORKFLOW, "pull_request"),
+            expected(WORKFLOW, "push"),
+        ],
         &mut |endpoint| {
             Ok(if endpoint.contains("check-runs?") {
                 json!([{"total_count":0,"check_runs":[]}])
@@ -74,7 +77,9 @@ fn missing_workflow_run_needs_a_separate_explicit_waiver() {
     assert_eq!(observed.entries[0].state, "missing");
     let mut approval = request(&sample_request(), &scope()).unwrap();
     assert!(coverage(&approval, &observed, HEAD).is_ok());
-    approval.waivers.pop();
+    approval
+        .waivers
+        .retain(|waiver| waiver.source != "actions:pull_request");
     assert!(coverage(&approval, &observed, HEAD).is_err());
 }
 
@@ -224,14 +229,17 @@ fn only_exact_merge_parents_and_tested_tree_are_eligible() {
     )
     .unwrap();
     fs::write(root.join("file"), "base").unwrap();
-    git(root, &["add", "file"], true).unwrap();
+    fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    fs::write(root.join(WORKFLOW), "on: [push, pull_request]\n").unwrap();
+    git(root, &["add", "--", "file", WORKFLOW], true).unwrap();
     git(root, &["commit", "-m", "base"], true).unwrap();
     let base = git(root, &["rev-parse", "HEAD"], true)
         .unwrap()
         .trim()
         .to_string();
     fs::write(root.join("file"), "head").unwrap();
-    git(root, &["add", "file"], true).unwrap();
+    fs::remove_file(root.join(WORKFLOW)).unwrap();
+    git(root, &["add", "--", "file", WORKFLOW], true).unwrap();
     git(root, &["commit", "-m", "head"], true).unwrap();
     let head = git(root, &["rev-parse", "HEAD"], true)
         .unwrap()
@@ -241,6 +249,10 @@ fn only_exact_merge_parents_and_tested_tree_are_eligible() {
         .unwrap()
         .trim()
         .to_string();
+    assert!(workflow_paths(root, &head).unwrap().is_empty());
+    let expected = workflow_expectations(root, &base, &head, false).unwrap();
+    assert!(expected.contains(&super::expected(WORKFLOW, "pull_request")));
+    assert!(expected.contains(&super::expected(WORKFLOW, "push")));
     let mut approval = request(&sample_request(), &scope()).unwrap();
     approval.base_sha = base.clone();
     approval.head_sha = head.clone();
@@ -302,4 +314,27 @@ fn only_exact_merge_parents_and_tested_tree_are_eligible() {
     .trim()
     .to_string();
     assert!(verify_merge(root, &approval, &wrong).is_err());
+}
+
+#[test]
+fn successful_push_does_not_hide_a_missing_pull_request_event() {
+    let observed = snapshot_with("example/product", HEAD,
+        &[expected(WORKFLOW, "push"), expected(WORKFLOW, "pull_request")],
+        &mut |endpoint| Ok(if endpoint.contains("check-runs?") {
+            json!([{"total_count":0,"check_runs":[]}])
+        } else if endpoint.contains("/statuses?") { json!([[]]) }
+        else { json!([{"total_count":1,"workflow_runs":[{"id":20,"head_sha":HEAD,"path":WORKFLOW,"event":"push","status":"completed","conclusion":"success"}]}]) })
+    ).unwrap();
+    assert!(
+        observed
+            .entries
+            .iter()
+            .any(|entry| entry.source == "actions:pull_request" && entry.state == "missing")
+    );
+    let mut approval = request(&sample_request(), &scope()).unwrap();
+    assert!(coverage(&approval, &observed, HEAD).is_ok());
+    approval
+        .waivers
+        .retain(|waiver| waiver.source != "actions:pull_request");
+    assert!(coverage(&approval, &observed, HEAD).is_err());
 }

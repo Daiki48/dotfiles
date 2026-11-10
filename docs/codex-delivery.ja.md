@@ -264,9 +264,9 @@ placeholderを承認された値へ置き換え、公開先へ貼り付けない
     {"kind": "check-run", "name": "<CHECK_NAME>", "source": "app:<APP_ID>",
      "states": ["failure", "queued", "in_progress"], "cause": "admission-failure", "evidence": "基盤障害の根拠"},
     {"kind": "workflow", "name": ".github/workflows/ci.yml", "source": "actions:pull_request",
-     "states": ["failure", "queued", "in_progress"], "cause": "service-outage", "evidence": "PR実行の障害根拠"},
+     "states": ["failure", "queued", "in_progress", "missing"], "cause": "service-outage", "evidence": "PR実行の障害根拠"},
     {"kind": "workflow", "name": ".github/workflows/ci.yml", "source": "actions:push",
-     "states": ["failure", "queued", "in_progress"], "cause": "service-outage", "evidence": "同じdeliveryの実mergeにも適用する障害根拠"},
+     "states": ["failure", "queued", "in_progress", "missing"], "cause": "service-outage", "evidence": "同じdeliveryの実mergeにも適用する障害根拠"},
     {"kind": "workflow", "name": ".github/workflows/ci.yml", "source": "actions",
      "states": ["missing"], "cause": "runner-unavailable", "evidence": "実行が作成されない場合の根拠"}
   ]
@@ -280,7 +280,11 @@ buildがないrepositoryでは構文検証等の実行可能性の検証を記�
 `pending`/`requested`/`waiting`/`missing`です。`action_required`や未知状態は免除できません。
 checkは`check-run`と`app:<ID>`、commit statusは`commit-status`と`user:<CREATOR_ID>`、
 workflow runは`workflow`、workflow pathと`actions:<EVENT>`で識別します。全て完全一致でwildcardはありません。
-workflow run不在は同じpath・source=`actions`・state=`missing`を別に承認します。
+承認base/head両方のworkflow定義から、headでは`push`/`pull_request`/`pull_request_target`、実mergeでは`push`の
+候補をevent別に列挙します。baseにのみ存在するworkflowも対象です。branch/path/type filterは不在を免除する根拠にせず、
+保守的に`actions:<EVENT>`・state=`missing`を観測します。push runでPR runの不在を隠しません。
+解釈不能なYAML、重複key、anchor/alias/tag、複数documentは判定不能として拒否し、不在へ読み替えません。
+該当する自動eventがないworkflowはsource=`actions`・state=`missing`として別に承認します。
 workflowも観測もない場合だけ`ci`・`no-observations`・`github`・`missing`を使います。
 別のcheck/提供元/状態は自動免除しません。check/status/run IDと実際の状態を保存し、生ログを取り込みません。
 
@@ -301,7 +305,8 @@ ledger付き旧v5は移行時にも旧証拠を検証します。merge後の移�
 `--replace-receipt`を明示します。task lockと既存stageで二重実行を制限し、merge済みなら同じreceiptのfinishから再開します。
 stateやinstalled helperの手編集は不要です。公開記録に所有不明の編集がある場合も保持して停止します。
 
-既存coordinatorへ渡す場合は旧writerの停止・回収を確認し、receipt作成後に次を使います。重複submitはしません。
+既存coordinatorへ渡す場合は旧版coordinatorと旧writerの停止・回収を確認し、receipt作成後に新版で次を使います。
+`start`の`already_running`は旧版の更新を保証しません。重複submitはしません。
 
 ```console
 codex-task resume --task-id <TASK_ID> --instruction '既存PRと承認済みreceiptのdeliver/finishを継続' --gate-mode emergency-ci --authorization '<今回の対象と理由を含む利用者の明示承認>'

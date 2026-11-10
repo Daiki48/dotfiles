@@ -151,6 +151,29 @@ pub(super) fn emergency_observation(proof: Value) -> Result<Observation, String>
         .iter()
         .map(|entry| entry["state"].as_str().unwrap_or(""))
         .collect();
+    if states.is_empty()
+        || states.iter().any(|state| {
+            !matches!(
+                *state,
+                "success"
+                    | "skipped"
+                    | "neutral"
+                    | "failure"
+                    | "error"
+                    | "startup_failure"
+                    | "timed_out"
+                    | "cancelled"
+                    | "missing"
+                    | "queued"
+                    | "in_progress"
+                    | "pending"
+                    | "requested"
+                    | "waiting"
+            )
+        })
+    {
+        return Err("緊急CIの実測が不足または不明です".into());
+    }
     let state = if states
         .iter()
         .any(|state| matches!(*state, "failure" | "error" | "startup_failure"))
@@ -162,6 +185,12 @@ pub(super) fn emergency_observation(proof: Value) -> Result<Observation, String>
         CiState::Cancelled
     } else if states.contains(&"missing") {
         CiState::Missing
+    } else if !states.contains(&"success")
+        && states
+            .iter()
+            .all(|state| matches!(*state, "skipped" | "neutral"))
+    {
+        CiState::Skipped
     } else if states
         .iter()
         .all(|state| matches!(*state, "success" | "skipped" | "neutral"))

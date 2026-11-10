@@ -1,4 +1,4 @@
-//! 明示承認のlocal-only gateで扱う、タグpushだけのworkflowの判定。
+//! 明示承認gateで使うworkflowの起動条件を保守的に検証する。
 use serde_json::{Map, Value};
 use std::collections::VecDeque;
 use yaml_rust2::Yaml;
@@ -48,7 +48,7 @@ fn node(events: &mut VecDeque<Event>, depth: usize) -> Result<Value, &'static st
     }
 }
 
-pub(super) fn tag_push_only(source: &str) -> Result<bool, &'static str> {
+fn parse_workflow(source: &str) -> Result<Value, &'static str> {
     if source.len() > MAX_BYTES {
         return Err("workflow YAMLが容量上限を超えています");
     }
@@ -79,6 +79,41 @@ pub(super) fn tag_push_only(source: &str) -> Result<bool, &'static str> {
     {
         return Err("workflow YAMLは単一documentに限定します");
     }
+    Ok(workflow)
+}
+
+/// filterは免除せず、起動し得るeventを保守的に列挙する。
+pub(super) fn trigger_events(source: &str) -> Result<Vec<String>, &'static str> {
+    let workflow = parse_workflow(source)?;
+    let on = workflow.get("on").ok_or("workflowのonがありません")?;
+    let mut events = match on {
+        Value::String(event) => vec![event.clone()],
+        Value::Array(events) => events
+            .iter()
+            .map(|event| {
+                event
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or("workflow eventが不正です")
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Value::Object(events) => events.keys().cloned().collect(),
+        _ => return Err("workflowのonが不正です"),
+    };
+    if events.is_empty()
+        || events.iter().any(|event| {
+            event.is_empty() || !event.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
+        })
+    {
+        return Err("workflow eventが不正です");
+    }
+    events.sort();
+    events.dedup();
+    Ok(events)
+}
+
+pub(super) fn tag_push_only(source: &str) -> Result<bool, &'static str> {
+    let workflow = parse_workflow(source)?;
     let Some(triggers) = workflow.get("on").and_then(Value::as_object) else {
         return Ok(false);
     };
@@ -112,6 +147,29 @@ mod tests {
             "'on': {push: {tags: ['v*', '*release*']}}\n",
         ] {
             assert_eq!(tag_push_only(yaml), Ok(true));
+        }
+    }
+
+    #[test]
+    fn emergency_trigger_expectations_cover_scalar_sequence_and_mapping_forms() {
+        assert_eq!(
+            trigger_events("on: pull_request\n").unwrap(),
+            ["pull_request"]
+        );
+        for source in [
+            "on: [push, pull_request]\n",
+            "on: {push: {branches: [main]}, pull_request: null}\n",
+        ] {
+            assert_eq!(trigger_events(source).unwrap(), ["pull_request", "push"]);
+        }
+        for source in [
+            "on: [push, false]",
+            "on: null",
+            "on: &event [push]",
+            "on: push\non: pull_request",
+            "on: [push]\n---\non: pull_request",
+        ] {
+            assert!(trigger_events(source).is_err(), "{source}");
         }
     }
 
