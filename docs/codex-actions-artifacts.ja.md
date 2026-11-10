@@ -78,6 +78,9 @@ policy v1の合成例です。実値と確認日時は非公開fileでだけ置�
 ```
 
 `recovery_jobs`は再実行してよいCI専用のworkflow/jobを登録します。配備や昇格を含むjobは登録しません。
+依存先jobの再実行も含めて配備・昇格が起きないことを確認します。
+GitHubが返すworkflow pathの`@ref` suffixを検証して除き、jobのattempt所属は
+[attempt専用のjobs API](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt)で照合します。
 参照確認のないartifactも棚卸しには表示しますが、削除候補にはしません。
 
 ## 容量障害からdeliveryへ戻る
@@ -102,6 +105,8 @@ recovery evidence v1は同じ固定scope、`version: 1`、`storage_recovered: tr
 日時はUTCのISO 8601表記です。両evidenceはGit管理外の0700 directory内に0600で保存し、本文とdigestをprivate記録に残します。
 回復観測前は`awaiting-storage-refresh`を維持します。削除後の6〜12時間を観測目安とし、確認できた回復を根拠に進めます。
 rerun前にscopeと証拠の期限を再照合し、要求前に一度性を保存します。run/jobが変われば新たな固定記録に分けます。
+非公開ledgerは読み取り上限を超える前に履歴をarchiveし、未確定の削除intentを現行記録へ引き継ぎます。
+旧履歴を削除せず、分割後も未確定結果の照合から再開します。
 
 再実行後のActions check成功を確認したら、既存receiptと同じ対象の通常deliveryを再開します。
 merge後に初めて障害が判明した場合も、[merge後証拠更新](codex-delivery.ja.md#merge後に判明した基盤障害の証拠更新)

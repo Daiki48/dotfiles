@@ -309,7 +309,7 @@ fn classify(
     };
     if run.id != artifact.workflow_run.id
         || run.head_sha != artifact.workflow_run.head_sha
-        || !workflow_yaml_path(run.path.split('@').next().unwrap_or(""))
+        || normalized_workflow_path(&run.path).is_err()
     {
         return hold("所属runのidentityを確認できない", days);
     }
@@ -324,6 +324,72 @@ fn classify(
         reason: "登録保持期間を超過し、通常CI・参照なし・再生成可能を確認".into(),
         retention_days: days,
     }
+}
+
+fn normalized_workflow_path(raw: &str) -> Result<&str> {
+    let mut parts = raw.split('@');
+    let path = parts.next().unwrap_or("");
+    if !workflow_yaml_path(path)
+        || parts.next().is_some_and(|reference| {
+            reference.is_empty()
+                || !reference
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-/_.".contains(&c))
+        })
+        || parts.next().is_some()
+    {
+        return Err(error("workflow pathまたはref suffixを確認できません"));
+    }
+    Ok(path)
+}
+
+/// job応答にattempt fieldはないため、attempt専用一覧で所属を確認する。
+fn attempt_job_with(
+    repository: &str,
+    run: i64,
+    attempt: i64,
+    job: i64,
+    head: &str,
+    fetch: &mut impl FnMut(&str) -> Result<Value>,
+) -> Result<()> {
+    let mut seen = 0;
+    let mut expected = None;
+    for page in 1..=MAX_PAGES {
+        let response = fetch(&format!(
+            "repos/{repository}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100&page={page}"
+        ))?;
+        let count = int_value(&response, "total_count")?;
+        let jobs = get(&response, "jobs")?
+            .as_array()
+            .ok_or_else(|| error("attempt jobsのschemaが不正です"))?;
+        if count < 0
+            || count as usize > MAX_ARTIFACTS
+            || jobs.len() > 100
+            || expected.is_some_and(|old| old != count)
+        {
+            return Err(error("attempt jobsの完全な一覧を確認できません"));
+        }
+        expected = Some(count);
+        seen += jobs.len();
+        if seen > count as usize {
+            return Err(error("attempt jobsの件数が一致しません"));
+        }
+        for item in jobs {
+            if int_value(item, "id")? == job {
+                if int_value(item, "run_id")? != run
+                    || str_value(item, "head_sha")? != head
+                    || str_value(item, "status")? != "completed"
+                {
+                    return Err(error("固定attemptのjob identity/stateが一致しません"));
+                }
+                return Ok(());
+            }
+        }
+        if seen >= count as usize || jobs.len() < 100 {
+            break;
+        }
+    }
+    Err(error("固定attemptに対象jobがありません"))
 }
 
 fn clearance_for<'a>(
@@ -653,14 +719,68 @@ fn append_record(root: &Path, path: &Path, policy_hash: &str, value: Value) -> R
             records: Vec::new(),
         }
     };
-    if ledger.version != LEDGER_VERSION || ledger.records.len() >= 10_000 {
+    if ledger.version != LEDGER_VERSION {
         return Err(error("artifact private ledgerを安全に更新できません"));
     }
+    let previous = serde_json::to_value(&ledger).map_err(|_| error("整理履歴を保存できません"))?;
     let mut value = value;
     value["policy_sha256"] = string(policy_hash);
     ledger.records.push(value);
-    let encoded = serde_json::to_value(ledger)
+    let mut encoded = serde_json::to_value(&ledger)
         .map_err(|_| error("artifact private ledgerを保存できません"))?;
+    if serde_json::to_vec(&encoded)
+        .map_err(|_| error("整理履歴のsizeを検査できません"))?
+        .len()
+        > MAX_FILE_BYTES as usize / 2
+    {
+        // atomic_jsonの整形分も含めread上限を超えないよう、余裕を持って履歴を分割する。
+        let archive = path.with_extension(format!(
+            "archive-{}.json",
+            sha256(serde_json::to_vec(&previous).map_err(|_| error("履歴digestを計算できません"))?)
+        ));
+        if archive.exists() || archive.is_symlink() {
+            if read_json_file(&archive, "整理履歴archive")? != previous {
+                return Err(error("整理履歴archiveが一致しません"));
+            }
+        } else {
+            atomic_json(&archive, &previous)?;
+        }
+        let mut latest = BTreeMap::new();
+        for entry in previous["records"]
+            .as_array()
+            .ok_or_else(|| error("整理履歴が不正です"))?
+        {
+            if let Some(id) = entry["artifact_id"].as_i64()
+                && matches!(
+                    entry["action"].as_str(),
+                    Some("delete-intent" | "delete-result")
+                )
+            {
+                latest.insert(id, entry.clone());
+            }
+        }
+        let newest = ledger
+            .records
+            .pop()
+            .ok_or_else(|| error("整理記録がありません"))?;
+        ledger.records = latest
+            .into_values()
+            .filter(|entry| entry["action"] == "delete-intent" && entry["state"] == "pending")
+            .collect();
+        ledger.records.push(newest);
+        encoded =
+            serde_json::to_value(ledger).map_err(|_| error("未確定intentを保存できません"))?;
+    }
+    if serde_json::to_vec_pretty(&encoded)
+        .map_err(|_| error("整理履歴のsizeを検査できません"))?
+        .len()
+        + 1
+        > MAX_FILE_BYTES as usize
+    {
+        return Err(error(
+            "未確定intentが記録上限を超えています。削除せず保持します",
+        ));
+    }
     atomic_json(path, &encoded)?;
     sync_directory(root, "artifact private ledger")
 }
@@ -1220,7 +1340,8 @@ fn recovery(root: &Path, args: &[String]) -> Result<Value> {
             "recovery run/job identityまたは完了状態が一致しません",
         ));
     }
-    let workflow_path = str_value(&run, "path")?;
+    let raw_workflow_path = str_value(&run, "path")?;
+    let workflow_path = normalized_workflow_path(&raw_workflow_path)?;
     let job_name = str_value(&job, "name")?;
     let registered = repo_policy.recovery_jobs.iter().any(|item| {
         item.workflow_path == workflow_path
@@ -1235,12 +1356,17 @@ fn recovery(root: &Path, args: &[String]) -> Result<Value> {
     }
     let run_head = oid(&str_value(&run, "head_sha")?, "run head")?;
     let run_attempt = int_value(&run, "run_attempt")?;
-    if run_attempt < 1
-        || int_value(&job, "run_attempt")? != run_attempt
-        || str_value(&job, "head_sha")? != run_head
-    {
+    if run_attempt < 1 || str_value(&job, "head_sha")? != run_head {
         return Err(error("workflow run attemptが不正です"));
     }
+    attempt_job_with(
+        repo,
+        run_id,
+        run_attempt,
+        job_id,
+        &run_head,
+        &mut |endpoint| api_get(root, endpoint),
+    )?;
     let mut record = if record_path.exists() {
         read_json_file(&record_path, "capacity recovery record")?
     } else {
@@ -1585,6 +1711,114 @@ pub(super) fn invocation_reason(args: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn real_api_shape_uses_ref_suffix_and_attempt_jobs_without_job_attempt_field() {
+        assert_eq!(
+            normalized_workflow_path(".github/workflows/ci.yml@main").unwrap(),
+            ".github/workflows/ci.yml"
+        );
+        assert_eq!(
+            normalized_workflow_path(".github/workflows/ci.yml").unwrap(),
+            ".github/workflows/ci.yml"
+        );
+        for raw in [
+            ".github/workflows/ci.yml@",
+            ".github/workflows/ci.yml@main@other",
+            "../ci.yml@main",
+        ] {
+            assert!(normalized_workflow_path(raw).is_err());
+        }
+        // 公式responseの構造を使うが、識別子とheadはすべて合成値。
+        let payload = serde_json::json!({"total_count":1,"jobs":[{"id":101,"run_id":202,"head_sha":"a".repeat(40),"status":"completed","conclusion":"failure","name":"unit-tests"}]});
+        assert!(
+            attempt_job_with(
+                "example/product",
+                202,
+                3,
+                101,
+                &"a".repeat(40),
+                &mut |endpoint| {
+                    assert!(endpoint.contains("/runs/202/attempts/3/jobs?"));
+                    Ok(payload.clone())
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            attempt_job_with(
+                "example/product",
+                202,
+                4,
+                101,
+                &"a".repeat(40),
+                &mut |_| Ok(serde_json::json!({"total_count":0,"jobs":[]}))
+            )
+            .is_err()
+        );
+        assert!(
+            attempt_job_with(
+                "example/product",
+                202,
+                3,
+                101,
+                &"b".repeat(40),
+                &mut |_| Ok(payload.clone())
+            )
+            .is_err()
+        );
+        assert!(
+            attempt_job_with("example/product", 202, 3, 101, &"a".repeat(40), &mut |_| {
+                Err(error("synthetic API unavailable"))
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ledger_rotation_preserves_history_pending_intents_and_readable_state() {
+        let root = env::temp_dir().join(format!(
+            "codex-artifact-ledger-{}-{}",
+            std::process::id(),
+            now().replace(':', "-")
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("ledger.json");
+        append_record(
+            &root,
+            &path,
+            "synthetic",
+            serde_json::json!({"artifact_id":101,"action":"delete-intent","state":"pending"}),
+        )
+        .unwrap();
+        for _ in 0..4 {
+            append_record(
+                &root,
+                &path,
+                "synthetic",
+                serde_json::json!({"action":"summary","padding":"x".repeat(90_000)}),
+            )
+            .unwrap();
+            assert!(fs::metadata(&path).unwrap().len() <= MAX_FILE_BYTES);
+        }
+        let current = read_json_file(&path, "fixture").unwrap();
+        assert!(
+            current["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["artifact_id"] == 101 && entry["state"] == "pending")
+        );
+        let archives: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path != &root.join("ledger.json"))
+            .collect();
+        assert!(!archives.is_empty());
+        for archive in archives {
+            assert!(read_json_file(&archive, "history fixture").is_ok());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn live_conflict_or_api_error_never_calls_delete_transport() {
         let requests = std::cell::Cell::new(0);
