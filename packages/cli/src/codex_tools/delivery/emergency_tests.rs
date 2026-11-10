@@ -39,6 +39,31 @@ fn snapshot(state: &str) -> Snapshot {
 }
 
 #[test]
+fn ci_resource_decision_requires_non_active_observations_in_both_snapshots() {
+    for state in [
+        "success",
+        "failure",
+        "missing",
+        "cancelled",
+        "queued",
+        "in_progress",
+        "unknown",
+    ] {
+        let mut observed = snapshot("failure");
+        observed.entries[0].state = state.into();
+        let active = matches!(state, "queued" | "in_progress" | "unknown");
+        assert_eq!(
+            reservation_required(&observed, &snapshot("success")),
+            active
+        );
+        assert_eq!(
+            reservation_required(&snapshot("success"), &observed),
+            active
+        );
+    }
+}
+
+#[test]
 fn workflow_admission_failure_and_pending_are_observed_then_explicitly_waived() {
     let request = request(&sample_request(), &scope()).unwrap();
     for state in ["failure", "queued", "in_progress", "success"] {

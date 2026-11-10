@@ -1,4 +1,4 @@
-//! 同一host/CODEX_HOMEのCI承認からfinishまでを直列化する。時刻やprocess終了で所有を解放しない。
+//! CI共有予約とrepository単位の納品予約。時刻やprocess終了で所有を解放しない。
 use super::*;
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +30,9 @@ impl Scope {
         Ok(())
     }
     fn same_pr(&self, other: &Self) -> bool {
-        self.repository == other.repository && self.task == other.task && self.pr == other.pr
+        self.repository.eq_ignore_ascii_case(&other.repository)
+            && self.task == other.task
+            && self.pr == other.pr
     }
 }
 
@@ -62,7 +64,7 @@ fn validate(state: &State) -> Result<()> {
     let mut identities = HashSet::new();
     for scope in state.owner.iter().chain(state.suspended.iter()) {
         scope.validate()?;
-        if !identities.insert((&scope.repository, &scope.task, scope.pr)) {
+        if !identities.insert((scope.repository.to_ascii_lowercase(), &scope.task, scope.pr)) {
             return Err(error("CI直列枠の修復経路が循環しています"));
         }
     }
@@ -76,7 +78,7 @@ fn claim_state(state: &mut State, scope: Scope, repair_parent: Option<&str>) -> 
         && !owner.same_pr(&scope)
     {
         if repair_parent == Some(owner.task.as_str())
-            && owner.repository == scope.repository
+            && owner.repository.eq_ignore_ascii_case(&scope.repository)
             && state.suspended.len() < 4
         {
             state.suspended.push(owner.clone());
@@ -99,7 +101,10 @@ fn claim_state(state: &mut State, scope: Scope, repair_parent: Option<&str>) -> 
 fn release_state(state: &mut State, repository: &str, task: &str, pr: u64) -> Result<()> {
     validate(state)?;
     if let Some(owner) = &state.owner {
-        if owner.repository != repository || owner.task != task || owner.pr != pr {
+        if !owner.repository.eq_ignore_ascii_case(repository)
+            || owner.task != task
+            || owner.pr != pr
+        {
             return Err(error(BUSY));
         }
         state.owner = state.suspended.pop();
@@ -152,7 +157,75 @@ fn update(root: &Path, change: impl FnOnce(&mut State) -> Result<()>) -> Result<
 }
 
 pub(super) fn claim(scope: Scope, repair_parent: Option<&str>) -> Result<()> {
-    update(&root()?, |state| claim_state(state, scope, repair_parent))
+    admit(scope, repair_parent, true)
+}
+
+// 旧state.jsonはCI予約として維持し、同じlockでrepository予約と照合する。
+fn repository_root(root: &Path, repository: &str) -> Result<PathBuf> {
+    let path = root.join(format!("repository-{}", repo_key(repository)?));
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    match builder.create(&path) {
+        Ok(()) => (),
+        Err(cause) if cause.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(_) => return Err(error("納品予約directoryを作成できません")),
+    }
+    safe_directory(&path)?;
+    Ok(path)
+}
+
+fn check_admission(state: &State, scope: &Scope, parent: Option<&str>, ci: bool) -> Result<()> {
+    validate(state)?;
+    scope.validate()?;
+    // 旧CI予約も同一repositoryの排他として扱う。修復中の親は復帰を待つ。
+    if state
+        .suspended
+        .iter()
+        .any(|owner| owner.repository.eq_ignore_ascii_case(&scope.repository))
+        && !state
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.same_pr(scope))
+    {
+        return Err(error(BUSY));
+    }
+    if ci
+        || state
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.repository.eq_ignore_ascii_case(&scope.repository))
+    {
+        claim_state(&mut state.clone(), scope.clone(), parent)?;
+    }
+    Ok(())
+}
+
+pub(super) fn admit(scope: Scope, repair_parent: Option<&str>, ci: bool) -> Result<()> {
+    admit_at(&root()?, scope, repair_parent, ci)
+}
+
+fn admit_at(root: &Path, scope: Scope, parent: Option<&str>, ci: bool) -> Result<()> {
+    let _lock =
+        super::super::task::store::Lock::acquire_short(&root.join("state.lock")).map_err(error)?;
+    let mut shared = read(root)?;
+    check_admission(&shared, &scope, parent, ci)?;
+    let path = repository_root(root, &scope.repository)?;
+    let mut delivery = read(&path)?;
+    claim_state(&mut delivery, scope.clone(), parent)?;
+    // 中途失敗も予約を保持して再開する。CI不要時は共有ownerを書き換えない。
+    atomic_json(
+        &path.join("state.json"),
+        &serde_json::to_value(delivery).map_err(|_| error("納品予約を保存できません"))?,
+    )?;
+    if ci {
+        claim_state(&mut shared, scope, parent)?;
+        atomic_json(
+            &root.join("state.json"),
+            &serde_json::to_value(shared).map_err(|_| error("CI予約を保存できません"))?,
+        )?;
+    }
+    Ok(())
 }
 
 fn repair_state(state: &mut State, parent: &Scope, child: Scope) -> Result<()> {
@@ -163,7 +236,7 @@ fn repair_state(state: &mut State, parent: &Scope, child: Scope) -> Result<()> {
     }
     if state.owner.as_ref() != Some(parent)
         || !state.suspended.is_empty()
-        || parent.repository == child.repository
+        || parent.repository.eq_ignore_ascii_case(&child.repository)
         || parent.same_pr(&child)
     {
         return Err(error("修復枠の親が変化したか、別の修復が進行中です"));
@@ -175,22 +248,53 @@ fn repair_state(state: &mut State, parent: &Scope, child: Scope) -> Result<()> {
 
 /// APIとreceipt検証を終えた固定scopeだけをCASで交換する。親を解放しない。
 pub(super) fn claim_repair(parent: &Scope, child: Scope) -> Result<()> {
-    update(&root()?, |state| repair_state(state, parent, child))
-}
-
-pub(super) fn release(repository: &str, task: &str, pr: u64) -> Result<()> {
-    update(&root()?, |state| {
-        // completed済みfinishの再実行で、後続PRの所有を変更しない。
-        if state.owner.as_ref().is_some_and(|owner| {
-            owner.repository == repository && owner.task == task && owner.pr == pr
-        }) {
-            release_state(state, repository, task, pr)?;
-        }
-        Ok(())
+    let root = root()?;
+    update(&root, |state| {
+        repair_state(state, parent, child.clone())?;
+        let path = repository_root(&root, &child.repository)?;
+        let mut delivery = read(&path)?;
+        claim_state(&mut delivery, child, None)?;
+        atomic_json(
+            &path.join("state.json"),
+            &serde_json::to_value(delivery).map_err(|_| error("修復納品予約を保存できません"))?,
+        )
     })
 }
 
-pub(super) fn available(
+pub(super) fn release(repository: &str, task: &str, pr: u64) -> Result<()> {
+    release_at(&root()?, repository, task, pr)
+}
+
+fn release_at(root: &Path, repository: &str, task: &str, pr: u64) -> Result<()> {
+    let _lock =
+        super::super::task::store::Lock::acquire_short(&root.join("state.lock")).map_err(error)?;
+    let mut state = read(root)?;
+    let path = repository_root(root, repository)?;
+    let mut delivery = read(&path)?;
+    if delivery.owner.as_ref().is_some_and(|owner| {
+        owner.repository.eq_ignore_ascii_case(repository) && owner.task == task && owner.pr == pr
+    }) {
+        release_state(&mut delivery, repository, task, pr)?;
+        atomic_json(
+            &path.join("state.json"),
+            &serde_json::to_value(delivery).map_err(|_| error("納品予約を保存できません"))?,
+        )?;
+    }
+    // completed済みfinishの再実行で、後続PRの所有を変更しない。
+    if state.owner.as_ref().is_some_and(|owner| {
+        owner.repository.eq_ignore_ascii_case(repository) && owner.task == task && owner.pr == pr
+    }) {
+        release_state(&mut state, repository, task, pr)?;
+        atomic_json(
+            &root.join("state.json"),
+            &serde_json::to_value(state).map_err(|_| error("CI予約を保存できません"))?,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn available(
     home: &Path,
     repository: &str,
     task: &str,
@@ -214,9 +318,157 @@ pub(super) fn available(
     }))
 }
 
+pub(super) fn admission_available(
+    home: &Path,
+    scope: &Scope,
+    parent: Option<&str>,
+    ci: bool,
+) -> Result<bool> {
+    scope.validate()?;
+    let worktrees = home.join("worktrees");
+    if !worktrees.exists() && !worktrees.is_symlink() {
+        return Ok(true);
+    }
+    safe_directory(&worktrees)?;
+    let root = worktrees.join(".delivery-lane");
+    if !root.exists() && !root.is_symlink() {
+        return Ok(true);
+    }
+    safe_directory(&root)?;
+    if let Err(cause) = check_admission(&read(&root)?, scope, parent, ci) {
+        return if cause.to_string() == BUSY {
+            Ok(false)
+        } else {
+            Err(cause)
+        };
+    }
+    let path = root.join(format!("repository-{}", repo_key(&scope.repository)?));
+    if !path.exists() && !path.is_symlink() {
+        return Ok(true);
+    }
+    safe_directory(&path)?;
+    match claim_state(&mut read(&path)?, scope.clone(), parent) {
+        Ok(()) => Ok(true),
+        Err(cause) if cause.to_string() == BUSY => Ok(false),
+        Err(cause) => Err(cause),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture() -> (PathBuf, PathBuf) {
+        let home = std::env::temp_dir().join(format!(
+            "delivery-admission-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(home.join("worktrees"))
+            .unwrap();
+        let root = root_at(&home).unwrap();
+        (home, root)
+    }
+
+    #[test]
+    fn ci_free_delivery_in_another_repository_does_not_touch_the_ci_owner() {
+        let (home, root) = fixture();
+        let first = scope("task-first", 1);
+        admit_at(&root, first.clone(), None, true).unwrap();
+        let before = fs::read(root.join("state.json")).unwrap();
+        let mut other = scope("task-second", 2);
+        other.repository = "example/another-product".into();
+        assert!(!admission_available(&home, &other, None, true).unwrap());
+        assert!(admit_at(&root, other.clone(), None, true).is_err());
+        assert!(admission_available(&home, &other, None, false).unwrap());
+        admit_at(&root, other.clone(), None, false).unwrap();
+        admit_at(&root, other.clone(), None, false).unwrap(); // crash後の再開
+        let mut conflict = other.clone();
+        conflict.task = "task-conflict".into();
+        conflict.pr = 3;
+        assert!(!admission_available(&home, &conflict, None, false).unwrap());
+        assert!(admit_at(&root, conflict.clone(), None, false).is_err());
+        release_at(&root, &other.repository, &other.task, other.pr).unwrap();
+        admit_at(&root, conflict.clone(), None, false).unwrap();
+        release_at(&root, &other.repository, &other.task, other.pr).unwrap(); // completed再実行
+        assert_eq!(
+            read(&repository_root(&root, &other.repository).unwrap())
+                .unwrap()
+                .owner,
+            Some(conflict)
+        );
+        assert_eq!(fs::read(root.join("state.json")).unwrap(), before);
+        assert_eq!(read(&root).unwrap().owner, Some(first));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn gate_changes_keep_existing_ci_responsibility_and_legacy_owners_block_same_repository() {
+        let (home, root) = fixture();
+        let first = scope("task-first", 1);
+        update(&root, |state| claim_state(state, first.clone(), None)).unwrap(); // 旧stateのみ
+        let mut conflict = scope("task-second", 2);
+        conflict.repository = "Example/Product".into();
+        assert!(admit_at(&root, conflict.clone(), None, false).is_err());
+        admit_at(&root, first.clone(), None, false).unwrap();
+        assert_eq!(read(&root).unwrap().owner, Some(first.clone()));
+        release_at(&root, &first.repository, &first.task, first.pr).unwrap();
+        admit_at(&root, conflict.clone(), None, false).unwrap();
+        conflict.head = "c".repeat(40);
+        admit_at(&root, conflict.clone(), None, true).unwrap();
+        assert_eq!(read(&root).unwrap().owner, Some(conflict));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn repair_parent_cannot_bypass_a_suspended_ci_reservation() {
+        let (home, root) = fixture();
+        let parent = scope("task-parent", 1);
+        admit_at(&root, parent.clone(), None, true).unwrap();
+        let mut child = scope("task-repair", 2);
+        child.repository = "example/infrastructure".into();
+        update(&root, |state| repair_state(state, &parent, child.clone())).unwrap();
+        assert!(!admission_available(&home, &parent, None, false).unwrap());
+        assert!(admit_at(&root, parent.clone(), None, false).is_err());
+        admit_at(&root, child.clone(), None, true).unwrap();
+        release_at(&root, &child.repository, &child.task, child.pr).unwrap();
+        assert_eq!(read(&root).unwrap().owner, Some(parent.clone()));
+        admit_at(&root, parent, None, false).unwrap();
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn unknown_ci_or_repository_schema_never_allows_admission() {
+        let (home, root) = fixture();
+        let owner = scope("task-first", 1);
+        atomic_json(
+            &root.join("state.json"),
+            &serde_json::json!({"version":99,"owner":null,"suspended":[]}),
+        )
+        .unwrap();
+        assert!(admit_at(&root, owner.clone(), None, false).is_err());
+        assert!(admission_available(&home, &owner, None, false).is_err());
+        atomic_json(
+            &root.join("state.json"),
+            &serde_json::to_value(State::default()).unwrap(),
+        )
+        .unwrap();
+        let path = repository_root(&root, &owner.repository).unwrap();
+        atomic_json(
+            &path.join("state.json"),
+            &serde_json::json!({"version":99,"owner":null,"suspended":[]}),
+        )
+        .unwrap();
+        assert!(admit_at(&root, owner.clone(), None, false).is_err());
+        assert!(admission_available(&home, &owner, None, false).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn concurrent_admission_is_persisted_until_the_matching_finish() {

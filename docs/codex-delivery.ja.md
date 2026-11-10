@@ -225,7 +225,7 @@ local検証で迂回せず、workflowのtrigger、`runs-on`、job、matrixとliv
 mergeやpushで自動起動する既存CDはそのworkflowへ任せて状態を報告します。manual dispatch、release、
 production deploy、新しいenvironment approvalはdelivery helperのscopeに含めません。
 
-### CI起動からfinishまでの直列化
+### CI予約と納品予約
 
 既存のCI起動labelの選択はCodexへ継続委任されています。workflowと用途を読み、review receiptを作成してから
 親checkoutで次を実行します。新labelやdeploy承認を作成するcommandではありません。
@@ -236,12 +236,38 @@ codex-delivery authorize-ci --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --ba
 
 PR identity、cleanな固定head、review、最新mainの包含、labelの実在を照合してから付与します。
 同じlabelが他のopen PRにある場合は待ちます。coordinatorの`--ci-label`も同じ経路を使います。
-同一host/CODEX_HOME全repositoryで1 PRの枠を`worktrees/.delivery-lane/`へprivateに保存し、
-CI起動・merge・main CI・main同期・記録・cleanupを終えた`finish`だけが解放します。
-head/base更新、セッション終了、process停止、待機時間では解放しません。中断時は所有taskを再開します。
+共有CI枠は`worktrees/.delivery-lane/state.json`、repository単位の納品予約はその配下の
+`repository-<repo_key>/state.json`へprivateに保存します。通常CIを起動するtaskは原則として両方を取得し、
+CI起動・merge・main CI・main同期・記録・cleanupを終えた`finish`だけが共有枠を解放します。
+head/base更新、gate変更、セッション終了、process停止、待機時間では枠を解放しません。
+中断時は所有taskを再開します。CIなしで進めるtaskもrepository単位の納品予約を保持するため、
+同一repositoryのmerge・main同期・cleanupは競合しません。
+
+### GitHub-hostedの通常CIで共有枠を省く条件
+
+明示的な`--ci-label`で起動する場合は、通常CIでも従来どおり共有枠を取得しfinishまで保持します。
+labelを明示しない通常CIは、live base・固定head・finish時の実mergeに含まれる全workflow jobが
+[公式標準GitHub-hosted runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)の固定scalar `runs-on`
+（例: `ubuntu-24.04`）で、job-level reusable workflow `uses`を含まず、live repository APIでownerが個人（`User`）かつ
+repository self-hosted runner一覧が明示的に空と確認できた場合に限り、共有枠を省略できます。
+これはGitHub-hosted runner利用が確認できる場合に運用上の共有待ちだけを除く条件です。CI check、レビュー、同一repositoryの納品予約は従来どおり必要です。
+`runs-on`のmatrix展開・式・`group`・複数labelなど固定scalarでない指定、標準hostedと確認できないlabel、job-level `uses`、
+self-hosted runner、organization/enterpriseなどからのrunner継承が不明なrepository、workflow treeやAPI応答が欠落・不明の場合は
+共有枠を取得します。runner labelの対象はGitHubの公式runner一覧を正本とし、独自labelを推測でhosted扱いしません。
+owner種別とrunner一覧は毎回live APIで照合します。owner情報・runner一覧が取得できない、runner APIが明示的な空一覧を返さない場合も枠を省略しません。
+判定はlive base、固定head、merge後の実merge revisionごとに行います。finishで実merge等の証拠が条件外なら通常の共有枠を取得し（必要なら待機）、CI gate・所有チェックを維持します。
+省略可能なのは共有枠だけで、repository単位の納品予約は必ず維持します。既存の共有枠ownerはfinishまで保持し、
+この条件に該当する別repositoryのtaskが既存ownerを変更・解放することはありません。
+
+live baseと固定headに適用されるworkflow policyを検証した`local-validation`は共有CI枠なしで進めます。
+`emergency-ci`はgate名だけで枠を免除しません。有効なreceiptを照合した後、最新API観測でheadとmerge targetの
+CI状態がpending/queued/in_progress等でないことを確認できた場合に限り、共有枠を使わず納品予約だけ取得します。
+API不明、未知状態、対象不一致、期限切れ・scope不一致の証拠は従来の予約要件に従うかfail closedします。
+通常CI ownerが既にあるtaskはgate変更後もfinishまで所有を維持し、CI不要taskは別repositoryのCI ownerを
+変更・解放しません。旧共有stateはCI ownerとして読み、移行時に稼働中のownerを削除しません。
 直接のlabel操作で迂回しません。検証済みのmain CI修復taskだけは親の枠を一時的に使い、finish後に親へ戻します。
 
-自動triggerによるCIの並列実行、他hostや人間の操作をこの枠で排他できるわけではありません。
+自動triggerによるCIの並列実行、他hostや人間の操作を共有枠で排他できるわけではありません。
 GitHubのlabel APIもPR単位なので、照合と付与の間のpushは取り消せません。直列化は事故ゼロの保証ではなく、
 merge前の最新base・head・conflict・check・reviewの再確認とサーバー側保護を維持します。
 
