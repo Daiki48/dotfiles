@@ -121,12 +121,18 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
     validate_receipt_evidence(&path, &manifest, &child)?;
     validate_receipt_review_history(&root, &child)?;
     review_safety(&root, &child_repo, request.child_pr)?;
+    let child_view = pr_view(&root, &child_repo, request.child_pr)?;
     assert_child_open(
-        &pr_view(&root, &child_repo, request.child_pr)?,
+        &child_view,
         &child_repo,
         &str_value(&manifest, "branch")?,
         &request.child_head,
     )?;
+    let child_ci_wait = if str_value(&child_view, "mergeStateStatus")? == "BLOCKED" {
+        blocked_ci_evidence(&root, &child_repo, &request.child_head)?
+    } else {
+        Value::Null
+    };
     let base = fetch_main(&root, &child_repo)?;
     if !emergency::git_ancestor(&root, &base, &request.child_head)? {
         return Err(error("修復headが最新baseを含んでいません"));
@@ -164,6 +170,7 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
                 string(request.parent_failure_evidence),
             ),
             ("observed", observed),
+            ("child_ci_wait", child_ci_wait),
             ("reason", string(request.reason)),
             (
                 "child",
@@ -173,6 +180,185 @@ pub(super) fn entry(args: &[String]) -> Result<Value> {
     )?;
     lane::claim_repair(&request.parent, scope)?;
     Ok(object([("status", string("repair-admitted"))]))
+}
+
+fn blocked_ci_evidence(root: &Path, repository: &str, head: &str) -> Result<Value> {
+    let data = graphql(
+        root,
+        repository,
+        "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){ref(qualifiedName:\"refs/heads/main\"){name branchProtectionRule{id}}}}",
+        &[],
+    )?;
+    let branch = get(get(&data, "repository")?, "ref")?;
+    if str_value(branch, "name")? != "main" {
+        return Err(error("修復base refを確認できません"));
+    }
+    let protection = get(branch, "branchProtectionRule")?;
+    let rules = gh_json(
+        root,
+        &[
+            "api".into(),
+            format!("repos/{repository}/rules/branches/main?per_page=100"),
+            "--paginate".into(),
+            "--slurp".into(),
+        ],
+    )?;
+    let checks = gh_json(
+        root,
+        &[
+            "api".into(),
+            format!("repos/{repository}/commits/{head}/check-runs?per_page=100"),
+            "--paginate".into(),
+            "--slurp".into(),
+        ],
+    )?;
+    blocked_ci_only(protection, &rules, &checks, head)?;
+    Ok(object([
+        ("head", string(head)),
+        ("observed_at", string(now())),
+        ("protection", protection.clone()),
+        ("rules", rules),
+        ("checks", checks),
+    ]))
+}
+
+/// BLOCKEDの理由をCI待ちへ限定する。配備・approval・未知ruleは枠取得前に保持する。
+fn blocked_ci_only(
+    protection: &Value,
+    rule_pages: &Value,
+    check_pages: &Value,
+    head: &str,
+) -> Result<()> {
+    if !protection.is_null() {
+        return Err(error("classic protectionのBLOCKED理由を確定できません"));
+    }
+    let pages = rule_pages
+        .as_array()
+        .filter(|pages| pages.len() <= MAX_PAGES)
+        .ok_or_else(|| error("適用Ruleset一覧が不完全です"))?;
+    let mut required = HashSet::new();
+    for page in pages {
+        for rule in page.as_array().ok_or_else(|| error("適用ruleが不正です"))? {
+            match str_value(rule, "type")?.as_str() {
+                "deletion" | "non_fast_forward" => (),
+                "pull_request" => {
+                    let p = get(rule, "parameters")?;
+                    let keys = [
+                        "dismiss_stale_reviews_on_push",
+                        "require_code_owner_review",
+                        "require_last_push_approval",
+                        "required_approving_review_count",
+                        "required_review_thread_resolution",
+                        "allowed_merge_methods",
+                        "require_extra_approval_for_unattributed_changes",
+                    ];
+                    if object_ref(p)?
+                        .keys()
+                        .any(|key| !keys.contains(&key.as_str()))
+                        || int_value(p, "required_approving_review_count")? != 0
+                        || bool_value(p, "require_code_owner_review")?
+                        || bool_value(p, "require_last_push_approval")?
+                        || p.get("require_extra_approval_for_unattributed_changes")
+                            .is_some_and(|value| value != false)
+                        || p["allowed_merge_methods"] != serde_json::json!(["merge"])
+                    {
+                        return Err(error("修復PRにCI以外のreview/merge条件があります"));
+                    }
+                }
+                "required_status_checks" => {
+                    let p = get(rule, "parameters")?;
+                    if !bool_value(p, "strict_required_status_checks_policy")?
+                        || object_ref(p)?.keys().any(|key| {
+                            ![
+                                "strict_required_status_checks_policy",
+                                "required_status_checks",
+                                "do_not_enforce_on_create",
+                            ]
+                            .contains(&key.as_str())
+                        })
+                    {
+                        return Err(error("required CI ruleを確定できません"));
+                    }
+                    for check in get(p, "required_status_checks")?
+                        .as_array()
+                        .ok_or_else(|| error("required CI一覧が不正です"))?
+                    {
+                        if int_value(check, "integration_id")? != 15368 {
+                            return Err(error("required CI提供元が確認できません"));
+                        }
+                        let context = str_value(check, "context")?;
+                        if context.is_empty() {
+                            return Err(error("required CI名が不正です"));
+                        }
+                        required.insert(context);
+                    }
+                }
+                _ => {
+                    return Err(error(
+                        "配備または未知のruleがBLOCKEDを阻害する可能性があります",
+                    ));
+                }
+            }
+        }
+    }
+    if required.is_empty() {
+        return Err(error("未完了required CIを確認できません"));
+    }
+    let pages = check_pages
+        .as_array()
+        .filter(|pages| pages.len() <= MAX_PAGES)
+        .ok_or_else(|| error("CI一覧が不完全です"))?;
+    let mut count = 0;
+    let mut total = None;
+    let mut passed = HashSet::new();
+    let mut waiting = false;
+    for page in pages {
+        let n = int_value(page, "total_count")?;
+        if n < 0 || n as usize > MAX_ITEMS || total.is_some_and(|old| old != n) {
+            return Err(error("CI一覧が取得中に変化しました"));
+        }
+        total = Some(n);
+        for check in get(page, "check_runs")?
+            .as_array()
+            .ok_or_else(|| error("CI一覧が不正です"))?
+        {
+            count += 1;
+            if str_value(check, "head_sha")? != head {
+                return Err(error("CI対象headが一致しません"));
+            }
+            let status = str_value(check, "status")?;
+            let name = str_value(check, "name")?;
+            let actions = int_value(get(check, "app")?, "id")? == 15368;
+            match status.as_str() {
+                "completed"
+                    if matches!(
+                        str_value(check, "conclusion")?.as_str(),
+                        "success" | "skipped" | "neutral"
+                    ) =>
+                {
+                    if actions {
+                        passed.insert(name);
+                    }
+                }
+                "queued" | "in_progress" | "pending" | "requested" | "waiting"
+                    if get(check, "conclusion")?.is_null() =>
+                {
+                    if actions && required.contains(&name) {
+                        waiting = true;
+                    }
+                }
+                _ => return Err(error("CI待ち以外の失敗または未知状態があります")),
+            }
+        }
+    }
+    if total != Some(count) {
+        return Err(error("CI一覧が不完全です"));
+    }
+    if waiting || required.iter().any(|name| !passed.contains(name)) {
+        Ok(())
+    } else {
+        Err(error("BLOCKED理由をrequired CI待ちと確認できません"))
+    }
 }
 
 /// CI起動の枠を借りる段階ではrequired checks未完了のBLOCKEDを許可する。merge許可ではない。
@@ -224,6 +410,58 @@ fn repair_needed(observed: &Value) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blocked_admission_requires_only_ruleset_ci_wait_and_rejects_deployment_or_unknown_blockers()
+    {
+        let rules = serde_json::json!([[{"type":"pull_request","parameters":{"required_approving_review_count":0,"require_code_owner_review":false,"require_last_push_approval":false,"required_review_thread_resolution":true,"allowed_merge_methods":["merge"]}},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"required_status_checks":[{"context":"unit","integration_id":15368}]}}]]);
+        let checks = serde_json::json!([{"total_count":1,"check_runs":[{"name":"unit","head_sha":"a".repeat(40),"status":"queued","conclusion":null,"app":{"id":15368}}]}]);
+        assert!(blocked_ci_only(&Value::Null, &rules, &checks, &"a".repeat(40)).is_ok());
+        assert!(
+            blocked_ci_only(
+                &Value::Null,
+                &rules,
+                &serde_json::json!([{"total_count":0,"check_runs":[]}]),
+                &"a".repeat(40)
+            )
+            .is_ok()
+        );
+        let mut deployment = rules.clone();
+        deployment[0].as_array_mut().unwrap().push(serde_json::json!({"type":"required_deployments","parameters":{"required_deployment_environments":["production"]}}));
+        assert!(blocked_ci_only(&Value::Null, &deployment, &checks, &"a".repeat(40)).is_err());
+        assert!(
+            blocked_ci_only(
+                &serde_json::json!({"id":"synthetic-protection"}),
+                &rules,
+                &checks,
+                &"a".repeat(40)
+            )
+            .is_err()
+        );
+        assert!(
+            blocked_ci_only(
+                &Value::Null,
+                &serde_json::json!([[{"type":"unknown-rule"}]]),
+                &checks,
+                &"a".repeat(40)
+            )
+            .is_err()
+        );
+        let mut passed = checks.clone();
+        passed[0]["check_runs"][0]["status"] = string("completed");
+        passed[0]["check_runs"][0]["conclusion"] = string("success");
+        assert!(blocked_ci_only(&Value::Null, &rules, &passed, &"a".repeat(40)).is_err());
+        passed[0]["check_runs"][0]["conclusion"] = string("failure");
+        assert!(blocked_ci_only(&Value::Null, &rules, &passed, &"a".repeat(40)).is_err());
+        assert!(
+            blocked_ci_only(
+                &Value::Null,
+                &rules,
+                &serde_json::json!([]),
+                &"a".repeat(40)
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn repair_can_start_ci_while_required_checks_are_blocked_but_cannot_merge() {
         let mut view = serde_json::json!({"state":"OPEN","headRefOid":"a".repeat(40),"headRefName":"fix/infra","baseRefName":"main","isCrossRepository":false,"headRepository":{"nameWithOwner":"example/infrastructure"},"headRepositoryOwner":{"login":"example"},"autoMergeRequest":null,"mergeable":"MERGEABLE","isDraft":true,"mergeStateStatus":"BLOCKED"});
