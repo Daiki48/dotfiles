@@ -680,6 +680,23 @@ fn known_snapshot_states(snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 
+fn reservation_required(head: &Snapshot, target: &Snapshot) -> bool {
+    head.entries.iter().chain(&target.entries).any(|entry| {
+        !matches!(
+            entry.state.as_str(),
+            "success"
+                | "skipped"
+                | "neutral"
+                | "failure"
+                | "error"
+                | "startup_failure"
+                | "cancelled"
+                | "timed_out"
+                | "missing"
+        )
+    })
+}
+
 fn observe_inner(
     root: &Path,
     receipt: &Value,
@@ -741,6 +758,11 @@ fn observe_inner(
     };
     let result = object([
         ("approved", Value::Bool(approved)),
+        // gate名やlabel不在ではなく、毎回のAPI観測から資源予約の要否を返す。
+        (
+            "ci_reservation_required",
+            Value::Bool(!approved || reservation_required(&head, &actual)),
+        ),
         ("receipt_sha256", string(digest(receipt)?)),
         ("head", string(&request.head_sha)),
         ("base", string(live)),
