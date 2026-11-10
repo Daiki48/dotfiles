@@ -3556,7 +3556,7 @@ fn fetch_main(root: &Path, repository: &str) -> Result<String> {
 }
 fn validate_receipt_review_history(root: &Path, receipt_value: &Value) -> Result<()> {
     let version = int_value(receipt_value, "version")?;
-    if version == RECEIPT_VERSION {
+    if [RECEIPT_VERSION, emergency::VERSION].contains(&version) {
         return Ok(());
     }
     if version != LEGACY_LEDGER_RECEIPT_VERSION || !receipt_has_legacy_ledger(receipt_value) {
@@ -5723,7 +5723,7 @@ mod tests {
     }
 
     #[test]
-    fn emergency_schema_requires_explicit_approval_local_tests_and_independent_review() {
+    fn emergency_v7_receipt_requires_approval_evidence_and_passes_review_history() {
         let mut value = receipt_v6("high", false);
         let mut request = emergency::tests::sample_request();
         for key in [
@@ -5750,7 +5750,16 @@ mod tests {
                 Some("owner/repo"),
             )
         };
-        assert!(normalize(&value).is_ok());
+        let normalized = normalize(&value).unwrap();
+        validate_receipt_review_history(Path::new("/unused"), &normalized).unwrap();
+        let stale_base = emergency::observe(
+            Path::new("/unused"),
+            &normalized,
+            &serde_json::json!({"state":"OPEN"}),
+            &"c".repeat(40),
+        )
+        .unwrap_err();
+        assert!(stale_base.to_string().contains("base更新"));
         for field in [
             "decision",
             "risk",
@@ -5773,6 +5782,48 @@ mod tests {
                     .unwrap(),
             }
             assert!(normalize(&invalid).is_err(), "{field}");
+        }
+        for field in [
+            "repository",
+            "task_id",
+            "pr",
+            "head_sha",
+            "plan_id",
+            "plan_version",
+        ] {
+            let mut invalid = value.clone();
+            invalid["emergency"]["request"][field] = if matches!(field, "pr" | "plan_version") {
+                Value::from(99)
+            } else {
+                string("different")
+            };
+            assert!(normalize(&invalid).is_err(), "request scope: {field}");
+        }
+        for (path, replacement) in [
+            ("/gate_mode", string(STRICT_GATE_MODE)),
+            ("/version", Value::from(emergency::VERSION + 1)),
+            ("/emergency/request/authorization", string("")),
+            ("/emergency/request/base_sha", string("invalid")),
+            ("/emergency/request/independent_review", string("")),
+            (
+                "/emergency/request/local_validation/0/result",
+                string("failed"),
+            ),
+            ("/emergency/request/known_test_failures", Value::Bool(true)),
+            ("/emergency/observed_ci/sha", string("c".repeat(40))),
+            ("/emergency/observed_ci/entries/0/name", string("different")),
+            (
+                "/emergency/observed_ci/entries/0/source",
+                string("different"),
+            ),
+            (
+                "/emergency/observed_ci/entries/0/state",
+                string("action_required"),
+            ),
+        ] {
+            let mut invalid = value.clone();
+            *invalid.pointer_mut(path).unwrap() = replacement;
+            assert!(normalize(&invalid).is_err(), "{path}");
         }
     }
 
@@ -6806,6 +6857,9 @@ mod tests {
         );
         assert!(validate_receipt_review_history(Path::new("/unused"), &legacy_v5).is_err());
         assert!(validate_receipt_review_history(Path::new("/unused"), &receipt_v3()).is_err());
+        let mut unknown_version = current.clone();
+        unknown_version["version"] = Value::from(emergency::VERSION + 1);
+        assert!(validate_receipt_review_history(Path::new("/unused"), &unknown_version).is_err());
     }
 
     #[test]
