@@ -58,8 +58,19 @@ impl Approval {
 
     fn verify_merge(&self, root: &Path) -> Result<()> {
         emergency::verify_merge_tree(root, &self.base_sha, &self.head_sha, &self.merge_sha)?;
-        let message = git(root, &["show", "-s", "--format=%B", &self.merge_sha], true)?;
-        if !message.contains("[skip ci]")
+        let commit = git(
+            root,
+            &[
+                "--no-replace-objects",
+                "cat-file",
+                "commit",
+                &self.merge_sha,
+            ],
+            true,
+        )?;
+        if !commit
+            .split_once("\n\n")
+            .is_some_and(|(_, message)| message.contains("[skip ci]"))
             || !emergency::git_ancestor(root, &self.base_sha, &self.head_sha)?
         {
             return Err(error(

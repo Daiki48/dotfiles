@@ -627,12 +627,39 @@ fn verify_merge(root: &Path, request: &Request, merge: &str) -> Result<()> {
 }
 
 pub(super) fn verify_merge_tree(root: &Path, base: &str, head: &str, merge: &str) -> Result<()> {
-    let parents = git(root, &["rev-list", "--parents", "-n", "1", merge], true)?;
+    let parents = git(
+        root,
+        &[
+            "--no-replace-objects",
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            merge,
+        ],
+        true,
+    )?;
     if parents.split_whitespace().collect::<Vec<_>>() != [merge, base, head] {
         return Err(error("実mergeの親が承認済みbase/headと一致しません"));
     }
-    let merge_tree = git(root, &["rev-parse", &format!("{merge}^{{tree}}")], true)?;
-    let head_tree = git(root, &["rev-parse", &format!("{head}^{{tree}}")], true)?;
+    let merge_tree = git(
+        root,
+        &[
+            "--no-replace-objects",
+            "rev-parse",
+            &format!("{merge}^{{tree}}"),
+        ],
+        true,
+    )?;
+    let head_tree = git(
+        root,
+        &[
+            "--no-replace-objects",
+            "rev-parse",
+            &format!("{head}^{{tree}}"),
+        ],
+        true,
+    )?;
     if merge_tree != head_tree {
         return Err(error("実mergeのtreeがlocal検証済みheadと異なります"));
     }
@@ -732,6 +759,7 @@ fn observe_inner(
 pub(super) fn git_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
     let output = run(
         &git_command(&[
+            "--no-replace-objects".into(),
             "merge-base".into(),
             "--is-ancestor".into(),
             ancestor.into(),

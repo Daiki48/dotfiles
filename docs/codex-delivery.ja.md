@@ -473,6 +473,7 @@ live mainが実マージより先へ進んでいる場合は、live mainにも�
 承認と観測結果は元のreceiptに結び付け、納品予約を確保してからprivate delivery stateへ一度に保存します。
 元のriskと検証結果はreceiptに残ります。state保存前に中断した場合は同じ承認で再実行し、保存後は
 同じ `finish` で再開します。 `finish` は回収前に実マージとCIを再検証し、既存のIssue記録と物理回収を行います。
+対象別承認は実マージ後の回収に限ります。通常のマージは `deliver` のRulesetとCIのgateで検証します。
 
 #### Free/private profileでCIを確認済みの場合
 

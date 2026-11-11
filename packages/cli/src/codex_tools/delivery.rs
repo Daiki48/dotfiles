@@ -4518,11 +4518,7 @@ fn assert_finish_main_synced(
     repository: &str,
     receipt: &Value,
     view: &Value,
-    recovery_live: Option<&str>,
 ) -> Result<()> {
-    if let Some(live) = recovery_live {
-        return assert_synced_main_at(root, repository, live);
-    }
     assert_main_synced(root, repository)?;
     if receipt_gate_mode(receipt)? == emergency::GATE {
         let current = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
@@ -4855,6 +4851,10 @@ fn finish_locked(
         oid(&str_value(get(&view, "mergeCommit")?, "oid")?, "実merge")?;
         admit_delivery(root, &receipt_value, &live, &[])?;
     }
+    let assert_synced = || match recovery_live.as_deref() {
+        Some(live) => assert_synced_main_at(root, &repository, live),
+        None => assert_finish_main_synced(root, &repository, &receipt_value, &view),
+    };
     if stage == "merge_started" {
         state = save_stage(&repository, task, &state, "merged", "")?;
     }
@@ -4964,22 +4964,10 @@ fn finish_locked(
             }
             return Err(error("人間用mainをff-only syncできません"));
         }
-        assert_finish_main_synced(
-            root,
-            &repository,
-            &receipt_value,
-            &view,
-            recovery_live.as_deref(),
-        )?;
+        assert_synced()?;
         state = save_stage(&repository, task, &state, "main_synced", "")?;
     } else {
-        assert_finish_main_synced(
-            root,
-            &repository,
-            &receipt_value,
-            &view,
-            recovery_live.as_deref(),
-        )?;
+        assert_synced()?;
     }
     if gate == emergency::GATE {
         let live = fetch_main(root, &repository)?;
@@ -4990,13 +4978,7 @@ fn finish_locked(
     work_log::sync(root, &state, false)?;
     let stage = str_value(&state, "stage")?;
     if ["main_synced", "remote_delete_started"].contains(&stage.as_str()) {
-        assert_finish_main_synced(
-            root,
-            &repository,
-            &receipt_value,
-            &view,
-            recovery_live.as_deref(),
-        )?;
+        assert_synced()?;
         let branch = str_value(&manifest_value, "branch")?;
         let remote = remote_branch(root, &repository, &branch)?;
         if remote.as_deref().is_some_and(|v| v != head) {
@@ -5048,13 +5030,7 @@ fn finish_locked(
     }
     let stage = str_value(&state, "stage")?;
     if ["remote_deleted", "worktree_unlock_started"].contains(&stage.as_str()) {
-        assert_finish_main_synced(
-            root,
-            &repository,
-            &receipt_value,
-            &view,
-            recovery_live.as_deref(),
-        )?;
+        assert_synced()?;
         let branch = str_value(&manifest_value, "branch")?;
         if remote_branch(root, &repository, &branch)?.is_some() {
             return Err(error("remote task branchがcleanup中に再出現しました"));
@@ -5105,23 +5081,11 @@ fn finish_locked(
                 if unlocked.get("locked").is_some() {
                     return Err(error("worktree unlock後のlock状態を確認できません"));
                 }
-                assert_finish_main_synced(
-                    root,
-                    &repository,
-                    &receipt_value,
-                    &view,
-                    recovery_live.as_deref(),
-                )?;
+                assert_synced()?;
                 worktree(root, &manifest_value, &worktree_path)?;
                 worktree_clean_head(&worktree_path, &head)?;
             }
-            assert_finish_main_synced(
-                root,
-                &repository,
-                &receipt_value,
-                &view,
-                recovery_live.as_deref(),
-            )?;
+            assert_synced()?;
             worktree(root, &manifest_value, &worktree_path)?;
             worktree_clean_head(&worktree_path, &head)?;
             crate::clean_disk::ensure_artifact_idle(&worktree_path)
