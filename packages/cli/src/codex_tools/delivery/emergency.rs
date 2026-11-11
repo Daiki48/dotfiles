@@ -532,7 +532,7 @@ pub(super) fn prepare_merged(
     let mut proposed = payload.clone();
     proposed["emergency"] = evidence.clone();
     // 書換え前の全gateを確認する。旧auditの更新はreceipt確定後のfinishへ任せる。
-    observe_inner(root, &proposed, view, live, false, true)?;
+    observe_inner(root, &proposed, view, live, false)?;
     Ok(evidence)
 }
 
@@ -637,36 +637,19 @@ fn verify_merge(root: &Path, request: &Request, merge: &str) -> Result<()> {
 }
 
 pub(super) fn observe(root: &Path, receipt: &Value, view: &Value, live: &str) -> Result<Value> {
-    observe_inner(root, receipt, view, live, true, true)
+    observe_inner(root, receipt, view, live, true)
 }
 
-/// 修復枠の判断用に実測を返す。CI免除を認可せず、親のreceipt/auditも変更しない。
-pub(super) fn observe_for_repair(
-    root: &Path,
-    receipt: &Value,
-    view: &Value,
-    live: &str,
-) -> Result<Value> {
-    if str_value(view, "state")? != "MERGED" {
-        return Err(error("修復枠の親は実merge済みである必要があります"));
-    }
-    observe_inner(root, receipt, view, live, false, false)
-}
-
-fn snapshot_approval(
+fn validate_snapshot_coverage(
     request: &Request,
     head: &Snapshot,
     actual: &Snapshot,
     target: &str,
-    delivery: bool,
-) -> Result<bool> {
+) -> Result<()> {
     known_snapshot_states(head)?;
     known_snapshot_states(actual)?;
-    if delivery {
-        coverage(request, head, &request.head_sha)?;
-        coverage(request, actual, target)?;
-    }
-    Ok(delivery)
+    coverage(request, head, &request.head_sha)?;
+    coverage(request, actual, target)
 }
 
 fn known_snapshot_states(snapshot: &Snapshot) -> Result<()> {
@@ -675,26 +658,9 @@ fn known_snapshot_states(snapshot: &Snapshot) -> Result<()> {
         .iter()
         .any(|entry| !success(&entry.state) && !waived_state(&entry.state))
     {
-        return Err(error("修復判断にも未知のCI状態は使用できません"));
+        return Err(error("未知のCI状態は緊急CI判断に使用できません"));
     }
     Ok(())
-}
-
-fn reservation_required(head: &Snapshot, target: &Snapshot) -> bool {
-    head.entries.iter().chain(&target.entries).any(|entry| {
-        !matches!(
-            entry.state.as_str(),
-            "success"
-                | "skipped"
-                | "neutral"
-                | "failure"
-                | "error"
-                | "startup_failure"
-                | "cancelled"
-                | "timed_out"
-                | "missing"
-        )
-    })
 }
 
 fn observe_inner(
@@ -703,11 +669,7 @@ fn observe_inner(
     view: &Value,
     live: &str,
     persist: bool,
-    delivery: bool,
 ) -> Result<Value> {
-    if persist && !delivery {
-        return Err(error("修復枠の観測で親auditは更新できません"));
-    }
     validate_receipt(receipt)?;
     let request = request(get(get(receipt, "emergency")?, "request")?, receipt)?;
     let merged = str_value(view, "state")? == "MERGED";
@@ -736,40 +698,19 @@ fn observe_inner(
     } else {
         head.clone()
     };
-    let approved = snapshot_approval(&request, &head, &actual, &target, delivery)?;
+    validate_snapshot_coverage(&request, &head, &actual, &target)?;
     // 並行して統合された別変更のCIは、今回の免除対象にしない。
-    let live_ci = if merged && live != target {
-        if delivery {
-            check_required_ci(root, &request.repository, live)?;
-            Value::Null
-        } else {
-            let observed = snapshot(
-                root,
-                &request.repository,
-                live,
-                &workflow_expectations(root, live, live, true)?,
-            )?;
-            known_snapshot_states(&observed)?;
-            serde_json::to_value(observed)
-                .map_err(|_| error("最新mainの修復観測を保存できません"))?
-        }
-    } else {
-        Value::Null
-    };
+    if merged && live != target {
+        check_required_ci(root, &request.repository, live)?;
+    }
     let result = object([
-        ("approved", Value::Bool(approved)),
-        // gate名やlabel不在ではなく、毎回のAPI観測から資源予約の要否を返す。
-        (
-            "ci_reservation_required",
-            Value::Bool(!approved || reservation_required(&head, &actual)),
-        ),
+        ("approved", Value::Bool(true)),
         ("receipt_sha256", string(digest(receipt)?)),
         ("head", string(&request.head_sha)),
         ("base", string(live)),
         ("approved_base", string(&request.base_sha)),
         ("target", string(&target)),
         ("merged", Value::Bool(merged)),
-        ("live_ci", live_ci),
         (
             "head_ci",
             serde_json::to_value(head).map_err(|_| error("CI観測を保存できません"))?,

@@ -39,31 +39,6 @@ fn snapshot(state: &str) -> Snapshot {
 }
 
 #[test]
-fn ci_resource_decision_requires_non_active_observations_in_both_snapshots() {
-    for state in [
-        "success",
-        "failure",
-        "missing",
-        "cancelled",
-        "queued",
-        "in_progress",
-        "unknown",
-    ] {
-        let mut observed = snapshot("failure");
-        observed.entries[0].state = state.into();
-        let active = matches!(state, "queued" | "in_progress" | "unknown");
-        assert_eq!(
-            reservation_required(&observed, &snapshot("success")),
-            active
-        );
-        assert_eq!(
-            reservation_required(&snapshot("success"), &observed),
-            active
-        );
-    }
-}
-
-#[test]
 fn workflow_admission_failure_and_pending_are_observed_then_explicitly_waived() {
     let request = request(&sample_request(), &scope()).unwrap();
     for state in ["failure", "queued", "in_progress", "success"] {
@@ -80,15 +55,15 @@ fn workflow_admission_failure_and_pending_are_observed_then_explicitly_waived() 
 }
 
 #[test]
-fn uncovered_new_failure_can_be_observed_for_repair_without_approving_delivery() {
+fn uncovered_or_unknown_main_ci_failure_blocks_emergency_delivery() {
     let approval = request(&sample_request(), &scope()).unwrap();
     let head = snapshot("failure");
     let mut actual = head.clone();
     actual.entries[0].name = "new-main-ci-check".into();
-    assert!(snapshot_approval(&approval, &head, &actual, HEAD, true).is_err());
-    assert!(!snapshot_approval(&approval, &head, &actual, HEAD, false).unwrap());
+    assert!(validate_snapshot_coverage(&approval, &head, &actual, HEAD).is_err());
+    actual.entries[0].name = head.entries[0].name.clone();
     actual.entries[0].state = "unknown-status".into();
-    assert!(snapshot_approval(&approval, &head, &actual, HEAD, false).is_err());
+    assert!(validate_snapshot_coverage(&approval, &head, &actual, HEAD).is_err());
 }
 
 #[test]

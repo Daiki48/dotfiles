@@ -1,9 +1,8 @@
-//! CI共有予約とrepository単位の納品予約。時刻やprocess終了で所有を解放しない。
-use super::ci_capacity::{Demand, Policy};
+//! Repository単位の納品予約。時刻やprocess終了で所有を解放しない。
 use super::*;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const BUSY: &str = "先行PRのCI・統合・main同期・cleanupの完了を待っています";
+pub(crate) const BUSY: &str = "同じrepositoryの先行PRの納品完了を待っています";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,11 +21,11 @@ impl Scope {
             || task_id(&self.task).is_err()
             || self.pr == 0
             || self.pr > 999_999_999
-            || oid(&self.head, "CI直列枠head").is_err()
-            || oid(&self.base, "CI直列枠base").is_err()
+            || oid(&self.head, "納品予約head").is_err()
+            || oid(&self.base, "納品予約base").is_err()
             || !super::super::task::valid_ci_labels(&self.labels)
         {
-            return Err(error("CI直列枠の対象が不正です"));
+            return Err(error("納品予約の対象が不正です"));
         }
         Ok(())
     }
@@ -60,13 +59,13 @@ fn validate(state: &State) -> Result<()> {
         || state.suspended.len() > 4
         || state.owner.is_none() && !state.suspended.is_empty()
     {
-        return Err(error("CI直列枠のschemaが不正です"));
+        return Err(error("納品予約のschemaが不正です"));
     }
     let mut identities = HashSet::new();
     for scope in state.owner.iter().chain(state.suspended.iter()) {
         scope.validate()?;
         if !identities.insert((scope.repository.to_ascii_lowercase(), &scope.task, scope.pr)) {
-            return Err(error("CI直列枠の修復経路が循環しています"));
+            return Err(error("納品予約の修復経路が循環しています"));
         }
     }
     Ok(())
@@ -117,14 +116,6 @@ fn root() -> Result<PathBuf> {
     root_at(&codex_home()?)
 }
 
-pub(super) fn capacity_status() -> Result<Value> {
-    let worktrees = codex_home()?.join("worktrees");
-    if worktrees.exists() || worktrees.is_symlink() {
-        safe_directory(&worktrees)?;
-    }
-    Ok(Policy::load(&worktrees.join(".delivery-lane"))?.status())
-}
-
 fn root_at(home: &Path) -> Result<PathBuf> {
     let worktrees = home.join("worktrees");
     safe_directory(&worktrees)?;
@@ -135,394 +126,114 @@ fn root_at(home: &Path) -> Result<PathBuf> {
     match builder.create(&root) {
         Ok(()) => (),
         Err(cause) if cause.kind() == std::io::ErrorKind::AlreadyExists => (),
-        Err(_) => return Err(error("CI直列枠のprivate directoryを作成できません")),
+        Err(_) => return Err(error("納品予約のprivate directoryを作成できません")),
     }
     safe_directory(&root)?;
     Ok(root)
 }
 
-fn read(root: &Path) -> Result<State> {
+#[derive(Deserialize)]
+struct LegacyReservation {
+    lane: State,
+}
+
+fn legacy_repository_state(root: &Path, repository: &str) -> Result<State> {
     let path = root.join("state.json");
     if !path.exists() && !path.is_symlink() {
         return Ok(State::default());
     }
-    let state = serde_json::from_value(read_json_file(&path, "CI直列枠")?)
-        .map_err(|_| error("CI直列枠のschemaが不正です"))?;
-    validate(&state)?;
+    let value = read_json_file(&path, "旧納品予約")?;
+    let lanes = match value["version"].as_u64() {
+        Some(1) => {
+            vec![serde_json::from_value(value).map_err(|_| error("旧納品予約のschemaが不正です"))?]
+        }
+        Some(2) => {
+            let reservations: Vec<LegacyReservation> =
+                serde_json::from_value(value["reservations"].clone())
+                    .map_err(|_| error("旧納品予約のschemaが不正です"))?;
+            reservations
+                .into_iter()
+                .map(|reservation| reservation.lane)
+                .collect()
+        }
+        _ => return Err(error("旧納品予約のschemaが不正です")),
+    };
+    let mut state = State::default();
+    for lane in lanes {
+        validate(&lane)?;
+        let mut scopes = lane
+            .suspended
+            .into_iter()
+            .chain(lane.owner)
+            .filter(|scope| scope.repository.eq_ignore_ascii_case(repository))
+            .collect::<Vec<_>>();
+        if let Some(owner) = scopes.pop() {
+            if state.owner.is_some() {
+                return Err(error("旧納品予約でrepositoryの所有が重複しています"));
+            }
+            state.owner = Some(owner);
+            state.suspended = scopes;
+        }
+    }
     Ok(state)
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct CiRequest<'a> {
-    pub checkout: Option<&'a Path>,
-    pub finishing: bool,
+fn repository_path(root: &Path, repository: &str) -> Result<PathBuf> {
+    Ok(root.join(format!("repository-{}", repo_key(repository)?)))
 }
 
-struct Admission {
-    policy: Option<Policy>,
-    demand: Demand,
-    finishing: bool,
-}
-
-fn prepare(
-    root: &Path,
-    scope: &Scope,
-    request: Option<CiRequest<'_>>,
-) -> Result<Option<Admission>> {
-    request
-        .map(|request| {
-            let policy = if request.finishing {
-                None
-            } else {
-                Some(Policy::load(root)?)
-            };
-            let demand = policy.as_ref().map_or(Demand::Exclusive, |policy| {
-                policy.demand(request.checkout, scope)
-            });
-            Ok(Admission {
-                policy,
-                demand,
-                finishing: request.finishing,
-            })
-        })
-        .transpose()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Reservation {
-    lane: State,
-    demand: Demand,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Shared {
-    version: u32,
-    reservations: Vec<Reservation>,
-}
-
-impl Shared {
-    fn read(root: &Path) -> Result<Self> {
-        let path = root.join("state.json");
-        if !path.exists() && !path.is_symlink() {
-            return Ok(Self {
-                version: 2,
-                reservations: vec![],
-            });
-        }
-        let json = read_json_file(&path, "共有CI予約")?;
-        let shared = if json["version"] == 1 {
-            let legacy: State =
-                serde_json::from_value(json).map_err(|_| error("旧共有CI予約が不正です"))?;
-            validate(&legacy)?;
-            Self {
-                version: 2,
-                reservations: legacy
-                    .owner
-                    .is_some()
-                    .then_some(Reservation {
-                        lane: legacy,
-                        demand: Demand::Exclusive,
-                    })
-                    .into_iter()
-                    .collect(),
-            }
-        } else {
-            serde_json::from_value(json).map_err(|_| error("共有CI予約が不正です"))?
-        };
-        shared.validate()?;
-        Ok(shared)
-    }
-
-    fn validate(&self) -> Result<()> {
-        if self.version != 2 || self.reservations.len() > 3 {
-            return Err(error("共有CI予約のschemaが不正です"));
-        }
-        let mut repos = HashSet::new();
-        let mut jobs = 0;
-        for reservation in &self.reservations {
-            validate(&reservation.lane)?;
-            let owner = reservation
-                .lane
-                .owner
-                .as_ref()
-                .ok_or_else(|| error("共有CI予約の所有者がありません"))?;
-            let family: HashSet<_> = std::iter::once(owner)
-                .chain(&reservation.lane.suspended)
-                .map(|scope| scope.repository.to_ascii_lowercase())
-                .collect();
-            if family.into_iter().any(|repo| !repos.insert(repo)) {
-                return Err(error("repositoryの共有CI予約が重複しています"));
-            }
-            match reservation.demand {
-                Demand::Exclusive if self.reservations.len() == 1 => {}
-                Demand::Jobs(weight @ 1..=3) => jobs += weight,
-                _ => return Err(error("共有CI予約のjob数が不正です")),
-            }
-        }
-        if jobs > 3 {
-            return Err(error("共有CI予約のjob数が上限を超えています"));
-        }
-        Ok(())
-    }
-
-    fn save(&self, root: &Path) -> Result<()> {
-        self.validate()?;
-        // 排他だけで運用するホストは旧形式のまま読み書きできる。
-        let json = match self.reservations.as_slice() {
-            [] => serde_json::to_value(State::default()),
-            [
-                Reservation {
-                    lane,
-                    demand: Demand::Exclusive,
-                },
-            ] => serde_json::to_value(lane),
-            _ => serde_json::to_value(self),
-        }
-        .map_err(|_| error("共有CI予約を保存できません"))?;
-        atomic_json(&root.join("state.json"), &json)
-    }
-
-    fn repository_index(&self, repository: &str) -> Option<usize> {
-        self.reservations.iter().position(|entry| {
-            entry
-                .lane
+fn repository_state(root: &Path, repository: &str) -> Result<State> {
+    let dir = repository_path(root, repository)?;
+    if dir.exists() || dir.is_symlink() {
+        safe_directory(&dir)?;
+        let path = dir.join("state.json");
+        if path.exists() || path.is_symlink() {
+            let state: State = serde_json::from_value(read_json_file(&path, "納品予約")?)
+                .map_err(|_| error("納品予約のschemaが不正です"))?;
+            validate(&state)?;
+            if state
                 .owner
                 .iter()
-                .chain(&entry.lane.suspended)
-                .any(|scope| scope.repository.eq_ignore_ascii_case(repository))
-        })
-    }
-
-    fn admit(
-        &mut self,
-        scope: &Scope,
-        parent: Option<&str>,
-        request: Option<&Admission>,
-    ) -> Result<()> {
-        let index = self.repository_index(&scope.repository);
-        let existing = index.map(|i| &self.reservations[i]);
-        let lane = existing.map(|entry| entry.lane.clone()).unwrap_or_default();
-        check_repository(&lane, scope, parent)?;
-        let Some(request) = request else {
-            return Ok(());
-        };
-        let own = lane
-            .owner
-            .as_ref()
-            .is_some_and(|owner| owner.same_pr(scope));
-        if request.finishing && own {
-            return Ok(());
-        }
-        let demand = if existing.is_some() && !own {
-            // 修復元の実行中CIが資源を解放したとは扱わない。
-            Demand::Exclusive
-        } else {
-            request.demand
-        };
-        self.reserve_with(
-            index,
-            demand,
-            |jobs| {
-                request
-                    .policy
-                    .as_ref()
-                    .is_some_and(|policy| policy.allows(jobs))
-            },
-            |state| claim_state(state, scope.clone(), parent),
-        )
-    }
-
-    fn reserve_with(
-        &mut self,
-        index: Option<usize>,
-        demand: Demand,
-        allows: impl FnOnce(u8) -> bool,
-        claim: impl FnOnce(&mut State) -> Result<()>,
-    ) -> Result<()> {
-        let existing = index.map(|i| &self.reservations[i]);
-        let mut lane = existing.map(|entry| entry.lane.clone()).unwrap_or_default();
-        claim(&mut lane)?;
-        let demand = match (existing.map(|entry| entry.demand), demand) {
-            (Some(Demand::Exclusive), _) | (_, Demand::Exclusive) => Demand::Exclusive,
-            (Some(Demand::Jobs(previous)), Demand::Jobs(requested)) => {
-                Demand::Jobs(previous.max(requested))
+                .chain(&state.suspended)
+                .any(|scope| !scope.repository.eq_ignore_ascii_case(repository))
+            {
+                return Err(error("納品予約のrepositoryが一致しません"));
             }
-            (None, demand) => demand,
-        };
-        let others = self
-            .reservations
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| Some(*i) != index)
-            .map(|(_, entry)| entry.demand);
-        if !match demand {
-            Demand::Exclusive => others.count() == 0,
-            Demand::Jobs(weight) => {
-                let jobs = others.fold(weight, |total, demand| match demand {
-                    Demand::Jobs(other) => total.saturating_add(other),
-                    Demand::Exclusive => u8::MAX,
-                });
-                (1..=3).contains(&weight) && jobs <= 3 && allows(jobs)
-            }
-        } {
-            return Err(error(BUSY));
+            return Ok(state);
         }
-        let reservation = Reservation { lane, demand };
-        if let Some(i) = index {
-            self.reservations[i] = reservation;
-        } else {
-            self.reservations.push(reservation);
-        }
-        Ok(())
     }
+    // 旧共有ファイルしか残っていない場合も、同じrepositoryの所有を引き継ぐ。
+    legacy_repository_state(root, repository)
 }
 
-#[cfg(test)]
-fn update(root: &Path, change: impl FnOnce(&mut State) -> Result<()>) -> Result<()> {
-    let _lock =
-        super::super::task::store::Lock::acquire_short(&root.join("state.lock")).map_err(error)?;
-    let mut state = read(root)?;
-    change(&mut state)?;
-    validate(&state)?;
-    atomic_json(
-        &root.join("state.json"),
-        &serde_json::to_value(state).unwrap(),
-    )
-}
-
-// 旧state.jsonはCI予約として維持し、同じlockでrepository予約と照合する。
-fn repository_root(root: &Path, repository: &str) -> Result<PathBuf> {
-    let path = root.join(format!("repository-{}", repo_key(repository)?));
+fn save_repository(root: &Path, repository: &str, state: &State) -> Result<()> {
+    let dir = repository_path(root, repository)?;
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     builder.mode(0o700);
-    match builder.create(&path) {
+    match builder.create(&dir) {
         Ok(()) => (),
         Err(cause) if cause.kind() == std::io::ErrorKind::AlreadyExists => (),
         Err(_) => return Err(error("納品予約directoryを作成できません")),
     }
-    safe_directory(&path)?;
-    Ok(path)
-}
-
-fn check_repository(state: &State, scope: &Scope, parent: Option<&str>) -> Result<()> {
-    validate(state)?;
-    scope.validate()?;
-    // 旧CI予約も同一repositoryの排他として扱う。修復中の親は復帰を待つ。
-    if state
-        .suspended
-        .iter()
-        .any(|owner| owner.repository.eq_ignore_ascii_case(&scope.repository))
-        && !state
-            .owner
-            .as_ref()
-            .is_some_and(|owner| owner.same_pr(scope))
-    {
-        return Err(error(BUSY));
-    }
-    if state
-        .owner
-        .as_ref()
-        .is_some_and(|owner| owner.repository.eq_ignore_ascii_case(&scope.repository))
-    {
-        claim_state(&mut state.clone(), scope.clone(), parent)?;
-    }
-    Ok(())
-}
-
-pub(super) fn admit(
-    scope: Scope,
-    repair_parent: Option<&str>,
-    ci: Option<CiRequest<'_>>,
-) -> Result<()> {
-    admit_at(&root()?, scope, repair_parent, ci)
-}
-
-fn admit_at(
-    root: &Path,
-    scope: Scope,
-    parent: Option<&str>,
-    ci: Option<CiRequest<'_>>,
-) -> Result<()> {
-    // 固定workflowの確認はlockの外で行う。受付直前に設定と空き資源を再照合する。
-    let mut request = prepare(root, &scope, ci)?;
-    let _lock =
-        super::super::task::store::Lock::acquire_short(&root.join("state.lock")).map_err(error)?;
-    if let Some(policy) = request.as_mut().and_then(|request| request.policy.as_mut()) {
-        let fresh = Policy::load(root)?;
-        if !policy.same_config(&fresh) {
-            return Err(error(BUSY));
-        }
-        *policy = fresh;
-    }
-    let mut shared = Shared::read(root)?;
-    shared.admit(&scope, parent, request.as_ref())?;
-    let path = repository_root(root, &scope.repository)?;
-    let mut delivery = read(&path)?;
-    claim_state(&mut delivery, scope.clone(), parent)?;
-    // 中断時に共有枠の計上が欠けないよう、納品予約より先に永続化する。
-    if ci.is_some() {
-        shared.save(root)?;
-    }
+    safe_directory(&dir)?;
     atomic_json(
-        &path.join("state.json"),
-        &serde_json::to_value(delivery).map_err(|_| error("納品予約を保存できません"))?,
+        &dir.join("state.json"),
+        &serde_json::to_value(state).map_err(|_| error("納品予約を保存できません"))?,
     )
 }
 
-fn repair_state(state: &mut State, parent: &Scope, child: Scope) -> Result<()> {
-    validate(state)?;
-    child.validate()?;
-    if state.owner.as_ref() == Some(&child) && state.suspended.last() == Some(parent) {
-        return Ok(());
-    }
-    if state.owner.as_ref() != Some(parent)
-        || !state.suspended.is_empty()
-        || parent.repository.eq_ignore_ascii_case(&child.repository)
-        || parent.same_pr(&child)
-    {
-        return Err(error("修復枠の親が変化したか、別の修復が進行中です"));
-    }
-    state.suspended.push(parent.clone());
-    state.owner = Some(child);
-    validate(state)
+pub(super) fn admit(scope: Scope, repair_parent: Option<&str>) -> Result<()> {
+    admit_at(&root()?, scope, repair_parent)
 }
 
-/// APIとreceipt検証を終えた固定scopeだけをCASで交換する。親を解放しない。
-pub(super) fn claim_repair(parent: &Scope, child: Scope) -> Result<()> {
-    claim_repair_at(&root()?, parent, child)
-}
-
-fn claim_repair_at(root: &Path, parent: &Scope, child: Scope) -> Result<()> {
+fn admit_at(root: &Path, scope: Scope, parent: Option<&str>) -> Result<()> {
     let _lock =
         super::super::task::store::Lock::acquire_short(&root.join("state.lock")).map_err(error)?;
-    let mut shared = Shared::read(root)?;
-    let index = shared
-        .repository_index(&parent.repository)
-        .ok_or_else(|| error("修復枠の親が変化しました"))?;
-    if shared
-        .repository_index(&child.repository)
-        .is_some_and(|other| other != index)
-    {
-        return Err(error(BUSY));
-    }
-    // 親のCIが停止したと推測せず、別の共有予約が残る間は移譲しない。
-    shared.reserve_with(
-        Some(index),
-        Demand::Exclusive,
-        |_| false,
-        |state| repair_state(state, parent, child.clone()),
-    )?;
-    let path = repository_root(root, &child.repository)?;
-    let mut delivery = read(&path)?;
-    claim_state(&mut delivery, child, None)?;
-    shared.save(root)?;
-    atomic_json(
-        &path.join("state.json"),
-        &serde_json::to_value(delivery).map_err(|_| error("修復納品予約を保存できません"))?,
-    )
+    let repository = scope.repository.clone();
+    let mut state = repository_state(root, &repository)?;
+    claim_state(&mut state, scope, parent)?;
+    save_repository(root, &repository, &state)
 }
 
 pub(super) fn release(repository: &str, task: &str, pr: u64) -> Result<()> {
@@ -532,66 +243,23 @@ pub(super) fn release(repository: &str, task: &str, pr: u64) -> Result<()> {
 fn release_at(root: &Path, repository: &str, task: &str, pr: u64) -> Result<()> {
     let _lock =
         super::super::task::store::Lock::acquire_short(&root.join("state.lock")).map_err(error)?;
-    let mut shared = Shared::read(root)?;
-    let path = repository_root(root, repository)?;
-    let mut delivery = read(&path)?;
-    if delivery.owner.as_ref().is_some_and(|owner| {
-        owner.repository.eq_ignore_ascii_case(repository) && owner.task == task && owner.pr == pr
-    }) {
-        release_state(&mut delivery, repository, task, pr)?;
-        atomic_json(
-            &path.join("state.json"),
-            &serde_json::to_value(delivery).map_err(|_| error("納品予約を保存できません"))?,
-        )?;
-    }
-    // completed済みfinishの再実行で、後続PRの所有を変更しない。
-    if let Some(index) = shared.reservations.iter().position(|entry| {
-        entry.lane.owner.as_ref().is_some_and(|owner| {
-            owner.repository.eq_ignore_ascii_case(repository)
-                && owner.task == task
-                && owner.pr == pr
-        })
-    }) {
-        let lane = &mut shared.reservations[index].lane;
-        release_state(lane, repository, task, pr)?;
-        if lane.owner.is_none() {
-            shared.reservations.remove(index);
-        }
-        shared.save(root)?;
+    let mut state = repository_state(root, repository)?;
+    // 完了済みfinishの再実行は後続PRの所有を変更しない。
+    if state
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner.task == task && owner.pr == pr)
+    {
+        release_state(&mut state, repository, task, pr)?;
+        save_repository(root, repository, &state)?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-fn available(
-    home: &Path,
-    repository: &str,
-    task: &str,
-    pr: u64,
-    repair_parent: Option<&str>,
-) -> Result<bool> {
-    let worktrees = home.join("worktrees");
-    if !worktrees.exists() && !worktrees.is_symlink() {
-        return Ok(true);
-    }
-    safe_directory(&worktrees)?;
-    let root = worktrees.join(".delivery-lane");
-    if !root.exists() && !root.is_symlink() {
-        return Ok(true);
-    }
-    safe_directory(&root)?;
-    let state = read(&root)?;
-    Ok(state.owner.is_none_or(|owner| {
-        owner.repository == repository
-            && (owner.task == task && owner.pr == pr || repair_parent == Some(owner.task.as_str()))
-    }))
 }
 
 pub(super) fn admission_available(
     home: &Path,
     scope: &Scope,
     parent: Option<&str>,
-    ci: Option<CiRequest<'_>>,
 ) -> Result<bool> {
     scope.validate()?;
     let worktrees = home.join("worktrees");
@@ -604,20 +272,11 @@ pub(super) fn admission_available(
         return Ok(true);
     }
     safe_directory(&root)?;
-    let request = prepare(&root, scope, ci)?;
-    if let Err(cause) = Shared::read(&root)?.admit(scope, parent, request.as_ref()) {
-        return if cause.to_string() == BUSY {
-            Ok(false)
-        } else {
-            Err(cause)
-        };
-    }
-    let path = root.join(format!("repository-{}", repo_key(&scope.repository)?));
-    if !path.exists() && !path.is_symlink() {
-        return Ok(true);
-    }
-    safe_directory(&path)?;
-    match claim_state(&mut read(&path)?, scope.clone(), parent) {
+    match claim_state(
+        &mut repository_state(&root, &scope.repository)?,
+        scope.clone(),
+        parent,
+    ) {
         Ok(()) => Ok(true),
         Err(cause) if cause.to_string() == BUSY => Ok(false),
         Err(cause) => Err(cause),
@@ -627,118 +286,6 @@ pub(super) fn admission_available(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn legacy_request(ci: bool) -> Option<CiRequest<'static>> {
-        ci.then_some(CiRequest {
-            checkout: None,
-            finishing: false,
-        })
-    }
-
-    fn admit_at(root: &Path, scope: Scope, parent: Option<&str>, ci: bool) -> Result<()> {
-        super::admit_at(root, scope, parent, legacy_request(ci))
-    }
-
-    fn admission_available(
-        home: &Path,
-        scope: &Scope,
-        parent: Option<&str>,
-        ci: bool,
-    ) -> Result<bool> {
-        super::admission_available(home, scope, parent, legacy_request(ci))
-    }
-
-    #[test]
-    fn weighted_reservations_survive_restarts_and_release_only_the_matching_owner() {
-        let (home, root) = fixture();
-        let first = scope("task-first", 1);
-        let mut second = scope("task-second", 2);
-        second.repository = "example/another-product".into();
-        let mut third = scope("task-third", 3);
-        third.repository = "example/third-product".into();
-        let reserve = |shared: &mut Shared, scope: &Scope, weight, capacity| {
-            shared.reserve_with(
-                shared.repository_index(&scope.repository),
-                Demand::Jobs(weight),
-                |total| total <= capacity,
-                |lane| claim_state(lane, scope.clone(), None),
-            )
-        };
-        let mut shared = Shared::read(&root).unwrap();
-        reserve(&mut shared, &first, 2, 3).unwrap();
-        assert!(reserve(&mut shared, &second, 2, 3).is_err());
-        assert!(reserve(&mut shared, &second, 1, 2).is_err());
-        reserve(&mut shared, &second, 1, 3).unwrap();
-        reserve(&mut shared, &first, 1, 3).unwrap();
-        assert!(reserve(&mut shared, &third, 1, 3).is_err());
-        // 共有予約を保存した直後、repository予約の書込前に停止した状態。
-        shared.save(&root).unwrap();
-        let delivery = repository_root(&root, &first.repository).unwrap();
-        assert!(!delivery.join("state.json").exists());
-        let mut loaded = Shared::read(&root).unwrap();
-        assert_eq!(loaded.reservations[0].demand, Demand::Jobs(2));
-        assert_eq!(loaded.reservations[1].demand, Demand::Jobs(1));
-        assert!(reserve(&mut loaded, &third, 1, 3).is_err());
-        super::admit_at(
-            &root,
-            first.clone(),
-            None,
-            Some(CiRequest {
-                checkout: None,
-                finishing: true,
-            }),
-        )
-        .unwrap();
-        assert_eq!(read(&delivery).unwrap().owner, Some(first.clone()));
-        assert_eq!(
-            Shared::read(&root).unwrap().reservations[0].demand,
-            Demand::Jobs(2)
-        );
-        release_at(&root, &first.repository, &first.task, 99).unwrap();
-        assert_eq!(Shared::read(&root).unwrap().reservations.len(), 2);
-        release_at(&root, &first.repository, &first.task, first.pr).unwrap();
-        let mut loaded = Shared::read(&root).unwrap();
-        assert_eq!(loaded.reservations.len(), 1);
-        assert_eq!(loaded.reservations[0].lane.owner.as_ref(), Some(&second));
-        reserve(&mut loaded, &third, 2, 3).unwrap();
-        // repository予約が未保存でも、照合できる共有予約だけを回収できる。
-        release_at(&root, &second.repository, &second.task, second.pr).unwrap();
-        assert!(Shared::read(&root).unwrap().reservations.is_empty());
-        fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn weighted_repair_waits_for_other_reservations_then_preserves_the_parent() {
-        let (home, root) = fixture();
-        let parent = scope("task-parent", 1);
-        let mut other = scope("task-other", 2);
-        other.repository = "example/second-product".into();
-        let mut child = scope("task-child", 3);
-        child.repository = "example/infrastructure".into();
-        let mut shared = Shared::read(&root).unwrap();
-        for (owner, weight) in [(&parent, 2), (&other, 1)] {
-            shared
-                .reserve_with(
-                    None,
-                    Demand::Jobs(weight),
-                    |total| total <= 3,
-                    |lane| claim_state(lane, owner.clone(), None),
-                )
-                .unwrap();
-        }
-        shared.save(&root).unwrap();
-        assert!(claim_repair_at(&root, &parent, child.clone()).is_err());
-        assert_eq!(Shared::read(&root).unwrap().reservations.len(), 2);
-        release_at(&root, &other.repository, &other.task, other.pr).unwrap();
-        claim_repair_at(&root, &parent, child.clone()).unwrap();
-        claim_repair_at(&root, &parent, child.clone()).unwrap();
-        assert!(!admission_available(&home, &parent, None, false).unwrap());
-        release_at(&root, &child.repository, &child.task, child.pr).unwrap();
-        let restored = Shared::read(&root).unwrap();
-        assert_eq!(restored.reservations[0].lane.owner.as_ref(), Some(&parent));
-        assert_eq!(restored.reservations[0].demand, Demand::Exclusive);
-        fs::remove_dir_all(home).unwrap();
-    }
 
     fn fixture() -> (PathBuf, PathBuf) {
         let home = std::env::temp_dir().join(format!(
@@ -759,150 +306,127 @@ mod tests {
     }
 
     #[test]
-    fn ci_free_delivery_in_another_repository_does_not_touch_the_ci_owner() {
-        let (home, root) = fixture();
-        let first = scope("task-first", 1);
-        admit_at(&root, first.clone(), None, true).unwrap();
-        let before = fs::read(root.join("state.json")).unwrap();
-        let mut other = scope("task-second", 2);
-        other.repository = "example/another-product".into();
-        assert!(!admission_available(&home, &other, None, true).unwrap());
-        assert!(admit_at(&root, other.clone(), None, true).is_err());
-        assert!(admission_available(&home, &other, None, false).unwrap());
-        admit_at(&root, other.clone(), None, false).unwrap();
-        admit_at(&root, other.clone(), None, false).unwrap(); // crash後の再開
-        let mut conflict = other.clone();
-        conflict.task = "task-conflict".into();
-        conflict.pr = 3;
-        assert!(!admission_available(&home, &conflict, None, false).unwrap());
-        assert!(admit_at(&root, conflict.clone(), None, false).is_err());
-        release_at(&root, &other.repository, &other.task, other.pr).unwrap();
-        admit_at(&root, conflict.clone(), None, false).unwrap();
-        release_at(&root, &other.repository, &other.task, other.pr).unwrap(); // completed再実行
-        assert_eq!(
-            read(&repository_root(&root, &other.repository).unwrap())
-                .unwrap()
-                .owner,
-            Some(conflict)
-        );
-        assert_eq!(fs::read(root.join("state.json")).unwrap(), before);
-        assert_eq!(read(&root).unwrap().owner, Some(first));
-        fs::remove_dir_all(home).unwrap();
+    fn legacy_reservations_only_affect_their_own_repository() {
+        for version in [1, 2] {
+            let (home, root) = fixture();
+            let owner = scope("task-first", 1);
+            let lane = serde_json::json!({"version":1,"owner":owner,"suspended":[]});
+            let state = if version == 1 {
+                lane
+            } else {
+                serde_json::json!({"version":2,"reservations":[{"lane":lane,"demand":{"jobs":2}}]})
+            };
+            let legacy_path = root.join("state.json");
+            atomic_json(&legacy_path, &state).unwrap();
+            let before = fs::read(&legacy_path).unwrap();
+            fs::write(root.join("capacity.json"), b"obsolete capacity fixture").unwrap();
+
+            let mut other = scope("task-other", 2);
+            other.repository = "example/other".into();
+            assert!(admission_available(&home, &other, None).unwrap());
+            admit_at(&root, other.clone(), None).unwrap();
+            let mut conflict = scope("task-conflict", 3);
+            conflict.repository = "Example/Product".into();
+            assert!(!admission_available(&home, &conflict, None).unwrap());
+            assert!(admit_at(&root, conflict.clone(), None).is_err());
+
+            release_at(&root, &owner.repository, &owner.task, owner.pr).unwrap();
+            assert!(admission_available(&home, &conflict, None).unwrap());
+            admit_at(&root, conflict.clone(), None).unwrap();
+            release_at(&root, &owner.repository, &owner.task, owner.pr).unwrap();
+            assert_eq!(
+                repository_state(&root, &conflict.repository).unwrap().owner,
+                Some(conflict)
+            );
+            assert_eq!(
+                repository_state(&root, &other.repository).unwrap().owner,
+                Some(other)
+            );
+            assert_eq!(fs::read(&legacy_path).unwrap(), before);
+            fs::remove_dir_all(home).unwrap();
+        }
     }
 
     #[test]
-    fn gate_changes_keep_existing_ci_responsibility_and_legacy_owners_block_same_repository() {
-        let (home, root) = fixture();
-        let first = scope("task-first", 1);
-        update(&root, |state| claim_state(state, first.clone(), None)).unwrap(); // 旧stateのみ
-        let mut conflict = scope("task-second", 2);
-        conflict.repository = "Example/Product".into();
-        assert!(admit_at(&root, conflict.clone(), None, false).is_err());
-        admit_at(&root, first.clone(), None, false).unwrap();
-        assert_eq!(read(&root).unwrap().owner, Some(first.clone()));
-        release_at(&root, &first.repository, &first.task, first.pr).unwrap();
-        admit_at(&root, conflict.clone(), None, false).unwrap();
-        conflict.head = "c".repeat(40);
-        admit_at(&root, conflict.clone(), None, true).unwrap();
-        assert_eq!(read(&root).unwrap().owner, Some(conflict));
-        fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn repair_parent_cannot_bypass_a_suspended_ci_reservation() {
+    fn legacy_cross_repository_repair_preserves_each_owner() {
         let (home, root) = fixture();
         let parent = scope("task-parent", 1);
-        admit_at(&root, parent.clone(), None, true).unwrap();
         let mut child = scope("task-repair", 2);
         child.repository = "example/infrastructure".into();
-        update(&root, |state| repair_state(state, &parent, child.clone())).unwrap();
-        assert!(!admission_available(&home, &parent, None, false).unwrap());
-        assert!(admit_at(&root, parent.clone(), None, false).is_err());
-        admit_at(&root, child.clone(), None, true).unwrap();
+        atomic_json(
+            &root.join("state.json"),
+            &serde_json::json!({"version":1,"owner":child,"suspended":[parent]}),
+        )
+        .unwrap();
+        admit_at(&root, parent.clone(), None).unwrap();
+        admit_at(&root, child.clone(), None).unwrap();
         release_at(&root, &child.repository, &child.task, child.pr).unwrap();
-        assert_eq!(read(&root).unwrap().owner, Some(parent.clone()));
-        admit_at(&root, parent, None, false).unwrap();
+        assert_eq!(
+            repository_state(&root, &parent.repository).unwrap().owner,
+            Some(parent)
+        );
+        assert!(
+            repository_state(&root, &child.repository)
+                .unwrap()
+                .owner
+                .is_none()
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
-    fn unknown_ci_or_repository_schema_never_allows_admission() {
+    fn invalid_repository_state_blocks_only_that_repository() {
         let (home, root) = fixture();
         let owner = scope("task-first", 1);
-        atomic_json(
-            &root.join("state.json"),
-            &serde_json::json!({"version":99,"owner":null,"suspended":[]}),
-        )
-        .unwrap();
-        assert!(admit_at(&root, owner.clone(), None, false).is_err());
-        assert!(admission_available(&home, &owner, None, false).is_err());
-        atomic_json(
-            &root.join("state.json"),
-            &serde_json::to_value(State::default()).unwrap(),
-        )
-        .unwrap();
-        let path = repository_root(&root, &owner.repository).unwrap();
+        admit_at(&root, owner.clone(), None).unwrap();
+        let path = repository_path(&root, &owner.repository).unwrap();
         atomic_json(
             &path.join("state.json"),
             &serde_json::json!({"version":99,"owner":null,"suspended":[]}),
         )
         .unwrap();
-        assert!(admit_at(&root, owner.clone(), None, false).is_err());
-        assert!(admission_available(&home, &owner, None, false).is_err());
+        assert!(admission_available(&home, &owner, None).is_err());
+        assert!(admit_at(&root, owner, None).is_err());
+        let mut other = scope("task-other", 2);
+        other.repository = "example/other".into();
+        assert!(admission_available(&home, &other, None).unwrap());
+        admit_at(&root, other, None).unwrap();
         fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
     fn concurrent_admission_is_persisted_until_the_matching_finish() {
-        let root = std::env::temp_dir().join(format!(
-            "delivery-lane-{}-{}",
-            std::process::id(),
-            now().replace(':', "-")
-        ));
-        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(root.join("worktrees"))
-            .unwrap();
-        let path = root_at(&root).unwrap();
+        let (home, root) = fixture();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let handles: Vec<_> = (1..=8)
             .map(|pr| {
-                let path = path.clone();
+                let root = root.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    admit_at(&path, scope(&format!("task-{pr}"), pr), None, true).is_ok()
+                    admit_at(&root, scope(&format!("task-{pr}"), pr), None).is_ok()
                 })
             })
             .collect();
         assert_eq!(
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap())
+                .map(|handle| handle.join().unwrap())
                 .filter(|ok| *ok)
                 .count(),
             1
         );
-        let owner = read(&path).unwrap().owner.unwrap();
-        assert!(!available(&root, "example/other", "task-other", 99, None).unwrap());
-        assert!(available(&root, &owner.repository, &owner.task, owner.pr, None).unwrap());
-        assert!(
-            update(&path, |state| release_state(
-                state,
-                "example/product",
-                "task-other",
-                99
-            ))
-            .is_err()
-        );
-        assert_eq!(read(&path).unwrap().owner, Some(owner.clone()));
-        update(&path, |state| {
-            release_state(state, &owner.repository, &owner.task, owner.pr)
-        })
-        .unwrap();
-        assert!(available(&root, "example/other", "task-other", 99, None).unwrap());
-        fs::remove_dir_all(root).unwrap();
+        let owner = repository_state(&root, "example/product")
+            .unwrap()
+            .owner
+            .unwrap();
+        let other = scope("task-other", 99);
+        assert!(!admission_available(&home, &other, None).unwrap());
+        release_at(&root, &other.repository, &other.task, other.pr).unwrap();
+        assert!(!admission_available(&home, &other, None).unwrap());
+        release_at(&root, &owner.repository, &owner.task, owner.pr).unwrap();
+        assert!(admission_available(&home, &other, None).unwrap());
+        fs::remove_dir_all(home).unwrap();
     }
 
     fn scope(task: &str, pr: u64) -> Scope {
@@ -937,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn another_repository_is_serialized_without_disclosing_its_identity() {
+    fn repository_state_conflict_does_not_disclose_owner() {
         let mut state = State::default();
         claim_state(&mut state, scope("task-first", 1), None).unwrap();
         let mut other = scope("task-second", 2);
@@ -960,26 +484,5 @@ mod tests {
         assert_eq!(state.owner.as_ref().unwrap().task, "task-parent");
         release_state(&mut state, "example/product", "task-parent", 1).unwrap();
         assert!(state.owner.is_none());
-    }
-
-    #[test]
-    fn cross_repository_repair_compares_fixed_parent_and_restores_it() {
-        let mut state = State::default();
-        let parent = scope("task-parent", 1);
-        claim_state(&mut state, parent.clone(), None).unwrap();
-        let mut child = scope("task-repair", 2);
-        child.repository = "example/infrastructure".into();
-        let mut stale = parent.clone();
-        stale.head = "d".repeat(40);
-        assert!(repair_state(&mut state, &stale, child.clone()).is_err());
-        repair_state(&mut state, &parent, child.clone()).unwrap();
-        repair_state(&mut state, &parent, child.clone()).unwrap();
-        let mut nested = scope("task-nested", 3);
-        nested.repository = "example/tools".into();
-        assert!(repair_state(&mut state, &child, nested).is_err());
-        assert!(release_state(&mut state, &parent.repository, &parent.task, parent.pr).is_err());
-        state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
-        release_state(&mut state, &child.repository, &child.task, child.pr).unwrap();
-        assert_eq!(state.owner, Some(parent));
     }
 }

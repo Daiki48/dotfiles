@@ -44,7 +44,7 @@ CI/workflow、Ruleset、hook、AGENTS、Skills、helper、installer等の安全�
 
 Actionsの容量不足では[artifact運用](../../../docs/codex-actions-artifacts.ja.md)を読み、明示登録された通常CI artifactだけを棚卸し・整理する。共通保持既定7日とrepository/用途上書き、保護・参照・再生成性の証拠を照合し、API不明なら保持する。非公開の反映待ちと回復確認を記録し、対象jobだけを制限付きで再実行する。削除成功をCI回復と見なさず、通常のdelivery gateへ戻す。
 
-merge後の新たな基盤障害では[deliveryガイド](../../../docs/codex-delivery.ja.md)のmerge後証拠更新を使う。同じPR/head/base/Plan・実mergeの親/tree/main到達、固定headのlocal test/buildと独立reviewを再確認し、旧履歴を保存した`record-review --replace-receipt --gate-mode emergency-ci`から既存finishへ戻る。共有枠と別repositoryの修復が相互待ちなら、固定親子のprivate requestによる`repair-lane`で一時移譲し、修復finishで親へ戻す。state手編集、旧helper、guard解除、無条件の枠解放を使わない。
+merge後の新たな基盤障害では[deliveryガイド](../../../docs/codex-delivery.ja.md)のmerge後証拠更新を使う。同じPR/head/base/Plan・実mergeの親/tree/main到達、固定headのlocal test/buildと独立reviewを再確認し、旧履歴を保存した`record-review --replace-receipt --gate-mode emergency-ci`から既存finishへ戻る。別repositoryの修復は独立taskとして進め、各repositoryの納品予約を保持する。
 
 ## commit・PR・delivery
 
@@ -58,7 +58,7 @@ merge後の新たな基盤障害では[deliveryガイド](../../../docs/codex-de
 6. merge後に同じ指定で`codex-delivery finish`する。`issue-N` taskはIssue Nへ自動記録する。通常の`task-*`へ関連Issueを付ける場合は`finish --issue <番号>`も指定する。helperはPR本文と固定headをIssueへ保存確認してから、main同期済みのworktreeと成果物を物理削除し、同じ記録へ結果を反映する。PR本文は削除後も理解できる作業記録にしておく。
 7. Issue更新やcleanupが失敗したら同じ指定で再開する。削除前のIssue API失敗なら作業場を保持し、削除後の更新失敗なら物理回収済み・記録更新待ちを区別する。直接`gh pr merge`、`rm`、`worktree remove/prune`で迂回しない。
 
-CIはrepositoryの設定に従います。Utakataはopt-in先のself-hosted CIを使い、WSL2や他repositoryへ強制しません。既存のCI起動labelはworkflowと用途を確認し、review receipt作成後に`codex-delivery authorize-ci`で起動します。明示的な`--ci-label`は共有CI枠をfinishまで保持し、labelなしhosted exemptionと`local-validation`・有効な`emergency-ci`は[deliveryガイド](../../../docs/codex-delivery.ja.md#ci予約と納品予約)の証拠条件に従います。self-hosted、動的な`runs-on`、job-level `uses`、不明なAPI・runner継承では共有枠を維持し、どの経路もrepository単位の納品予約、同一repositoryの排他、CI check・review・finishの要件を保ちます。直接label操作で迂回せず、存在するActions checkの完了と成功系conclusionを確認し、skipだけで実質検証を省略しません。
+CIはrepositoryの設定に従います。Utakataはopt-in先のself-hosted CIを使い、WSL2や他repositoryへ強制しません。既存のCI起動labelはworkflowと用途を確認し、review receipt作成後に`codex-delivery authorize-ci`で起動します。repository横断の共有CI予約・capacity設定・hosted runner判定は行いません。repository単位の納品予約、同一repositoryの排他、CI check・review・finish要件を維持します。直接label操作で迂回せず、存在するActions checkの完了と成功系conclusionを確認し、skipだけで実質検証を省略しません。runnerの稼働数とPC資源はrunner運用側で管理します。
 
 CI基盤障害の判断は継続委任されている。[deliveryガイド](../../../docs/codex-delivery.ja.md)の`emergency-ci`で対象ごとの証拠を揃え、人間の再承認待ちを追加しない。repository/task/PR/head/base/Plan・免除対象・原因、固定headのlocal test/buildと独立review、workflow/CDの影響を確認し、private requestで`record-review --gate-mode emergency-ci --emergency-request <絶対path>`を実行する。既存receiptからは同一対象・Planを保持して`--replace-receipt`を明示する。CI実測と判断根拠を別に保存し、公開先には公開用要約だけを記録する。head/baseや根拠が変われば検証・review・receiptを更新する。既知のtest失敗、API不明、CI以外のgate、GitHubの保護要件は免除せず、別main更新には通常CIを要求する。通常CIが既定で、新しい権限・費用・deploy承認は委任に含まない。
 

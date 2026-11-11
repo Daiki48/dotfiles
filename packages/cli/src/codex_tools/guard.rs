@@ -5051,11 +5051,8 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
         return None;
     }
     let command = &args[0];
-    if command == "ci-capacity" {
-        return (args.len() != 1).then(|| "ci-capacityに引数は指定できません".into());
-    }
-    if ["actions-artifacts", "repair-lane"].contains(&command.as_str()) {
-        return super::delivery::recovery_invocation_reason(args);
+    if command == "actions-artifacts" {
+        return super::delivery::actions_artifacts_invocation_reason(&args[1..]);
     }
     if command == "authorize-ci" {
         return super::delivery::ci_authorization_invocation_reason(args);
@@ -7761,8 +7758,6 @@ mod recovery_tests {
     #[test]
     fn recovery_commands_require_private_paths_and_narrow_arguments() {
         for command in [
-            "codex-delivery ci-capacity",
-            "codex-delivery repair-lane --request /private-fixture/request.json",
             "codex-delivery actions-artifacts inventory --policy /private-fixture/policy.json",
             "codex-delivery actions-artifacts cleanup --policy /private-fixture/policy.json",
         ] {
@@ -7777,9 +7772,8 @@ mod recovery_tests {
             );
         }
         for command in [
-            "codex-delivery ci-capacity --policy /private-fixture/policy.json",
-            "codex-delivery repair-lane --request relative.json",
-            "codex-delivery repair-lane --request /private-fixture/request.json --force",
+            "codex-delivery ci-capacity",
+            "codex-delivery repair-lane --request /private-fixture/request.json",
             "codex-delivery actions-artifacts cleanup --policy relative.json",
             "codex-delivery actions-artifacts delete-run --policy /private-fixture/policy.json",
         ] {

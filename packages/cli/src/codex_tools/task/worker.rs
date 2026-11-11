@@ -368,7 +368,7 @@ pub(super) fn prompt(task: &Task) -> String {
     };
     let phase = if task.phase == Phase::CiEvidence && task.merge_commit.is_some() {
         format!(
-            "{phase}\nmerge後の障害です。同じPR/head/Plan/版と保存済みbase（実mergeの第1親）、実mergeの親/tree/main到達を照合し、--replace-receiptで旧履歴を保持して証拠を更新してください。新たなmergeやsource変更をせず、既存MainCi/finishへ戻します。容量障害はdocs/codex-actions-artifacts.ja.mdの反映待ちと回復確認を使い、削除や再試行の成功だけを回復扱いしません。別repository修復の枠待ちは固定親子requestのrepair-lane経路で処理し、無条件に枠を解放しません。"
+            "{phase}\nmerge後の障害です。同じPR/head/Plan/版と保存済みbase（実mergeの第1親）、実mergeの親/tree/main到達を照合し、--replace-receiptで旧履歴を保持して証拠を更新してください。新たなmergeやsource変更をせず、既存MainCi/finishへ戻します。容量障害はdocs/codex-actions-artifacts.ja.mdの反映待ちと回復確認を使い、削除や再試行の成功だけを回復扱いしません。別repositoryでの基盤修復は、親の納品予約を保持したまま進めます。"
         )
     } else {
         phase.into()

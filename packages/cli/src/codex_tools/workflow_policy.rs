@@ -136,69 +136,9 @@ pub(super) fn tag_push_only(source: &str) -> Result<bool, &'static str> {
         }))
 }
 
-/// 公式の標準GitHub-hostedラベルを直接指定したjobだけを認識する。
-/// runner group・式・配列・reusable workflowは静的に確定できないので共有枠を維持する。
-pub(super) fn standard_hosted_jobs(source: &str) -> bool {
-    let Ok(workflow) = parse_workflow(source) else {
-        return false;
-    };
-    workflow
-        .get("jobs")
-        .and_then(Value::as_object)
-        .is_some_and(|jobs| {
-            !jobs.is_empty()
-                && jobs.values().all(|job| {
-                    job.get("uses").is_none()
-                        && matches!(
-                            job.get("runs-on").and_then(Value::as_str),
-                            Some(
-                                "ubuntu-latest"
-                                    | "ubuntu-22.04"
-                                    | "ubuntu-24.04"
-                                    | "ubuntu-26.04"
-                                    | "ubuntu-22.04-arm"
-                                    | "ubuntu-24.04-arm"
-                                    | "ubuntu-26.04-arm"
-                                    | "ubuntu-slim"
-                                    | "windows-latest"
-                                    | "windows-2022"
-                                    | "windows-2025"
-                                    | "windows-11-arm"
-                                    | "macos-latest"
-                                    | "macos-15"
-                                    | "macos-26"
-                                    | "macos-15-intel"
-                                    | "macos-26-intel"
-                            )
-                        )
-                })
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_literal_standard_hosted_jobs_exclude_shared_runner_use() {
-        assert!(standard_hosted_jobs(
-            "on: [pull_request, push]\njobs: {check: {runs-on: ubuntu-24.04}, other: {runs-on: 'windows-latest'}}"
-        ));
-        for source in [
-            "jobs: {check: {runs-on: self-hosted}}",
-            "jobs: {check: {runs-on: ubuntu-24.04}, other: {runs-on: custom}}",
-            "jobs: {check: {runs-on: '${{ matrix.runner }}'}}",
-            "jobs: {check: {runs-on: [ubuntu-24.04]}}",
-            "jobs: {check: {runs-on: {group: hosted, labels: ubuntu-24.04}}}",
-            "jobs: {check: {uses: example/reusable/.github/workflows/ci.yml@main}}",
-            "jobs: {check: {runs-on: ubuntu-24.04, uses: ./.github/workflows/ci.yml}}",
-            "jobs: {check: {runs-on: ubuntu-24.04, runs-on: self-hosted}}",
-            "jobs: {check: {runs-on: &runner ubuntu-24.04}}",
-            "jobs: {}",
-        ] {
-            assert!(!standard_hosted_jobs(source), "{source}");
-        }
-    }
 
     #[test]
     fn accepts_block_and_flow_tag_only_triggers_with_quoted_keys() {

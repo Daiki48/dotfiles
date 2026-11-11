@@ -110,8 +110,7 @@ rerun前にscopeと証拠の期限を再照合し、要求前に一度性を保�
 
 再実行後のActions check成功を確認したら、既存receiptと同じ対象の通常deliveryを再開します。
 merge後に初めて障害が判明した場合も、[merge後証拠更新](codex-delivery.ja.md#merge後に判明した基盤障害の証拠更新)
-で実mergeの親・tree・main到達を照合します。別repositoryの基盤修復が共有枠を待つ場合は同ガイドの
-`repair-lane`を使い、親の所有を保持します。state手編集やguard解除で復旧しません。
+で実mergeの親・tree・main到達を照合します。別repositoryの基盤修復は独立taskとして進め、各repositoryの納品予約を保持します。
 
 ## 導入手順
 
