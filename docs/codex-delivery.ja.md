@@ -441,6 +441,41 @@ helperはPR本文を作業記録として固定し、task、PR、source head、�
 
 ### 手動マージ・main同期後の管理状態の復旧
 
+private repositoryで人間が `[skip ci]` 付きのmerge commitでPRをマージし、ローカルmainも同期済みの場合は、
+既存のstrict-ruleset v6 receiptを使って回収を承認できます。人間の対象別の明示承認を、Git checkout外の
+同一UID専用directoryにある0600の通常ファイルへ記録します。次の値は合成例です。
+
+```json
+{
+  "version": 1,
+  "approved": true,
+  "repository": "example/project",
+  "task_id": "issue-42",
+  "pr": 123,
+  "plan_id": "recover-example-v1",
+  "plan_version": 1,
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "merge_sha": "cccccccccccccccccccccccccccccccccccccccc"
+}
+```
+
+```sh
+codex-delivery approve-review --task-id issue-42 --pr 123 --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --plan-id recover-example-v1 --plan-version 1 --recover-merged --manual-merge-request /private/path/request.json
+codex-delivery finish --task-id issue-42 --pr 123 --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --plan-id recover-example-v1 --plan-version 1
+```
+
+PRのmerge SHA、実マージの第1親（base）と第2親（head）、headと同じtree、cleanなworktreeとmain、
+実マージのlive mainへの到達、未解決reviewがないことを照合します。headと実マージのworkflow run、
+check run、commit statusを取得し、未実行は0件として保存します。失敗、未完了、取得不能で停止します。
+live mainが実マージより先へ進んでいる場合は、live mainにも通常のActions checkを要求します。
+
+承認と観測結果は元のreceiptに結び付け、納品予約を確保してからprivate delivery stateへ一度に保存します。
+元のriskと検証結果はreceiptに残ります。state保存前に中断した場合は同じ承認で再実行し、保存後は
+同じ `finish` で再開します。 `finish` は回収前に実マージとCIを再検証し、既存のIssue記録と物理回収を行います。
+
+#### Free/private profileでCIを確認済みの場合
+
 人間がPRをmergeしてmainを同期し、delivery stateが作成されていない場合には、次の明示的な復旧経路を使えます。
 通常の同一headのmode変更禁止は維持し、この復旧操作だけで既存v6 receiptのstrict-rulesetからprivate profileへの変更を認めます。
 Free/private経路と復旧について、先に人間の明示承認を得てください。

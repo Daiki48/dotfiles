@@ -2026,7 +2026,7 @@ fn completed_delivery(manifest: &Manifest) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(&contents) else {
         return false;
     };
-    super::delivery::supported_state_version(value["version"].as_i64())
+    super::delivery::supported_state_version(&value)
         && value["kind"].as_str() == Some("delivery")
         && value["stage"].as_str() == Some("completed")
         && value["task_id"].as_str() == Some(&manifest.task_id)

@@ -265,7 +265,7 @@ fn workflow_expectations(
         .collect())
 }
 
-fn pages(value: &Value, field: Option<&str>) -> Result<Vec<Value>> {
+pub(super) fn pages(value: &Value, field: Option<&str>) -> Result<Vec<Value>> {
     let pages = value
         .as_array()
         .ok_or_else(|| error("CI paginationが不正です"))?;
@@ -449,16 +449,20 @@ fn snapshot(
     workflows: &[ExpectedWorkflow],
 ) -> Result<Snapshot> {
     snapshot_with(repository, sha, workflows, &mut |endpoint| {
-        gh_json(
-            root,
-            &[
-                "api".into(),
-                endpoint.into(),
-                "--paginate".into(),
-                "--slurp".into(),
-            ],
-        )
+        ci_pages(root, endpoint)
     })
+}
+
+pub(super) fn ci_pages(root: &Path, endpoint: &str) -> Result<Value> {
+    gh_json(
+        root,
+        &[
+            "api".into(),
+            endpoint.into(),
+            "--paginate".into(),
+            "--slurp".into(),
+        ],
+    )
 }
 
 pub(super) fn prepare(root: &Path, payload: &Value, path: &Path, live: &str) -> Result<Value> {
@@ -485,6 +489,9 @@ pub(super) fn prepare(root: &Path, payload: &Value, path: &Path, live: &str) -> 
 }
 
 pub(super) fn replacement_stage(state: &Value, merged: bool) -> Result<()> {
+    if state.get("manual_merge").is_some() {
+        return Err(error("手動merge回収に結び付いたreceiptは変更できません"));
+    }
     let stage = str_value(state, "stage")?;
     if stage == "merge_started" || merged && ["merged", "main_synced"].contains(&stage.as_str()) {
         Ok(())
@@ -616,20 +623,16 @@ pub(super) fn replacement_scope(existing: &Value, proposed: &Value) -> Result<()
 }
 
 fn verify_merge(root: &Path, request: &Request, merge: &str) -> Result<()> {
+    verify_merge_tree(root, &request.base_sha, &request.head_sha, merge)
+}
+
+pub(super) fn verify_merge_tree(root: &Path, base: &str, head: &str, merge: &str) -> Result<()> {
     let parents = git(root, &["rev-list", "--parents", "-n", "1", merge], true)?;
-    if parents.split_whitespace().collect::<Vec<_>>()
-        != [merge, &request.base_sha, &request.head_sha]
-    {
-        return Err(error(
-            "実mergeの親が承認済みbase/headと一致しません。別baseへCI免除を拡張しません",
-        ));
+    if parents.split_whitespace().collect::<Vec<_>>() != [merge, base, head] {
+        return Err(error("実mergeの親が承認済みbase/headと一致しません"));
     }
     let merge_tree = git(root, &["rev-parse", &format!("{merge}^{{tree}}")], true)?;
-    let head_tree = git(
-        root,
-        &["rev-parse", &format!("{}^{{tree}}", request.head_sha)],
-        true,
-    )?;
+    let head_tree = git(root, &["rev-parse", &format!("{head}^{{tree}}")], true)?;
     if merge_tree != head_tree {
         return Err(error("実mergeのtreeがlocal検証済みheadと異なります"));
     }

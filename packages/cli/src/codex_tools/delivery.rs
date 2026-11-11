@@ -20,6 +20,7 @@ use super::{process, trust};
 mod actions_artifacts;
 mod emergency;
 mod lane;
+mod manual_merge;
 mod work_log;
 
 #[cfg(unix)]
@@ -30,8 +31,12 @@ const LEGACY_LEDGER_RECEIPT_VERSION: i64 = 5;
 const RECEIPT_VERSION: i64 = 6;
 const STATE_VERSION: i64 = 2;
 
-pub(super) fn supported_state_version(version: Option<i64>) -> bool {
-    matches!(version, Some(1 | STATE_VERSION))
+pub(super) fn supported_state_version(state: &Value) -> bool {
+    match state["version"].as_i64() {
+        Some(1 | STATE_VERSION) => state.get("manual_merge").is_none(),
+        Some(manual_merge::STATE_VERSION) => state["manual_merge"].is_object(),
+        _ => false,
+    }
 }
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -3146,6 +3151,13 @@ fn write_review_request_locked(
         {
             return Ok(existing);
         }
+        let state_file = state_path(&repository, task)?;
+        if (state_file.exists() || state_file.is_symlink())
+            && read_json_file(&state_file, "delivery state")?["version"].as_i64()
+                == Some(manual_merge::STATE_VERSION)
+        {
+            return Err(error("手動merge回収に結び付いたreceiptは変更できません"));
+        }
         if replace_receipt {
             emergency::archive_replacement(&path, &existing, &payload)?;
         }
@@ -3989,7 +4001,7 @@ fn load_state(repository: &str, task: &str, receipt_value: &Value, branch: &str)
         return Err(error("delivery stateが存在しません"));
     }
     let mut state = read_json_file(&path, "delivery state")?;
-    if !supported_state_version(state.get("version").and_then(Value::as_i64)) {
+    if !supported_state_version(&state) {
         return Err(error("delivery stateのversionが未対応です"));
     }
     // v1の進行中taskも、既存fieldの厳密検証を保ったまま読み替える。
@@ -4000,25 +4012,24 @@ fn load_state(repository: &str, task: &str, receipt_value: &Value, branch: &str)
         state["version"] = Value::from(STATE_VERSION);
         state["issue_record"] = Value::Null;
     }
-    expected_keys(
-        &state,
-        &[
-            "version",
-            "kind",
-            "task_id",
-            "repository",
-            "pr",
-            "head_sha",
-            "branch",
-            "stage",
-            "updated_at",
-            "last_error",
-            "issue_record",
-        ],
-        "delivery state",
-    )?;
-    if int_value(&state, "version")? != STATE_VERSION
-        || str_value(&state, "kind")? != "delivery"
+    let mut keys = vec![
+        "version",
+        "kind",
+        "task_id",
+        "repository",
+        "pr",
+        "head_sha",
+        "branch",
+        "stage",
+        "updated_at",
+        "last_error",
+        "issue_record",
+    ];
+    if int_value(&state, "version")? == manual_merge::STATE_VERSION {
+        keys.push("manual_merge");
+    }
+    expected_keys(&state, &keys, "delivery state")?;
+    if str_value(&state, "kind")? != "delivery"
         || str_value(&state, "task_id")? != task
         || str_value(&state, "repository")? != str_value(receipt_value, "repository")?
         || int_value(&state, "pr")? != int_value(receipt_value, "pr")?
@@ -4482,6 +4493,9 @@ fn prepare_main_sync_from(root: &Path, target: &str, expected_head: &str) -> Res
 }
 
 fn assert_main_synced(root: &Path, repository: &str) -> Result<()> {
+    synced_main(root, repository).map(|_| ())
+}
+fn synced_main(root: &Path, repository: &str) -> Result<String> {
     assert_main_clean(root)?;
     let remote = fetch_main(root, repository)?;
     if oid(
@@ -4491,6 +4505,12 @@ fn assert_main_synced(root: &Path, repository: &str) -> Result<()> {
     {
         return Err(error("人間用mainがorigin/mainと一致しません"));
     }
+    Ok(remote)
+}
+fn assert_synced_main_at(root: &Path, repository: &str, expected: &str) -> Result<()> {
+    if synced_main(root, repository)? != expected {
+        return Err(error("mainが手動merge回収の検証中に変化しました"));
+    }
     Ok(())
 }
 fn assert_finish_main_synced(
@@ -4498,7 +4518,11 @@ fn assert_finish_main_synced(
     repository: &str,
     receipt: &Value,
     view: &Value,
+    recovery_live: Option<&str>,
 ) -> Result<()> {
+    if let Some(live) = recovery_live {
+        return assert_synced_main_at(root, repository, live);
+    }
     assert_main_synced(root, repository)?;
     if receipt_gate_mode(receipt)? == emergency::GATE {
         let current = git(root, &["rev-parse", "HEAD"], true)?.trim().to_string();
@@ -4719,15 +4743,25 @@ fn finish_locked(
     {
         return Err(error("lock取得前に緊急承認receiptが変更されました"));
     }
+    let recovery = state
+        .get("manual_merge")
+        .map(|_| manual_merge::Recovery::from_state(&state, &receipt_value))
+        .transpose()?;
+    if recovery.is_some() && (sandbox_retry || recover_main_sync.is_some()) {
+        return Err(error("手動merge回収にはmain同期の復旧を指定できません"));
+    }
     let mut bound = work_log::bind(root, &state, issue)?;
-    if expected_gate == emergency::GATE && bound != state && !bound["issue_record"].is_null() {
-        let body = format!(
-            "{}\n\n{}",
-            str_value(&bound["issue_record"], "body")?,
-            emergency::note(&receipt_value)?
-        );
-        bound["issue_record"]["body"] = string(body);
-        work_log::validate_record(task, &bound["issue_record"])?;
+    if bound != state && !bound["issue_record"].is_null() {
+        let note = if expected_gate == emergency::GATE {
+            Some(emergency::note(&receipt_value)?)
+        } else {
+            recovery.as_ref().map(manual_merge::Recovery::note)
+        };
+        if let Some(note) = note {
+            let body = format!("{}\n\n{note}", str_value(&bound["issue_record"], "body")?);
+            bound["issue_record"]["body"] = string(body);
+            work_log::validate_record(task, &bound["issue_record"])?;
+        }
     }
     if bound != state {
         atomic_json(&state_path(&repository, task)?, &bound)?;
@@ -4786,7 +4820,20 @@ fn finish_locked(
         worktree_clean_head(&worktree_path, &head)?;
         validate_receipt_evidence(&worktree_path, &manifest_value, &receipt_value)?;
     }
-    if finish_requires_live_delivery_gate(&stage) {
+    let mut recovery_live = None;
+    if finish_requires_live_delivery_gate(&stage)
+        && let Some(recovery) = &recovery
+    {
+        if stage == "main_synced" || worktree_path.exists() || worktree_path.is_symlink() {
+            worktree(root, &manifest_value, &worktree_path)?;
+            worktree_clean_head(&worktree_path, &head)?;
+            validate_receipt_evidence(&worktree_path, &manifest_value, &receipt_value)?;
+        }
+        let live = recovery.verify(root, &view, &str_value(&manifest_value, "branch")?)?;
+        review_safety(root, &repository, expected_pr)?;
+        admit_delivery(root, &receipt_value, &live, &[])?;
+        recovery_live = Some(live);
+    } else if finish_requires_live_delivery_gate(&stage) {
         let live = fetch_main(root, &repository)?;
         validate_local_gate_workflow_policy(root, &live, &head, &gate)?;
         if gate == emergency::GATE {
@@ -4816,6 +4863,9 @@ fn finish_locked(
         assert_main_clean(root)?;
     }
     if stage == "completed" || stage == "cleanup_complete" {
+        if let Some(recovery) = &recovery {
+            recovery.verify_pr(&view, &str_value(&manifest_value, "branch")?)?;
+        }
         if remote_branch(root, &repository, &str_value(&manifest_value, "branch")?)?.is_some()
             || worktree_path.exists()
             || worktree_path.is_symlink()
@@ -4914,10 +4964,22 @@ fn finish_locked(
             }
             return Err(error("人間用mainをff-only syncできません"));
         }
-        assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
+        assert_finish_main_synced(
+            root,
+            &repository,
+            &receipt_value,
+            &view,
+            recovery_live.as_deref(),
+        )?;
         state = save_stage(&repository, task, &state, "main_synced", "")?;
     } else {
-        assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
+        assert_finish_main_synced(
+            root,
+            &repository,
+            &receipt_value,
+            &view,
+            recovery_live.as_deref(),
+        )?;
     }
     if gate == emergency::GATE {
         let live = fetch_main(root, &repository)?;
@@ -4928,7 +4990,13 @@ fn finish_locked(
     work_log::sync(root, &state, false)?;
     let stage = str_value(&state, "stage")?;
     if ["main_synced", "remote_delete_started"].contains(&stage.as_str()) {
-        assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
+        assert_finish_main_synced(
+            root,
+            &repository,
+            &receipt_value,
+            &view,
+            recovery_live.as_deref(),
+        )?;
         let branch = str_value(&manifest_value, "branch")?;
         let remote = remote_branch(root, &repository, &branch)?;
         if remote.as_deref().is_some_and(|v| v != head) {
@@ -4980,7 +5048,13 @@ fn finish_locked(
     }
     let stage = str_value(&state, "stage")?;
     if ["remote_deleted", "worktree_unlock_started"].contains(&stage.as_str()) {
-        assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
+        assert_finish_main_synced(
+            root,
+            &repository,
+            &receipt_value,
+            &view,
+            recovery_live.as_deref(),
+        )?;
         let branch = str_value(&manifest_value, "branch")?;
         if remote_branch(root, &repository, &branch)?.is_some() {
             return Err(error("remote task branchがcleanup中に再出現しました"));
@@ -5031,11 +5105,23 @@ fn finish_locked(
                 if unlocked.get("locked").is_some() {
                     return Err(error("worktree unlock後のlock状態を確認できません"));
                 }
-                assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
+                assert_finish_main_synced(
+                    root,
+                    &repository,
+                    &receipt_value,
+                    &view,
+                    recovery_live.as_deref(),
+                )?;
                 worktree(root, &manifest_value, &worktree_path)?;
                 worktree_clean_head(&worktree_path, &head)?;
             }
-            assert_finish_main_synced(root, &repository, &receipt_value, &view)?;
+            assert_finish_main_synced(
+                root,
+                &repository,
+                &receipt_value,
+                &view,
+                recovery_live.as_deref(),
+            )?;
             worktree(root, &manifest_value, &worktree_path)?;
             worktree_clean_head(&worktree_path, &head)?;
             crate::clean_disk::ensure_artifact_idle(&worktree_path)
@@ -5487,6 +5573,7 @@ struct CliArgs {
     sandbox_retry: bool,
     recover_main_sync: Option<MainSyncRecovery>,
     recover_merged: bool,
+    manual_merge_request: Option<PathBuf>,
     gate: String,
     issue: Option<i64>,
     emergency_request: Option<PathBuf>,
@@ -5534,6 +5621,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             "recover-main-sync-to",
             "issue",
             "emergency-request",
+            "manual-merge-request",
         ];
         if flag_options.contains(&normalized.as_str()) {
             if !flags.insert(normalized) {
@@ -5584,6 +5672,39 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
         .map_err(|_| error("Plan versionが不正です"))?;
     if !(1..=999_999).contains(&plan_version) {
         return Err(error("Plan versionが不正です"));
+    }
+    if let Some(path) = values.get("manual-merge-request") {
+        if command != "approve-review"
+            || flags.len() != 1
+            || !flags.contains("recover-merged")
+            || values.len() != 6
+        {
+            return Err(error(
+                "手動merge回収の承認はapprove-review --recover-mergedと固定対象だけを指定してください",
+            ));
+        }
+        let path = PathBuf::from(path);
+        validate_absolute_path(&path, "手動merge回収の承認")?;
+        return Ok(CliArgs {
+            command,
+            task,
+            pr,
+            head,
+            risk: None,
+            plan,
+            plan_version,
+            tests: false,
+            independent: false,
+            specialist: false,
+            sandbox_retry: false,
+            recover_main_sync: None,
+            recover_merged: true,
+            manual_merge_request: Some(path),
+            gate: STRICT_GATE_MODE.into(),
+            issue: None,
+            emergency_request: None,
+            replace_receipt: false,
+        });
     }
     let gate = values
         .get("gate-mode")
@@ -5680,6 +5801,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             sandbox_retry: false,
             recover_main_sync: None,
             recover_merged,
+            manual_merge_request: None,
             gate,
             issue,
             emergency_request,
@@ -5732,11 +5854,22 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs> {
             sandbox_retry,
             recover_main_sync,
             recover_merged: false,
+            manual_merge_request: None,
             gate,
             issue,
             emergency_request,
             replace_receipt,
         })
+    }
+}
+
+pub(crate) fn manual_merge_invocation_reason(args: &[String]) -> Option<String> {
+    if parse_args(args.iter().map(OsString::from))
+        .is_ok_and(|args| args.manual_merge_request.is_some())
+    {
+        None
+    } else {
+        Some("手動merge回収はapprove-review --recover-mergedと固定対象、絶対pathの承認だけを指定してください".into())
     }
 }
 
@@ -5794,7 +5927,13 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 parsed.specialist,
                 &parsed.gate,
             ),
-            "approve-review" if parsed.recover_merged => recover_merged(&root, &parsed),
+            "approve-review" if parsed.recover_merged => {
+                if let Some(path) = parsed.manual_merge_request.as_deref() {
+                    manual_merge::recover(&root, &parsed, path)
+                } else {
+                    recover_merged(&root, &parsed)
+                }
+            }
             "approve-review" if parsed.gate == emergency::GATE || parsed.replace_receipt => {
                 write_emergency_review(&root, &parsed)
             }
@@ -5837,26 +5976,31 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
         }
     })();
     match result {
-        Ok(value) => match serde_json::to_string(&if value.get("gate_mode").and_then(Value::as_str)
-            == Some(emergency::GATE)
-        {
-            object([
-                (
-                    "task_id",
-                    get(&value, "task_id").cloned().unwrap_or(Value::Null),
-                ),
-                ("gate_mode", string(emergency::GATE)),
-                ("approved", Value::Bool(true)),
-            ])
-        } else {
-            value
-        }) {
-            Ok(text) => {
-                println!("{text}");
-                0
+        Ok(mut value) => {
+            match serde_json::to_string(&if value.get("gate_mode").and_then(Value::as_str)
+                == Some(emergency::GATE)
+            {
+                object([
+                    (
+                        "task_id",
+                        get(&value, "task_id").cloned().unwrap_or(Value::Null),
+                    ),
+                    ("gate_mode", string(emergency::GATE)),
+                    ("approved", Value::Bool(true)),
+                ])
+            } else {
+                if let Some(fields) = value.as_object_mut() {
+                    fields.remove("manual_merge");
+                }
+                value
+            }) {
+                Ok(text) => {
+                    println!("{text}");
+                    0
+                }
+                Err(_) => 1,
             }
-            Err(_) => 1,
-        },
+        }
         Err(err) => {
             eprintln!("codex-delivery: {err}");
             1
@@ -8194,6 +8338,95 @@ mod tests {
             invalid.insert("stage".into(), string("unknown"));
             write_private(&path, &Value::Object(invalid));
             assert!(load_state("owner/repo", "issue-24", &receipt, "feat/issue-24").is_err());
+        });
+    }
+
+    #[test]
+    fn manual_merge_state_resumes_after_reservation_and_preserves_medium_receipt() {
+        with_codex_home(|home| {
+            let root = home.join("checkout");
+            fs::create_dir(&root).unwrap();
+            for args in [
+                vec!["init", "-q", "-b", "main"],
+                vec![
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/owner/repo.git",
+                ],
+            ] {
+                assert!(
+                    Command::new(GIT_BINARY)
+                        .args(args)
+                        .current_dir(&root)
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            let repo = "owner/repo";
+            let task = "issue-24";
+            let branch = "fix/example";
+            let head = "b".repeat(40);
+            let merge = "c".repeat(40);
+            let receipt = receipt_v6_with_review("medium", false, false);
+            let receipt_file = receipt_path(repo, task, &head).unwrap();
+            write_private(&receipt_file, &receipt);
+            let original = fs::read(&receipt_file).unwrap();
+            let state_file = state_path(repo, task).unwrap();
+            let other = lane::Scope {
+                repository: repo.into(),
+                task: "issue-25".into(),
+                pr: 25,
+                head: head.clone(),
+                base: merge.clone(),
+                labels: vec![],
+            };
+            let observation = serde_json::json!({
+                "workflow_runs": 0, "actions_check_runs": 0, "other_check_runs": 0,
+                "commit_statuses": 0
+            });
+            let recovery = || {
+                serde_json::from_value(serde_json::json!({
+                    "approval": {
+                        "version": 1, "approved": true, "repository": repo, "task_id": task,
+                        "pr": 24, "plan_id": "CODEX-DELIVERY-TEST-v1", "plan_version": 2,
+                        "head_sha": head, "base_sha": "a".repeat(40), "merge_sha": merge
+                    },
+                    "receipt_sha256": emergency::digest(&receipt).unwrap(),
+                    "observed_at": "now",
+                    "head_ci": observation, "merge_ci": observation,
+                }))
+                .unwrap()
+            };
+            lane::admit(other.clone(), None).unwrap();
+            assert!(
+                manual_merge::save_recovery(&root, &receipt, branch, &merge, recovery()).is_err()
+            );
+            assert!(!state_file.exists());
+            lane::release(repo, "issue-25", 25).unwrap();
+
+            // 予約直後に中断しても、同じ対象でstateを作成できる。
+            admit_delivery(&root, &receipt, &merge, &[]).unwrap();
+            assert!(!state_file.exists());
+            let state =
+                manual_merge::save_recovery(&root, &receipt, branch, &merge, recovery()).unwrap();
+            assert_eq!(state["stage"], "main_synced");
+            assert_eq!(fs::read(&receipt_file).unwrap(), original);
+            assert!(lane::admit(other.clone(), None).is_err());
+
+            // finishの途中状態を読み直しても元の承認と観測結果を保持する。
+            save_stage(repo, task, &state, "remote_deleted", "").unwrap();
+            let resumed = load_state(repo, task, &receipt, branch).unwrap();
+            let approval = manual_merge::Recovery::from_state(&resumed, &receipt).unwrap();
+            assert_eq!(resumed["manual_merge"], state["manual_merge"]);
+            assert!(approval.note().contains("workflow 0 件 / check 0 件"));
+            assert!(emergency::replacement_stage(&state, true).is_err());
+            save_stage(repo, task, &resumed, "completed", "").unwrap();
+            lane::release(repo, task, 24).unwrap();
+            assert!(lane::admit(other, None).is_ok());
         });
     }
 
