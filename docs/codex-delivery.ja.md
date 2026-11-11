@@ -225,95 +225,23 @@ local検証で迂回せず、workflowのtrigger、`runs-on`、job、matrixとliv
 mergeやpushで自動起動する既存CDはそのworkflowへ任せて状態を報告します。manual dispatch、release、
 production deploy、新しいenvironment approvalはdelivery helperのscopeに含めません。
 
-### CI予約と納品予約
+### CI起動と納品予約
 
-既存のCI起動labelの選択はCodexへ継続委任されています。workflowと用途を読み、review receiptを作成してから
-親checkoutで次を実行します。新labelやdeploy承認を作成するcommandではありません。
+CI起動はrepositoryのworkflowと既存の権限・labelに従います。対象repositoryのworkflow、`runs-on`、job、matrix、Rulesetとbranch protectionを確認し、必要な既存CI labelは用途と実在を確認して`codex-delivery authorize-ci`で付与します。GitHub Actionsは利用可能なrunnerへjobを割り当て、該当runnerが稼働するまでjobを待機させます。Codex helperはhosted/self-hostedを問わずCI起動を別repositoryの状態や手動容量設定で待たせません。runnerの稼働数とPC資源はrunner運用側が管理します。
+
+既存CI labelで起動する場合は、review receiptの作成後に親checkoutで実行します。
 
 ```console
 codex-delivery authorize-ci --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --base <LATEST_MAIN_SHA> --ci-label <EXISTING_CI_LABEL>
 ```
 
-PR identity、cleanな固定head、review、最新mainの包含、labelの実在を照合してから付与します。
-同じlabelが他のopen PRにある場合は待ちます。coordinatorの`--ci-label`も同じ経路を使います。
-共有CI枠は`worktrees/.delivery-lane/state.json`、repository単位の納品予約はその配下の
-`repository-<repo_key>/state.json`へprivateに保存します。通常CIを起動するtaskは原則として両方を取得し、
-CI起動・merge・main CI・main同期・記録・cleanupを終えた`finish`だけが共有枠を解放します。
-head/base更新、gate変更、セッション終了、process停止、待機時間では枠を解放しません。
-中断時は所有taskを再開します。CIなしで進めるtaskもrepository単位の納品予約を保持するため、
-同一repositoryのmerge・main同期・cleanupは競合しません。
+PR identity、cleanな固定head、review、最新mainの包含、labelの実在を照合します。coordinatorの`--ci-label`も同じ経路を使います。
 
-### Self-hosted CI枠の容量設定
+repository単位の納品予約は`worktrees/.delivery-lane/repository-<repo_key>/state.json`へprivateに保存し、同一repositoryのCI起動・merge・main同期・cleanupを排他します。予約は`finish`で解放し、検証済みの同一repositoryのmain修復taskだけは一時的に親の予約を引き継げます。
 
-必要なrunner容量を実測した場合に限り、privateな
-`$CODEX_HOME/worktrees/.delivery-lane/capacity.json`で共有枠を最大3 jobまで設定できます。
-設定例は合成値です。`workflow_tree`は固定SHAに対する
-`git rev-parse <SHA>:.github/workflows`の結果を記録します。
+repository別の記録がまだない場合は、旧`worktrees/.delivery-lane/state.json`から同じrepositoryの所有者を引き継ぎます。更新はrepository別の記録に保存し、旧共有ファイルは保持します。別repositoryのCI、納品、修復は独立して進みます。手動の`capacity.json`設定、CI容量照会、hosted exemption、repository間の予約移譲は廃止しました。
 
-```json
-{
-  "version": 1,
-  "max_jobs": 3,
-  "disk_path": "/srv/runner-work",
-  "cpu_per_job": 2,
-  "memory_mib_per_job": 4096,
-  "disk_mib_per_job": 8192,
-  "reserve_cpus": 1,
-  "reserve_memory_mib": 2048,
-  "reserve_disk_mib": 16384,
-  "repositories": [
-    {"repository": "synthetic-org/build-a", "workflow_tree": "1111111111111111111111111111111111111111", "jobs": 2},
-    {"repository": "synthetic-org/build-b", "workflow_tree": "2222222222222222222222222222222222222222", "jobs": 1}
-  ]
-}
-```
-
-`capacity.json`は同一ユーザー所有の通常file（0600）にします。`disk_path`はrunnerの実ストレージを
-指す絶対canonical pathにします。登録するjob数には、同じ予約中にPR CI、main CI、再実行が
-重なる場合の最大同時実行数を使います。workflow変更後は容量設定を編集する前に
-head/base双方の最大同時実行数を再検証します。開始時の固定headとbaseのworkflow treeが
-登録値に一致する場合だけ重み付き予約を使います。未登録、tree不一致、構成不明は従来の
-排他予約です。既存のv1 stateも排他として扱います。
-
-判定は使用可能CPU数とload average、利用可能RAM、`disk_path`上の`statvfs`を参照し、
-稼働中予約の合計と設定reserveを保守的に差し引きます。容量不足なら新規開始を待たせますが、
-既存予約の`finish`は妨げません。同一repositoryの納品排他は維持します。修復taskは他の
-重み付き予約が解放されるまで待ち、その後に排他枠を取得します。ホスト計測は外部triggerを
-制御しないため、実際のrunner設定とhard limitを別途合わせてください。計測なしに有効化・増枠しません。
-
-初回は既存のmanaged refreshでhelperを更新し、新規Codex sessionから読み取り専用の
-`codex-delivery ci-capacity`で確認します。容量設定は受付ごとに読み直します。
-重み付きstateを読めない旧helperはfail closedし、
-設定なし・空stateの予約は従来のv1動作です。binaryを戻す前にcanonicalな`finish`で予約をdrainします。
-
-### GitHub-hostedの通常CIで共有枠を省く条件
-
-明示的な`--ci-label`で起動する場合は、通常CIでも従来どおり共有枠を取得しfinishまで保持します。
-labelを明示しない通常CIは、live base・固定head・finish時の実mergeに含まれる全workflow jobが
-[公式標準GitHub-hosted runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)の固定scalar `runs-on`
-（例: `ubuntu-24.04`）で、job-level reusable workflow `uses`を含まず、live repository APIでownerが個人（`User`）かつ
-repository self-hosted runner一覧が明示的に空と確認できた場合に限り、共有枠を省略できます。
-これはGitHub-hosted runner利用が確認できる場合に運用上の共有待ちだけを除く条件です。CI check、レビュー、同一repositoryの納品予約は従来どおり必要です。
-`runs-on`のmatrix展開・式・`group`・複数labelなど固定scalarでない指定、標準hostedと確認できないlabel、job-level `uses`、
-self-hosted runner、organization/enterpriseなどからのrunner継承が不明なrepository、workflow treeやAPI応答が欠落・不明の場合は
-共有枠を取得します。runner labelの対象はGitHubの公式runner一覧を正本とし、独自labelを推測でhosted扱いしません。
-owner種別とrunner一覧は毎回live APIで照合します。owner情報・runner一覧が取得できない、runner APIが明示的な空一覧を返さない場合も枠を省略しません。
-判定はlive base、固定head、merge後の実merge revisionごとに行います。finishで実merge等の証拠が条件外なら通常の共有枠を取得し（必要なら待機）、CI gate・所有チェックを維持します。
-省略可能なのは共有枠だけで、repository単位の納品予約は必ず維持します。既存の共有枠ownerはfinishまで保持し、
-この条件に該当する別repositoryのtaskが既存ownerを変更・解放することはありません。
-
-live baseと固定headに適用されるworkflow policyを検証した`local-validation`は共有CI枠なしで進めます。
-`emergency-ci`はgate名だけで枠を免除しません。有効なreceiptを照合した後、最新API観測でheadとmerge targetの
-CI状態がpending/queued/in_progress等でないことを確認できた場合に限り、共有枠を使わず納品予約だけ取得します。
-API不明、未知状態、対象不一致、期限切れ・scope不一致の証拠は従来の予約要件に従うかfail closedします。
-通常CI ownerが既にあるtaskはgate変更後もfinishまで所有を維持し、CI不要taskは別repositoryのCI ownerを
-変更・解放しません。旧共有stateはCI ownerとして読み、移行時に稼働中のownerを削除しません。
-直接のlabel操作で迂回しません。検証済みのmain CI修復taskだけは親の枠を一時的に使い、finish後に親へ戻します。
-
-自動triggerによるCIの並列実行、他hostや人間の操作を共有枠で排他できるわけではありません。
-GitHubのlabel APIもPR単位なので、照合と付与の間のpushは取り消せません。直列化は事故ゼロの保証ではなく、
-merge前の最新base・head・conflict・check・reviewの再確認とサーバー側保護を維持します。
-
+`local-validation`と`emergency-ci`は各々の正規証拠条件に従います。live workflow policy、固定head/base、review receipt、Actions check、merge後の実mergeとmain到達の検証を維持します。既存CI labelを別PRが持っている場合はrepository内で同labelの競合を再確認し、PR-wide labelが固定SHAの実行認可を保証しない点も引き続き確認します。
 ### CI基盤障害時の継続委任
 
 `--gate-mode emergency-ci`はrepositoryを限定しない例外経路です。通常のstrictを既定に保ち、CI失敗やpendingだけで
@@ -436,51 +364,19 @@ receiptをatomic更新します。同じrequestの再実行は既存receiptを�
 更新後は同じtask/PR/head/Planの`finish --gate-mode emergency-ci`を使います。state手編集や再mergeは不要です。
 回復後の実CI成功はfinishで再観測し、免除範囲を拡張せず通常の同期・記録・cleanupへ戻ります。
 
-### 別repositoryの基盤修復へ共有枠を一時移譲する
-
-同一host/CODEX_HOMEで先行PRがmerge後の基盤障害に止まり、別repositoryの修復PRがその枠を待つ場合は、
-修復repositoryの親checkoutから`codex-delivery repair-lane --request <PRIVATE_REQUEST_ABSOLUTE_PATH>`を使います。
-先行PRは対象別emergency receiptと未回復の実CI観測、修復PRはhigh以上・独立review済みの固定receiptが必要です。
-API不明や製品test失敗を修復の根拠へ読み替えません。修復PRの新規作成は元の依頼scopeに従います。
-
-request v1は次のfieldを持つ0600のGit管理外JSONです。実値は公開しません。
-
-- `version: 1`、`parent_checkout`、`reason`（今回の基盤修復との関係）
-- `purpose: "repair-ci-infrastructure"`、`authorization`（元依頼に含まれる修復の根拠）
-- `product_test_failures: false`、`parent_failure_evidence`（最新の失敗が基盤障害である根拠）
-- `parent`: 非公開枠の固定`repository/task/pr/head/base/labels`のobject
-- `parent_receipt_sha256`、`parent_merge`: 先行receiptと実mergeの固定値
-- `child_task`、`child_pr`、`child_head`、`child_plan`、`child_plan_version`、`child_receipt_sha256`
-
-このrequestが交差repositoryの固定親子関係の明示登録です。Codexは元依頼と原因を照合して作成します。
-helperは修復内容の意味を自動証明せず、登録scopeと証拠・競合を検証します。無関係な待機PRを自動選択しません。
-helperは双方のreceipt、親のmerged state・実merge・障害、子のopen PR・clean head・最新base・reviewを照合し、
-private証拠を保存した後、固定した親scopeに一致する場合だけ枠を交換します。親の所有はsuspendedとして残ります。
-親の新しいCI状態が旧waiver外でも、修復のための実測は取得できます。この観測は`approved: false`であり、
-親のCI免除、receipt更新、finish許可には使いません。Codexが最新の基盤障害を分類してrequestへ根拠を記録します。
-mainが実mergeより先へ進んでいれば、そのlive SHAのCIもAPI取得して同じ非公開観測へ束縛します。
-既知の製品test失敗やAPI不明はこの修復枠にも使いません。親の既存receipt/auditとdelivery gateは維持します。
-先行checkoutへのfetchがsandboxの書込み範囲外なら、同一UIDの通常ホストで正規helperを実行します。
-修復PRのCI起動前にはrequired checks待ちの`BLOCKED`を枠認可だけに許容します。適用Rulesetとcheck-runを取得し、
-CI以外のrule、配備・review承認、classic protectionなどの判定不能な阻害条件がなく、未完了required Actionsだけが
-残っていることを確認してprivate証拠へ保存します。API不明や、全required CI成功後も理由不明のBLOCKEDなら保持します。conflict/UNKNOWNも保持し、
-merge時のCI・Ruleset gateは通常のdeliverで再検証します。CI起動labelを必要とする修復PRも先行枠との相互待ちにしません。
-枠取得前にもchildの通常deliveryに必要な非CI契約を確認します。strictは既存の完全なRuleset契約を使い、
-default Ruleset不足・bypass・配備条件などを枠取得後へ持ち越しません。UNSTABLEのchildは保持し、修復・再検証へ戻します。
-交差repositoryの修復は1段に制限し、競合・循環・別の修復中は保持します。再実行は同じ固定scopeで再照合します。
-修復PRは通常のauthorize-ci/deliver/finishを使い、finish完了時だけ親scopeへ戻ります。親のfinishを再開して
-CI回復または更新済みの限定証拠を確認します。無条件release、state手編集、旧helperへの退避を使いません。
-
 Actionsの容量棚卸し・保持方針・回復確認は[artifact運用](codex-actions-artifacts.ja.md)を参照してください。
 PRには定型の検証結果・免除の限界と、検証済みの原因区分だけを保存確認します。
 `public_summary`はrequest v1の互換fieldとして非公開に保持し、自由記述・task名・path・command・check名は投稿しません。
 旧形式の公開記録は、privateな保存記録と一致する自分のcommentだけを定型文へ移行します。所有不明の編集は保持します。
 Issue記録とcleanupは既存finishを使い、API取得不能や保存確認失敗では削除しません。
 
-CI待機の免除はworkflowの停止ではありません。事前にbase/headのtriggerと既存CDへの影響を調べて報告し、
-`acknowledge_workflow_runs`で記録します。push/mergeの自動起動は既存設定に従います。
-manual dispatch、release、production deploy、新しいenvironment approvalは含みません。
+CI待機を免除した場合もworkflowは既存のtriggerに従います。事前にbase/headのtriggerと既存CDへの影響を調べて報告し、
+`acknowledge_workflow_runs`で記録します。manual dispatch、release、production deploy、新しいenvironment approvalには別途許可が必要です。
 次の新しいtask/deliveryではgate指定を省略して通常経路から始めます。新しい権限・費用・deploy承認は継続委任に含みません。
+
+### 別repositoryの基盤修復
+
+別repositoryの修復は通常の独立taskとして進めます。修復repository自身のworkflow、CI、review、納品予約を確認します。親repositoryの予約は通常のfinishまで保持します。merge後の証拠更新は前節の手順を使い、実mergeの親・tree・main到達を照合します。
 
 ## deliver
 

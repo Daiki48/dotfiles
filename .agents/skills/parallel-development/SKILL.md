@@ -12,7 +12,7 @@ description: 複数Issueの並列実装、進行中に別タスクを追加す�
 - 別Issueの実装依頼は`submit --task-id issue-<番号> --objective '<許可された目的・受入条件・停止境界>'`へ変換する。Issueなしは衝突しない`task-<ID>`を使う。相談・調査・Issue化だけの依頼を実装へ変換しない。
 - `--authorization`には利用者の元の目的・明示境界を保存し、親が分割した`--objective`と区別する。利用者がPRまで・mergeまでを指定した場合だけ`--stop-after pr|merge`を付け、通常は既定のfinishまで進める。既存repository方針で明示されたFree/private運用は受付時に`--gate-mode github-free-private`を付ける。403から推測して切り替えない。既存taskのpolicyはstateを手編集せず、所有と既存receiptを確認する。
 - 受付を担当するmainがAGENTSの基準でriskを判断し、`--risk low|medium|high|critical`へ渡す。判断できなければ既定のhighを使う。登録riskはレビュー深度の下限であり、実装workerの自己申告では下げない。
-- CI起動labelの選択は継続委任されている。workflow・用途・labelの実在を確認して`submit`または停止回収後の`resume`へ`--ci-label <既存label>`を渡し、レビュー後にRustがPR/head/最新baseを照合する。明示的な`--ci-label`は共有枠をfinishまで保持し、labelなしhosted exemptionと`local-validation`・有効な`emergency-ci`は[deliveryガイド](../../../docs/codex-delivery.ja.md#ci予約と納品予約)の証拠条件に従います。self-hosted、動的な`runs-on`、job-level `uses`、不明なAPI・runner継承では共有枠を維持し、全経路でrepository単位の納品予約、同一repositoryの排他、CI check・finishの要件を保ちます。先行する共有枠ownerのmain同期・finish完了までは次の明示labelを付けず、単独sessionも`codex-delivery authorize-ci`を使います。PR-wide labelは固定SHA単位の実行認可を保証せず、他host・自動trigger・人間の操作はliveで再確認します。新label・deploy承認・追加権限や費用は推測で登録しません。
+- CI起動labelの選択は継続委任されています。workflow・用途・labelの実在を確認して`submit`または停止回収後の`resume`へ`--ci-label <既存label>`を渡し、レビュー後にRustがPR/head/最新baseを照合する。repository横断の共有CI予約や容量設定はありません。既存の納品予約はrepository単位で保持し、同一repositoryの排他、CI check・finish要件を維持します。単独sessionも`codex-delivery authorize-ci`を使います。PR-wide labelは固定SHA単位の実行認可を保証せず、他host・自動trigger・人間の操作はliveで再確認します。runnerの稼働数とホスト資源はrunner運用側で管理します。新label・deploy承認・追加権限や費用は推測で登録しません。
 - `submit`は登録だけで、`start`がOSタイマーなしのcoordinatorを起動する。登録後は`codex-task start --json`を呼ぶ。稼働済みなら同じcoordinatorが新taskを扱う。受付後も別依頼や相談に応じ、元workerの完了を会話の前提にしない。
 - 通常実装のCI待ちを引き継ぐ場合も、既存taskとmanaged worktreeを照合する。未登録の既存worktreeには同じtask IDと実際の`--branch`を指定し、既存PR・固定head・Plan/版・残るdelivery・元の終了境界を保存する。旧writer停止・非使用を確認してから引き継ぎ、別IDや既定branchで同じ作業を再登録しない。`start`成功だけでなく、対象taskが既存PR/headと次段階を認識したことを`show`で確認する。CI待ちや先行作業待ちを便宜的なpauseへ変換しない。
 - CI起動は完了ではない。finishまでの依頼は、CI後のreview・delivery・main CI・finish・物理cleanupまで担当を維持する。親終了を許可された場合だけ確認済みの自律継続を報告し、親を継続する指示があれば最終回答で終了しない。画面のWorked表示はcoordinatorの稼働やtask完了の証拠に使わない。
@@ -26,6 +26,6 @@ description: 複数Issueの並列実装、進行中に別タスクを追加す�
 - Finishでmainが最初cleanかつmanaged Skill等の更新を含む場合は、同一UIDの通常ホスト側でexecの`require_escalated`/既存auto-reviewを通して正規helperを実行する。permission設定を変更しない。通常sandboxで失敗しhelperが`sandbox-retry-ready`を発行した場合だけ、同じhostで1回の`--sandbox-retry`を使う。消費後の追加復旧には人間の明示承認が必要で、他taskの承認を流用しない。未知dirtyは保持する。
 - FedoraとWSL2はそれぞれ実行先のpath・認証・stateを使う。SSH経由の依頼は接続先が所有host。host間の暗黙移動やfailoverを行わない。
 
-容量障害は[artifact運用](../../../docs/codex-actions-artifacts.ja.md)の棚卸し・明示登録内の整理・反映待ち・対象jobの回復確認を使う。merge後も同じPR/head/base/Planと実mergeの親/tree/main到達を検証して固定証拠を更新し、既存taskのfinishへ戻せる。別repositoryの基盤修復との相互待ちは[deliveryガイド](../../../docs/codex-delivery.ja.md)の`repair-lane --request`で親の所有を保持して一時移譲する。修復finish後は親へ戻る。新taskの無断登録、state手編集、旧helperや無条件の枠解放で回避しない。
+- 容量障害は[artifact運用](../../../docs/codex-actions-artifacts.ja.md)の棚卸し・明示登録内の整理・反映待ち・対象jobの回復確認を使う。merge後も同じPR/head/base/Planと実mergeの親/tree/main到達を検証して固定証拠を更新し、既存taskのfinishへ戻せる。別repositoryの基盤修復は独立taskとして進め、親の納品予約を保持する。新taskの無断登録やstate手編集で回避しない。
 
 起動・停止・復旧・現在の対応範囲は[タスク運用ガイド](../../../docs/codex-tasks.ja.md)を必要時に読む。

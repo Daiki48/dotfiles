@@ -85,20 +85,6 @@ pub(super) struct Observation {
 }
 
 impl Observation {
-    pub fn requires_ci_reservation(&self) -> bool {
-        if !self.allows_delivery() {
-            return true;
-        }
-        match self.gate_mode {
-            GateMode::LocalValidation => false,
-            GateMode::EmergencyCi => self
-                .emergency
-                .as_ref()
-                .is_none_or(|proof| proof["ci_reservation_required"] != false),
-            _ => true,
-        }
-    }
-
     pub fn allows_delivery(&self) -> bool {
         if self.gate_mode == GateMode::EmergencyCi {
             return self.state != CiState::Stale
