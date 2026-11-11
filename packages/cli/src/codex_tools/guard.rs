@@ -5060,6 +5060,9 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
     if !["record-review", "approve-review", "deliver", "finish"].contains(&command.as_str()) {
         return Some("許可されていないdelivery helper操作です".into());
     }
+    if args.iter().any(|arg| arg == "--manual-merge-request") {
+        return super::delivery::manual_merge_invocation_reason(args);
+    }
     let rest = &args[1..];
     if rest == ["--help"] || rest == ["-h"] {
         return None;
@@ -7819,6 +7822,40 @@ mod recovery_tests {
             );
         }
     }
+
+    #[test]
+    fn manual_merge_request_uses_the_narrow_recovery_entrypoint() {
+        let valid = "codex-delivery approve-review --task-id issue-24 --pr 24 --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --plan-id EXAMPLE-PLAN-v1 --plan-version 1 --recover-merged --manual-merge-request /private/request.json";
+        assert!(
+            delivery_helper_invocation_reason(
+                &valid
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            )
+            .is_none()
+        );
+
+        for command in [
+            "codex-delivery approve-review --task-id issue-24 --pr 24 --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --plan-id EXAMPLE-PLAN-v1 --plan-version 1 --recover-merged --manual-merge-request relative/request.json",
+            "codex-delivery finish --task-id issue-24 --pr 24 --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --plan-id EXAMPLE-PLAN-v1 --plan-version 1 --recover-merged --manual-merge-request /private/request.json",
+            "codex-delivery approve-review --task-id issue-24 --pr 24 --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --plan-id EXAMPLE-PLAN-v1 --plan-version 1 --gate-mode github-free-private --recover-merged --manual-merge-request /private/request.json",
+            "codex-delivery approve-review --task-id issue-24 --pr 24 --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --plan-id EXAMPLE-PLAN-v1 --plan-version 1 --risk medium --tests-passed --recover-merged --manual-merge-request /private/request.json",
+            "codex-delivery approve-review --task-id issue-24 --pr 24 --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --plan-id EXAMPLE-PLAN-v1 --plan-version 1 --recover-merged --manual-merge-request /private/request.json --manual-merge-request /private/other.json",
+        ] {
+            assert!(
+                delivery_helper_invocation_reason(
+                    &command
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                )
+                .is_some(),
+                "unexpectedly allowed {command}"
+            );
+        }
+    }
+
     #[test]
     fn retire_guard_binds_task_and_exact_head_without_force_options() {
         let good = "codex-worktree retire --task-id task-video --head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
