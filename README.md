@@ -67,7 +67,7 @@ cargo run -- [--distro <ubuntu|fedora>] <command> [command options]
 | `claude` | Install Claude Code via the official installer (`curl -fsSL https://claude.ai/install.sh \| bash`). Symlinks `CLAUDE.md`, `settings.json`, `settings.local.json`, `skills/`, and `agents/` under `~/.claude/`. | no |
 | `codex` | Require a trusted Codex CLI at `~/.local/bin/codex`, symlink shared instructions, safety rules, Skills, and the generic disk-cleanup policy, then release-build and atomically install the Rust Git/GitHub hook plus `codex-worktree`, `codex-delivery`, `codex-task`, `codex-discussions`, and `runner-storage-cleanup` multi-call helpers. The setup preflights every managed destination before mutation and idempotently migrates local Codex config; it never executes `codex`, `cargo`, or `npm` from `PATH`. Machine-local trust and TUI settings are preserved. | no |
 | `clean-disk [--dry-run]` | Inspect configured development roots, remove old inactive rebuildable Rust caches, ask `y/N` before deleting expired trash, and invoke explicitly registered project-owned runner cleanup adapters. Active or technically unverified paths are never overrideable. | no |
-| `gemini` | Install Gemini CLI via `npm install -g @google/gemini-cli` and symlink `~/.gemini/settings.json`, `~/.gemini/GEMINI.md`, and `~/.gemini/policies/`. Requires `GEMINI_API_KEY` exported in your shell. | no |
+| `antigravity` | Require an installed Antigravity CLI (`agy`) and symlink `~/.gemini/GEMINI.md` with concise, evidence-based working instructions. Refuse conflicting destinations. Run from the normal dotfiles checkout after merging. | no |
 
 #### AI CLI configuration policy
 
@@ -217,9 +217,23 @@ the hook is not active until it is trusted.
 Authentication, session history, pairing information, local databases, and credentials
 must remain outside this public repository. Diff review is required before external writes.
 
-`~/.gemini/policies/` is managed by this repository as a symlink and stores Gemini CLI
-Policy Engine rules. Do not use deprecated `tools.allowed` in
-`~/.gemini/settings.json` for persistent tool rules.
+#### Antigravity CLI
+
+Antigravity CLI本体は[公式手順](https://antigravity.google/docs/getting-started?tab=cli)で
+導入し、`agy --version`を確認してください。統合後の通常のdotfiles checkout直下で
+`cargo run -- antigravity`を実行すると、グローバルルールだけをリンクします。
+既存の異なるファイルやsymlinkは保持し、エラーで停止します。
+
+[公式Rules](https://antigravity.google/docs/rules/)に従い、`~/.gemini/GEMINI.md`を使います。
+このファイル名はAntigravityでも正式対応しています。内容は、一次情報による確認、
+事実・推論・未確認事項の区別、出典と作業結果を作らないことに絞っています。
+調査・実装は依頼の範囲で自律的に進めます。教師モードやGit操作の一律禁止はありません。
+指示文はハルシネーションを完全に防ぐ仕組みではありません。
+
+旧Gemini CLIのモデル指定、Policy Engine、npm導入処理と、同CLIに依存するClaude用skillは
+廃止しました。Antigravityの[CLI設定](https://antigravity.google/docs/settings?tab=cli)は
+`~/.gemini/antigravity-cli/settings.json`に保存されますが、dotfilesでは管理しません。
+モデル、認証、権限、履歴はローカルに保持し、新しい`agy`セッションでルールを読み込みます。
 
 #### Examples
 
@@ -233,7 +247,7 @@ cargo run -- build-nvim-config
 cargo run -- tmux
 cargo run -- claude
 cargo run -- codex
-cargo run -- gemini
+cargo run -- antigravity
 ```
 
 `codex`の初回セットアップまたは更新後は、managed設定と2つのhelperを反映するため
