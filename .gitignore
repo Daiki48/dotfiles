@@ -38,9 +38,9 @@
 .codex/models_cache.json
 .codex/version.json
 
-# Gemini CLI - excluded (API keys)
-.gemini/.env
-.gemini/credentials/
+# Antigravity: グローバルルール以外の認証・設定・実行時データを公開しない
+.gemini/*
+!.gemini/GEMINI.md
 
 # Added by cargo
 #

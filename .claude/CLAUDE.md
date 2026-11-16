@@ -176,23 +176,5 @@ Daikiがエラーを報告した場合:
 
 ---
 
-## AI 検索・検証コマンド
-- 「ファクトチェック」（「クロス」を**含まない**）→ `/fact-check`
-- 「クロスファクトチェック / クロスチェック」→ `/cross-fact-check`
-- 「Gemini検索 / Geminiで検索 / Geminiで調べて」→ `/gemini-search`（WebSearch使用禁止）
-- 曖昧な場合は Daiki に確認する
-
----
-
-## Gemini Collaboration
-
-When Daiki shares screenshots/videos with "Geminiで確認して":
-- Use Gemini for visual verification (low hallucination risk)
-- Screenshot: UI state, error messages, layout check
-- Video: Demo review, behavior verification, timing analysis
-- Report findings back to Claude for implementation decisions
-
-⚠️ Do NOT use Gemini for:
-- Technical research (high hallucination risk)
-- Fact-checking (88-91% error rate on unknown facts)
-- Architecture decisions (trust required)
+## AI 検証コマンド
+- 「ファクトチェック」→ `/fact-check`
