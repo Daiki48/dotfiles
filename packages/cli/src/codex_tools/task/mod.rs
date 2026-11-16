@@ -101,6 +101,11 @@ enum Commands {
         #[arg(long)]
         task_id: String,
     },
+    /// deliveryとworktree回収を検証し、停止済みtaskのphaseを完了へ同期する。
+    SyncCompleted {
+        #[arg(long)]
+        task_id: String,
+    },
     /// 一度だけ照合し、実行可能なworkerを起動する。
     Reconcile,
     /// coordinatorを端末から切り離して起動する。既に稼働中なら再利用する。
@@ -647,6 +652,50 @@ fn apply_report(context: &Context, task: &mut Task) -> Result<()> {
     apply_report_with(context, task, |context, task| {
         worktree::task_completed(&context.repository, &task.id).map_err(|error| error.to_string())
     })
+}
+
+fn sync_completed(context: &Context, task_id: &str) -> Result<Value> {
+    sync_completed_with(context, task_id, |context, task| {
+        worktree::task_completed_for_branch(&context.repository, &task.id, &task.branch)
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn sync_completed_with(
+    context: &Context,
+    task_id: &str,
+    completed: impl FnOnce(&Context, &Task) -> Result<bool>,
+) -> Result<Value> {
+    if !valid_id(task_id) {
+        return Err("task IDが不正です".into());
+    }
+    let _state = context.store.lock()?;
+    let mut task = context.load(task_id)?;
+    if task.run.is_some() {
+        return Err("worker実行中のtaskは同期できません".into());
+    }
+    if task.stop_after != recovery::Boundary::Finish {
+        return Err("stop_afterがfinishのtaskだけ同期できます".into());
+    }
+    if !matches!(task.phase, Phase::Paused | Phase::Completed) {
+        return Err("停止済みtaskだけ同期できます".into());
+    }
+    let _lease =
+        Lock::try_acquire(&context.store.lease_path(task_id)?)?.ok_or("workerが動作中です")?;
+    if !completed(context, &task)? {
+        return Err("completed deliveryとworktree・artifact回収を確認できません".into());
+    }
+    if task.phase == Phase::Completed {
+        return Ok(json!({"task_id":task_id,"phase":task.phase,"synchronized":false}));
+    }
+    task.phase = Phase::Completed;
+    task.pause_requested = false;
+    task.event(
+        "completion_synchronized",
+        "completed deliveryとworktree・artifact回収を検証してphaseを同期しました",
+    );
+    context.store.save(&task)?;
+    Ok(json!({"task_id":task_id,"phase":task.phase,"synchronized":true}))
 }
 
 fn apply_report_with(
@@ -2485,6 +2534,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 json!({"task_id":task_id,"removed_worker_generations":removed,"retained_events":task.events.len()}),
             )
         }
+        Commands::SyncCompleted { task_id } => sync_completed(&context, &task_id),
         Commands::Pause { task_id } => {
             let _lock = context.store.lock()?;
             let mut task = context.load(&task_id)?;
@@ -2719,7 +2769,8 @@ pub(crate) fn invocation_reason(args: &[String]) -> Option<String> {
         | Commands::Pause { task_id }
         | Commands::Ack { task_id, .. }
         | Commands::Retention { task_id, .. }
-        | Commands::Collect { task_id } => {
+        | Commands::Collect { task_id }
+        | Commands::SyncCompleted { task_id } => {
             (!valid_id(&task_id)).then(|| "task IDが不正です".into())
         }
         Commands::Resume {
@@ -2795,6 +2846,170 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0.home);
         }
+    }
+
+    fn pause_task(fixture: &Fixture, id: &str) -> Task {
+        fixture.submit(id);
+        let mut task = fixture.0.load(id).unwrap();
+        task.phase = Phase::Paused;
+        task.pause_requested = true;
+        task.generation = 7;
+        task.head = Some("a".repeat(40));
+        task.base = Some("b".repeat(40));
+        task.pr = Some(81);
+        task.merge_commit = Some("c".repeat(40));
+        task.checkpoint = "保存済みcheckpoint".into();
+        task.ci_fingerprint = "保存済みfingerprint".into();
+        task.emergency_receipt_sha256 = Some("d".repeat(64));
+        task.review = Some(worker::Report {
+            generation: 6,
+            outcome: "needs_changes".into(),
+            summary: "保存済みreview".into(),
+            pr: Some(80),
+            head: Some("e".repeat(40)),
+            risk: "high".into(),
+            assessment: None,
+        });
+        task.review_independent = true;
+        fixture.0.store.save(&task).unwrap();
+        task
+    }
+
+    #[test]
+    fn sync_completed_updates_only_phase_pause_and_local_event_and_is_idempotent() {
+        let fixture = Fixture::new();
+        let original = pause_task(&fixture, "task-one");
+        let mut checks = 0;
+
+        let result = sync_completed_with(&fixture.0, &original.id, |context, task| {
+            checks += 1;
+            assert_eq!(task.id, original.id);
+            assert_eq!(task.branch, "feat/task-one");
+            assert!(
+                Lock::try_acquire(&context.store.lease_path(&task.id).unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(result["synchronized"], true);
+        let synced = fixture.0.load("task-one").unwrap();
+        assert_eq!(synced.phase, Phase::Completed);
+        assert!(!synced.pause_requested);
+        assert!(synced.run.is_none());
+        assert_eq!(synced.generation, original.generation);
+        assert_eq!(synced.head, original.head);
+        assert_eq!(synced.base, original.base);
+        assert_eq!(synced.pr, original.pr);
+        assert_eq!(synced.merge_commit, original.merge_commit);
+        assert_eq!(synced.checkpoint, original.checkpoint);
+        assert_eq!(synced.ci_fingerprint, original.ci_fingerprint);
+        assert_eq!(
+            synced.emergency_receipt_sha256,
+            original.emergency_receipt_sha256
+        );
+        assert_eq!(synced.review.as_ref().unwrap().summary, "保存済みreview");
+        assert_eq!(synced.review_independent, original.review_independent);
+        assert_eq!(synced.event_sequence, original.event_sequence + 1);
+        assert_eq!(
+            synced.events.last().unwrap().kind,
+            "completion_synchronized"
+        );
+
+        let before_retry = serde_json::to_value(&synced).unwrap();
+        let result = sync_completed_with(&fixture.0, &original.id, |_, _| {
+            checks += 1;
+            Ok(true)
+        })
+        .unwrap();
+        let after_retry = serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap();
+        assert_eq!(result["synchronized"], false);
+        assert_eq!(checks, 2);
+        assert_eq!(after_retry, before_retry);
+    }
+
+    #[test]
+    fn sync_completed_rejects_active_run_or_worker_lease_without_state_changes() {
+        let fixture = Fixture::new();
+        let mut task = pause_task(&fixture, "task-one");
+        task.run = Some(Run {
+            generation: task.generation,
+            phase: Phase::Finish,
+            started: now(),
+        });
+        fixture.0.store.save(&task).unwrap();
+        let before_run = serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap();
+        assert!(sync_completed_with(&fixture.0, "task-one", |_, _| Ok(true)).is_err());
+        assert_eq!(
+            serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap(),
+            before_run
+        );
+
+        task.run = None;
+        fixture.0.store.save(&task).unwrap();
+        let before_lease = serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap();
+        let _lease = Lock::try_acquire(&fixture.0.store.lease_path("task-one").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(sync_completed_with(&fixture.0, "task-one", |_, _| Ok(true)).is_err());
+        assert_eq!(
+            serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap(),
+            before_lease
+        );
+    }
+
+    #[test]
+    fn sync_completed_rejects_wrong_boundary_phase_and_missing_evidence_without_mutation() {
+        for boundary in [recovery::Boundary::Pr, recovery::Boundary::Merge] {
+            let fixture = Fixture::new();
+            let mut task = pause_task(&fixture, "task-one");
+            task.stop_after = boundary;
+            fixture.0.store.save(&task).unwrap();
+            let before = serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap();
+            assert!(sync_completed_with(&fixture.0, "task-one", |_, _| Ok(true)).is_err());
+            assert_eq!(
+                serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap(),
+                before
+            );
+        }
+
+        for phase in [Phase::Implementation, Phase::Blocked, Phase::Completed] {
+            let fixture = Fixture::new();
+            let mut task = pause_task(&fixture, "task-one");
+            task.phase = phase;
+            task.pause_requested = false;
+            fixture.0.store.save(&task).unwrap();
+            let before = serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap();
+            assert!(sync_completed_with(&fixture.0, "task-one", |_, _| Ok(false)).is_err());
+            assert_eq!(
+                serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap(),
+                before
+            );
+        }
+
+        let fixture = Fixture::new();
+        pause_task(&fixture, "task-one");
+        let before = serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap();
+        assert!(
+            sync_completed_with(&fixture.0, "task-one", |_, task| {
+                Ok(task.branch == "feat/other")
+            })
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap(),
+            before
+        );
+
+        let fixture = Fixture::new();
+        pause_task(&fixture, "task-one");
+        let before = serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap();
+        assert!(sync_completed_with(&fixture.0, "task-one", |_, _| Ok(false)).is_err());
+        assert_eq!(
+            serde_json::to_value(fixture.0.load("task-one").unwrap()).unwrap(),
+            before
+        );
     }
 
     pub(super) fn successful_observation() -> ci::Observation {

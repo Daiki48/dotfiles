@@ -5347,8 +5347,16 @@ fn has_write_operation(tokens: &[String]) -> bool {
         match basename(tokens.get(start).unwrap_or(&String::new())) {
             "codex-task" => {
                 return tokens.iter().skip(start + 1).any(|value| {
-                    ["submit", "resume", "pause", "run", "start", "reconcile"]
-                        .contains(&value.as_str())
+                    [
+                        "submit",
+                        "resume",
+                        "pause",
+                        "run",
+                        "start",
+                        "reconcile",
+                        "sync-completed",
+                    ]
+                    .contains(&value.as_str())
                 });
             }
             "codex-worktree" => {
@@ -6860,6 +6868,10 @@ mod tests {
             write_context_reason("codex-worktree create --task-id task-example", None).is_some()
         );
         assert!(write_context_reason("codex-delivery deliver --task-id task-example --pr 1 --head 0123456789012345678901234567890123456789 --plan-id PLAN-TEST-v1 --plan-version 1", None).is_some());
+        assert!(
+            write_context_reason("codex-task sync-completed --task-id task-example", None)
+                .is_some()
+        );
     }
 
     #[test]
@@ -7930,6 +7942,7 @@ mod recovery_tests {
             "codex-task doctor",
             "codex-task show --task-id task-example --json",
             "codex-task submit --task-id task-example --objective implement",
+            "codex-task sync-completed --task-id task-example",
             "codex-task run --poll-seconds 15",
         ] {
             assert!(blocked_reason(command, None, 0).is_none(), "{command}");
@@ -7941,12 +7954,17 @@ mod recovery_tests {
             "python3 /tmp/codex-task list",
             "sh -c 'codex-task list'",
             "codex-task run --force",
+            "codex-task sync-completed --task-id ../private",
             "codex-task list; git status",
+            "codex-task sync-completed --task-id task-example; codex-task list",
         ] {
             assert!(blocked_reason(command, None, 0).is_some(), "{command}");
         }
         assert!(has_write_operation(
             &["codex-task", "reconcile"].map(str::to_string)
+        ));
+        assert!(has_write_operation(
+            &["codex-task", "sync-completed", "--task-id", "task-example"].map(str::to_string)
         ));
         assert!(!has_write_operation(
             &["codex-task", "list"].map(str::to_string)
