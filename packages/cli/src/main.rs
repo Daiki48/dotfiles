@@ -1,10 +1,10 @@
 mod alacritty;
+mod antigravity;
 mod claude;
 mod clean_disk;
 mod codex;
 mod codex_tools;
 mod common;
-mod gemini;
 mod ghostty;
 mod mise;
 mod neovim;
@@ -86,8 +86,8 @@ enum Commands {
     /// Refresh only managed Codex guardrail binaries from a task worktree
     #[command(hide = true)]
     CodexGuardrails,
-    /// Setup for Gemini CLI
-    Gemini,
+    /// Link global rules for an installed Antigravity CLI (agy)
+    Antigravity,
 }
 
 fn multicall_exit_code<I>(executable: &Path, args: I) -> Option<i32>
@@ -221,8 +221,8 @@ fn run() -> anyhow::Result<()> {
         Commands::CodexGuardrails => {
             codex::refresh_guardrails()?;
         }
-        Commands::Gemini => {
-            gemini::setup()?;
+        Commands::Antigravity => {
+            antigravity::setup()?;
         }
     }
     Ok(())
