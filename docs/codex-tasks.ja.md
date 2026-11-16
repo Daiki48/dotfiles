@@ -38,6 +38,13 @@ codex-task ack --task-id issue-123 --through 42
 引継ぎであり、上位の依頼の終了境界にはなりません。終了境界へ到達したtaskは
 `boundary_reached`となり、未統合のsource・PRを保持します。
 
+親sessionが停止した後、正規の`codex-delivery finish`とworktree/artifact回収を完了済みの場合は、
+`codex-task sync-completed --task-id <ID>`で停止taskのphaseを同期できます。
+`phase=paused`、`stop_after=finish`、worker停止を確認し、同じrepository・task・branchのcompleted deliveryと
+worktree/artifact消失を検証します。証拠がない場合や他の停止境界では状態を変更せず拒否します。
+再実行も証拠を再確認してno-opになります。保存済みhead・PR・merge commit・checkpoint・generation・review・receiptは変更せず、
+worker、GitHub、delivery、worktree、artifactには操作しません。
+
 既存方針でFree/private経路が明示されているrepositoryは、受付時に
 `--gate-mode github-free-private`を付けます。risk下限はhighです。Rules APIの403から推測せず、
 live private repository policy、同repositoryのPR、固定headと実mergeのActions・statusを確認します。

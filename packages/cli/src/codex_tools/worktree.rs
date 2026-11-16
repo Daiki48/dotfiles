@@ -1141,7 +1141,33 @@ pub(crate) fn task_observation(cwd: &Path) -> Result<String, WorktreeError> {
 }
 
 pub(crate) fn task_completed(cwd: &Path, task: &str) -> Result<bool, WorktreeError> {
-    let repository = inspect_repository(cwd, false, false)?;
+    task_completed_with_branch(cwd, task, None, false)
+}
+
+pub(crate) fn task_completed_for_branch(
+    cwd: &Path,
+    task: &str,
+    expected_branch: &str,
+) -> Result<bool, WorktreeError> {
+    task_completed_with_branch(cwd, task, Some(expected_branch), false)
+}
+
+#[cfg(test)]
+fn task_completed_for_local_fixture(
+    cwd: &Path,
+    task: &str,
+    expected_branch: &str,
+) -> Result<bool, WorktreeError> {
+    task_completed_with_branch(cwd, task, Some(expected_branch), true)
+}
+
+fn task_completed_with_branch(
+    cwd: &Path,
+    task: &str,
+    expected_branch: Option<&str>,
+    allow_local_origin: bool,
+) -> Result<bool, WorktreeError> {
+    let repository = inspect_repository(cwd, allow_local_origin, false)?;
     let manifests = load_manifests(&repository)?;
     let Some((_, manifest)) = manifests
         .iter()
@@ -1149,10 +1175,13 @@ pub(crate) fn task_completed(cwd: &Path, task: &str) -> Result<bool, WorktreeErr
     else {
         return Ok(false);
     };
-    Ok(!Path::new(&manifest.worktree)
-        .try_exists()
-        .map_err(|_| error("worktreeを確認できません"))?
-        && completed_delivery(manifest))
+    Ok(
+        expected_branch.is_none_or(|branch| manifest.branch == branch)
+            && !Path::new(&manifest.worktree)
+                .try_exists()
+                .map_err(|_| error("worktreeを確認できません"))?
+            && completed_delivery(manifest),
+    )
 }
 
 fn repository_key(github_name: &str) -> Result<String, WorktreeError> {
@@ -4294,6 +4323,18 @@ mod tests {
     fn completed_delivery_recognizes_current_writer_and_legacy_state_after_cleanup() {
         let (fixture, _, mut state) = completed_delivery_fixture();
         assert_completed_diagnosis(&fixture, true);
+        assert!(
+            task_completed_for_local_fixture(
+                &fixture.repository,
+                "task-completed",
+                "feat/completed"
+            )
+            .unwrap()
+        );
+        assert!(
+            !task_completed_for_local_fixture(&fixture.repository, "task-completed", "feat/other")
+                .unwrap()
+        );
 
         state["version"] = Value::from(1);
         state.as_object_mut().unwrap().remove("issue_record");
@@ -4302,6 +4343,62 @@ mod tests {
             .with_file_name("task-completed.delivery.json");
         fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
         assert_completed_diagnosis(&fixture, true);
+    }
+
+    #[test]
+    fn task_completed_requires_matching_delivery_identity_and_absent_worktree_artifacts() {
+        let (fixture, target, original) = completed_delivery_fixture();
+        let delivery = fixture
+            .manifest("task-completed")
+            .with_file_name("task-completed.delivery.json");
+        for (key, invalid) in [
+            ("task_id", Value::from("task-other")),
+            ("repository", Value::from("other/repository")),
+            ("branch", Value::from("feat/other")),
+        ] {
+            let mut state = original.clone();
+            state[key] = invalid;
+            fs::write(&delivery, serde_json::to_vec(&state).unwrap()).unwrap();
+            assert!(
+                !task_completed_for_local_fixture(
+                    &fixture.repository,
+                    "task-completed",
+                    "feat/completed"
+                )
+                .unwrap()
+            );
+        }
+        fs::write(&delivery, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert!(
+            task_completed_for_local_fixture(
+                &fixture.repository,
+                "task-completed",
+                "feat/completed"
+            )
+            .unwrap()
+        );
+
+        fs::create_dir(&target).unwrap();
+        assert!(
+            !task_completed_for_local_fixture(
+                &fixture.repository,
+                "task-completed",
+                "feat/completed"
+            )
+            .unwrap()
+        );
+        fs::remove_dir(&target).unwrap();
+
+        let common = fixture.repository.join(".git");
+        super::super::artifacts::create(&target, "task-completed", &common).unwrap();
+        assert!(
+            !task_completed_for_local_fixture(
+                &fixture.repository,
+                "task-completed",
+                "feat/completed"
+            )
+            .unwrap()
+        );
     }
 
     #[test]
