@@ -439,6 +439,50 @@ pub(crate) fn completion_worker_scope(task_id: &str, marker: &str) -> Result<boo
     checked_completion_worker_scope(&Context::open()?, task_id, marker)
 }
 
+/// 担当workerの生存leaseを確認する。通常sessionでは同じleaseを取得して保持する。
+pub(crate) fn merge_base_writer(
+    task_id: &str,
+    branch: &str,
+    workspace: &std::path::Path,
+    pr: u64,
+    marker: Option<&str>,
+) -> Result<Option<Lock>> {
+    checked_merge_base_writer(&Context::open()?, task_id, branch, workspace, pr, marker)
+}
+
+fn checked_merge_base_writer(
+    context: &Context,
+    task_id: &str,
+    branch: &str,
+    workspace: &std::path::Path,
+    pr: u64,
+    marker: Option<&str>,
+) -> Result<Option<Lock>> {
+    if let Some(marker) = marker {
+        checked_completion_worker_scope(context, task_id, marker)?;
+        let task = context.load(task_id)?;
+        if task.pause_requested
+            || task.branch != branch
+            || task.worktree.as_deref() != Some(workspace)
+            || task.pr.is_some_and(|saved| saved != pr)
+            || task.phase != Phase::Implementation
+            || task.run.as_ref().is_none_or(|run| {
+                run.phase != Phase::Implementation
+                    || marker != format!("{task_id}:{}", run.generation)
+            })
+        {
+            return Err("取り込みを担当する実装workerと一致しません".into());
+        }
+        return Ok(None);
+    }
+    let lease = Lock::try_acquire(&context.store.lease_path(task_id)?)?
+        .ok_or("別のwriterがtaskを使用中です")?;
+    match std::fs::symlink_metadata(context.store.path(task_id)?) {
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(Some(lease)),
+        _ => Err("coordinatorの管理下にあるtaskは担当workerから実行してください".into()),
+    }
+}
+
 fn checked_completion_worker_scope(context: &Context, task_id: &str, marker: &str) -> Result<bool> {
     let (id, generation) = marker.rsplit_once(':').ok_or("worker scopeが不正です")?;
     if id != task_id {
@@ -3790,6 +3834,45 @@ mod tests {
         assert!(checked_completion_worker_scope(&fixture.0, "task-one", "task-two:1").is_err());
         drop(lease);
         assert!(checked_completion_worker_scope(&fixture.0, "task-one", "task-one:1").is_err());
+    }
+
+    #[test]
+    fn merge_base_writer_excludes_another_writer_and_requires_the_current_implementation_scope() {
+        let fixture = Fixture::new();
+        let context = &fixture.0;
+        let workspace = context.repository.join("fixture-worktree");
+        let check = |branch, pr, marker| {
+            checked_merge_base_writer(context, "task-one", branch, &workspace, pr, marker)
+        };
+        let lease = check("fix/base", 7, None).unwrap().unwrap();
+        assert!(check("fix/base", 7, None).is_err());
+        drop(lease);
+
+        fixture.submit("task-one");
+        assert!(check("fix/base", 7, None).is_err());
+        let mut task = context.load("task-one").unwrap();
+        task.branch = "fix/base".into();
+        task.worktree = Some(workspace.clone());
+        task.pr = Some(7);
+        task.generation = 2;
+        task.run = Some(Run {
+            generation: 2,
+            phase: Phase::Implementation,
+            started: now(),
+        });
+        context.store.save(&task).unwrap();
+        assert!(check("fix/base", 7, Some("task-one:2")).is_err());
+        let _lease = Lock::try_acquire(&context.store.lease_path("task-one").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(check("fix/base", 7, Some("task-one:2")).unwrap().is_none());
+        assert!(check("fix/base", 7, None).is_err());
+        assert!(check("fix/base", 7, Some("task-one:1")).is_err());
+        assert!(check("fix/other", 7, Some("task-one:2")).is_err());
+        assert!(check("fix/base", 8, Some("task-one:2")).is_err());
+        task.pause_requested = true;
+        context.store.save(&task).unwrap();
+        assert!(check("fix/base", 7, Some("task-one:2")).is_err());
     }
 
     #[test]

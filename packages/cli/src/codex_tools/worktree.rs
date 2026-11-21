@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 use super::{guard::GuardGhSandbox, trust};
 
 pub(crate) mod completion;
+mod merge_base;
 
 pub(crate) fn valid_artifact_task_id(task: &str) -> bool {
     valid_task_id(task)
@@ -607,6 +608,8 @@ fn safe_environment(command: &mut Command, gh_config: Option<&Path>) {
     #[cfg(windows)]
     command.env("GIT_CONFIG_GLOBAL", "NUL");
     command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
     command.env("GIT_SSH_VARIANT", "ssh");
     command.env("GIT_PAGER", "cat");
     command.env("PATH", SYSTEM_PATH);
@@ -2220,8 +2223,14 @@ fn ensure_no_git_operation(path: &Path) -> Result<(), WorktreeError> {
     let git_dir = absolute_git_path(path, "--git-dir")?;
     for marker in [
         "MERGE_HEAD",
+        "MERGE_AUTOSTASH",
+        "MERGE_MSG",
+        "MERGE_MODE",
+        "AUTO_MERGE",
         "CHERRY_PICK_HEAD",
         "REVERT_HEAD",
+        "REBASE_HEAD",
+        "BISECT_START",
         "rebase-apply",
         "rebase-merge",
         "sequencer",
@@ -2690,6 +2699,15 @@ fn run_entrypoint(args: Vec<OsString>) -> Result<i32, (i32, String)> {
     let parsed = parse_args(&args).map_err(|message| (2, message))?;
     let cwd = std::env::current_dir()
         .map_err(|cause| (1, format!("current directoryを取得できません: {cause}")))?;
+    if parsed.command == "merge-base" {
+        return merge_base::run(
+            &cwd,
+            parsed.task_id.as_deref().unwrap_or(""),
+            parsed.pr.unwrap_or(0),
+            parsed.expected_head.as_deref().unwrap_or(""),
+            parsed.expected_base.as_deref().unwrap_or(""),
+        );
+    }
     let operation = match parsed.command.as_str() {
         "prepare" => prepare_repository(
             &cwd,
@@ -2799,6 +2817,8 @@ struct ParsedArgs {
     head: Option<String>,
     expected_head: Option<String>,
     expected_remote_head: Option<String>,
+    expected_base: Option<String>,
+    pr: Option<u64>,
     user_name: Option<String>,
     user_email: Option<String>,
 }
@@ -2822,9 +2842,34 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         .first()
         .cloned()
         .ok_or_else(|| "commandを指定してください".to_string())?;
+    if command == "merge-base" {
+        return match &values[1..] {
+            [task_flag, task, pr_flag, pr, head_flag, head, base_flag, base]
+                if task_flag == "--task-id"
+                    && valid_task_id(task)
+                    && pr_flag == "--pr"
+                    && !pr.starts_with('0')
+                    && pr.bytes().all(|byte| byte.is_ascii_digit())
+                    && head_flag == "--expected-head"
+                    && valid_oid(head)
+                    && base_flag == "--expected-base"
+                    && valid_oid(base) =>
+            {
+                Ok(ParsedArgs {
+                    command,
+                    task_id: Some(task.clone()),
+                    pr: Some(pr.parse().map_err(|_| "PR番号が不正です")?),
+                    expected_head: Some(head.to_ascii_lowercase()),
+                    expected_base: Some(base.to_ascii_lowercase()),
+                    ..ParsedArgs::default()
+                })
+            }
+            _ => Err("usage: codex-worktree merge-base --task-id <ID> --pr <番号> --expected-head <SHA> --expected-base <SHA>".into()),
+        };
+    }
     if matches!(command.as_str(), "-h" | "--help") {
         return Err(
-            "usage: codex-worktree <prepare|create|list|doctor|resume|sync|recover|artifacts|clean-artifacts|archive-artifacts|retire> [options]".to_string(),
+            "usage: codex-worktree <prepare|create|list|doctor|resume|sync|merge-base|recover|artifacts|clean-artifacts|archive-artifacts|retire> [options]".to_string(),
         );
     }
     if !matches!(
@@ -2975,6 +3020,11 @@ fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     Ok(parsed)
 }
 
+pub(super) fn valid_merge_base_args(args: &[String]) -> bool {
+    args.first().is_some_and(|arg| arg == "merge-base")
+        && parse_args(&args.iter().map(OsString::from).collect::<Vec<_>>()).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3068,7 +3118,7 @@ mod tests {
         }
     }
 
-    fn run_git(cwd: &Path, args: &[&str]) {
+    pub(super) fn run_git(cwd: &Path, args: &[&str]) {
         let status = Command::new("git")
             .current_dir(cwd)
             .args(args)

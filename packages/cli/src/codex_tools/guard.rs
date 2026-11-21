@@ -4973,6 +4973,9 @@ fn worktree_helper_invocation_reason(tokens: &[String]) -> Option<String> {
                 )
             }
         }
+        "merge-base" => (!super::worktree::valid_merge_base_args(args)).then(|| {
+            "merge-baseは--task-id、--pr、--expected-head、--expected-baseを固定順で指定してください".into()
+        }),
         "create" => {
             let mut seen = HashMap::new();
             let mut i = 0;
@@ -5370,6 +5373,7 @@ fn has_write_operation(tokens: &[String]) -> bool {
                         "archive-artifacts",
                         "retire",
                         "sync",
+                        "merge-base",
                         "completion",
                     ]
                     .contains(&v.as_str())
@@ -7764,6 +7768,36 @@ mod tests {
                 blocked_reason(command, None, 0).is_some(),
                 "blocked: {command}"
             );
+        }
+    }
+
+    #[test]
+    fn merge_base_guard_only_allows_the_fixed_helper_shape() {
+        let head = "b".repeat(40);
+        let base = "c".repeat(40);
+        let good = format!(
+            "codex-worktree merge-base --task-id issue-422 --pr 7 --expected-head {head} --expected-base {base}"
+        );
+        let tokens = good
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(has_write_operation(&tokens));
+        assert!(blocked_reason(&good, None, 0).is_none());
+        for command in [
+            good.replace("--pr 7", "--pr 0"),
+            good.replace("--pr 7", "--pr 7 --pr 8"),
+            good.replace("--pr 7", "--repo example/other --pr 7"),
+            good.replace(&base, "origin/main"),
+            good.replace(&head, "HEAD"),
+            format!("{good} --force"),
+            format!("{good} && git status"),
+            format!("/tmp/{good}"),
+            format!("git merge {base}"),
+            "git push -u --force origin HEAD:refs/heads/fix/base".into(),
+            "git push -u origin HEAD:refs/heads/main".into(),
+        ] {
+            assert!(blocked_reason(&command, None, 0).is_some(), "{command}");
         }
     }
 }

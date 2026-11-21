@@ -204,6 +204,9 @@ pub(super) fn bind_current(cwd: &Path, task_id: &str) -> Result<()> {
         return Ok(());
     }
     let repo = inspect_repository(cwd, false, false).map_err(|e| e.to_string())?;
+    // base取り込みの担当確認からGit操作まで、新しいsessionの担当追加を待たせる。
+    let (_, _, lock_path) = managed_paths(&repo, task_id, false).map_err(|e| e.to_string())?;
+    let _lifecycle = ExclusiveLock::acquire(&lock_path).map_err(|e| e.to_string())?;
     let manifest = load_manifests(&repo)
         .map_err(|e| e.to_string())?
         .into_iter()
@@ -224,6 +227,78 @@ pub(super) fn bind_current(cwd: &Path, task_id: &str) -> Result<()> {
             exception: None,
         },
     )
+}
+
+pub(super) fn lock_merge_binding(
+    home: &Path,
+    id: &str,
+    repository: &Repository,
+    target: &Manifest,
+) -> Result<Lock> {
+    let path = session_path(home, id, false)?;
+    let lock = Lock::acquire_short(&path.with_extension("lock"))?;
+    let session = load(&path, id)?;
+    let binding = session
+        .bindings
+        .iter()
+        .find(|binding| {
+            binding.active
+                && binding.task_id == target.task_id
+                && binding.repository == repository.root
+                && binding.common_git_dir == repository.common_git_dir
+                && binding.github == repository.github_name
+        })
+        .ok_or("現在のsessionの有効な担当記録がありません")?;
+    if manifest(binding)? != *target {
+        return Err("現在のsessionと担当worktreeが一致しません".into());
+    }
+    Ok(lock)
+}
+
+/// lifecycle lockの保持中に呼ぶ。担当解除はatomicで、別sessionの新規担当は同じlockを通る。
+pub(super) fn reject_other_active_sessions(
+    home: &Path,
+    target: &Manifest,
+    owner: Option<&str>,
+) -> Result<()> {
+    let directory = home.join("worktrees/.sessions");
+    reject_symlink_components(&directory).map_err(|e| e.to_string())?;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(cause) if cause.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("担当session一覧を安全に確認できません".into()),
+    };
+    safe_directory(&directory).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|_| "担当session一覧を安全に確認できません")?;
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            return Err("担当session記録が通常fileではありません".into());
+        }
+        let id = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .filter(|id| valid_session(id))
+            .ok_or("担当session記録の名前が不正です")?;
+        if Some(id) == owner {
+            continue;
+        }
+        let session = load(&path, id)?;
+        if session.bindings.iter().any(|binding| {
+            binding.active
+                && (binding.worktree == Path::new(&target.worktree)
+                    || binding.task_id == target.task_id
+                        && binding.common_git_dir == Path::new(&target.common_git_dir))
+        }) {
+            return Err(
+                "別sessionに有効な担当記録があります。担当を照合してから再試行してください".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -368,6 +443,31 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn merge_base_requires_one_active_session_or_no_standalone_session_for_worker() {
+        let (fixture, mut binding) = fixture();
+        let repository = repository(&binding);
+        let target = manifest(&binding).unwrap();
+        let home = &fixture.codex_home;
+        assert!(lock_merge_binding(home, "absent", &repository, &target).is_err());
+        bind(home, "owner", binding.clone()).unwrap();
+        let _session = lock_merge_binding(home, "owner", &repository, &target).unwrap();
+        assert!(reject_other_active_sessions(home, &target, Some("owner")).is_ok());
+        assert!(reject_other_active_sessions(home, &target, None).is_err());
+        bind(home, "other", binding.clone()).unwrap();
+        assert!(reject_other_active_sessions(home, &target, Some("owner")).is_err());
+
+        let other_path = session_path(home, "other", false).unwrap();
+        let mut other = load(&other_path, "other").unwrap();
+        other.bindings[0].active = false;
+        atomic_json(&other_path, &other).unwrap();
+        assert!(reject_other_active_sessions(home, &target, Some("owner")).is_ok());
+        binding.task_id = "task-unrelated".into();
+        binding.worktree.set_file_name("task-unrelated");
+        bind(home, "unrelated", binding).unwrap();
+        assert!(reject_other_active_sessions(home, &target, Some("owner")).is_ok());
     }
 
     #[test]

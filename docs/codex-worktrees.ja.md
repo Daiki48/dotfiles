@@ -173,6 +173,30 @@ helperはmanifestに登録されたrepository・task branch・pathだけを扱�
 
 lifecycle lockはmanaged helper同士を直列化します。通常Gitやremoteの更新とは原子的な排他にならないため、同期対象を触る他のGit操作は同時に実行しないでください。同期後の不一致を検知した場合も自動rollbackせず、現在の状態を保持して報告します。
 
+既存PRの `gh pr update-branch` が競合で止まった場合は、担当sessionまたは実装workerが、
+親checkoutから次の正規形で取り込みを開始します。HEADにはlocalとPRで一致する完全SHA、
+baseにはoriginの現在のdefault branchの完全SHAを指定します。
+
+```sh
+codex-worktree merge-base --task-id issue-22 --pr 7 --expected-head <作業branchの完全SHA> --expected-base <default branchの完全SHA>
+```
+
+通常sessionは `resume` などで記録した現在の担当とwriter leaseを確認します。
+coordinator管理下では、現在の実装workerの世代・生存lease・担当worktreeを照合します。
+別sessionの有効な担当記録が残っている場合は停止します。引き継ぐ際は旧担当の作業を止め、
+明示した引き継ぎ境界を既存の `codex-worktree completion` で記録してから進めます。
+helperは、同一repositoryのopen PRにGitHubが競合を報告していることと、originの実refを取得の前後で照合します。
+親checkoutと作業worktreeはcleanで、進行中のGit操作がないことが必要です。
+worktree固有configやbranchのmergeOptionsが設定されている場合は取り込みを拒否します。
+
+- 終了コード `0` では、取り込み結果が作業worktreeのindexに残ります。
+- 終了コード `3` では、同じworktreeに `MERGE_HEAD` と通常のGit競合が残ります。
+
+いずれも担当が同じworktreeで `git status` と `MERGE_HEAD` の完全SHAを確認します。
+競合があれば解消したpathを明示してstageし、取り込み結果を検証して通常の `git commit` で確定します。
+既存作業branchへの通常push後は、新しいHEADでレビューとCIを行います。
+中断後は同じtaskを再開して既存のマージを確認します。取り込み開始コマンドを再実行すると進行中の操作として拒否されます。
+
 `resume` が返すのはpathだけで、directoryの移動や変更のclean化は行いません。`ready` と
 `dirty` のworktreeだけが再開対象です。`missing`、`unregistered`、`branch-mismatch`、
 `invalid`、`failed` の場合は、該当taskのmanifest、Git登録、branch、作業内容を保全した
