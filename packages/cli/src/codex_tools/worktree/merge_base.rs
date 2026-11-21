@@ -97,16 +97,9 @@ fn verify_checkout(
     request: Request<'_>,
     allow_local_origin: bool,
 ) -> Result<(), WorktreeError> {
+    verify_merge_config(&repository.root)?;
     verify_sync_task(repository, manifest, request.head, allow_local_origin)?;
     let target = Path::new(&manifest.worktree);
-    if local_config_keys(target)?
-        .iter()
-        .any(|key| key.starts_with("branch.") && key.ends_with(".mergeoptions"))
-    {
-        return Err(error(
-            "branchのmergeOptionsを設定したworktreeは取り込めません",
-        ));
-    }
     match fs::symlink_metadata(repository.common_git_dir.join("info/grafts")) {
         Err(cause) if cause.kind() == io::ErrorKind::NotFound => {}
         _ => return Err(error("graftsが存在するrepositoryの取り込みを拒否しました")),
@@ -133,6 +126,25 @@ fn verify_checkout(
     Ok(())
 }
 
+fn verify_merge_config(root: &Path) -> Result<(), WorktreeError> {
+    let keys = local_config_keys(root)?;
+    // --localの検査に含まれないworktree固有configをGitに読ませない。
+    if keys.iter().any(|key| key == "extensions.worktreeconfig") {
+        return Err(error(
+            "worktree固有configを利用するrepositoryは取り込めません",
+        ));
+    }
+    if keys
+        .iter()
+        .any(|key| key.starts_with("branch.") && key.ends_with(".mergeoptions"))
+    {
+        return Err(error(
+            "branchのmergeOptionsを設定したrepositoryは取り込めません",
+        ));
+    }
+    Ok(())
+}
+
 fn start(
     repository: &Repository,
     manifest: &Manifest,
@@ -144,6 +156,7 @@ fn start(
     if repository.default_oid != request.base || manifest.branch == repository.default_branch {
         return Err(error("指定baseがoriginのdefault branchと一致しません"));
     }
+    verify_merge_config(&repository.root)?;
     let before = snapshot(&repository.root)?;
     if before.0.trim() != format!("refs/heads/{}", repository.default_branch)
         || before.1.is_none()
@@ -250,9 +263,12 @@ pub(super) fn run(
     base: &str,
 ) -> Result<i32, (i32, String)> {
     let execute = || {
-        let repository = inspect_repository(cwd, false, true)?;
+        let mut repository = inspect_repository(cwd, false, false)?;
         let (_, _, lock_path) = managed_paths(&repository, task_id, false)?;
         let _lifecycle = ExclusiveLock::acquire(&lock_path)?;
+        verify_merge_config(&repository.root)?;
+        (repository.default_branch, repository.default_oid) =
+            remote_default(&repository.root, &repository.origin_url)?;
         let manifest = load_manifests(&repository)?
             .into_iter()
             .find(|(_, manifest)| manifest.task_id == task_id && manifest.status == "ready")
@@ -519,6 +535,15 @@ mod tests {
             &["config", "--unset", "branch.fix/base.mergeOptions"],
         )
         .unwrap();
+        git_stdout(target, &["config", "extensions.worktreeConfig", "true"]).unwrap();
+        let target_git_dir = absolute_git_path(target, "--git-dir").unwrap();
+        fs::write(
+            target_git_dir.join("config.worktree"),
+            "[merge \"fixture\"]\n\tdriver = false\n",
+        )
+        .unwrap();
+        reject();
+        git_stdout(target, &["config", "--unset", "extensions.worktreeConfig"]).unwrap();
         git_stdout(
             target,
             &[

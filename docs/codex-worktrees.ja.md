@@ -187,6 +187,7 @@ coordinator管理下では、現在の実装workerの世代・生存lease・担�
 明示した引き継ぎ境界を既存の `codex-worktree completion` で記録してから進めます。
 helperは、同一repositoryのopen PRにGitHubが競合を報告していることと、originの実refを取得の前後で照合します。
 親checkoutと作業worktreeはcleanで、進行中のGit操作がないことが必要です。
+worktree固有configやbranchのmergeOptionsが設定されている場合は取り込みを拒否します。
 
 - 終了コード `0` では、取り込み結果が作業worktreeのindexに残ります。
 - 終了コード `3` では、同じworktreeに `MERGE_HEAD` と通常のGit競合が残ります。
