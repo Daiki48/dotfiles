@@ -183,6 +183,8 @@ codex-worktree merge-base --task-id issue-22 --pr 7 --expected-head <作業branc
 
 通常sessionは `resume` などで記録した現在の担当とwriter leaseを確認します。
 coordinator管理下では、現在の実装workerの世代・生存lease・担当worktreeを照合します。
+別sessionの有効な担当記録が残っている場合は停止します。引き継ぐ際は旧担当の作業を止め、
+明示した引き継ぎ境界を既存の `codex-worktree completion` で記録してから進めます。
 helperは、同一repositoryのopen PRにGitHubが競合を報告していることと、originの実refを取得の前後で照合します。
 親checkoutと作業worktreeはcleanで、進行中のGit操作がないことが必要です。
 

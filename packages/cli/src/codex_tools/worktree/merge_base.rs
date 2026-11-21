@@ -267,11 +267,22 @@ pub(super) fn run(
                     .ok_or_else(|| error("worker scopeが不正です"))
             })
             .transpose()?;
-        let _session = if marker.is_none() {
-            Some(completion::lock_current_binding(&repository, &manifest).map_err(error)?)
+        let home = codex_home()?;
+        let owner = if marker.is_none() {
+            Some(
+                std::env::var("CODEX_THREAD_ID")
+                    .map_err(|_| error("現在のCodex session IDが必要です"))?,
+            )
         } else {
             None
         };
+        let _session = owner
+            .as_deref()
+            .map(|id| completion::lock_merge_binding(&home, id, &repository, &manifest))
+            .transpose()
+            .map_err(error)?;
+        completion::reject_other_active_sessions(&home, &manifest, owner.as_deref())
+            .map_err(error)?;
         let target = Path::new(&manifest.worktree);
         let check_writer = || {
             super::super::task::merge_base_writer(task_id, &manifest.branch, target, pr, marker)
