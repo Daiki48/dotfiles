@@ -221,6 +221,11 @@ strict時は既存parserの契約どおり`--gate-mode`を省略します。`str
 head/base一致、最新base、review receipt、未解決thread等の既存delivery gateは引き続きhelperが検証します。
 追加pushやbase変更では旧CI・旧レビューを無効化し、現在のheadで実装・検証・レビューをやり直します。
 
+既存PRの通常のbranch更新が競合した場合、担当のImplementation workerは親checkoutから
+[`codex-worktree merge-base`](codex-worktrees.ja.md#再開)を使えます。
+作業worktreeに `MERGE_HEAD` が残っている場合は、担当・対象SHA・差分を照合した上で同じworktreeで
+競合解消、検証、通常commitとpushを続けます。新しいHEADでレビューとCIを行います。
+
 merge後は実merge commitがlive mainの履歴に含まれることを確認し、そのcommitのworkflowと
 実在check/statusを観測します。local gateの条件を満たしたときだけmain-ci待機からFinishへ進みます。
 Finish起動直前にも再観測し、古い証跡やAPIエラーでは起動しません。mainのworkflow追加をlocalへ読み替えず、

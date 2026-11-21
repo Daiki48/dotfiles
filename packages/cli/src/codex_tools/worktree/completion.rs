@@ -226,6 +226,28 @@ pub(super) fn bind_current(cwd: &Path, task_id: &str) -> Result<()> {
     )
 }
 
+pub(super) fn lock_current_binding(repository: &Repository, target: &Manifest) -> Result<Lock> {
+    let id = std::env::var("CODEX_THREAD_ID").map_err(|_| "現在のCodex session IDが必要です")?;
+    let path = session_path(&codex_home().map_err(|e| e.to_string())?, &id, false)?;
+    let lock = Lock::acquire_short(&path.with_extension("lock"))?;
+    let session = load(&path, &id)?;
+    let binding = session
+        .bindings
+        .iter()
+        .find(|binding| {
+            binding.active
+                && binding.task_id == target.task_id
+                && binding.repository == repository.root
+                && binding.common_git_dir == repository.common_git_dir
+                && binding.github == repository.github_name
+        })
+        .ok_or("現在のsessionの有効な担当記録がありません")?;
+    if manifest(binding)? != *target {
+        return Err("現在のsessionと担当worktreeが一致しません".into());
+    }
+    Ok(lock)
+}
+
 #[derive(Parser)]
 #[command(name = "codex-worktree completion")]
 struct Args {

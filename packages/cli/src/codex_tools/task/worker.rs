@@ -375,8 +375,8 @@ pub(super) fn prompt(task: &Task) -> String {
     };
     let phase = if task.phase == Phase::Implementation && task.pr.is_some() {
         format!(
-            "{phase}\nbase更新が必要なら、既存PRの通常のgh pr update-branch（rebase・forceは使わない）でremoteを更新し、親checkoutからcodex-worktree sync --task-id {} --expected-head <更新前local SHA> --expected-remote-head <更新後remote SHA>で照合して取り込みます。conflictや所有不明の差分は保持してblockedにしてください。",
-            task.id
+            "{phase}\nbase更新が必要なら、既存PRに通常のgh pr update-branchを使い、成功時は親checkoutからcodex-worktree sync --task-id {id} --expected-head <更新前local SHA> --expected-remote-head <更新後remote SHA>で取り込みます。GitHubが競合を返した場合は、同じ親checkoutからcodex-worktree merge-base --task-id {id} --pr <既存PR番号> --expected-head <localとPRの完全SHA> --expected-base <originのdefault branchの完全SHA>を実行します。終了code 0または3では、同じ担当worktreeに残ったMERGE_HEADとgit statusを確認します。競合を解消して明示pathをstageし、検証、通常のgit commit、既存作業branchへの通常pushを行います。担当worktreeにMERGE_HEADが既にあれば、新しい取り込みを始めず、直前の担当・対象SHA・差分を照合して作業を続けます。所有不明の差分は保持して診断します。更新後のHEADでreviewとCIをやり直します。",
+            id = task.id
         )
     } else {
         phase
