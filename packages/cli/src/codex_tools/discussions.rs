@@ -247,6 +247,9 @@ fn response(bytes: &[u8]) -> Result<Value> {
 
 impl Api for Github {
     fn call(&mut self, query: &str, variables: Value) -> Result<Value> {
+        if query.starts_with("mutation(") {
+            trust::github_actor(self.sandbox.path(), None)?;
+        }
         let timeout = self
             .deadline
             .saturating_duration_since(Instant::now())

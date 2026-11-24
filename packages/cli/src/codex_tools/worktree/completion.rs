@@ -614,13 +614,7 @@ pub(crate) fn hook_entrypoint(claude: bool) -> i32 {
         if claude {
             input.session_id = format!("claude-{}", input.session_id);
         }
-        let checked = check(&codex_home().map_err(|e| e.to_string())?, &input);
-        if input.stop_hook_active && checked.is_err() {
-            return Ok(
-                json!({"systemMessage":"担当記録を検証できません。完了記録を保持し、再開時に同じ task の doctor と状態を確認してください。"}),
-            );
-        }
-        checked
+        check(&codex_home().map_err(|e| e.to_string())?, &input)
     })();
     let output = result.unwrap_or_else(|_| json!({"decision":"block", "reason":
         "session完了記録を安全に検証できません。完了と報告せず、managed helperの状態・所有・設定を診断してください。状態の削除やhook無効化で迂回せず、修復不能なら具体的な根拠を利用者へ伝えてください。"}));
