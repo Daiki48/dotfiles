@@ -82,8 +82,52 @@ fn parse_workflow(source: &str) -> Result<Value, &'static str> {
     Ok(workflow)
 }
 
-/// filterは免除せず、起動し得るeventを保守的に列挙する。
-pub(super) fn trigger_events(source: &str) -> Result<Vec<String>, &'static str> {
+/// 確実にmainに一致しないref条件だけを除外する。
+fn targets_main(event: &str, options: Option<&Value>) -> Result<bool, &'static str> {
+    let Some(options) = options.filter(|value| !value.is_null()) else {
+        return Ok(true);
+    };
+    let filters = options
+        .as_object()
+        .ok_or("workflow eventの設定が不正です")?;
+    for (include, exclude) in [("branches", "branches-ignore"), ("tags", "tags-ignore")] {
+        if filters.contains_key(include) && filters.contains_key(exclude) {
+            return Err("workflow ref filterが競合しています");
+        }
+        for key in [include, exclude] {
+            if let Some(value) = filters.get(key) {
+                let patterns = value.as_array().ok_or("workflow ref filterが不正です")?;
+                if patterns.is_empty()
+                    || patterns
+                        .iter()
+                        .any(|p| !p.as_str().is_some_and(|s| !s.is_empty()))
+                {
+                    return Err("workflow ref patternが不正です");
+                }
+            }
+        }
+    }
+    for key in ["branches", "branches-ignore"] {
+        if let Some(patterns) = filters.get(key).and_then(Value::as_array) {
+            // globや否定条件は保守的に扱う。
+            if patterns.iter().all(|p| {
+                p.as_str()
+                    .unwrap()
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_./".contains(&c))
+            }) {
+                return Ok(patterns.iter().any(|p| p == "main") == (key == "branches"));
+            }
+            return Ok(true);
+        }
+    }
+    Ok(event != "push" || !(filters.contains_key("tags") || filters.contains_key("tags-ignore")))
+}
+
+pub(super) fn trigger_events(
+    source: &str,
+    merged_target: bool,
+) -> Result<Vec<String>, &'static str> {
     let workflow = parse_workflow(source)?;
     let on = workflow.get("on").ok_or("workflowのonがありません")?;
     let mut events = match on {
@@ -109,7 +153,18 @@ pub(super) fn trigger_events(source: &str) -> Result<Vec<String>, &'static str> 
     }
     events.sort();
     events.dedup();
-    Ok(events)
+    let mut applicable = Vec::new();
+    for event in events {
+        let matches_stage = if merged_target {
+            event == "push"
+        } else {
+            matches!(event.as_str(), "pull_request" | "pull_request_target")
+        };
+        if matches_stage && targets_main(&event, on.get(&event))? {
+            applicable.push(event);
+        }
+    }
+    Ok(applicable)
 }
 
 pub(super) fn tag_push_only(source: &str) -> Result<bool, &'static str> {
@@ -153,14 +208,15 @@ mod tests {
     #[test]
     fn emergency_trigger_expectations_cover_scalar_sequence_and_mapping_forms() {
         assert_eq!(
-            trigger_events("on: pull_request\n").unwrap(),
+            trigger_events("on: pull_request\n", false).unwrap(),
             ["pull_request"]
         );
         for source in [
             "on: [push, pull_request]\n",
             "on: {push: {branches: [main]}, pull_request: null}\n",
         ] {
-            assert_eq!(trigger_events(source).unwrap(), ["pull_request", "push"]);
+            assert_eq!(trigger_events(source, false).unwrap(), ["pull_request"]);
+            assert_eq!(trigger_events(source, true).unwrap(), ["push"]);
         }
         for source in [
             "on: [push, false]",
@@ -169,7 +225,34 @@ mod tests {
             "on: push\non: pull_request",
             "on: [push]\n---\non: pull_request",
         ] {
-            assert!(trigger_events(source).is_err(), "{source}");
+            assert!(trigger_events(source, false).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn emergency_ref_filters_only_exclude_proven_mismatches() {
+        for (filters, applies) in [
+            ("branches: [main]", true),
+            ("branches: [other]", false),
+            ("branches-ignore: [main]", false),
+            ("branches: ['release/**']", true),
+            ("tags: ['v*']", false),
+            ("tags-ignore: ['v*']", false),
+            ("branches: [main], tags: ['v*']", true),
+        ] {
+            assert_eq!(
+                !trigger_events(&format!("on: {{push: {{{filters}}}}}"), true)
+                    .unwrap()
+                    .is_empty(),
+                applies
+            );
+        }
+        for filters in [
+            "tags: []",
+            "tags: [false]",
+            "branches: [main], branches-ignore: [main]",
+        ] {
+            assert!(trigger_events(&format!("on: {{push: {{{filters}}}}}"), true).is_err());
         }
     }
 
