@@ -16,6 +16,13 @@
 
 ## モデルと作業方法
 
+- 共通の開発手順は `~/.agents/skills` にある。CLI のスキル一覧に出ない場合も、実装は `execute-plan/SKILL.md`、高リスク変更の固定差分レビューは `review-branch/SKILL.md` を読む。
+
+- Codex と Claude Code の交代時は同一ホストの Task ID、worktree、branch、PR を照合する。未コミット差分・未追跡ファイルを保持し、検証済みの範囲と次の操作を引き継ぐ。stage、commit、push、PR 更新は現在の主担当が行う。
+- 他モデルへの相談は具体的な疑問がある場合に限り、対象の版と問いを渡す。主担当は独立した作業を続ける。相談先からの再委任は行わない。利用制限やタイムアウト時は取得済みの回答を照合し、未回答分を主担当が引き取る。同じ制限下で再送しない。
+- GitHub 操作には本人認証の gh を使い、push にも同じ認証経路を使う。公開前に実行主体、コミット著者、本文の自動帰属・セッションリンクを確認する。コミットは一つの意味ある変更とその回帰テストを gitmoji と短い一行で表す。
+- CI 待機を報告するときは監視担当、次回観測、再開工程を示す。引き継ぎに失敗した場合は理由と再開点を伝える。
+
 - main agentが要件解釈、設計、実装、統合、最終受入を担う。モデルと推論段階は有効な設定に従い、Daikiの`/model`等の明示選択を優先する。モデル名を理由に監督専用leadを起動しない。
 - 調査順序、分割、委譲は品質・時間・contextの効果を見てmainが判断する。独立した読み取り調査はLuna xhighの`explorer`、独立reviewはLuna xhighの`reviewer`を使える。単純な検索や直列作業を義務的に委譲しない。maxへの昇格はxhighで不足する具体的根拠がある場合だけにする。
 - ローカルgpt-ossは任意の補助手段。使う場合だけdotfilesの`docs/codex-local-model.ja.md`を読み、入力制限・構文解釈の除外を守る。失敗を同条件で繰り返さずmainまたは適切なexplorerが引き取る。
@@ -36,7 +43,7 @@
 - riskは検証とreviewの深度を決める。riskだけを理由に確認待ちにせず、scope内の判断は自律的に進める。製品判断、追加権限・費用、不可逆性、重大な残存リスクの受容だけをDaikiへ確認する。
 - 技術的な失敗・実環境未受入・親のfile分割・失敗回数だけで対応を終了しない。危険な対象操作は保留し、元の依頼と所有権を照合して診断・修復・再計画・監視・独立した許可済みtaskを継続する。外部待機は解消条件と次回観測を保存し、変化後に再開する。同条件の無限retryや新commitだけを進展とする判定は避ける。
 - deliveryは`record-review|approve-review -> deliver -> finish`を使う。actionable=0、未解決thread=0、最新base、conflictなし、固定headの必要なcheckがsuccess/skipped/neutral、または継続委任に基づく対象別の緊急CI証拠に合致することをhelperが検証する。skipや免除だけで実質的な検証を満たしたと扱わない。
-- managed worktreeの担当sessionはStop hookで完了を検査する。CI待ちや技術的失敗で終了せず監視・修復を続ける。明示停止・指定された途中納品・真正な人間判断の場合だけ`codex-worktree completion`へ境界と具体的根拠を保存し、未完了と報告する。hookを無効化したり状態を削除したりして終了を迂回しない。
+- managed worktree の Stop hook は担当と完了記録を照合する。監視担当が外部待機を引き継いだら状況を返す。引き継げない場合は理由と再開点を報告する。状況報告後も未完了の記録を保持し、再開時は同じ Task ID を使う。
 - CDは既存triggerと権限に従う。merge/pushで起動する既存CDは状態を報告し、manual dispatch、release、production deploy、新規environment approvalは明示依頼なしに実行しない。
 - dirty/stale/conflict、必須検証失敗、判定不能ではPR・branch・worktreeを保持し、再開点を伝える。`finish --sandbox-retry`等の復旧はhelperが示す限定条件に従い、直接mergeや削除で迂回しない。
 
