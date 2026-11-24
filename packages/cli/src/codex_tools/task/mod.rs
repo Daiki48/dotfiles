@@ -3897,6 +3897,10 @@ mod tests {
 
     #[test]
     fn completion_worker_exemption_requires_saved_generation_and_live_lease() {
+        // 他testのforkがlease descriptorを一時保持する影響を分離する。
+        if !crate::codex_tools::delivery::authorization_tests::isolated_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.submit("task-one");
         let mut task = fixture.0.load("task-one").unwrap();
