@@ -6126,7 +6126,7 @@ fn denial_guidance(reason: &str) -> DenialGuidance {
         return DenialGuidance {
             rule_id: "github-operation-not-allowed",
             safety_basis: "対象repository、単一resource、許可済みlifecycle、body snapshotを固定できるGitHub操作だけを実行します。",
-            next_action: "repositoryとresource IDを明示し、許可済みの`gh issue`、`gh pr`、読み取り専用操作、または`codex-delivery`へ置き換えてください。",
+            next_action: "対象を明示し、許可済みの読み取り・管理操作またはcodex-deliveryを使ってください。Issue・Draft PRの本文は公開前に確認し、docs/github-guardrails.ja.md#github-write-examples の該当例に沿って --body-file で指定してください。",
         };
     }
     if reason.contains("hook input") || reason == "command is required" {
@@ -6403,6 +6403,15 @@ mod tests {
                 "unexpected guidance for: {reason}"
             );
         }
+    }
+
+    #[test]
+    fn inline_issue_comment_denial_points_to_body_file_examples() {
+        let args = ["42", "--repo", "example/project", "--body", "公開用の例"].map(String::from);
+        let reason = issue_write_reason("comment", &args, ".").unwrap();
+        let next_action = denial_guidance(&reason).next_action;
+        assert!(next_action.contains("docs/github-guardrails.ja.md#github-write-examples"));
+        assert!(next_action.contains("--body-file"));
     }
 
     #[test]
