@@ -57,6 +57,7 @@ const STRICT_GATE_MODE: &str = "strict-ruleset";
 const FREE_PRIVATE_GATE_MODE: &str = "github-free-private";
 const FREE_PRIVATE_LOCAL_GATE_MODE: &str = "github-free-private-local";
 const LOCAL_VALIDATION_GATE_MODE: &str = "local-validation";
+const OPTIONAL_CI_LOCAL: &str = "optional-ci-local";
 const LOOP_LEDGER_V1_MARKER: &str = "<!-- codex-loop-ledger:v1 -->";
 const LOOP_LEDGER_V2_MARKER: &str = "<!-- codex-loop-ledger:v2 -->";
 const THREAD_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{isResolved}pageInfo{hasNextPage,endCursor}}}}}";
@@ -251,6 +252,7 @@ fn gate_mode(value: &str) -> Result<&'static str> {
         FREE_PRIVATE_GATE_MODE => Ok(FREE_PRIVATE_GATE_MODE),
         FREE_PRIVATE_LOCAL_GATE_MODE => Ok(FREE_PRIVATE_LOCAL_GATE_MODE),
         LOCAL_VALIDATION_GATE_MODE => Ok(LOCAL_VALIDATION_GATE_MODE),
+        OPTIONAL_CI_LOCAL => Ok(OPTIONAL_CI_LOCAL),
         emergency::GATE => Ok(emergency::GATE),
         _ => Err(error("gate modeが不正です")),
     }
@@ -259,7 +261,12 @@ fn free_private_gate(value: &str) -> bool {
     [FREE_PRIVATE_GATE_MODE, FREE_PRIVATE_LOCAL_GATE_MODE].contains(&value)
 }
 fn remote_ci_required(value: &str) -> bool {
-    ![FREE_PRIVATE_LOCAL_GATE_MODE, LOCAL_VALIDATION_GATE_MODE].contains(&value)
+    ![
+        FREE_PRIVATE_LOCAL_GATE_MODE,
+        LOCAL_VALIDATION_GATE_MODE,
+        OPTIONAL_CI_LOCAL,
+    ]
+    .contains(&value)
 }
 pub(super) fn workflow_yaml_path(value: &str) -> bool {
     let Some(name) = value.strip_prefix(".github/workflows/") else {
@@ -823,6 +830,9 @@ pub(crate) fn task_add_ci_labels(
     let receipt =
         load_receipt(cwd, task, head, Some(repository)).map_err(|cause| cause.to_string())?;
     let gate = receipt_gate_mode(&receipt).map_err(|cause| cause.to_string())?;
+    if gate == OPTIONAL_CI_LOCAL && !labels.is_empty() {
+        return Err("任意CIを起動しないreceiptに起動labelを付与できません".into());
+    }
     match_cli_receipt(&receipt, Some(pr as i64), Some(head), None, None, &gate)
         .map_err(|cause| cause.to_string())?;
     if labels.is_empty() && (gate == emergency::GATE || !remote_ci_required(&gate)) {
@@ -2558,10 +2568,30 @@ fn validate_legacy_decision(
     }
     Ok(())
 }
+pub(super) fn require_optional_ci_policy(repository: &str) -> std::result::Result<(), String> {
+    let path = codex_home()
+        .map_err(|e| e.to_string())?
+        .join("ci-policies")
+        .join(format!(
+            "{}.json",
+            repo_key(repository).map_err(|e| e.to_string())?
+        ));
+    let policy = external_private_json(&path, "任意CI方針").map_err(|e| e.to_string())?;
+    if policy
+        != serde_json::json!({"version":1,"repository":repository,"gate_mode":OPTIONAL_CI_LOCAL})
+    {
+        return Err("任意CI方針が対象repositoryと一致しません".into());
+    }
+    Ok(())
+}
+
 fn validate_gate_repository(repository: &str, gate: &str) -> Result<()> {
     gate_mode(gate)?;
     if !repository_name(repository) {
         return Err(error("gate repository名が不正です"));
+    }
+    if gate == OPTIONAL_CI_LOCAL {
+        require_optional_ci_policy(repository).map_err(error)?;
     }
     Ok(())
 }
@@ -2743,6 +2773,9 @@ fn receipt(
         if version == emergency::VERSION {
             keys.push("emergency");
         }
+        if version == RECEIPT_VERSION && payload["gate_mode"] == OPTIONAL_CI_LOCAL {
+            keys.push("review_base");
+        }
         expected_keys(payload, &keys, "receipt")?;
     } else {
         return Err(error("receipt schemaが一致しません"));
@@ -2755,6 +2788,9 @@ fn receipt(
         return Err(error("receipt task/repositoryが一致しません"));
     }
     let gate = receipt_gate_mode(&normalized)?;
+    if gate == OPTIONAL_CI_LOCAL {
+        oid(&str_value(&normalized, "review_base")?, "review base")?;
+    }
     if (gate == emergency::GATE) != (version == emergency::VERSION) {
         return Err(error("緊急gateには専用schemaの承認receiptが必要です"));
     }
@@ -2883,6 +2919,7 @@ fn review_receipt_scope_matches(existing: &Value, proposed: &Value) -> bool {
     let existing_gate = existing.get("gate_mode").and_then(Value::as_str);
     let proposed_gate = proposed.get("gate_mode").and_then(Value::as_str);
     (existing_gate == proposed_gate
+        && existing.get("review_base") == proposed.get("review_base")
         && (existing_gate != Some(emergency::GATE)
             || existing
                 .get("emergency")
@@ -3038,6 +3075,16 @@ fn write_review_request_locked(
         ("gate_mode", string(gate)),
         ("plan_version", Value::Number(plan_version.into())),
     ]);
+    if gate == OPTIONAL_CI_LOCAL {
+        payload["review_base"] = string(&live);
+        validate_delivery(
+            root,
+            &payload,
+            true,
+            Some(&str_value(&manifest_value, "branch")?),
+            None,
+        )?;
+    }
     if gate == emergency::GATE {
         let path = emergency_request.ok_or_else(|| error("--emergency-requestが必要です"))?;
         let view = pr_view(root, &repository, pr)?;
@@ -3816,6 +3863,30 @@ fn validate_receipt_review_history(root: &Path, receipt_value: &Value) -> Result
     }
     Ok(())
 }
+fn verify_optional_delivery(
+    root: &Path,
+    receipt: &Value,
+    live: &str,
+    merge: Option<&str>,
+) -> Result<()> {
+    let head = str_value(receipt, "head_sha")?;
+    let base = str_value(receipt, "review_base")?;
+    if let Some(sha) = merge {
+        emergency::verify_merge_tree(root, &base, &head, sha)?;
+    } else if base != live || !emergency::git_ancestor(root, live, &head)? {
+        return Err(error("検証済みheadのbaseが最新mainと一致しません"));
+    }
+    super::task::verify_optional_ci(
+        root,
+        &str_value(receipt, "repository")?,
+        int_value(receipt, "pr")? as u64,
+        &head,
+        live,
+        merge,
+    )
+    .map_err(error)
+}
+
 fn validate_delivery(
     root: &Path,
     receipt_value: &Value,
@@ -3877,6 +3948,8 @@ fn validate_delivery(
     if gate == emergency::GATE {
         assert_main_clean(root)?;
         emergency::observe(root, receipt_value, &view, &live)?;
+    } else if gate == OPTIONAL_CI_LOCAL {
+        verify_optional_delivery(root, receipt_value, &live, None)?;
     } else if remote_ci_required(&gate) {
         check_required_ci(root, &repository, &head)?;
     } else {
@@ -4835,6 +4908,9 @@ fn finish_locked(
         if gate == emergency::GATE {
             emergency::observe(root, &receipt_value, &view, &live)?;
             emergency::publish_note(root, &receipt_value)?;
+        } else if gate == OPTIONAL_CI_LOCAL {
+            let merge = oid(&str_value(get(&view, "mergeCommit")?, "oid")?, "実merge")?;
+            verify_optional_delivery(root, &receipt_value, &live, Some(&merge))?;
         } else if remote_ci_required(&gate) {
             check_required_ci(root, &repository, &head)?;
         } else {
@@ -6828,6 +6904,25 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
+    }
+
+    #[test]
+    fn optional_ci_requires_exact_private_repository_policy() {
+        with_codex_home(|home| {
+            let directory = home.join("ci-policies");
+            fs::create_dir(&directory).unwrap();
+            set_private_dir(&directory);
+            let repository = "example/product";
+            let path = directory.join(format!("{}.json", repo_key(repository).unwrap()));
+            assert!(require_optional_ci_policy(repository).is_err());
+            let mut policy = serde_json::json!({"version":1,"repository":"example/other","gate_mode":OPTIONAL_CI_LOCAL});
+            write_private(&path, &policy);
+            assert!(require_optional_ci_policy(repository).is_err());
+            policy["repository"] = string(repository);
+            write_private(&path, &policy);
+            require_optional_ci_policy(repository).unwrap();
+            assert!(require_optional_ci_policy("example/other").is_err());
+        });
     }
 
     #[test]

@@ -10,6 +10,24 @@ const OTHER: &str = "dddddddddddddddddddddddddddddddddddddddd";
 struct Api(HashMap<String, Value>);
 
 impl Api {
+    fn optional() -> Self {
+        let mut api = Self::new();
+        api.workflow(HEAD);
+        api.set("branches/main", json!({"name":"main","commit":{"sha":BASE},
+            "protection":{"required_status_checks":{"enforcement_level":"off","contexts":[],"checks":[]}}}));
+        api.set(
+            "rules/branches/main?per_page=100",
+            json!([[{"type":"pull_request"}]]),
+        );
+        for sha in [HEAD, MERGE] {
+            api.set(
+                &format!("actions/runs?head_sha={sha}&per_page=100"),
+                json!([{"total_count":0,"workflow_runs":[]}]),
+            );
+        }
+        api
+    }
+
     fn new() -> Self {
         let mut api = Self(HashMap::new());
         api.set(
@@ -115,6 +133,70 @@ impl Api {
             }]),
         );
     }
+}
+
+#[test]
+fn optional_policy_checks_pr_and_actual_merge_without_starting_ci() {
+    let mut api = Api::optional();
+    let gate = GateMode::OptionalCiLocal;
+    assert_eq!(
+        api.observe_policy(None, GateMode::Strict).unwrap().state,
+        CiState::Missing
+    );
+    assert!(api.observe_policy(None, gate).unwrap().allows_delivery());
+    api.0.get_mut("repos/example/product/pulls/1").unwrap()["merged"] = json!(true);
+    api.workflow(MERGE);
+    assert!(
+        api.observe_policy(Some(gate), gate)
+            .unwrap()
+            .allows_delivery()
+    );
+    api.check(HEAD, "completed", Some("failure"));
+    assert_eq!(
+        api.observe_policy(Some(gate), gate).unwrap().state,
+        CiState::Failure
+    );
+    api.check(HEAD, "completed", Some("success"));
+    api.set(
+        &format!("actions/runs?head_sha={MERGE}&per_page=100"),
+        json!([{"total_count":1,"workflow_runs":[{"head_sha":MERGE,"status":"queued"}]}]),
+    );
+    assert_eq!(
+        api.observe_policy(Some(gate), gate).unwrap().state,
+        CiState::Pending
+    );
+    api.0.get_mut("repos/example/product/pulls/1").unwrap()["merged"] = json!(false);
+    assert_eq!(
+        api.observe_policy(None, gate).unwrap().state,
+        CiState::Pending
+    );
+}
+
+#[test]
+fn optional_policy_refuses_protected_or_unknown_ci() {
+    let gate = GateMode::OptionalCiLocal;
+    for endpoint in [
+        "branches/main",
+        "rules/branches/main?per_page=100",
+        &format!("actions/runs?head_sha={HEAD}&per_page=100"),
+    ] {
+        let mut api = Api::optional();
+        api.0.remove(&format!("repos/example/product/{endpoint}"));
+        assert!(api.observe_policy(None, gate).is_err());
+    }
+    for rule in ["required_status_checks", "workflows", "unknown"] {
+        let mut api = Api::optional();
+        api.set(
+            "rules/branches/main?per_page=100",
+            json!([[],[{"type":rule}]]),
+        );
+        assert!(api.observe_policy(None, gate).is_err());
+    }
+    let mut api = Api::optional();
+    api.0
+        .get_mut("repos/example/product/branches/main")
+        .unwrap()["protection"]["required_status_checks"]["contexts"] = json!(["build"]);
+    assert!(api.observe_policy(None, gate).is_err());
 }
 
 #[test]

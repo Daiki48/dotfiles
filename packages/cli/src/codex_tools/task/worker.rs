@@ -421,6 +421,9 @@ pub(super) fn prompt(task: &Task) -> String {
             super::ci::GateMode::LocalValidation => {
                 "record-review・deliver・finishにはすべて --gate-mode local-validation を明示してください。"
             }
+            super::ci::GateMode::OptionalCiLocal => {
+                "record-review・deliver・finishには --gate-mode optional-ci-local を指定し、固定headのlocal検証を記録してください。"
+            }
             super::ci::GateMode::GithubFreePrivate => {
                 "record-review・deliver・finishにはすべて --gate-mode github-free-private を明示し、既存のlive private repository policy・固定headのActionsとreviewをhelperで検証してください。API失敗から別modeを推測しないでください。"
             }

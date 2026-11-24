@@ -64,7 +64,7 @@ enum Commands {
         #[arg(long)]
         ci_label: Vec<String>,
         /// 既存方針で明示されたremote gate。API失敗から推測しない。
-        #[arg(long, default_value = "strict", value_parser = ["strict", "github-free-private"])]
+        #[arg(long, default_value = "strict", value_parser = ["strict", "github-free-private", "optional-ci-local"])]
         gate_mode: String,
         /// 利用者の終了境界。worker内部のPR作成段階とは別に保存する。
         #[arg(long, default_value = "finish", value_parser = ["pr", "merge", "finish"])]
@@ -123,7 +123,7 @@ enum Commands {
         task_id: String,
         #[arg(long)]
         instruction: String,
-        #[arg(long, value_parser = ["strict", "github-free-private", "emergency-ci"])]
+        #[arg(long, value_parser = ["strict", "github-free-private", "emergency-ci", "optional-ci-local"])]
         gate_mode: Option<String>,
         #[arg(long)]
         authorization: Option<String>,
@@ -604,6 +604,7 @@ fn submit_with_policy(
     if !valid_id(&id) || !safe_text(&objective, 32 * 1024) {
         return Err("task IDまたは目的が不正です".into());
     }
+    validate_optional_intake(&context.github, requested_gate, &ci_labels)?;
     let risk = if requested_gate == ci::GateMode::GithubFreePrivate
         && risk_rank(&risk) < risk_rank("high")
     {
@@ -1828,6 +1829,9 @@ fn resume_with_ci_labels(
     if !valid_ci_labels(&ci_labels) {
         return Err("既存CI labelの形式が不正です".into());
     }
+    if gate_mode.as_deref() == Some("optional-ci-local") && ci_labels.is_empty() {
+        task.ci_labels.clear();
+    }
     if !ci_labels.is_empty() {
         task.ci_labels = ci_labels;
     }
@@ -1841,6 +1845,7 @@ fn resume_with_ci_labels(
         let gate = match gate.as_str() {
             "strict" => ci::GateMode::Strict,
             "github-free-private" => ci::GateMode::GithubFreePrivate,
+            "optional-ci-local" => ci::GateMode::OptionalCiLocal,
             "emergency-ci" => ci::GateMode::EmergencyCi,
             _ => return Err("受付policyが不正です".into()),
         };
@@ -1885,6 +1890,7 @@ fn resume_with_ci_labels(
             task.phase = Phase::Implementation;
         }
     }
+    validate_optional_intake(&context.github, task.requested_gate, &task.ci_labels)?;
     task.pause_requested = false;
     task.failures = 0;
     task.recovery.attempts = 0;
@@ -2075,6 +2081,37 @@ fn review_ready(task: &Task) -> bool {
         })
 }
 
+fn validate_optional_intake(repository: &str, gate: ci::GateMode, labels: &[String]) -> Result<()> {
+    if gate == ci::GateMode::OptionalCiLocal {
+        if !labels.is_empty() {
+            return Err("任意CIを起動しない方針と起動labelが競合します".into());
+        }
+        super::delivery::require_optional_ci_policy(repository)?;
+    }
+    Ok(())
+}
+
+pub(super) fn verify_optional_ci(
+    root: &std::path::Path,
+    repository: &str,
+    pr: u64,
+    head: &str,
+    base: &str,
+    merge: Option<&str>,
+) -> Result<()> {
+    let gate = ci::GateMode::OptionalCiLocal;
+    let observation = ci::observe(root, repository, pr, merge.map(|_| gate), gate)?;
+    if !observation.allows_delivery()
+        || observation.head != head
+        || observation.base != base
+        || observation.merged != merge.is_some()
+        || merge.is_some_and(|sha| observation.target != sha)
+    {
+        return Err("任意CIの固定対象・保護・実行状態を確認できません".into());
+    }
+    Ok(())
+}
+
 pub(super) fn valid_ci_labels(labels: &[String]) -> bool {
     labels.len() <= 20
         && labels.iter().all(|label| {
@@ -2101,7 +2138,9 @@ fn add_ci_labels(context: &Context, task: &Task) -> Result<()> {
         task.base.as_deref().ok_or("baseがありません")?,
         if matches!(
             task.delivery_gate(),
-            ci::GateMode::EmergencyCi | ci::GateMode::LocalValidation
+            ci::GateMode::EmergencyCi
+                | ci::GateMode::LocalValidation
+                | ci::GateMode::OptionalCiLocal
         ) {
             &[]
         } else {
@@ -2115,6 +2154,8 @@ fn authorize_ci_with(
     mut add_labels: impl FnMut(&Task) -> Result<()>,
 ) -> Result<()> {
     if task.phase != Phase::CiAuthorization
+        // local方針はCI観測からIntegrationへ進み、receipt作成後にdeliverで予約する。
+        || task.requested_gate == ci::GateMode::OptionalCiLocal
         || task.pause_requested
         || !review_ready(task)
         || task.base.is_none()
@@ -2515,10 +2556,10 @@ fn execute(cli: Cli) -> Result<Value> {
             gate_mode,
             stop_after,
         } => {
-            let requested_gate = if gate_mode == "github-free-private" {
-                ci::GateMode::GithubFreePrivate
-            } else {
-                ci::GateMode::Strict
+            let requested_gate = match gate_mode.as_str() {
+                "github-free-private" => ci::GateMode::GithubFreePrivate,
+                "optional-ci-local" => ci::GateMode::OptionalCiLocal,
+                _ => ci::GateMode::Strict,
             };
             let stop_after = match stop_after.as_str() {
                 "pr" => recovery::Boundary::Pr,
@@ -3632,6 +3673,21 @@ mod tests {
             );
             assert!(!local.contains("--gate-mode を省略"));
         }
+    }
+
+    #[test]
+    fn optional_gate_waits_for_observation_without_label_admission() {
+        let fixture = Fixture::new();
+        let mut task = reviewed_task(&fixture);
+        task.requested_gate = ci::GateMode::OptionalCiLocal;
+        task.base = Some("b".repeat(40));
+        authorize_ci_with(&mut task, |_| panic!("任意CIの起動")).unwrap();
+        assert_eq!(task.phase, Phase::CiAuthorization);
+        let mut observation = local_observation(false);
+        observation.gate_mode = task.requested_gate;
+        record_ci_result(&mut task, Ok(observation)).unwrap();
+        assert_eq!(task.phase, Phase::Integration);
+        assert!(worker::prompt(&task).contains("--gate-mode optional-ci-local"));
     }
 
     #[test]

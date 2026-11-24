@@ -75,6 +75,18 @@ codex-delivery deliver --task-id <task-id> --pr <PR番号> --head <40桁SHA> --p
 codex-delivery finish --task-id <task-id> --pr <PR番号> --head <40桁SHA> --plan-id <Plan ID> --plan-version <Plan版> --gate-mode github-free-private-local
 ```
 
+### 任意CIの事前方針
+
+任意のリモートCIを起動せず固定headをローカルで検証するリポジトリでは、Git checkout外の `$CODEX_HOME/ci-policies/`（0700）に、所有者だけが読める方針ファイル（0600）を置きます。ファイル名にはmanaged worktreeと同じrepository keyを使います。架空の `example/product` の例は `7-example--7-product.json` です。
+
+```json
+{"version":1,"repository":"example/product","gate_mode":"optional-ci-local"}
+```
+
+受付時に `--gate-mode optional-ci-local` を指定し、変更に比例したローカル検証とriskに応じたレビューを行います。`record-review`、`deliver`、`finish` にも同じgateを指定します。方針と対象repositoryが一致し、mainの必須CIがないことをAPIで確認できた場合に選べます。起動済みのrun・check・commit statusを確認し、未完了・失敗・取得不能では納品を保留します。通常のRuleset・競合・レビュー検証を維持し、実マージの親とtreeを検証済みbase/headに照合します。
+
+### workflowが存在しない場合
+
 公開・非公開を問わずPRのlive baseと固定headの双方にworkflow YAMLが存在しないrepositoryでは、変更riskに応じたreview evidenceと
 product固有のlocal検証を使って`local-validation`を自律的に選択できます。CI不在だけを理由に
 `approve-review`へ切り替えません。
