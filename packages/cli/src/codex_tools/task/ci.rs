@@ -338,6 +338,30 @@ pub(super) fn observe_repair(
 
 type Fetch<'a> = dyn FnMut(&[String]) -> Result<Value, String> + 'a;
 
+/// receipt作成前にも、live baseと固定headのworkflowから通常gateを確定する。
+pub(super) fn authorization_gate(
+    root: &Path,
+    repository: &str,
+    pr: u64,
+    head: &str,
+    base: &str,
+) -> Result<GateMode, String> {
+    validate_repository(repository)?;
+    let mut fetch = |args: &[String]| task_gh_json(root, args);
+    let current = fetch_pull_request(repository, pr, true, &mut fetch)?;
+    if current.merged || current.head != head || current.base != base || current.base_ref != "main"
+    {
+        return Err("receipt作成前にPRのhead/baseが変化しました".into());
+    }
+    let base = workflow_tree(repository, base, &mut fetch)?;
+    let head = workflow_tree(repository, head, &mut fetch)?;
+    Ok(if base.workflows.is_empty() && head.workflows.is_empty() {
+        GateMode::LocalValidation
+    } else {
+        GateMode::Strict
+    })
+}
+
 #[cfg(test)]
 fn observe_with(
     repository: &str,

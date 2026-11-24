@@ -693,6 +693,10 @@ fn parse_json(text: &str, label: &str) -> Result<Value> {
     serde_json::from_str(text).map_err(|_| error(format!("{label}のJSONを安全に解析できません")))
 }
 fn gh_json(cwd: &Path, args: &[String]) -> Result<Value> {
+    #[cfg(test)]
+    if let Some(result) = authorization_tests::github(args) {
+        return result;
+    }
     parse_json(&gh(cwd, args, true)?, "GitHub")
 }
 
@@ -910,6 +914,10 @@ pub(crate) fn task_gh_json(cwd: &Path, args: &[String]) -> std::result::Result<V
             "--paginate" | "--slurp" => index += 1,
             _ => return Err("task監視のGitHub引数が読み取り契約に一致しません".into()),
         }
+    }
+    #[cfg(test)]
+    if let Some(result) = authorization_tests::github(args) {
+        return result.map_err(|cause| cause.to_string());
     }
     let sandbox = GhSandbox::create(cwd).map_err(|_| "GitHub認証の隔離に失敗しました")?;
     let args = sandbox
@@ -3336,6 +3344,87 @@ fn write_review(
     )
 }
 
+/// 固定headのコードレビュー後、CI認可より先に正規receiptを保存・再検証する。
+pub(crate) fn task_record_review(
+    root: &Path,
+    task: &str,
+    pr: u64,
+    head: &str,
+    risk_value: &str,
+    independent: bool,
+    gate: &str,
+) -> std::result::Result<(), String> {
+    (|| -> Result<()> {
+        task_id(task)?;
+        risk(risk_value)?;
+        gate_mode(gate)?;
+        validate_review_evidence_flags(risk_value, true, independent, false)?;
+        let repository = repository(root)?;
+        let _lock = task_lock(&repository, task)?;
+        let path = receipt_path(&repository, task, head)?;
+        let existing = if path.exists() || path.is_symlink() {
+            Some(load_receipt(root, task, head, Some(&repository))?)
+        } else {
+            None
+        };
+        let mut plan = format!("codex-task-{task}-v1");
+        let mut version = 1;
+        let mut review_risk = risk_value.to_string();
+        let mut independent = independent;
+        let mut specialist = false;
+        let mut replace = false;
+        let mut reusable = false;
+        if let Some(receipt) = &existing {
+            let old_gate = receipt_gate_mode(receipt)?;
+            match_cli_receipt(receipt, Some(pr as i64), Some(head), None, None, &old_gate)?;
+            plan = str_value(receipt, "plan_id")?;
+            version = int_value(receipt, "plan_version")?;
+            let old_risk = str_value(receipt, "risk")?;
+            if risk_level(&old_risk) > risk_level(&review_risk) {
+                review_risk = old_risk.clone();
+            }
+            independent |= bool_value(receipt, "independent_review_passed")?;
+            specialist = bool_value(receipt, "specialist_review_passed")?;
+            reusable = old_gate == gate
+                && risk_level(&old_risk) >= risk_level(risk_value)
+                && (!independent || bool_value(receipt, "independent_review_passed")?);
+            replace = old_gate == emergency::GATE && gate == STRICT_GATE_MODE;
+            if old_gate != gate && !replace {
+                return Err(error("CI認可前のreceiptのgateが一致しません"));
+            }
+        }
+        let receipt = if reusable {
+            // human-approvedを含む既存の承認・Plan・証拠を書き換えない。
+            existing.ok_or_else(|| error("再利用するreceiptがありません"))?
+        } else {
+            write_review_request_locked(
+                root,
+                task,
+                pr as i64,
+                head,
+                &review_risk,
+                &plan,
+                version,
+                false,
+                true,
+                independent,
+                specialist,
+                gate,
+                None,
+                replace,
+            )?
+        };
+        let (manifest, worktree_path) = manifest(root, task, &repository)?;
+        worktree(root, &manifest, &worktree_path)?;
+        worktree_clean_head(&worktree_path, head)?;
+        validate_receipt_evidence(&worktree_path, &manifest, &receipt)?;
+        validate_receipt_review_history(root, &receipt)?;
+        review_safety(root, &repository, pr as i64)?;
+        Ok(())
+    })()
+    .map_err(|cause| cause.to_string())
+}
+
 fn pr_view(root: &Path, repository: &str, pr: i64) -> Result<Value> {
     let args = vec!["pr".into(), "view".into(), pr.to_string(), "--repo".into(), repository.into(), "--json".into(), "number,state,isDraft,headRefOid,headRefName,baseRefName,mergeable,mergeStateStatus,mergedAt,mergeCommit,headRepository,headRepositoryOwner,isCrossRepository,autoMergeRequest".into()];
     let value = gh_json(root, &args)?;
@@ -3807,6 +3896,13 @@ fn ruleset(root: &Path, repository: &str) -> Result<()> {
 }
 
 fn fetch_main(root: &Path, repository: &str) -> Result<String> {
+    #[cfg(test)]
+    if authorization_tests::active() {
+        return oid(
+            git(root, &["rev-parse", "refs/remotes/origin/main"], true)?.trim(),
+            "fixture origin/main",
+        );
+    }
     let args_vec = vec![
         "fetch".into(),
         canonical_remote_url(root, repository)?,
@@ -6049,6 +6145,9 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
 }
 
 #[cfg(test)]
+pub(super) mod authorization_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -6859,13 +6958,16 @@ mod tests {
         pages
     }
 
-    fn with_codex_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+    pub(super) fn with_codex_home<T>(f: impl FnOnce(&Path) -> T) -> T {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let home = env::temp_dir().join(format!("codex-delivery-rust-{suffix}"));
+        let home = env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir)
+            .join(format!("codex-delivery-rust-{suffix}"));
         let managed = home.join("worktrees").join(repo_key("owner/repo").unwrap());
         fs::create_dir_all(managed.join(".state")).unwrap();
         fs::create_dir_all(managed.join(".locks")).unwrap();

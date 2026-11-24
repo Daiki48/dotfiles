@@ -7,6 +7,8 @@ mod ci;
 mod followup_tests;
 #[cfg(test)]
 mod handoff_tests;
+#[cfg(test)]
+mod receipt_tests;
 mod recovery;
 pub(super) mod resources;
 pub(crate) mod store;
@@ -2129,15 +2131,35 @@ fn authorize_ci(context: &Context, task: &mut Task) -> Result<()> {
 }
 
 fn add_ci_labels(context: &Context, task: &Task) -> Result<()> {
+    let pr = task.pr.ok_or("PRがありません")?;
+    let head = task.head.as_deref().ok_or("HEADがありません")?;
+    let base = task.base.as_deref().ok_or("baseがありません")?;
+    let gate = if task.requested_gate == ci::GateMode::Strict {
+        ci::authorization_gate(&context.repository, &context.github, pr, head, base)?
+    } else {
+        task.delivery_gate()
+    };
+    super::delivery::task_record_review(
+        &context.repository,
+        &task.id,
+        pr,
+        head,
+        &task.risk,
+        task.review_independent,
+        match gate {
+            ci::GateMode::Strict => "strict-ruleset",
+            gate => gate.as_str(),
+        },
+    )?;
     super::delivery::task_add_ci_labels(
         &context.repository,
         &context.github,
         &task.id,
-        task.pr.ok_or("PRがありません")?,
-        task.head.as_deref().ok_or("HEADがありません")?,
-        task.base.as_deref().ok_or("baseがありません")?,
+        pr,
+        head,
+        base,
         if matches!(
-            task.delivery_gate(),
+            gate,
             ci::GateMode::EmergencyCi
                 | ci::GateMode::LocalValidation
                 | ci::GateMode::OptionalCiLocal

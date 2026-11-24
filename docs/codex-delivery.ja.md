@@ -248,6 +248,9 @@ codex-delivery authorize-ci --task-id <TASK_ID> --pr <PR> --head <HEAD_SHA> --ba
 ```
 
 PR identity、cleanな固定head、review、最新mainの包含、labelの実在を照合します。coordinatorの`--ci-label`も同じ経路を使います。
+coordinatorはコードレビュー成功後、認可前に正規receiptを保存・再検証します。既存receiptのPlan・版・承認を保持し、
+保存・対象照合・レビュー検証の失敗ではlabelを付けません。統合担当は作成済みreceiptを再利用し、
+同じheadの`emergency-ci`から通常CIへの復帰だけは既存の`--replace-receipt`手順で証拠を移行します。
 
 repository単位の納品予約は`worktrees/.delivery-lane/repository-<repo_key>/state.json`へprivateに保存し、同一repositoryのCI起動・merge・main同期・cleanupを排他します。予約は`finish`で解放し、検証済みの同一repositoryのmain修復taskだけは一時的に親の予約を引き継げます。
 

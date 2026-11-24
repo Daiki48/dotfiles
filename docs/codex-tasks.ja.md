@@ -85,6 +85,12 @@ GitHubの[label API](https://docs.github.com/en/rest/issues/labels#add-labels-to
 labelをレビュー証拠には使わず、HEAD/base変更時はレビューを無効化し、merge前に再照合します。
 既存deliveryのreview receipt・固定SHA・remote gate・cleanup検証を省略しません。
 
+コードレビュー成功後、coordinatorはCI認可より先に正規の`record-review`と同じ処理でreceiptを保存します。
+新規receiptはtaskのPlanと版1を使い、既存receiptのPlan・版・人間の承認は保持します。
+保存や固定対象・レビューの照合に失敗した場合はCI起動labelを付けず診断へ戻します。
+通常gateはlive baseと固定headのworkflowをAPIで確認してから記録し、workflow不在を推測しません。
+`optional-ci-local`はlabelを付けず、CI観測を通過してから統合担当がreceiptを作成します。
+
 ## 保存場所とhost境界
 
 account homeはsetupと同じ検証を使います。`CODEX_HOME`が絶対pathで指定されていれば優先し、
