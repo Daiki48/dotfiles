@@ -96,6 +96,26 @@ fn missing_workflow_run_needs_a_separate_explicit_waiver() {
 }
 
 #[test]
+fn excluded_workflows_need_no_waiver_but_their_actual_runs_are_checked() {
+    let mut approval = request(&sample_request(), &scope()).unwrap();
+    approval
+        .waivers
+        .retain(|waiver| waiver.source == "actions:pull_request");
+    for failed in [false, true] {
+        let observed = snapshot_with("example/product", HEAD, &[], &mut |endpoint| {
+            Ok(if endpoint.contains("check-runs?") {
+                json!([{"total_count":0,"check_runs":[]}])
+            } else if endpoint.contains("actions/runs?") && failed {
+                json!([{"total_count":1,"workflow_runs":[{"id":1,"head_sha":HEAD,"path":WORKFLOW,"event":"workflow_dispatch","status":"completed","conclusion":"failure"}]}])
+            } else if endpoint.contains("actions/runs?") {
+                json!([{"total_count":0,"workflow_runs":[]}])
+            } else { json!([[]]) })
+        }).unwrap();
+        assert_eq!(coverage(&approval, &observed, HEAD).is_ok(), !failed);
+    }
+}
+
+#[test]
 fn unknown_check_provider_state_and_target_never_inherit_a_waiver() {
     let approval = request(&sample_request(), &scope()).unwrap();
     for change in ["name", "source", "state", "sha"] {
@@ -291,7 +311,22 @@ fn only_exact_merge_parents_and_tested_tree_are_eligible() {
         .to_string();
     fs::write(root.join("file"), "head").unwrap();
     fs::remove_file(root.join(WORKFLOW)).unwrap();
-    git(root, &["add", "--", "file", WORKFLOW], true).unwrap();
+    for (file, source) in [
+        ("main.yml", "on: {push: {branches: [main]}}"),
+        (
+            "tags.yml",
+            "on: {push: {tags: ['v*']}, workflow_dispatch: null}",
+        ),
+        ("reusable.yml", "on: workflow_call"),
+        ("manual.yml", "on: workflow_dispatch"),
+        (
+            "mixed.yml",
+            "on: {push: {tags-ignore: ['v*']}, pull_request_target: null}",
+        ),
+    ] {
+        fs::write(root.join(".github/workflows").join(file), source).unwrap();
+    }
+    git(root, &["add", "--", "file", ".github/workflows"], true).unwrap();
     git(root, &["commit", "-m", "head"], true).unwrap();
     let head = git(root, &["rev-parse", "HEAD"], true)
         .unwrap()
@@ -301,10 +336,24 @@ fn only_exact_merge_parents_and_tested_tree_are_eligible() {
         .unwrap()
         .trim()
         .to_string();
-    assert!(workflow_paths(root, &head).unwrap().is_empty());
-    let expected = workflow_expectations(root, &base, &head, false).unwrap();
-    assert!(expected.contains(&super::expected(WORKFLOW, "pull_request")));
-    assert!(expected.contains(&super::expected(WORKFLOW, "push")));
+    assert_eq!(
+        workflow_expectations(root, &base, &head, false)
+            .unwrap()
+            .unwrap(),
+        [
+            expected(WORKFLOW, "pull_request"),
+            expected(".github/workflows/mixed.yml", "pull_request_target")
+        ]
+    );
+    assert_eq!(
+        workflow_expectations(root, &base, &head, true)
+            .unwrap()
+            .unwrap(),
+        [
+            expected(WORKFLOW, "push"),
+            expected(".github/workflows/main.yml", "push")
+        ]
+    );
     let mut approval = request(&sample_request(), &scope()).unwrap();
     approval.base_sha = base.clone();
     approval.head_sha = head.clone();
@@ -458,7 +507,7 @@ fn replacement_history_keeps_old_receipt_and_audit_on_retry() {
 #[test]
 fn successful_push_does_not_hide_a_missing_pull_request_event() {
     let observed = snapshot_with("example/product", HEAD,
-        &[expected(WORKFLOW, "push"), expected(WORKFLOW, "pull_request")],
+        &[expected(WORKFLOW, "pull_request")],
         &mut |endpoint| Ok(if endpoint.contains("check-runs?") {
             json!([{"total_count":0,"check_runs":[]}])
         } else if endpoint.contains("/statuses?") { json!([[]]) }

@@ -297,12 +297,12 @@ buildがないrepositoryでは構文検証等の実行可能性の検証を記�
 `pending`/`requested`/`waiting`/`missing`です。`action_required`や未知状態は免除できません。
 checkは`check-run`と`app:<ID>`、commit statusは`commit-status`と`user:<CREATOR_ID>`、
 workflow runは`workflow`、workflow pathと`actions:<EVENT>`で識別します。全て完全一致でwildcardはありません。
-承認base/head両方のworkflow定義から、headでは`push`/`pull_request`/`pull_request_target`、実mergeでは`push`の
-候補をevent別に列挙します。baseにのみ存在するworkflowも対象です。branch/path/type filterは不在を免除する根拠にせず、
-保守的に`actions:<EVENT>`・state=`missing`を観測します。push runでPR runの不在を隠しません。
-解釈不能なYAML、重複key、anchor/alias/tag、複数documentは判定不能として拒否し、不在へ読み替えません。
-該当する自動eventがないworkflowはsource=`actions`・state=`missing`として別に承認します。
-workflowも観測もない場合だけ`ci`・`no-observations`・`github`・`missing`を使います。
+承認base/head両方の定義を確認し、PRでは `pull_request` / `pull_request_target`、mainの実mergeでは
+ブランチへの `push` を期待します。タグ限定push、手動・再利用専用の定義には未実行の承認は不要です。
+単純なbranch名のリストはmainと照合し、複雑なpatternやpath/type条件は起動し得るものとして扱います。
+対象eventのrunがなければ `actions:<EVENT>` の `missing` を記録します。実際のcheck/status/runはeventにかかわらず照合します。
+解釈不能なYAML、重複key、anchor/alias/tag、複数documentは判定不能として拒否します。
+両treeにworkflow定義がなく、実測もない場合だけ `ci`・`no-observations`・`github`・`missing` の承認を要求します。
 別のcheck/提供元/状態は自動免除しません。check/status/run IDと実際の状態を保存し、生ログを取り込みません。
 
 親checkoutから既存taskを照合し、それぞれ独立commandとして実行します。
