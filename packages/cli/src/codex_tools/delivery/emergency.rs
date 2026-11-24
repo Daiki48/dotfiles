@@ -66,7 +66,7 @@ struct Snapshot {
     entries: Vec<Entry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ExpectedWorkflow {
     path: String,
     source: String,
@@ -188,7 +188,7 @@ pub(super) fn validate_receipt(payload: &Value) -> Result<()> {
 }
 
 fn coverage(request: &Request, snapshot: &Snapshot, sha: &str) -> Result<()> {
-    if snapshot.sha != sha || snapshot.entries.is_empty() || snapshot.entries.len() > MAX_ITEMS {
+    if snapshot.sha != sha || snapshot.entries.len() > MAX_ITEMS {
         return Err(error("CI観測の対象SHAまたは件数が不正です"));
     }
     for entry in &snapshot.entries {
@@ -233,36 +233,22 @@ fn workflow_expectations(
     base: &str,
     head: &str,
     merged_target: bool,
-) -> Result<Vec<ExpectedWorkflow>> {
-    let mut paths: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+) -> Result<Option<Vec<ExpectedWorkflow>>> {
+    // None は両方のtreeに定義がない場合。空のSomeは全定義が段階の対象外。
+    let mut has_definitions = false;
+    let mut workflows = std::collections::BTreeSet::new();
     for reference in [base, head] {
         for path in workflow_paths(root, reference)? {
+            has_definitions = true;
             let source = git(root, &["show", &format!("{reference}:{path}")], true)?;
-            let events = super::super::workflow_policy::trigger_events(&source).map_err(error)?;
-            let expected = paths.entry(path).or_default();
-            expected.extend(events.into_iter().filter(|event| {
-                event == "push"
-                    || !merged_target
-                        && ["pull_request", "pull_request_target"].contains(&event.as_str())
-            }));
+            for event in super::super::workflow_policy::trigger_events(&source, merged_target)
+                .map_err(error)?
+            {
+                workflows.insert(expected(&path, &event));
+            }
         }
     }
-    Ok(paths
-        .into_iter()
-        .flat_map(|(path, events)| {
-            if events.is_empty() {
-                vec![ExpectedWorkflow {
-                    path,
-                    source: "actions".into(),
-                }]
-            } else {
-                events
-                    .into_iter()
-                    .map(|event| expected(&path, &event))
-                    .collect()
-            }
-        })
-        .collect())
+    Ok(has_definitions.then(|| workflows.into_iter().collect()))
 }
 
 pub(super) fn pages(value: &Value, field: Option<&str>) -> Result<Vec<Value>> {
@@ -424,18 +410,6 @@ fn snapshot_with(
             );
         }
     }
-    if entries.is_empty() {
-        entries.insert(
-            ("ci".into(), "no-observations".into(), "github".into()),
-            Entry {
-                kind: "ci".into(),
-                name: "no-observations".into(),
-                source: "github".into(),
-                state: "missing".into(),
-                id: 0,
-            },
-        );
-    }
     Ok(Snapshot {
         sha: sha.into(),
         entries: entries.into_values().collect(),
@@ -446,11 +420,24 @@ fn snapshot(
     root: &Path,
     repository: &str,
     sha: &str,
-    workflows: &[ExpectedWorkflow],
+    workflows: Option<&[ExpectedWorkflow]>,
 ) -> Result<Snapshot> {
-    snapshot_with(repository, sha, workflows, &mut |endpoint| {
-        ci_pages(root, endpoint)
-    })
+    let mut observed = snapshot_with(
+        repository,
+        sha,
+        workflows.unwrap_or_default(),
+        &mut |endpoint| ci_pages(root, endpoint),
+    )?;
+    if workflows.is_none() && observed.entries.is_empty() {
+        observed.entries.push(Entry {
+            kind: "ci".into(),
+            name: "no-observations".into(),
+            source: "github".into(),
+            state: "missing".into(),
+            id: 0,
+        });
+    }
+    Ok(observed)
 }
 
 pub(super) fn ci_pages(root: &Path, endpoint: &str) -> Result<Value> {
@@ -477,7 +464,12 @@ pub(super) fn prepare(root: &Path, payload: &Value, path: &Path, live: &str) -> 
         return Err(error("緊急承認baseがlive mainと一致しません"));
     }
     let expected = workflow_expectations(root, &request.base_sha, &request.head_sha, false)?;
-    let observed = snapshot(root, &request.repository, &request.head_sha, &expected)?;
+    let observed = snapshot(
+        root,
+        &request.repository,
+        &request.head_sha,
+        expected.as_deref(),
+    )?;
     coverage(&request, &observed, &request.head_sha)?;
     Ok(object([
         ("request", value),
@@ -527,7 +519,12 @@ pub(super) fn prepare_merged(
         return Err(error("実mergeがmainへ到達していません"));
     }
     let expected = workflow_expectations(root, &request.base_sha, &request.head_sha, false)?;
-    let observed = snapshot(root, &request.repository, &request.head_sha, &expected)?;
+    let observed = snapshot(
+        root,
+        &request.repository,
+        &request.head_sha,
+        expected.as_deref(),
+    )?;
     coverage(&request, &observed, &request.head_sha)?;
     let evidence = object([
         ("request", value),
@@ -717,13 +714,18 @@ fn observe_inner(
         request.head_sha.clone()
     };
     let expected = workflow_expectations(root, &request.base_sha, &request.head_sha, false)?;
-    let head = snapshot(root, &request.repository, &request.head_sha, &expected)?;
+    let head = snapshot(
+        root,
+        &request.repository,
+        &request.head_sha,
+        expected.as_deref(),
+    )?;
     let actual = if merged {
         snapshot(
             root,
             &request.repository,
             &target,
-            &workflow_expectations(root, &request.base_sha, &request.head_sha, true)?,
+            workflow_expectations(root, &request.base_sha, &request.head_sha, true)?.as_deref(),
         )?
     } else {
         head.clone()
