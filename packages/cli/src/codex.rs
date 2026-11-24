@@ -2398,7 +2398,7 @@ fn private_file_permissions(_fallback: &fs::Permissions) -> fs::Permissions {
     }
 }
 
-fn verify_current_user_regular_file(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+pub(crate) fn verify_current_user_regular_file(path: &Path, metadata: &fs::Metadata) -> Result<()> {
     if !metadata.file_type().is_file() {
         anyhow::bail!("Managed path must be a regular file: {}", path.display());
     }
@@ -3306,6 +3306,21 @@ fn ensure_config_unchanged(
         );
     }
     Ok(())
+}
+
+pub(crate) fn replace_personal_config(
+    path: &Path,
+    original: &str,
+    updated: &[u8],
+    permissions: fs::Permissions,
+) -> Result<()> {
+    let temporary = write_file_temp(path, updated, permissions)?;
+    let result = ensure_config_unchanged(path, original, false)
+        .and_then(|()| rename_managed_file(&temporary, path));
+    if result.is_err() {
+        let _ = remove_managed_file(&temporary);
+    }
+    result
 }
 
 fn migrate_managed_config_from_template(

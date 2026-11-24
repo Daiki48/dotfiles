@@ -553,3 +553,5 @@ state machineです。lock取得待ちもdeadlineへ含め、競合processが停
 停止時の報告には、PR URL、repository、base/head、現在SHAとreceipt SHA、CI状態、review状態、
 未解決件数、risk、残存PR/branch/worktree、再開に必要な操作を含めます。失敗した試行を理由に
 PR、branch、worktreeを削除・reset・force updateしません。
+
+レビュー記録の保存後は、親 checkout から `codex-delivery deliver --task-id <ID>`、統合後は `codex-delivery finish --task-id <ID>` で進められます。helper は担当 worktree の HEAD と保存済み receipt から PR、Plan と gate を照合します。finish の再試行では納品記録に固定した head を使います。緊急 CI は対象と免除範囲を確認した既存の receipt が必要です。

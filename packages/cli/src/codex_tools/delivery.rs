@@ -6041,10 +6041,44 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 &parse_ci_authorization(&args)?,
             );
         }
-        let parsed = parse_args(args);
-        let parsed = parsed?;
         let root =
             env::current_dir().map_err(|_| error("current checkout rootを確認できません"))?;
+        let parsed = if let [command, flag, task] = args.as_slice()
+            && (command == "deliver" || command == "finish")
+            && flag == "--task-id"
+        {
+            let task = task.to_str().ok_or_else(|| error("task IDが不正です"))?;
+            task_id(task)?;
+            let repo = repository(&root)?;
+            let (snapshot, path) = manifest(&root, task, &repo)?;
+            let head = if command == "finish" && state_path(&repo, task)?.exists() {
+                str_value(
+                    &read_json_file(&state_path(&repo, task)?, "delivery state")?,
+                    "head_sha",
+                )?
+            } else {
+                worktree(&root, &snapshot, &path)?;
+                git(&path, &["rev-parse", "HEAD"], true)?.trim().to_string()
+            };
+            let receipt = load_receipt(&root, task, &head, Some(&repo))?;
+            parse_args([
+                command.clone(),
+                flag.clone(),
+                task.into(),
+                "--pr".into(),
+                int_value(&receipt, "pr")?.to_string().into(),
+                "--head".into(),
+                head.into(),
+                "--plan-id".into(),
+                str_value(&receipt, "plan_id")?.into(),
+                "--plan-version".into(),
+                int_value(&receipt, "plan_version")?.to_string().into(),
+                "--gate-mode".into(),
+                receipt_gate_mode(&receipt)?.into(),
+            ])?
+        } else {
+            parse_args(args)?
+        };
         match parsed.command.as_str() {
             "record-review" if parsed.gate == emergency::GATE || parsed.replace_receipt => {
                 write_emergency_review(&root, &parsed)

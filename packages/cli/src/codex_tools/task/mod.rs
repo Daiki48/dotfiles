@@ -562,6 +562,41 @@ pub(crate) fn delivery_repair_parent(root: &std::path::Path, id: &str) -> Result
     }
 }
 
+/// Stop hook から、同じ worktree の監視担当と予約済みの次回観測を照合する。
+pub(crate) fn monitoring(
+    home: &std::path::Path,
+    root: &std::path::Path,
+    workspace: &std::path::Path,
+    id: &str,
+    branch: &str,
+) -> Result<bool> {
+    let directory = workspace.parent().ok_or("worktree の親がありません")?;
+    if !directory
+        .join(".tasks")
+        .join(format!("{id}.json"))
+        .try_exists()
+        .map_err(|_| "task を確認できません")?
+    {
+        return Ok(false);
+    }
+    let (repository, github, key) = worktree::task_repository(root).map_err(|e| e.to_string())?;
+    let store = Store::open(home, &key)?;
+    let task = store.load(id)?;
+    Ok(task.repository == repository
+        && task.github == github
+        && task.branch == branch
+        && task.worktree.as_deref() == Some(workspace)
+        && !task.pause_requested
+        && task.pr.is_some()
+        && task.head.is_some()
+        && matches!(
+            task.phase,
+            Phase::CiAuthorization | Phase::MainCi | Phase::Waiting
+        )
+        && (task.next_check > 0 || task.recovery.next_observation > 0)
+        && Lock::try_acquire(&store.root.join("coordinator.lock"))?.is_none())
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn submit(
