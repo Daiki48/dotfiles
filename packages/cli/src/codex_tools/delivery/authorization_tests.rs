@@ -53,7 +53,30 @@ pub(super) fn github(args: &[String]) -> Option<Result<Value>> {
             if api.unavailable {
                 return Err(error("synthetic API failure"));
             }
+            if args.first().map(String::as_str) == Some("pr")
+                && args.get(1).map(String::as_str) == Some("view")
+                && args.get(2).map(String::as_str) == Some("7")
+            {
+                return Ok(json!({
+                    "number":7,"state":"OPEN","isDraft":true,
+                    "headRefOid":api.head,"headRefName":"feat/fixture","baseRefName":"main",
+                    "mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+                    "mergedAt":null,"mergeCommit":null,
+                    "headRepository":{"nameWithOwner":"owner/repo"},"headRepositoryOwner":{"login":"owner"},
+                    "isCrossRepository":false,"autoMergeRequest":null
+                }));
+            }
             match args.get(1).map(String::as_str) {
+                Some("repos/owner/repo") => Ok(json!({"default_branch":"main"})),
+                Some(endpoint)
+                    if endpoint
+                        == format!(
+                            "repos/owner/repo/commits/{}/check-runs?filter=latest&per_page=100",
+                            api.head
+                        ) =>
+                {
+                    Ok(json!([{"total_count":0,"check_runs":[]}]))
+                }
                 Some("repos/owner/repo/pulls/7") => Ok(json!({
                     "number":7,"state":"open",
                     "merged":false,"merge_commit_sha":null,

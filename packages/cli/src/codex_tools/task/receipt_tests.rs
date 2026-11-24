@@ -100,6 +100,77 @@ fn automatic_ci_without_labels_records_before_authorization() {
 }
 
 #[test]
+fn scheduler_records_receipt_after_first_base_observation_without_labels() {
+    if !isolated_process() {
+        return;
+    }
+    for risk in ["low", "medium", "high"] {
+        for workflows in [false, true] {
+            with_fixture(|fixture| {
+                let (context, mut task) = reviewed_task(fixture);
+                task.risk = risk.into();
+                task.review.as_mut().unwrap().risk = risk.into();
+                task.review_independent = risk == "high";
+                task.base = None;
+                task.ci_labels.clear();
+                if !workflows {
+                    fixture.without_workflows();
+                }
+                let gate = if workflows {
+                    ci::GateMode::Strict
+                } else {
+                    ci::GateMode::LocalValidation
+                };
+                let mut value = serde_json::to_value(tests::successful_observation()).unwrap();
+                value["head"] = json!(fixture.head);
+                value["target"] = json!(fixture.head);
+                value["base"] = json!(fixture.base);
+                if !workflows {
+                    value["state"] = json!("local_validation");
+                    value["gate_mode"] = json!(gate.as_str());
+                    let tree = |sha: &str| json!({"commit":sha,"tree":sha,"workflows":[]});
+                    value["workflows"] = json!({
+                        "base":tree(&fixture.base),"head":tree(&fixture.head),"main":null
+                    });
+                }
+                let observation: ci::Observation = serde_json::from_value(value).unwrap();
+                assert!(observation.allows_delivery());
+
+                // reconcileと同じ認可・観測・再認可の順序で初回base取得を通す。
+                authorize_ci(&context, &mut task).unwrap();
+                assert_eq!(fixture.calls(), 0);
+                observe_ci_with(&context, &mut task, |_, _| Ok(observation.clone())).unwrap();
+                authorize_ci(&context, &mut task).unwrap();
+                assert_eq!(task.phase, Phase::CiAuthorization);
+                assert_eq!(task.base.as_ref(), Some(&fixture.base));
+                assert!(!fixture.receipt.exists());
+
+                // 次の観測期限に認可が先行し、receiptを保存してから統合へ進む。
+                task.next_check = 0;
+                authorize_ci(&context, &mut task).unwrap();
+                assert_eq!(task.phase, Phase::Integration, "{}", task.checkpoint);
+                let receipt = fixture.receipt();
+                assert_eq!(receipt["head_sha"], fixture.head);
+                assert_eq!(receipt["risk"], risk);
+                assert_eq!(receipt["tests_passed"], true);
+                assert_eq!(receipt["independent_review_passed"], risk == "high");
+                assert_eq!(
+                    receipt["gate_mode"],
+                    if workflows {
+                        "strict-ruleset"
+                    } else {
+                        gate.as_str()
+                    }
+                );
+                assert_eq!(fixture.labels(), 0);
+                observe_ci_with(&context, &mut task, |_, _| Ok(observation)).unwrap();
+                assert!(task.ci_evidence.as_ref().unwrap().allows_delivery());
+            });
+        }
+    }
+}
+
+#[test]
 fn receipt_gate_uses_complete_live_workflow_trees() {
     if !isolated_process() {
         return;

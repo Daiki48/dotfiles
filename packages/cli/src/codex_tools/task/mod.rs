@@ -1677,10 +1677,12 @@ fn record_ci_result(task: &mut Task, result: Result<ci::Observation>) -> Result<
         return Ok(());
     }
     if task.phase == Phase::CiAuthorization
-        && !task.ci_labels.is_empty()
-        && task.requested_gate != ci::GateMode::EmergencyCi
+        && !matches!(
+            task.requested_gate,
+            ci::GateMode::OptionalCiLocal | ci::GateMode::EmergencyCi
+        )
     {
-        // 初回base観測がreview後になっても、admission failureより認可を先に行う。
+        // labelがなくても初回base観測だけでは進めず、正規receiptの保存を先に行う。
         return Ok(());
     }
     if eligible {
@@ -3512,6 +3514,7 @@ mod tests {
             assert!(!ready(&fixture.0, &task, std::slice::from_ref(&task)).unwrap());
         }
         let mut ordinary = reviewed_task(&fixture);
+        authorize_ci_with(&mut ordinary, |_| Ok(())).unwrap();
         record_ci_result(&mut ordinary, Ok(successful_observation())).unwrap();
         assert!(ready(&fixture.0, &ordinary, std::slice::from_ref(&ordinary)).unwrap());
         ordinary.phase = Phase::MainCi;
@@ -3716,6 +3719,7 @@ mod tests {
     fn local_gate_connects_review_integration_main_and_finish_without_ci_success() {
         let fixture = Fixture::new();
         let mut task = reviewed_task(&fixture);
+        authorize_ci_with(&mut task, |_| Ok(())).unwrap();
         record_ci_result(&mut task, Ok(local_observation(false))).unwrap();
         assert_eq!(task.phase, Phase::Integration);
         assert_eq!(task.ci_state, Some(ci::CiState::LocalValidation));
