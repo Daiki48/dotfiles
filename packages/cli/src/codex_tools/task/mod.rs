@@ -56,6 +56,9 @@ enum Commands {
         authorization: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+        /// 既存 PR の固定 head からレビュー・CI 監視を引き継ぐ。
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        resume_pr: Option<u64>,
         #[arg(long)]
         depends_on: Vec<String>,
         #[arg(long)]
@@ -441,6 +444,12 @@ pub(crate) fn completion_worker_scope(task_id: &str, marker: &str) -> Result<boo
     checked_completion_worker_scope(&Context::open()?, task_id, marker)
 }
 
+pub(crate) fn standalone_writer_lease(task: &str) -> Result<Lock> {
+    let context = Context::open()?;
+    Lock::try_acquire(&context.store.lease_path(task)?)?
+        .ok_or("別の worker がこの task を使用しています".into())
+}
+
 /// 担当workerの生存leaseを確認する。通常sessionでは同じleaseを取得して保持する。
 pub(crate) fn merge_base_writer(
     task_id: &str,
@@ -560,6 +569,53 @@ pub(crate) fn delivery_repair_parent(root: &std::path::Path, id: &str) -> Result
     } else {
         Err("main修復taskの親子関係を確認できません".into())
     }
+}
+
+/// Stop hook から、同じ worktree の監視担当と予約済みの次回観測を照合する。
+pub(crate) fn monitoring(
+    home: &std::path::Path,
+    root: &std::path::Path,
+    workspace: &std::path::Path,
+    id: &str,
+    branch: &str,
+) -> Result<bool> {
+    let directory = workspace.parent().ok_or("worktree の親がありません")?;
+    if !directory
+        .join(".tasks")
+        .join(format!("{id}.json"))
+        .try_exists()
+        .map_err(|_| "task を確認できません")?
+    {
+        return Ok(false);
+    }
+    let (repository, github, key) = worktree::task_repository(root).map_err(|e| e.to_string())?;
+    let store = Store::open(home, &key)?;
+    let task = store.load(id)?;
+    Ok(task.repository == repository
+        && task.github == github
+        && task.branch == branch
+        && task.worktree.as_deref() == Some(workspace)
+        && !task.pause_requested
+        && task.pr.is_some()
+        && worktree::matches_monitored_head(workspace, branch, task.head.as_deref())
+            .map_err(|e| e.to_string())?
+        && matches!(
+            task.phase,
+            Phase::Review
+                | Phase::CiAuthorization
+                | Phase::CiEvidence
+                | Phase::Integration
+                | Phase::MainCi
+                | Phase::Finish
+                | Phase::Waiting
+        )
+        && (task.next_check > 0
+            || task.recovery.next_observation > 0
+            || matches!(
+                task.phase,
+                Phase::Review | Phase::CiEvidence | Phase::Integration | Phase::Finish
+            ))
+        && Lock::try_acquire(&store.root.join("coordinator.lock"))?.is_none())
 }
 
 #[cfg(test)]
@@ -2357,6 +2413,14 @@ fn reconcile(context: &Context, children: &mut Vec<Child>) -> Result<Value> {
             Some(lease) => lease,
             None => continue,
         };
+        if !worktree::completion::worker_available(
+            &context.codex_home,
+            &context.repository,
+            &context.github,
+            &tasks[index].id,
+        )? {
+            continue;
+        }
         let budget = resources::Budget::load(&context.store.root)?;
         let admission_root = context.codex_home.join("worktrees/.task-admission");
         let Some(admission) = resources::Reservation::acquire(&admission_root, &budget)? else {
@@ -2573,6 +2637,7 @@ fn execute(cli: Cli) -> Result<Value> {
             objective,
             authorization,
             branch,
+            resume_pr,
             depends_on,
             resource,
             risk,
@@ -2590,9 +2655,24 @@ fn execute(cli: Cli) -> Result<Value> {
                 "merge" => recovery::Boundary::Merge,
                 _ => recovery::Boundary::Finish,
             };
-            submit_with_policy(
+            let resumed = resume_pr
+                .map(|pr| {
+                    let branch = branch.clone().unwrap_or_else(|| format!("feat/{task_id}"));
+                    super::delivery::reviewed_workspace(&context.repository, &task_id, &branch, pr)
+                        .map(|(path, head)| (pr, path, head))
+                })
+                .transpose()?;
+            let lease = if resumed.is_some() {
+                Some(
+                    Lock::try_acquire(&context.store.lease_path(&task_id)?)?
+                        .ok_or("担当 worker が実行中です")?,
+                )
+            } else {
+                None
+            };
+            let result = submit_with_policy(
                 &context,
-                task_id,
+                task_id.clone(),
                 objective.clone(),
                 authorization.unwrap_or(objective),
                 branch,
@@ -2602,7 +2682,37 @@ fn execute(cli: Cli) -> Result<Value> {
                 ci_label,
                 requested_gate,
                 stop_after,
-            )
+            )?;
+            if let Some((pr, path, head)) = resumed {
+                let _lock = context.store.lock()?;
+                let mut task = context.load(&task_id)?;
+                if task.pr == Some(pr) && task.head.as_deref() == Some(head.as_str()) {
+                    return Ok(result);
+                }
+                if task.generation != 0
+                    || task.phase != Phase::Implementation
+                    || task.pause_requested
+                    || task.pr.is_some()
+                {
+                    return Err("既存 task の進捗と指定 PR を照合できません".into());
+                }
+                task.pr = Some(pr);
+                task.head = Some(head);
+                task.worktree = Some(path);
+                task.phase = if task.stop_after == recovery::Boundary::Pr {
+                    Phase::BoundaryReached
+                } else {
+                    Phase::Review
+                };
+                task.next_check = now();
+                task.event("pr_handoff", "既存 PR の固定 head を照合しました");
+                context.store.save(&task)?;
+                drop(lease);
+                return Ok(
+                    json!({"task_id":task_id,"phase":task.phase,"pr":pr,"next_check":task.next_check}),
+                );
+            }
+            Ok(result)
         }
         Commands::List => {
             let tasks = context.store.list()?;

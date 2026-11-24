@@ -2680,19 +2680,38 @@ fn git_push_reason(args: &[String], cwd: &str) -> Option<String> {
     }) {
         return Some("force、削除、mirror、tagまたは一括pushは許可されていません".into());
     }
-    if args.len() != 3
-        || !["-u", "--set-upstream"].contains(&args[0].as_str())
-        || args[1] != "origin"
-    {
-        return Some("pushはoriginへの単一作業ブランチを明示してください".into());
-    }
-    let Some(branch) = args[2].strip_prefix("HEAD:refs/heads/") else {
-        return Some("push元はHEAD、push先はrefs/heads/<branch>で明示してください".into());
-    };
-    if !valid_work_branch(branch) {
+    let Some(branch) = push_branch(args, cwd) else {
         return Some("保護ブランチまたは許可されていないprefixへのpushです".into());
+    };
+    push_preflight_reason(cwd, &branch)
+}
+
+fn push_branch(args: &[String], cwd: &str) -> Option<String> {
+    let args = if args
+        .first()
+        .is_some_and(|v| matches!(v.as_str(), "-u" | "--set-upstream"))
+    {
+        &args[1..]
+    } else {
+        args
+    };
+    let [remote, destination] = args else {
+        return None;
+    };
+    if remote != "origin" {
+        return None;
     }
-    push_preflight_reason(cwd, branch)
+    let branch = if destination == "HEAD" {
+        run_git(cwd, &["symbolic-ref", "--short", "HEAD"])?
+            .trim()
+            .to_owned()
+    } else {
+        destination
+            .strip_prefix("HEAD:refs/heads/")
+            .unwrap_or(destination)
+            .to_owned()
+    };
+    valid_work_branch(&branch).then_some(branch)
 }
 
 fn changes_secret_reason(names: &str, patch: &str, label: &str) -> Option<String> {
@@ -3068,10 +3087,10 @@ fn strict_gh_args(
             i += 2;
             continue;
         }
-        if value_options
-            .iter()
-            .any(|(_, long)| starts_with_option(token, long))
-        {
+        if value_options.iter().any(|(short, long)| {
+            starts_with_option(token, long)
+                || matches!(*short, "-R" | "-F") && token.starts_with(short) && token.len() > 2
+        }) {
             i += 1;
             continue;
         }
@@ -3423,6 +3442,14 @@ fn git_subcommand_index(tokens: &[String]) -> Option<(usize, usize, &str)> {
 /// passed the strict parser. Repository hooks and user SSH configuration must
 /// not become a second execution path for an otherwise allowed command.
 fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option<String>, String> {
+    rewrite_git_with_actor(command, cwd, trust::github_actor)
+}
+
+fn rewrite_git_with_actor(
+    command: &str,
+    cwd: Option<&str>,
+    verify: fn(&Path, Option<&str>) -> Result<(), String>,
+) -> Result<Option<String>, String> {
     let segments = command_segments(command);
     if segments.len() != 1 {
         return Ok(None);
@@ -3449,6 +3476,17 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
     let network = subcommand
         .as_deref()
         .is_some_and(|value| ["fetch", "pull", "push", "ls-remote"].contains(&value));
+    if matches!(subcommand.as_deref(), Some("diff" | "show" | "log")) {
+        tokens.insert(subcommand_index + 1, "--no-ext-diff".to_string());
+    }
+    if subcommand.as_deref() == Some("push") {
+        let branch = push_branch(
+            &tokens[subcommand_index + 1..],
+            execution_cwd.as_deref().unwrap_or(""),
+        )
+        .ok_or("push先branchを解決できません")?;
+        *tokens.last_mut().ok_or("push先がありません")? = format!("HEAD:refs/heads/{branch}");
+    }
 
     let git = trust::trusted_system_binary(SYSTEM_GIT, "Git")?;
     tokens[git_index] = git;
@@ -3484,8 +3522,14 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
             .as_deref()
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "network Gitのrepository cwdを確認できません".to_string())?;
-        let (_, origin) = verified_origin(cwd)
+        let (repository, origin) = verified_origin(cwd)
             .ok_or_else(|| "network GitのGitHub originを確認できません".to_string())?;
+        let transport = if subcommand.as_deref() == Some("push") && !origin.starts_with("https://")
+        {
+            format!("https://github.com/{repository}.git")
+        } else {
+            origin.clone()
+        };
         configs.extend(
             [
                 "-c",
@@ -3521,25 +3565,38 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
             "-c".to_string(),
             format!("remote.origin.pushurl={origin}"),
             "-c".to_string(),
-            format!("url.{origin}.insteadOf={origin}"),
+            format!("url.{transport}.insteadOf={origin}"),
             "-c".to_string(),
-            format!("url.{origin}.pushInsteadOf={origin}"),
+            format!("url.{transport}.pushInsteadOf={origin}"),
             "-c".to_string(),
-            format!("credential.{origin}.helper="),
+            format!("credential.{transport}.helper="),
             "-c".to_string(),
-            format!("http.{origin}.proxy="),
+            format!("http.{transport}.proxy="),
             "-c".to_string(),
-            format!("http.{origin}.extraHeader="),
+            format!("http.{transport}.extraHeader="),
             "-c".to_string(),
-            format!("http.{origin}.sslVerify=true"),
+            format!("http.{transport}.sslVerify=true"),
         ]);
-        if origin.starts_with("https://") {
+        if transport.starts_with("https://") {
             trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI")?;
-            let snapshot = GuardGhSandbox::create()
-                .ok_or_else(|| {
-                    "Git credential configをprivate snapshotへ固定できません".to_string()
-                })?
-                .into_persistent();
+            let snapshot = GuardGhSandbox::create().ok_or_else(|| {
+                "Git credential configをprivate snapshotへ固定できません".to_string()
+            })?;
+            if subcommand.as_deref() == Some("push") {
+                let listing = run_git(
+                    cwd,
+                    &["log", "--format=%ae", "HEAD", "--not", "--remotes=origin"],
+                )
+                .ok_or("Git 著者を確認できません")?;
+                let authors: std::collections::BTreeSet<_> = listing.lines().collect();
+                if authors.is_empty() {
+                    verify(snapshot.path(), None)?;
+                }
+                for author in authors {
+                    verify(snapshot.path(), Some(author))?;
+                }
+            }
+            let snapshot = snapshot.into_persistent();
             let snapshot = snapshot
                 .to_str()
                 .ok_or_else(|| "Git credential snapshot pathを確認できません".to_string())?
@@ -3623,7 +3680,34 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
     ))
 }
 
-fn rewrite_gh_safety_command(command: &str) -> Result<Option<String>, String> {
+fn bind_write_repo(tokens: &mut Vec<String>, cwd: Option<&str>) -> Result<(), String> {
+    if let [gh, kind, action, args @ ..] = tokens.as_slice()
+        && gh == "gh"
+        && matches!(kind.as_str(), "issue" | "pr")
+        && matches!(
+            action.as_str(),
+            "create"
+                | "edit"
+                | "comment"
+                | "review"
+                | "close"
+                | "reopen"
+                | "ready"
+                | "update-branch"
+        )
+        && !args
+            .iter()
+            .any(|arg| arg.starts_with("-R") || arg.starts_with("--repo"))
+    {
+        let repo = cwd
+            .and_then(origin_repository)
+            .ok_or("書き込み先の origin を確認できません")?;
+        tokens.extend(["--repo".to_string(), repo]);
+    }
+    Ok(())
+}
+
+fn rewrite_gh_safety_command(command: &str, cwd: Option<&str>) -> Result<Option<String>, String> {
     let segments = command_segments(command);
     if segments.len() != 1 {
         return Ok(None);
@@ -3632,11 +3716,15 @@ fn rewrite_gh_safety_command(command: &str) -> Result<Option<String>, String> {
     if tokens.first().map(String::as_str) != Some("gh") {
         return Ok(None);
     }
+    bind_write_repo(&mut tokens, cwd)?;
     let gh = trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI")?;
     trust::trusted_system_binary(SYSTEM_ENV, "Env")?;
     let snapshot = GuardGhSandbox::create()
-        .ok_or_else(|| "GitHub configをprivate snapshotへ固定できません".to_string())?
-        .into_persistent();
+        .ok_or_else(|| "GitHub configをprivate snapshotへ固定できません".to_string())?;
+    if has_write_operation(&tokens) {
+        trust::github_actor(snapshot.path(), None)?;
+    }
+    let snapshot = snapshot.into_persistent();
     let snapshot = snapshot
         .to_str()
         .ok_or_else(|| "GitHub config snapshot pathを確認できません".to_string())?;
@@ -3948,7 +4036,7 @@ fn rewrite_single_safety_command(
             changed = true;
         }
     }
-    if let Some(next) = rewrite_gh_safety_command(&updated)? {
+    if let Some(next) = rewrite_gh_safety_command(&updated, cwd)? {
         updated = next;
         changed = true;
     }
@@ -4632,6 +4720,7 @@ fn gh_read_only_args_reason(args: &[String], label: &str) -> Option<String> {
     ];
     const SWITCHES: &[&str] = &[
         "--comments",
+        "--verbose",
         "--watch",
         "--required",
         "--fail-fast",
@@ -4706,7 +4795,11 @@ fn gh_invocation_reason(tokens: &[String], cwd: Option<&str>) -> Option<String> 
     {
         return None;
     }
-    let (command, args) = first_command(&tokens[1..], GH_GLOBAL_VALUE_OPTIONS);
+    let mut resolved = tokens.to_vec();
+    if let Err(reason) = bind_write_repo(&mut resolved, cwd) {
+        return Some(reason);
+    }
+    let (command, args) = first_command(&resolved[1..], GH_GLOBAL_VALUE_OPTIONS);
     let command = command?;
     let cwd = cwd.unwrap_or("");
     match command.as_str() {
@@ -5059,6 +5152,13 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
     }
     if command == "authorize-ci" {
         return super::delivery::ci_authorization_invocation_reason(args);
+    }
+    if matches!(command.as_str(), "deliver" | "finish" | "status")
+        && args.len() == 3
+        && args[1] == "--task-id"
+        && valid_task_id(&args[2])
+    {
+        return None;
     }
     if !["record-review", "approve-review", "deliver", "finish"].contains(&command.as_str()) {
         return Some("許可されていないdelivery helper操作です".into());
@@ -6182,7 +6282,7 @@ fn allow_updated_input(command: &str) {
 }
 
 /// Run the hook protocol.  `0` means allow, `2` means deny or malformed input.
-pub fn entrypoint() -> i32 {
+pub fn entrypoint(claude: bool) -> i32 {
     let mut input = Vec::with_capacity(8 * 1024);
     let mut limited = io::stdin().lock().take((MAX_HOOK_INPUT_BYTES + 1) as u64);
     if limited.read_to_end(&mut input).is_err() || input.len() > MAX_HOOK_INPUT_BYTES {
@@ -6239,7 +6339,22 @@ pub fn entrypoint() -> i32 {
         }
     };
     if updated_command != command {
-        allow_updated_input(&updated_command);
+        if claude {
+            // Claude Code は updatedInput で引数全体を置換する。元の権限判定に委ねる。
+            let Ok(mut event) = serde_json::from_str::<serde_json::Value>(input) else {
+                deny("Claude Code の入力を解析できません");
+                return 2;
+            };
+            event["tool_input"]["command"] = updated_command.into();
+            println!(
+                "{}",
+                serde_json::json!({"hookSpecificOutput":{
+                    "hookEventName":"PreToolUse", "updatedInput": event["tool_input"]
+                }})
+            );
+        } else {
+            allow_updated_input(&updated_command);
+        }
     }
     0
 }
@@ -7224,6 +7339,7 @@ mod tests {
             vec!["init", "-q"],
             vec!["config", "user.name", "Codex Test"],
             vec!["config", "user.email", "codex@example.invalid"],
+            vec!["commit", "--allow-empty", "-qm", "fixture"],
             vec![
                 "remote",
                 "add",
@@ -7257,7 +7373,7 @@ mod tests {
             "git push -u origin feature/example",
             "git ls-remote --branches origin feature/example",
         ] {
-            let rewritten = rewrite_git_safety_command(command, Some(cwd))
+            let rewritten = rewrite_git_with_actor(command, Some(cwd), |_, _| Ok(()))
                 .expect("rewrite network command")
                 .expect("network command requires a rewrite");
             assert!(
@@ -7331,7 +7447,7 @@ mod tests {
     fn allowed_gh_command_uses_a_private_fixed_environment_snapshot() {
         use std::os::unix::fs::MetadataExt;
 
-        let rewritten = rewrite_gh_safety_command("gh issue view 31 --repo Daiki48/dotfiles")
+        let rewritten = rewrite_gh_safety_command("gh issue view 31 --repo Daiki48/dotfiles", None)
             .expect("rewrite GitHub command")
             .expect("GitHub command requires a rewrite");
         assert!(rewritten.starts_with("'/usr/bin/env'"));

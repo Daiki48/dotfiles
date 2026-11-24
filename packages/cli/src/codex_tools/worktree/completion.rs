@@ -24,6 +24,8 @@ struct Binding {
     worktree: PathBuf,
     branch: String,
     active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer: Option<Writer>,
     // 再開しても最後の停止理由は監査用に保持する。
     exception: Option<Exception>,
 }
@@ -34,6 +36,159 @@ struct Exception {
     boundary: Boundary,
     reason: String,
     at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Writer {
+    pid: u32,
+    start: u64,
+    boot: String,
+    namespace: PathBuf,
+}
+
+// 同じ PID が再利用されても別の CLI を旧担当とみなさない。
+fn process(pid: u32) -> io::Result<(String, u32, u64)> {
+    read_process(&Path::new("/proc").join(pid.to_string()))
+}
+
+fn read_process(directory: &Path) -> io::Result<(String, u32, u64)> {
+    let stat = fs::read_to_string(directory.join("stat"))?;
+    let invalid = || io::Error::from(io::ErrorKind::InvalidData);
+    let (_, rest) = stat.split_once('(').ok_or_else(invalid)?;
+    let (name, fields) = rest.rsplit_once(')').ok_or_else(invalid)?;
+    let fields: Vec<_> = fields.split_whitespace().collect();
+    let parent = fields
+        .get(1)
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(invalid)?;
+    let start = fields
+        .get(19)
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(invalid)?;
+    Ok((name.to_owned(), parent, start))
+}
+
+impl Writer {
+    fn for_process(pid: u32, start: u64) -> Option<Self> {
+        Some(Self {
+            pid,
+            start,
+            boot: fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?,
+            namespace: fs::read_link("/proc/self/ns/pid").ok()?,
+        })
+    }
+    fn current() -> Option<Self> {
+        let mut pid = std::process::id();
+        while pid > 1 {
+            let (name, parent, start) = process(pid).ok()?;
+            if matches!(name.as_str(), "codex" | "claude") {
+                return Self::for_process(pid, start);
+            }
+            pid = parent;
+        }
+        None
+    }
+
+    fn exited(&self) -> bool {
+        if fs::read_to_string("/proc/sys/kernel/random/boot_id").is_ok_and(|boot| boot != self.boot)
+        {
+            return true;
+        }
+        if fs::read_link("/proc/self/ns/pid").ok().as_ref() != Some(&self.namespace) {
+            return false;
+        }
+        match process(self.pid) {
+            Ok((_, _, start)) => start != self.start,
+            Err(e) => e.kind() == io::ErrorKind::NotFound,
+        }
+    }
+}
+
+// 旧記録には PID がない。通常ホストで、その記録より前から生存する
+// 同一 UID の Codex が一つもないことを確認できた場合だけ移行する。
+#[cfg(target_os = "linux")]
+fn legacy_writer_exited(record: &Path) -> bool {
+    legacy_writer_exited_in(record, Path::new("/proc"))
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_writer_exited_in(record: &Path, processes: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::UNIX_EPOCH;
+    let inspect = || -> Option<bool> {
+        let init = fs::read_to_string(processes.join("1/comm")).ok()?;
+        if !matches!(init.trim(), "systemd" | "init") {
+            return None;
+        }
+        let written = fs::metadata(record)
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let boot: u64 = fs::read_to_string(processes.join("stat"))
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))?
+            .parse()
+            .ok()?;
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks <= 0 {
+            return None;
+        }
+        let uid = unsafe { libc::geteuid() };
+        for item in fs::read_dir(processes).ok()? {
+            let item = item.ok()?;
+            let Some(_) = item
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let metadata = match item.metadata() {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                result => result.ok()?,
+            };
+            if metadata.uid() != uid {
+                continue;
+            }
+            let (name, _, start) = match read_process(&item.path()) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                result => result.ok()?,
+            };
+            if (name.starts_with("codex") || name == "claude")
+                && boot + start / ticks as u64 <= written + 1
+            {
+                return Some(false);
+            }
+        }
+        Some(true)
+    };
+    inspect() == Some(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn legacy_writer_exited(_: &Path) -> bool {
+    false
+}
+
+pub(super) fn current_session() -> Option<String> {
+    let claude = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+    let codex = std::env::var("CODEX_THREAD_ID").ok();
+    if claude.is_some() && codex.is_some() {
+        let mut pid = std::process::id();
+        while pid > 0 {
+            let (name, parent, _) = process(pid).ok()?;
+            match name.as_str() {
+                "codex" => return codex,
+                "claude" => break,
+                _ => pid = parent,
+            }
+        }
+    }
+    claude.map(|id| format!("claude-{id}")).or(codex)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, ValueEnum)]
@@ -185,6 +340,9 @@ fn bind(home: &Path, id: &str, binding: Binding) -> Result<()> {
             return Err("既存sessionの担当identityが一致しません".into());
         }
         old.active = true;
+        if binding.writer.is_some() {
+            old.writer = binding.writer;
+        }
     } else {
         if session.bindings.len() >= 64 {
             return Err("sessionの担当数が上限です".into());
@@ -195,14 +353,15 @@ fn bind(home: &Path, id: &str, binding: Binding) -> Result<()> {
 }
 
 pub(super) fn bind_current(cwd: &Path, task_id: &str) -> Result<()> {
-    let Some(id) = std::env::var_os("CODEX_THREAD_ID") else {
+    let Some(id) = current_session() else {
         return Ok(());
     };
-    let id = id.to_str().ok_or("session IDがUTF-8ではありません")?;
     if let Ok(marker) = std::env::var("CODEX_TASK_WORKER") {
         crate::codex_tools::task::completion_worker_scope(task_id, &marker)?;
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    let _worker = crate::codex_tools::task::standalone_writer_lease(task_id)?;
     let repo = inspect_repository(cwd, false, false).map_err(|e| e.to_string())?;
     // base取り込みの担当確認からGit操作まで、新しいsessionの担当追加を待たせる。
     let (_, _, lock_path) = managed_paths(&repo, task_id, false).map_err(|e| e.to_string())?;
@@ -213,9 +372,14 @@ pub(super) fn bind_current(cwd: &Path, task_id: &str) -> Result<()> {
         .find(|(_, m)| m.task_id == task_id && m.status == "ready")
         .map(|(_, m)| m)
         .ok_or("担当manifestを確認できません")?;
+    reject_other_active_sessions(
+        &codex_home().map_err(|e| e.to_string())?,
+        &manifest,
+        Some(&id),
+    )?;
     bind(
         &codex_home().map_err(|e| e.to_string())?,
-        id,
+        &id,
         Binding {
             task_id: task_id.into(),
             github: repo.github_name,
@@ -224,6 +388,7 @@ pub(super) fn bind_current(cwd: &Path, task_id: &str) -> Result<()> {
             worktree: manifest.worktree.into(),
             branch: manifest.branch,
             active: true,
+            writer: Writer::current(),
             exception: None,
         },
     )
@@ -243,6 +408,7 @@ pub(super) fn lock_merge_binding(
         .iter()
         .find(|binding| {
             binding.active
+                && !binding.writer.as_ref().is_some_and(Writer::exited)
                 && binding.task_id == target.task_id
                 && binding.repository == repository.root
                 && binding.common_git_dir == repository.common_git_dir
@@ -261,11 +427,35 @@ pub(super) fn reject_other_active_sessions(
     target: &Manifest,
     owner: Option<&str>,
 ) -> Result<()> {
+    if conflicting_session(home, owner, |binding| {
+        binding.worktree == Path::new(&target.worktree)
+            || binding.task_id == target.task_id
+                && binding.common_git_dir == Path::new(&target.common_git_dir)
+    })? {
+        return Err(
+            "別sessionに有効な担当記録があります。担当を照合してから再試行してください".into(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn worker_available(home: &Path, root: &Path, github: &str, id: &str) -> Result<bool> {
+    conflicting_session(home, None, |binding| {
+        binding.repository == root && binding.github == github && binding.task_id == id
+    })
+    .map(|busy| !busy)
+}
+
+fn conflicting_session(
+    home: &Path,
+    owner: Option<&str>,
+    matches: impl Fn(&Binding) -> bool,
+) -> Result<bool> {
     let directory = home.join("worktrees/.sessions");
     reject_symlink_components(&directory).map_err(|e| e.to_string())?;
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
-        Err(cause) if cause.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(cause) if cause.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(_) => return Err("担当session一覧を安全に確認できません".into()),
     };
     safe_directory(&directory).map_err(|e| e.to_string())?;
@@ -289,16 +479,16 @@ pub(super) fn reject_other_active_sessions(
         let session = load(&path, id)?;
         if session.bindings.iter().any(|binding| {
             binding.active
-                && (binding.worktree == Path::new(&target.worktree)
-                    || binding.task_id == target.task_id
-                        && binding.common_git_dir == Path::new(&target.common_git_dir))
+                && matches(binding)
+                && !binding
+                    .writer
+                    .as_ref()
+                    .map_or_else(|| legacy_writer_exited(&path), Writer::exited)
         }) {
-            return Err(
-                "別sessionに有効な担当記録があります。担当を照合してから再試行してください".into(),
-            );
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 #[derive(Parser)]
@@ -317,7 +507,7 @@ pub(super) fn command(args: &[OsString]) -> Result<()> {
         std::iter::once(OsString::from("completion")).chain(args.iter().cloned()),
     )
     .map_err(|e| e.to_string())?;
-    let id = std::env::var("CODEX_THREAD_ID").map_err(|_| "現在のCodex session IDが必要です")?;
+    let id = current_session().ok_or("現在の CLI session IDが必要です")?;
     let path = session_path(&codex_home().map_err(|e| e.to_string())?, &id, false)?;
     let _lock = Lock::acquire_short(&path.with_extension("lock"))?;
     let mut session = load(&path, &id)?;
@@ -345,9 +535,13 @@ pub(super) fn command(args: &[OsString]) -> Result<()> {
         atomic_json(&path, &session)?;
         println!("指定境界を記録しました。task完了を意味しません。");
     } else {
+        let mut summary = serde_json::to_value(binding).map_err(|e| e.to_string())?;
+        if let Some(fields) = summary.as_object_mut() {
+            fields.remove("writer");
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(binding).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?
         );
     }
     Ok(())
@@ -357,6 +551,8 @@ pub(super) fn command(args: &[OsString]) -> Result<()> {
 struct StopInput {
     session_id: String,
     hook_event_name: String,
+    #[serde(default)]
+    stop_hook_active: bool,
 }
 
 fn check(home: &Path, input: &StopInput) -> Result<Value> {
@@ -370,22 +566,39 @@ fn check(home: &Path, input: &StopInput) -> Result<Value> {
     {
         return Ok(json!({}));
     }
-    let session = load(&path, &input.session_id)?;
+    let _lock = Lock::acquire_short(&path.with_extension("lock"))?;
+    let mut session = load(&path, &input.session_id)?;
     let mut pending = Vec::new();
-    for binding in session.bindings.iter().filter(|b| b.active) {
-        if !completed(binding)? {
-            pending.push(binding.task_id.as_str());
+    let mut transferred = false;
+    for binding in session.bindings.iter_mut().filter(|b| b.active) {
+        if completed(binding)? {
+            continue;
+        }
+        if crate::codex_tools::task::monitoring(
+            home,
+            &binding.repository,
+            &binding.worktree,
+            &binding.task_id,
+            &binding.branch,
+        )? {
+            binding.active = false;
+            transferred = true;
+        } else {
+            pending.push(binding.task_id.clone());
         }
     }
-    if pending.is_empty() {
+    if transferred {
+        atomic_json(&path, &session)?;
+    }
+    if pending.is_empty() || input.stop_hook_active {
         return Ok(json!({}));
     }
     // 任意のログ・Issue本文・assistant最終文は継続promptへ挿入しない。
     Ok(json!({"decision":"block", "reason":format!(
-        "担当task {} はfinish・Issue記録・main同期・物理cleanupまで未完了です。CI開始・待機・成功だけで終了しないでください。現在の固定headと担当を照合し、CIを監視して失敗時は診断・許可内の修復、成功後はreview・deliver・main CI・finishまで続けてください。外部待機中は次回観測までtoolで待機し、同条件の無限retryをしないでください。新writerやtaskを追加せず既存担当を保護してください。利用者が明示停止・途中納品を指定した場合、または真正な人間判断が必要な場合だけ、codex-worktree completionで境界と具体的根拠を保存して返してください。技術的失敗やCI待ちは解除理由になりません。", pending.join(", "))}))
+        "担当task {} の完了記録を確認できません。実行可能な工程は続けてください。外部待機なら同じtaskを監視するcoordinatorと次回観測を照合し、状況を返してください。引き継げない場合は理由と再開点を返してください。", pending.join(", "))}))
 }
 
-pub(crate) fn hook_entrypoint() -> i32 {
+pub(crate) fn hook_entrypoint(claude: bool) -> i32 {
     let result = (|| {
         let mut bytes = Vec::new();
         std::io::stdin()
@@ -396,8 +609,11 @@ pub(crate) fn hook_entrypoint() -> i32 {
         if bytes.len() > 1024 * 1024 {
             return Err("Stop入力が上限を超えています".into());
         }
-        let input: StopInput =
+        let mut input: StopInput =
             serde_json::from_slice(&bytes).map_err(|_| "Stop入力の形式が不正です")?;
+        if claude {
+            input.session_id = format!("claude-{}", input.session_id);
+        }
         check(&codex_home().map_err(|e| e.to_string())?, &input)
     })();
     let output = result.unwrap_or_else(|_| json!({"decision":"block", "reason":
@@ -429,6 +645,9 @@ mod tests {
             worktree: path,
             branch: "fix/completion".into(),
             active: true,
+            writer: process(std::process::id())
+                .ok()
+                .and_then(|(_, _, start)| Writer::for_process(std::process::id(), start)),
             exception: None,
         };
         (fixture, binding)
@@ -440,6 +659,7 @@ mod tests {
             &StopInput {
                 session_id: id.into(),
                 hook_event_name: "Stop".into(),
+                stop_hook_active: false,
             },
         )
         .unwrap()
@@ -468,6 +688,73 @@ mod tests {
         binding.worktree.set_file_name("task-unrelated");
         bind(home, "unrelated", binding).unwrap();
         assert!(reject_other_active_sessions(home, &target, Some("owner")).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn legacy_writer_requires_an_unambiguous_host_process_scan() {
+        let (fixture, _) = fixture();
+        let root = fixture.codex_home.join("synthetic-proc");
+        fs::create_dir_all(root.join("1")).unwrap();
+        fs::write(root.join("1/comm"), "systemd\n").unwrap();
+        fs::write(root.join("stat"), "btime 1\n").unwrap();
+        let record = fixture.codex_home.join("legacy-record");
+        fs::write(&record, "{}").unwrap();
+        let pid = root.join("20");
+        fs::create_dir(&pid).unwrap();
+        let stat = format!("20 (codex) S {}2", "0 ".repeat(18));
+        fs::write(pid.join("stat"), &stat).unwrap();
+        assert!(!legacy_writer_exited_in(&record, &root));
+        fs::write(pid.join("stat"), stat.replace("(codex)", "(sh)")).unwrap();
+        assert!(legacy_writer_exited_in(&record, &root));
+        fs::write(root.join("1/comm"), "isolated").unwrap();
+        assert!(!legacy_writer_exited_in(&record, &root));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn limited_writer_can_be_replaced_in_both_directions_with_dirty_worktree() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        for (old, next) in [
+            ("codex-example", "claude-example"),
+            ("claude-example", "codex-example"),
+        ] {
+            let (fixture, mut binding) = fixture();
+            let next_writer = binding.writer.clone();
+            let tracked = binding.worktree.join("README.md");
+            let partial = binding.worktree.join("unverified.txt");
+            fs::write(&tracked, "未検証の変更").unwrap();
+            fs::write(&partial, "取得済みの途中結果").unwrap();
+            // 制限時に終了する CLI を模擬し、旧担当からの解放操作を要求しない。
+            let mut child = Command::new("sh")
+                .args(["-c", "read answer; exit 75"])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            binding.writer = Some(Writer {
+                pid,
+                start: process(pid).unwrap().2,
+                namespace: fs::read_link("/proc/self/ns/pid").unwrap(),
+                boot: fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap(),
+            });
+            let home = &fixture.codex_home;
+            bind(home, old, binding.clone()).unwrap();
+            let target = manifest(&binding).unwrap();
+            assert!(reject_other_active_sessions(home, &target, Some(next)).is_err());
+            child.stdin.take().unwrap().write_all(b"limited\n").unwrap();
+            assert_eq!(child.wait().unwrap().code(), Some(75));
+            assert!(reject_other_active_sessions(home, &target, Some(next)).is_ok());
+            let resumed =
+                super::super::resume(&binding.repository, &binding.task_id, true).unwrap();
+            assert_eq!(resumed, binding.worktree);
+            binding.writer = next_writer;
+            bind(home, next, binding).unwrap();
+            assert_eq!(fs::read_to_string(tracked).unwrap(), "未検証の変更");
+            assert_eq!(fs::read_to_string(partial).unwrap(), "取得済みの途中結果");
+            assert!(reject_other_active_sessions(home, &target, Some(old)).is_err());
+        }
     }
 
     #[test]
@@ -505,6 +792,22 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(stop(&fixture.codex_home, "owner")["decision"], "block");
         }
+    }
+
+    #[test]
+    fn status_response_keeps_the_pending_binding_for_next_turn() {
+        let (fixture, binding) = fixture();
+        let home = &fixture.codex_home;
+        bind(home, "example", binding.clone()).unwrap();
+        assert_eq!(stop(home, "example")["decision"], "block");
+        let input = StopInput {
+            session_id: "example".into(),
+            hook_event_name: "Stop".into(),
+            stop_hook_active: true,
+        };
+        assert_eq!(check(home, &input).unwrap(), json!({}));
+        assert!(!completed(&binding).unwrap());
+        assert_eq!(stop(home, "example")["decision"], "block");
     }
 
     #[test]
@@ -558,7 +861,8 @@ mod tests {
                 &fixture.codex_home,
                 &StopInput {
                     session_id: "owner".into(),
-                    hook_event_name: "Stop".into()
+                    hook_event_name: "Stop".into(),
+                    stop_hook_active: false,
                 }
             )
             .is_err()

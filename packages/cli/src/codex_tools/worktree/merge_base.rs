@@ -286,8 +286,8 @@ pub(super) fn run(
         let home = codex_home()?;
         let owner = if marker.is_none() {
             Some(
-                std::env::var("CODEX_THREAD_ID")
-                    .map_err(|_| error("現在のCodex session IDが必要です"))?,
+                completion::current_session()
+                    .ok_or_else(|| error("現在の CLI session IDが必要です"))?,
             )
         } else {
             None

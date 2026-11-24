@@ -1,4 +1,10 @@
 {
+  "attribution": { "commit": "", "pr": "" },
+  "pluginConfigs": {
+    "cc-plugin-agents-md@builtin": {
+      "options": { "instructionFiles": "claude-md-and-agents-md" }
+    }
+  },
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
@@ -57,6 +63,17 @@
   },
   "model": "claude-fable-5[1m]",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [{ "type": "command", "command": "\"$HOME/.codex/hooks/block-git-write\" --claude" }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{ "type": "command", "command": "\"$HOME/.codex/hooks/block-git-write\" --claude-stop" }]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",

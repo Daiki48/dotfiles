@@ -20,7 +20,7 @@ Issueの作成・本文編集・コメントとDraft PRの作成は、[公開用
 - 親checkoutで`codex-worktree create --issue <番号> --branch <branch>`、Issueなしなら`--issue`を省略して実行する。helperがoriginのdefault branchをfetchするため、手動fetchを前提にしない。初期化済みremoteならlocalにcommitがなくても親のファイルを保持して作成する。remoteが空なら初回公開の内容と対象branchを具体化して確認する。
 - 再開は`doctor --task-id <ID>`と`resume --task-id <ID>`で照合する。作成途中の`interrupted`だけは`recover`で検証して再開する。所有不明の差分、想定外のremote/path/branchは保持して停止する。
 - 全編集とtestの実行先を専用worktreeへ固定する。Git書き込みは`git -C <worktree絶対path> ...`、環境にSSH_ASKPASSがあれば`env -u SSH_ASKPASS git -C ...`を使う。helperは親checkoutから単独commandで呼ぶ。
-- `create/resume/recover`は現在のCodex sessionに完了責任を自動記録する。Stop hookはその担当だけを検査し、CI待ち・技術的失敗では終了を継続へ戻す。`codex-worktree completion --task-id <ID>`で担当を確認できる。古いworktreeは所有を照合して通常の`resume`で接続し、別IDを作らない。
+- `create/resume/recover`は現在の CLI セッションに担当を記録する。同一ホストで交代するときは親 checkout から `codex-worktree resume --task-id <ID>` を使い、表示された worktree の status、diff、PR、固定 head の検証を照合する。旧担当の CLI が終了し、同じホストでプロセス終了を確認できれば、旧担当の追加操作は不要。生存または所有不明の担当がいれば引き継ぎを保留する。
 - 利用者の明示停止、指定された途中納品、真正な人間判断で返答が必要な場合だけ、`codex-worktree completion --task-id <ID> --boundary user-stop|changes|pr|merge|human-decision --reason '<元の指示または必要判断の具体的根拠>'`を保存する。これは完了ではなく例外境界の記録であり、CI待ち・失敗回数・便宜的な終了に使わない。再開の`resume`で再び有効になる。coordinator workerは保存済み世代と生存lockを照合し、段階報告後の継続をcoordinatorへ返す。
 - branch、commit、PRの形式は最近の関連履歴に合わせる。慣例がなければ日本語、branchは一般的prefixと英語kebab-caseとし、`codex/`は使わない。
 
@@ -66,7 +66,7 @@ CI基盤障害の判断は継続委任されている。[deliveryガイド](../.
 
 strict modeはlive Ruleset gateを必要とする。明示認可されたprivate repositoryの`github-free-private`はhigh以上とし、APIエラーから自動選択しない。gateの詳細、main同期の限定復旧、sandbox retryは[deliveryガイド](../../../docs/codex-delivery.ja.md)を必要時に読む。`--sandbox-retry`はhelperが発行したtokenがある場合だけ、同一UIDで1回再試行する。
 
-finishまでの依頼を、CI起動・CI待機だけで最終回答して終了しない。固定headのCIを監視し、失敗なら原因へ戻り、成功後もreview・deliver・実mergeのmain CI・finishまで続ける。Daikiが親セッションの継続を求めた場合は、そのセッションも終了しない。
+外部待機では同じ Task ID・PR・head を担当する coordinator の生存と次回観測を確認し、残工程を引き継いで状況を返す。既存の clean な PR を引き継ぐときは、親 checkout で `codex-task submit` に元の依頼・停止条件・Task ID・branch と `--resume-pr <番号>` を指定し、`start` と `show` で担当を確認する。引き継げなければ理由と再開点を報告する。完了は finish と実環境の受け入れ条件で判定する。
 
 親終了後の自律継続を依頼された場合は、終了前に`parallel-development`へ引き継ぐ。既存taskを`list/show`で照合して再利用し、未登録なら既存managed worktreeと同じtask ID・明示branchで登録する。旧writerの停止・非使用を確認し、既存PR・固定head・Plan/版・risk・gate・CI label許可・停止境界と残るdeliveryを目的へ保存する。同UIDの通常ホスト側で`start`した後、対象taskが既存PR/headを認識し、CI監視または次段階を担当していることまで確認する。`already_running`だけでは対象taskの引継ぎ完了と扱わない。引継ぎ記録と完了報告を区別し、CI待ちを理由にtaskをpauseしない。既存の利用者pauseは勝手に解除しない。
 

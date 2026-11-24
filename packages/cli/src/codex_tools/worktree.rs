@@ -1116,14 +1116,28 @@ pub(crate) fn task_head(cwd: &Path) -> Result<String, WorktreeError> {
     git_stdout(cwd, &["rev-parse", "--verify", "HEAD^{commit}"]).map(|head| head.trim().into())
 }
 
+fn task_status(cwd: &Path) -> Result<String, WorktreeError> {
+    git_stdout(
+        cwd,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+    )
+}
+
+pub(super) fn matches_monitored_head(
+    cwd: &Path,
+    branch: &str,
+    head: Option<&str>,
+) -> Result<bool, WorktreeError> {
+    Ok(head == Some(task_head(cwd)?.as_str())
+        && git_stdout(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() == branch
+        && task_status(cwd)?.is_empty())
+}
+
 /// 監視には状態のdigestだけを渡し、file名や内容をtaskイベントへ保存しない。
 pub(crate) fn task_observation(cwd: &Path) -> Result<String, WorktreeError> {
     use sha2::{Digest, Sha256};
     let head = task_head(cwd)?;
-    let status = git_stdout(
-        cwd,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
-    )?;
+    let status = task_status(cwd)?;
     let mut observed = format!("{head}\n{status}");
     for row in status.split('\0') {
         if row.len() < 4 {
@@ -3934,6 +3948,11 @@ mod tests {
             }
             let task_before = snapshot(&target).unwrap();
             let parent_before = snapshot(&fixture.repository).unwrap();
+            assert_eq!(
+                matches_monitored_head(&target, "fix/sync", Some(&old)).unwrap(),
+                kind == "parent",
+                "{kind}"
+            );
             assert!(
                 sync_worktree(&fixture.repository, "task-sync", &old, &new, true).is_err(),
                 "{kind}"
