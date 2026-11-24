@@ -597,12 +597,8 @@ pub(crate) fn monitoring(
         && task.worktree.as_deref() == Some(workspace)
         && !task.pause_requested
         && task.pr.is_some()
-        && task.head.as_deref()
-            == Some(
-                worktree::task_head(workspace)
-                    .map_err(|e| e.to_string())?
-                    .as_str(),
-            )
+        && worktree::matches_monitored_head(workspace, branch, task.head.as_deref())
+            .map_err(|e| e.to_string())?
         && matches!(
             task.phase,
             Phase::Review
