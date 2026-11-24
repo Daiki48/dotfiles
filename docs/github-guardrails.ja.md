@@ -69,6 +69,30 @@ Codexの[`PreToolUse` hook](https://learn.chatgpt.com/docs/hooks)は現時点で
 毎回確認する[`prompt` rule](https://learn.chatgpt.com/docs/agent-configuration/rules)を組み合わせます。その経路が実装・検証されるまでは、確認済みという
 会話上の事実だけでhard denyを迂回しません。
 
+<a id="github-write-examples"></a>
+
+## Issue・Draft PRの本文を送る正規形
+
+送信する本文を `/tmp` 配下の自分が所有する通常ファイル（UTF-8、256 KiB 以下）に保存します。
+タイトルと本文全体を読み、公開できる情報だけが含まれていることを確認します。
+確認したファイルの絶対パスを `--body-file` に渡し、各操作を単独で実行します。
+
+以下は架空の例です。実行時は `--repo` を現在の origin に合わせ、編集・コメントには対象の番号を1件だけ指定します。
+
+```sh
+gh issue create --repo example/project --title '表示例を更新する' --body-file /tmp/example-issue.md
+gh issue edit 42 --repo example/project --body-file /tmp/example-issue.md
+gh issue comment 42 --repo example/project --body-file /tmp/example-comment.md
+```
+
+Draft PR は `gh pr create --draft` で始め、origin の default branch と、
+clean な managed worktree から push 済みの作業ブランチを指定します。
+本文には関連する Issue を「関連 Issue #42」のように記載できます。
+
+```sh
+gh pr create --draft --repo example/project --base main --head feat/example --title '表示例を更新' --body-file /tmp/example-pr.md
+```
+
 ## Discussions専用helper
 
 `codex-discussions`はcurrent originのGitHub repositoryだけを対象に、固定GraphQL query/mutationを
