@@ -6126,7 +6126,7 @@ fn denial_guidance(reason: &str) -> DenialGuidance {
         return DenialGuidance {
             rule_id: "github-operation-not-allowed",
             safety_basis: "対象repository、単一resource、許可済みlifecycle、body snapshotを固定できるGitHub操作だけを実行します。",
-            next_action: "対象を明示し、許可済みの読み取り・管理操作またはcodex-deliveryを使ってください。Issue・Draft PRの本文は公開前に確認し、docs/github-guardrails.ja.md#github-write-examples の該当例に沿って --body-file で指定してください。",
+            next_action: "対象を明示し、許可済みの読み取り・管理操作またはcodex-deliveryを使ってください。Issue・Draft PRの本文は公開前に確認し、https://github.com/Daiki48/dotfiles/blob/main/docs/github-guardrails.ja.md#github-write-examples の該当例に沿って --body-file で指定してください。",
         };
     }
     if reason.contains("hook input") || reason == "command is required" {
@@ -6410,7 +6410,9 @@ mod tests {
         let args = ["42", "--repo", "example/project", "--body", "公開用の例"].map(String::from);
         let reason = issue_write_reason("comment", &args, ".").unwrap();
         let next_action = denial_guidance(&reason).next_action;
-        assert!(next_action.contains("docs/github-guardrails.ja.md#github-write-examples"));
+        assert!(next_action.contains(
+            "https://github.com/Daiki48/dotfiles/blob/main/docs/github-guardrails.ja.md#github-write-examples"
+        ));
         assert!(next_action.contains("--body-file"));
     }
 
