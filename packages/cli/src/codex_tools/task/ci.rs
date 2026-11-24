@@ -36,6 +36,7 @@ pub(super) enum GateMode {
     Strict,
     LocalValidation,
     GithubFreePrivate,
+    OptionalCiLocal,
     EmergencyCi,
 }
 
@@ -45,6 +46,7 @@ impl GateMode {
             Self::Strict => "strict",
             Self::LocalValidation => "local-validation",
             Self::GithubFreePrivate => "github-free-private",
+            Self::OptionalCiLocal => "optional-ci-local",
             Self::EmergencyCi => "emergency-ci",
         }
     }
@@ -109,15 +111,19 @@ impl Observation {
             (GateMode::GithubFreePrivate, CiState::Success) => {
                 free_private_actions_success(&self.snapshot, &self.target)
             }
-            (GateMode::LocalValidation, CiState::LocalValidation) => {
+            (GateMode::OptionalCiLocal | GateMode::LocalValidation, CiState::LocalValidation) => {
+                let optional = self.gate_mode == GateMode::OptionalCiLocal;
                 self.workflows.as_ref().is_some_and(|evidence| {
                     evidence.base.commit == self.base
                         && evidence.head.commit == self.head
-                        && evidence.base.workflows.is_empty()
-                        && evidence.head.workflows.is_empty()
+                        && (!optional || self.required.is_empty())
+                        && (optional
+                            || evidence.base.workflows.is_empty()
+                                && evidence.head.workflows.is_empty())
                         && if self.merged {
                             evidence.main.as_ref().is_some_and(|main| {
-                                main.commit == self.target && main.workflows.is_empty()
+                                main.commit == self.target
+                                    && (optional || main.workflows.is_empty())
                             })
                         } else {
                             self.target == self.head && evidence.main.is_none()
@@ -299,6 +305,9 @@ pub(super) fn observe(
     main: Option<GateMode>,
     policy: GateMode,
 ) -> Result<Observation, String> {
+    if policy == GateMode::OptionalCiLocal {
+        super::super::delivery::require_optional_ci_policy(repository)?;
+    }
     observe_with_policy(repository, pr, main, policy, &mut |args| {
         task_gh_json(root, args)
     })
@@ -313,6 +322,9 @@ pub(super) fn observe_repair(
     main: GateMode,
     policy: GateMode,
 ) -> Result<Observation, String> {
+    if policy == GateMode::OptionalCiLocal {
+        super::super::delivery::require_optional_ci_policy(repository)?;
+    }
     observe_repair_with(
         repository,
         original_merge,
@@ -325,6 +337,30 @@ pub(super) fn observe_repair(
 }
 
 type Fetch<'a> = dyn FnMut(&[String]) -> Result<Value, String> + 'a;
+
+/// receipt作成前にも、live baseと固定headのworkflowから通常gateを確定する。
+pub(super) fn authorization_gate(
+    root: &Path,
+    repository: &str,
+    pr: u64,
+    head: &str,
+    base: &str,
+) -> Result<GateMode, String> {
+    validate_repository(repository)?;
+    let mut fetch = |args: &[String]| task_gh_json(root, args);
+    let current = fetch_pull_request(repository, pr, true, &mut fetch)?;
+    if current.merged || current.head != head || current.base != base || current.base_ref != "main"
+    {
+        return Err("receipt作成前にPRのhead/baseが変化しました".into());
+    }
+    let base = workflow_tree(repository, base, &mut fetch)?;
+    let head = workflow_tree(repository, head, &mut fetch)?;
+    Ok(if base.workflows.is_empty() && head.workflows.is_empty() {
+        GateMode::LocalValidation
+    } else {
+        GateMode::Strict
+    })
+}
 
 #[cfg(test)]
 fn observe_with(
@@ -350,8 +386,11 @@ fn observe_with_policy(
     // Strict is the default policy: workflow-free repositories retain the local gate.
     // Preserve an existing local receipt, but never reinterpret a FreePrivate receipt.
     let selection = if policy == GateMode::Strict {
-        if main == Some(GateMode::GithubFreePrivate) {
-            return Err("github-free-private receiptをstrict policyへ変更できません".into());
+        if matches!(
+            main,
+            Some(GateMode::GithubFreePrivate | GateMode::OptionalCiLocal)
+        ) {
+            return Err("明示gateのreceiptをstrict policyへ変更できません".into());
         }
         None
     } else {
@@ -380,12 +419,11 @@ fn observe_with_selection(
         validate_github_free_private_repository(repository, fetch)?;
     }
 
-    let before = fetch_pull_request(
-        repository,
-        pr,
-        requested_mode == Some(GateMode::GithubFreePrivate),
-        fetch,
-    )?;
+    let same_repo = matches!(
+        requested_mode,
+        Some(GateMode::GithubFreePrivate | GateMode::OptionalCiLocal)
+    );
+    let before = fetch_pull_request(repository, pr, same_repo, fetch)?;
     let base = workflow_tree(repository, &before.base, fetch)?;
     let head = workflow_tree(repository, &before.head, fetch)?;
     let workflow_free = base.workflows.is_empty() && head.workflows.is_empty();
@@ -400,7 +438,11 @@ fn observe_with_selection(
     } else {
         GateMode::Strict
     };
-    let rules = if gate_mode == GateMode::GithubFreePrivate {
+    let optional = gate_mode == GateMode::OptionalCiLocal;
+    let rules = if optional {
+        verify_optional_protection(repository, &before, fetch)?;
+        Vec::new()
+    } else if gate_mode == GateMode::GithubFreePrivate {
         // FreePrivateはRules APIに依存しない。403などのAPI失敗を別modeへ変換しない。
         Vec::new()
     } else {
@@ -438,7 +480,7 @@ fn observe_with_selection(
             .transpose()?;
         let (target, snapshot) = if matches!(
             gate_mode,
-            GateMode::LocalValidation | GateMode::GithubFreePrivate
+            GateMode::LocalValidation | GateMode::GithubFreePrivate | GateMode::OptionalCiLocal
         ) {
             // local/free-privateはtest mergeで固定headの証跡を隠さない。
             (before.head.clone(), head_snapshot)
@@ -453,24 +495,32 @@ fn observe_with_selection(
         (target, snapshot, None)
     };
 
+    let mut state = classify(&rules, &snapshot.runs, &snapshot.statuses, &target);
+    if optional {
+        state = optional_state(repository, &target, &snapshot, fetch)?;
+        let other = if main.is_some() {
+            Some(before.head.as_str())
+        } else {
+            before.merge_commit.as_deref()
+        };
+        if state == CiState::LocalValidation
+            && let Some(sha) = other.filter(|sha| *sha != target)
+        {
+            let other_snapshot = fetch_snapshot(repository, sha, fetch)?;
+            state = optional_state(repository, sha, &other_snapshot, fetch)?;
+        }
+    }
     // rules/check/statusを個別に照会した後、PRを再取得する。
     // 観測中にGitHub上のPRが変わっていたら、このsnapshotを信頼しない。
-    let after = fetch_pull_request(
-        repository,
-        pr,
-        requested_mode == Some(GateMode::GithubFreePrivate),
-        fetch,
-    )?;
+    let after = fetch_pull_request(repository, pr, same_repo, fetch)?;
     if gate_mode == GateMode::GithubFreePrivate {
         // 観測中にprivate/merge policyが変わっていないことも確認する。
         validate_github_free_private_repository(repository, fetch)?;
     }
     let changed = before != after;
-    let mut state = if changed {
-        CiState::Stale
-    } else {
-        classify(&rules, &snapshot.runs, &snapshot.statuses, &target)
-    };
+    if changed {
+        state = CiState::Stale;
+    }
     if gate_mode == GateMode::GithubFreePrivate
         && state == CiState::Success
         && !free_private_actions_success(&snapshot, &target)
@@ -599,7 +649,7 @@ fn fetch_pull_request(
         && (!repository_identity_matches(value.pointer("/head/repo/full_name"), repository)
             || !repository_identity_matches(value.pointer("/base/repo/full_name"), repository))
     {
-        return Err("github-free-privateのPR head/base repository identityが一致しません".into());
+        return Err("PR head/baseのrepository identityが一致しません".into());
     }
     let base_ref = nested_text(&value, &["base", "ref"], "PR base branch")?;
     // PR payloadのbase.shaはmerge後も古いことがある。対象branchの実refを正本にする。
@@ -817,6 +867,127 @@ fn required_checks(
     );
     let value = fetch(&["api".into(), endpoint, "--method".into(), "GET".into()])?;
     parse_required_rules(&value)
+}
+
+fn verify_optional_protection(
+    repository: &str,
+    pr: &PullRequest,
+    fetch: &mut Fetch<'_>,
+) -> Result<(), String> {
+    let branch = get(fetch, format!("repos/{repository}/branches/main"))?;
+    let checks = &branch["protection"]["required_status_checks"];
+    if pr.base_ref != "main"
+        || branch["name"] != "main"
+        || branch["commit"]["sha"] != pr.base
+        || checks["enforcement_level"] != "off"
+        || checks["contexts"]
+            .as_array()
+            .is_none_or(|items| !items.is_empty())
+        || checks
+            .get("checks")
+            .is_some_and(|items| items.as_array().is_none_or(|items| !items.is_empty()))
+    {
+        return Err("mainの必須status checkがないことを確認できません".into());
+    }
+    let value = fetch(&[
+        "api".into(),
+        format!("repos/{repository}/rules/branches/main?per_page=100"),
+        "--paginate".into(),
+        "--slurp".into(),
+    ])?;
+    for page in pages(&value, "branch rules")? {
+        for rule in page.as_array().ok_or("branch rulesの形式が不正です")? {
+            match rule["type"].as_str() {
+                Some(
+                    "deletion"
+                    | "non_fast_forward"
+                    | "pull_request"
+                    | "creation"
+                    | "update"
+                    | "required_linear_history"
+                    | "required_signatures",
+                ) => (),
+                _ => return Err("必須検証または未対応のbranch ruleがあります".into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn optional_state(
+    repository: &str,
+    sha: &str,
+    snapshot: &Snapshot,
+    fetch: &mut Fetch<'_>,
+) -> Result<CiState, String> {
+    let state = classify(&[], &snapshot.runs, &snapshot.statuses, sha);
+    if !matches!(
+        state,
+        CiState::Success | CiState::Skipped | CiState::Missing
+    ) {
+        return Ok(state);
+    }
+    if snapshot
+        .runs
+        .iter()
+        .filter_map(|check| check.workflow_run.as_ref())
+        .any(|run| {
+            run.status != "completed"
+                || !matches!(
+                    run.conclusion.as_deref(),
+                    Some("success" | "neutral" | "skipped")
+                )
+        })
+    {
+        return Err("checkに対応するActions runの完了を確認できません".into());
+    }
+    // check作成前のrunも確認する。総数がAPIの検索上限に達した場合は判定しない。
+    let value = fetch(&[
+        "api".into(),
+        format!("repos/{repository}/actions/runs?head_sha={sha}&per_page=100"),
+        "--paginate".into(),
+        "--slurp".into(),
+    ])?;
+    let mut total = None;
+    let mut count = 0;
+    for page in pages(&value, "Actions runs")? {
+        let expected = page["total_count"]
+            .as_u64()
+            .filter(|n| *n < 1000)
+            .ok_or("Actions run総数が不明です")?;
+        if total
+            .replace(expected)
+            .is_some_and(|previous| previous != expected)
+        {
+            return Err("Actions run取得中に総数が変化しました".into());
+        }
+        for run in page["workflow_runs"]
+            .as_array()
+            .ok_or("Actions run一覧が不明です")?
+        {
+            count += 1;
+            if run["head_sha"] != sha {
+                return Err("Actions runのSHAが一致しません".into());
+            }
+            if run["status"]
+                .as_str()
+                .ok_or("Actions runの状態が不明です")?
+                != "completed"
+            {
+                return Ok(CiState::Pending);
+            }
+            match run["conclusion"].as_str() {
+                Some("success" | "neutral" | "skipped") => (),
+                Some("cancelled") => return Ok(CiState::Cancelled),
+                Some("timed_out") => return Ok(CiState::TimedOut),
+                _ => return Ok(CiState::Failure),
+            }
+        }
+    }
+    if total != Some(count) {
+        return Err("Actions run一覧が不完全です".into());
+    }
+    Ok(CiState::LocalValidation)
 }
 
 fn parse_required_rules(value: &Value) -> Result<Vec<RequiredCheck>, String> {

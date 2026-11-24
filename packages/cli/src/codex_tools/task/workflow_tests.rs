@@ -15,7 +15,7 @@ fn reopen(context: &Context) -> Context {
     }
 }
 
-fn report(
+pub(super) fn report(
     context: &Context,
     task: &mut Task,
     outcome: &str,

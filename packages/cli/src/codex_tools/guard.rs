@@ -5219,6 +5219,7 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
             "github-free-private",
             "github-free-private-local",
             "local-validation",
+            "optional-ci-local",
             "emergency-ci",
         ]
         .contains(&v.as_str())

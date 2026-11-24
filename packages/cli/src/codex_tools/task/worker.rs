@@ -359,7 +359,7 @@ pub(super) fn prompt(task: &Task) -> String {
             "元の依頼を解釈して自律継続を組み立て直す読み取り専用の診断担当です。ソース・Git・GitHub・設定・receipt・task stateを書き換えず、旧writerの成果を保存したまま原因を調べてください。assessmentを必ず返し、cause/evidence/next_action/resume_whenを具体化します。親が便宜的に定めたfile分割とユーザーの明示した製品・権限・終了境界を区別し、前者だけなら元の仕様内で再分割してください。実値・credential・candidate不足でも取得コード・fake API検証など安全な残作業を見つけてください。riskや失敗回数だけで人間へ返してはいけません。readyは既存段階を安全に再試行できる場合、needs_changesは実装修復へ戻す場合です。main CIのsource修正や元依頼内の後続作業はfollowupsへobjectiveと元依頼に含まれるauthorizationの根拠を記載し、after_previousで順序を示してください。未許可の目的や新権限をfollowupsで追加しないでください。main CI失敗の元PRを追加pushせず、新しい修復PRへ分けます。製品/実質scope/新権限/費用/不可逆/重大リスクの意思決定だけawaiting_decisionとdecisionを返し、question/impact/recommendationを整理します。他の技術的保留はwaitingとし、解消条件を示してください。CI・Git状態・子task・host資源はRustが監視します。必要なら非秘密の受入証拠等のworkspace相対pathをwatch_pathsへ指定できます（.git・絶対path・親参照は禁止）。同じ証拠で無限retryせず、進展を示すevidenceと対応方法を見直してください。未知dirtyやsecret、所有不明、helperのretry制限・承認拒否を迂回する操作は保留し、独立した許可内作業を先に進めてください。"
         }
         Phase::Integration => {
-            "統合担当です。直前のriskに比例したレビューと固定headを確認してください。high/criticalは独立レビューが必須です。修正や追加pushは行わず、baseやheadが古い場合はneeds_changesに戻してください。既存のcodex-delivery record-review→deliverだけを使い、既存運用で許可されたCI承認label・レビュー・CI証拠を確認してmergeしてください。危険操作・製品判断の承認を自分で与えずawaiting_decisionへ返してください。今回はmergeまでの停止境界です。main CIとfinishはcoordinatorの次段階です。直接mergeやcleanupでhelperを迂回しないでください。実際のPR merge済みを確認した場合だけreadyにしてください。"
+            "統合担当です。直前のriskに比例したレビューと固定headを確認してください。high/criticalは独立レビューが必須です。修正や追加pushは行わず、baseやheadが古い場合はneeds_changesに戻してください。CI認可前にcoordinatorが保存した正規receiptは、同じ対象・Plan・版・承認を照合して再利用してください。未作成の任意CIローカル経路ではcodex-delivery record-reviewを先に実行します。既存のcodex-delivery deliverだけで、既存運用で許可されたCI承認label・レビュー・CI証拠を確認してmergeしてください。危険操作・製品判断の承認を自分で与えずawaiting_decisionへ返してください。今回はmergeまでの停止境界です。main CIとfinishはcoordinatorの次段階です。直接mergeやcleanupでhelperを迂回しないでください。実際のPR merge済みを確認した場合だけreadyにしてください。"
         }
         Phase::Finish => {
             "後処理担当です。coordinatorはmerge実体とmain側のgate条件を確認済みです。現在の親checkoutから既存のcodex-delivery finishを使い、同じtaskのmain同期・Issue記録・managed cleanupまで再開可能に進めてください。人間用checkoutがdirtyなら強制同期せずblockedにしてください。mainが最初cleanでmanaged Skill等の更新を含む場合は、同じUIDの通常ホスト側でexecのrequire_escalated/既存auto-reviewを通して正規finishを実行してください。permission設定は変更しません。通常sandboxで失敗しhelperがsandbox-retry-readyを発行した場合だけ、同じhostで1回の--sandbox-retryを使えます。消費後の追加復旧は人間の明示承認が必要です。未知dirtyは保持してください。Issue全体の受入条件を満たさない限りcloseしないでください。検証済みmanaged cleanup以外の削除はしないでください。完了記録と物理回収を確認した場合だけreadyにしてください。"
@@ -420,6 +420,9 @@ pub(super) fn prompt(task: &Task) -> String {
             }
             super::ci::GateMode::LocalValidation => {
                 "record-review・deliver・finishにはすべて --gate-mode local-validation を明示してください。"
+            }
+            super::ci::GateMode::OptionalCiLocal => {
+                "record-review・deliver・finishには --gate-mode optional-ci-local を指定し、固定headのlocal検証を記録してください。"
             }
             super::ci::GateMode::GithubFreePrivate => {
                 "record-review・deliver・finishにはすべて --gate-mode github-free-private を明示し、既存のlive private repository policy・固定headのActionsとreviewをhelperで検証してください。API失敗から別modeを推測しないでください。"

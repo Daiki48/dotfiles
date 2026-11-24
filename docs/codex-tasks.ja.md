@@ -85,6 +85,13 @@ GitHubの[label API](https://docs.github.com/en/rest/issues/labels#add-labels-to
 labelをレビュー証拠には使わず、HEAD/base変更時はレビューを無効化し、merge前に再照合します。
 既存deliveryのreview receipt・固定SHA・remote gate・cleanup検証を省略しません。
 
+コードレビュー成功後、coordinatorはCI認可より先に正規の`record-review`と同じ処理でreceiptを保存します。
+新規receiptはtaskのPlanと版1を使い、既存receiptのPlan・版・人間の承認は保持します。
+保存や固定対象・レビューの照合に失敗した場合はCI起動labelを付けず診断へ戻します。
+通常gateはlive baseと固定headのworkflowをAPIで確認してから記録し、workflow不在を推測しません。
+CI起動labelがない通常経路も、初回base観測後にこの保存処理を通してから統合へ進みます。
+`optional-ci-local`はlabelを付けず、CI観測を通過してから統合担当がreceiptを作成します。
+
 ## 保存場所とhost境界
 
 account homeはsetupと同じ検証を使います。`CODEX_HOME`が絶対pathで指定されていれば優先し、
@@ -110,7 +117,7 @@ status ID・提供者ID/login・対象SHA・更新時刻・参照URLを含みま
 check suite IDをrun IDとして扱いません。Actions以外の提供元や未提供のURL等は`null`です。
 head/base変更時は旧成功を無効化し、API失敗時は`ci_evidence`と成功状態を消して
 `ci_observation_error_at`へ失敗観測時刻を残します。統合・後処理の起動直前にも再観測して保存します。
-`gate_mode`は`strict`、`local-validation`、`github-free-private`で、merge後もreceiptに選んだgateを保持します。
+merge後もreceiptに記録したgateを使います。任意のリモートCIを起動せず固定headをローカルで検証する場合は、リポジトリの非公開方針を登録し、`submit` または停止回収後の `resume` で `--gate-mode optional-ci-local` を指定します。CI起動labelは指定しません。保存先と適用条件は[納品ガイド](codex-delivery.ja.md#任意ciの事前方針)を参照してください。
 local gateの`ci_state`はCI成功と区別した`local_validation`です。`ci_evidence.workflows`には
 live base・固定head・main側対象commitのSHA、tree SHA、workflow一覧を保存します。
 旧task JSONでこれらがない場合はstrictを既定とし、現在の一次情報で再観測します。
@@ -216,7 +223,8 @@ local gateでも固定headに実在するcheck/statusと必須checkを確認し�
 
 Review・Integration・Finishのworkerにはgate-modeと観測証跡を明示します。
 固定headに比例したlocal検証とriskに必要なレビューを揃え、`record-review`・`deliver`・`finish`の
-すべてへ`--gate-mode local-validation`を渡します。local検証の実行とreview receiptの記録はworkerが担当します。
+すべてへ`--gate-mode local-validation`を渡します。local検証はworkerが実行し、通常経路のreview receiptは
+coordinatorが統合前に保存します。
 strict時は既存parserの契約どおり`--gate-mode`を省略します。`strict`や`strict-ruleset`の明示指定はしません。
 head/base一致、最新base、review receipt、未解決thread等の既存delivery gateは引き続きhelperが検証します。
 追加pushやbase変更では旧CI・旧レビューを無効化し、現在のheadで実装・検証・レビューをやり直します。
