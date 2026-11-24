@@ -66,7 +66,7 @@ CI基盤障害の判断は継続委任されている。[deliveryガイド](../.
 
 strict modeはlive Ruleset gateを必要とする。明示認可されたprivate repositoryの`github-free-private`はhigh以上とし、APIエラーから自動選択しない。gateの詳細、main同期の限定復旧、sandbox retryは[deliveryガイド](../../../docs/codex-delivery.ja.md)を必要時に読む。`--sandbox-retry`はhelperが発行したtokenがある場合だけ、同一UIDで1回再試行する。
 
-外部待機では同じ Task ID・PR・head を担当する coordinator の生存と次回観測を確認し、残工程を引き継いで状況を返す。引き継げなければ理由と再開点を報告する。完了は finish と実環境の受け入れ条件で判定する。
+外部待機では同じ Task ID・PR・head を担当する coordinator の生存と次回観測を確認し、残工程を引き継いで状況を返す。既存の clean な PR を引き継ぐときは、親 checkout で `codex-task submit` に元の依頼・停止条件・Task ID・branch と `--resume-pr <番号>` を指定し、`start` と `show` で担当を確認する。引き継げなければ理由と再開点を報告する。完了は finish と実環境の受け入れ条件で判定する。
 
 親終了後の自律継続を依頼された場合は、終了前に`parallel-development`へ引き継ぐ。既存taskを`list/show`で照合して再利用し、未登録なら既存managed worktreeと同じtask ID・明示branchで登録する。旧writerの停止・非使用を確認し、既存PR・固定head・Plan/版・risk・gate・CI label許可・停止境界と残るdeliveryを目的へ保存する。同UIDの通常ホスト側で`start`した後、対象taskが既存PR/headを認識し、CI監視または次段階を担当していることまで確認する。`already_running`だけでは対象taskの引継ぎ完了と扱わない。引継ぎ記録と完了報告を区別し、CI待ちを理由にtaskをpauseしない。既存の利用者pauseは勝手に解除しない。
 

@@ -500,6 +500,7 @@ fn git(cwd: &Path, args: &[&str], check: bool) -> Result<String> {
 fn gh(cwd: &Path, args: &[String], check: bool) -> Result<String> {
     let sandbox = GhSandbox::create(cwd)?;
     let args = sandbox.snapshot_args(args)?;
+    verify_write_actor(&sandbox, &args)?;
     let is_merge = args.first().is_some_and(|arg| arg == "pr")
         && args.get(1).is_some_and(|arg| arg == "merge");
     let mut command = vec![trusted_binary(GH_BINARY, "GitHub CLI")?];
@@ -521,6 +522,24 @@ fn gh(cwd: &Path, args: &[String], check: bool) -> Result<String> {
         return Err(error("GitHub CLI commandに失敗しました"));
     }
     Ok(result.stdout)
+}
+
+fn verify_write_actor(sandbox: &GhSandbox, args: &[String]) -> Result<()> {
+    let lifecycle = matches!(args.first().map(String::as_str), Some("issue" | "pr"))
+        && matches!(
+            args.get(1).map(String::as_str),
+            Some("edit" | "comment" | "ready" | "merge" | "close" | "reopen" | "create" | "review")
+        );
+    let api = args.first().is_some_and(|v| v == "api")
+        && args.iter().any(|v| {
+            matches!(v.as_str(), "POST" | "PUT" | "PATCH" | "DELETE")
+                || v.contains("mutation(")
+                || v.contains("mutation ")
+        });
+    if lifecycle || api {
+        trust::github_actor(&sandbox.path, None).map_err(error)?;
+    }
+    Ok(())
 }
 
 fn merge_failure_diagnostic(code: Option<i32>, stderr: &str) -> String {
@@ -923,6 +942,7 @@ pub(crate) fn task_gh_json(cwd: &Path, args: &[String]) -> std::result::Result<V
     let args = sandbox
         .snapshot_args(args)
         .map_err(|_| "GitHub認証の隔離に失敗しました")?;
+    verify_write_actor(&sandbox, &args).map_err(|e| e.to_string())?;
     let mut command = vec![
         trusted_binary(GH_BINARY, "GitHub CLI").map_err(|_| "GitHub CLIを信頼検証できません")?,
     ];
@@ -6009,6 +6029,101 @@ pub(crate) fn manual_merge_invocation_reason(args: &[String]) -> Option<String> 
     }
 }
 
+fn handoff_status(
+    root: &Path,
+    task: &str,
+    repo: &str,
+    snapshot: &Value,
+    path: &Path,
+    head: &str,
+) -> Result<Value> {
+    let branch = str_value(snapshot, "branch")?;
+    let dirty = !git(
+        path,
+        &["status", "--porcelain", "--untracked-files=all"],
+        true,
+    )?
+    .is_empty();
+    let pulls = gh_json(
+        root,
+        &[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--head",
+            &branch,
+            "--state",
+            "open",
+            "--json",
+            "number,isCrossRepository,headRefName,headRefOid",
+        ]
+        .map(String::from),
+    )?;
+    let mut own = pulls
+        .as_array()
+        .ok_or_else(|| error("PR 一覧が不正です"))?
+        .iter()
+        .filter(|pr| pr["isCrossRepository"] == false && pr["headRefName"] == branch);
+    let pull = own.next();
+    if own.next().is_some() {
+        return Err(error("担当ブランチに複数の PR があります"));
+    }
+    let pr = pull.map(|p| int_value(p, "number")).transpose()?;
+    let reviewed = if receipt_path(repo, task, head)?
+        .try_exists()
+        .map_err(|_| error("レビュー記録を確認できません"))?
+    {
+        let receipt = load_receipt(root, task, head, Some(repo))?;
+        Some(int_value(&receipt, "pr")?) == pr && pull.is_some_and(|p| p["headRefOid"] == head)
+    } else {
+        false
+    };
+    let next = if dirty {
+        "未コミット差分と未追跡ファイルを確認し、未検証の変更を検証する"
+    } else if pr.is_none() {
+        "担当ブランチと作業の停止条件を確認する"
+    } else if reviewed {
+        "固定 head の CI と納品状態を確認する"
+    } else {
+        "現在の head の検証とレビューを確認する"
+    };
+    Ok(
+        serde_json::json!({"task_id":task,"worktree":path,"branch":branch,"head":head,"pr":pr,"dirty":dirty,"reviewed_head":reviewed,"next":next}),
+    )
+}
+
+pub(super) fn reviewed_workspace(
+    root: &Path,
+    task: &str,
+    branch: &str,
+    pr: u64,
+) -> std::result::Result<(PathBuf, String), String> {
+    let check = || -> Result<(PathBuf, String)> {
+        let repo = repository(root)?;
+        let (record, path) = manifest(root, task, &repo)?;
+        worktree(root, &record, &path)?;
+        if str_value(&record, "branch")? != branch {
+            return Err(error("担当ブランチが一致しません"));
+        }
+        let head = git(&path, &["rev-parse", "HEAD"], true)?.trim().to_string();
+        worktree_clean_head(&path, &head)?;
+        let number = i64::try_from(pr).map_err(|_| error("PR番号が不正です"))?;
+        let view = pr_view(root, &repo, number)?;
+        if !same_head_repository(&view, &repo)
+            || view["isCrossRepository"] != false
+            || view["headRefName"] != branch
+            || view["headRefOid"] != head
+            || view["state"] != "OPEN"
+            || view["baseRefName"] != "main"
+        {
+            return Err(error("監視を引き継ぐ PR と担当 worktree が一致しません"));
+        }
+        Ok((path, head))
+    };
+    check().map_err(|e| e.to_string())
+}
+
 /// canonical installed binary から起動する entrypoint。成功0、検証/操作失敗1。
 pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
     let result = (|| -> Result<Value> {
@@ -6044,7 +6159,7 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
         let root =
             env::current_dir().map_err(|_| error("current checkout rootを確認できません"))?;
         let parsed = if let [command, flag, task] = args.as_slice()
-            && (command == "deliver" || command == "finish")
+            && (command == "deliver" || command == "finish" || command == "status")
             && flag == "--task-id"
         {
             let task = task.to_str().ok_or_else(|| error("task IDが不正です"))?;
@@ -6060,6 +6175,9 @@ pub fn entrypoint(args: impl IntoIterator<Item = OsString>) -> i32 {
                 worktree(&root, &snapshot, &path)?;
                 git(&path, &["rev-parse", "HEAD"], true)?.trim().to_string()
             };
+            if command == "status" {
+                return handoff_status(&root, task, &repo, &snapshot, &path, &head);
+            }
             let receipt = load_receipt(&root, task, &head, Some(&repo))?;
             parse_args([
                 command.clone(),

@@ -3442,6 +3442,14 @@ fn git_subcommand_index(tokens: &[String]) -> Option<(usize, usize, &str)> {
 /// passed the strict parser. Repository hooks and user SSH configuration must
 /// not become a second execution path for an otherwise allowed command.
 fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option<String>, String> {
+    rewrite_git_with_actor(command, cwd, trust::github_actor)
+}
+
+fn rewrite_git_with_actor(
+    command: &str,
+    cwd: Option<&str>,
+    verify: fn(&Path, Option<&str>) -> Result<(), String>,
+) -> Result<Option<String>, String> {
     let segments = command_segments(command);
     if segments.len() != 1 {
         return Ok(None);
@@ -3571,11 +3579,24 @@ fn rewrite_git_safety_command(command: &str, cwd: Option<&str>) -> Result<Option
         ]);
         if transport.starts_with("https://") {
             trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI")?;
-            let snapshot = GuardGhSandbox::create()
-                .ok_or_else(|| {
-                    "Git credential configをprivate snapshotへ固定できません".to_string()
-                })?
-                .into_persistent();
+            let snapshot = GuardGhSandbox::create().ok_or_else(|| {
+                "Git credential configをprivate snapshotへ固定できません".to_string()
+            })?;
+            if subcommand.as_deref() == Some("push") {
+                let listing = run_git(
+                    cwd,
+                    &["log", "--format=%ae", "HEAD", "--not", "--remotes=origin"],
+                )
+                .ok_or("Git 著者を確認できません")?;
+                let authors: std::collections::BTreeSet<_> = listing.lines().collect();
+                if authors.is_empty() {
+                    verify(snapshot.path(), None)?;
+                }
+                for author in authors {
+                    verify(snapshot.path(), Some(author))?;
+                }
+            }
+            let snapshot = snapshot.into_persistent();
             let snapshot = snapshot
                 .to_str()
                 .ok_or_else(|| "Git credential snapshot pathを確認できません".to_string())?
@@ -3699,8 +3720,11 @@ fn rewrite_gh_safety_command(command: &str, cwd: Option<&str>) -> Result<Option<
     let gh = trust::trusted_system_binary(SYSTEM_GH, "GitHub CLI")?;
     trust::trusted_system_binary(SYSTEM_ENV, "Env")?;
     let snapshot = GuardGhSandbox::create()
-        .ok_or_else(|| "GitHub configをprivate snapshotへ固定できません".to_string())?
-        .into_persistent();
+        .ok_or_else(|| "GitHub configをprivate snapshotへ固定できません".to_string())?;
+    if has_write_operation(&tokens) {
+        trust::github_actor(snapshot.path(), None)?;
+    }
+    let snapshot = snapshot.into_persistent();
     let snapshot = snapshot
         .to_str()
         .ok_or_else(|| "GitHub config snapshot pathを確認できません".to_string())?;
@@ -5129,7 +5153,7 @@ fn delivery_helper_invocation_reason(tokens: &[String]) -> Option<String> {
     if command == "authorize-ci" {
         return super::delivery::ci_authorization_invocation_reason(args);
     }
-    if matches!(command.as_str(), "deliver" | "finish")
+    if matches!(command.as_str(), "deliver" | "finish" | "status")
         && args.len() == 3
         && args[1] == "--task-id"
         && valid_task_id(&args[2])
@@ -7315,6 +7339,7 @@ mod tests {
             vec!["init", "-q"],
             vec!["config", "user.name", "Codex Test"],
             vec!["config", "user.email", "codex@example.invalid"],
+            vec!["commit", "--allow-empty", "-qm", "fixture"],
             vec![
                 "remote",
                 "add",
@@ -7348,7 +7373,7 @@ mod tests {
             "git push -u origin feature/example",
             "git ls-remote --branches origin feature/example",
         ] {
-            let rewritten = rewrite_git_safety_command(command, Some(cwd))
+            let rewritten = rewrite_git_with_actor(command, Some(cwd), |_, _| Ok(()))
                 .expect("rewrite network command")
                 .expect("network command requires a rewrite");
             assert!(

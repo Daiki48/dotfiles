@@ -3,6 +3,89 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// 書き込みに使う認証 snapshot で本人を照合する。認証応答は表示しない。
+pub(crate) fn github_actor(config: &Path, author: Option<&str>) -> Result<(), String> {
+    let gh = trusted_system_binary("/usr/bin/gh", "GitHub CLI")?;
+    let api = |endpoint: &str| -> Result<serde_json::Value, String> {
+        let mut command = std::process::Command::new(&gh);
+        super::process::clear_environment(&mut command);
+        command
+            .current_dir(config)
+            .env("HOME", config)
+            .env("XDG_STATE_HOME", config)
+            .env("GH_CONFIG_DIR", config)
+            .env("GH_HOST", "github.com")
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("PATH", "/usr/bin:/bin")
+            .args(["api", endpoint]);
+        let result = super::process::run_with_limit(
+            &mut command,
+            std::time::Duration::from_secs(5),
+            256 * 1024,
+        )
+        .map_err(|_| "GitHub の本人確認に失敗しました")?;
+        if !result.status.success() {
+            return Err("GitHub の本人確認に失敗しました".into());
+        }
+        serde_json::from_slice(&result.stdout).map_err(|_| "GitHub の本人確認応答が不正です".into())
+    };
+    verify_identity(author, api)
+}
+
+fn verify_identity(
+    author: Option<&str>,
+    api: impl Fn(&str) -> Result<serde_json::Value, String>,
+) -> Result<(), String> {
+    let user = api("user")?;
+    if !user["login"]
+        .as_str()
+        .is_some_and(|login| login.eq_ignore_ascii_case("Daiki48"))
+    {
+        return Err("GitHub の認証アカウントが本人と一致しません".into());
+    }
+    if let Some(email) = author {
+        if user["id"].as_u64().is_some_and(|id| {
+            email.eq_ignore_ascii_case(&format!("{id}+Daiki48@users.noreply.github.com"))
+        }) {
+            return Ok(());
+        }
+        for endpoint in ["user/public_emails", "user/emails"] {
+            if api(endpoint)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .is_some_and(|rows| {
+                    rows.iter().any(|row| {
+                        row["verified"] == true
+                            && row["email"]
+                                .as_str()
+                                .is_some_and(|e| email.eq_ignore_ascii_case(e))
+                    })
+                })
+            {
+                return Ok(());
+            }
+        }
+        return Err("Git 著者と本人アカウントの紐付けを確認できません".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_and_commit_author_are_checked_separately() {
+    let api = |endpoint: &str| {
+        Ok(if endpoint == "user" {
+            serde_json::json!({"login":"Daiki48","id":123})
+        } else {
+            serde_json::json!([{"email":"author@example.invalid","verified":true}])
+        })
+    };
+    assert!(verify_identity(None, |_| Ok(serde_json::json!({"login":"other"}))).is_err());
+    assert!(verify_identity(None, api).is_ok());
+    assert!(verify_identity(Some("author@example.invalid"), api).is_ok());
+    assert!(verify_identity(Some("other@example.invalid"), api).is_err());
+}
+
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
