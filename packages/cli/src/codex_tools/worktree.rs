@@ -1133,6 +1133,24 @@ pub(super) fn matches_monitored_head(
         && task_status(cwd)?.is_empty())
 }
 
+pub(super) fn matches_closed_worktree(
+    root: &Path,
+    id: &str,
+    workspace: &Path,
+    branch: &str,
+    head: &str,
+) -> Result<bool, WorktreeError> {
+    let repository = inspect_repository(root, false, false)?;
+    let (target, _, _) = managed_paths(&repository, id, false)?;
+    if target != workspace
+        || !matches!(diagnose(root, Some(id), false)?.as_slice(), [(_, status, _)] if status == "ready")
+    {
+        return Ok(false);
+    }
+    ensure_no_git_operation(workspace)?;
+    matches_monitored_head(workspace, branch, Some(head))
+}
+
 /// 監視には状態のdigestだけを渡し、file名や内容をtaskイベントへ保存しない。
 pub(crate) fn task_observation(cwd: &Path) -> Result<String, WorktreeError> {
     use sha2::{Digest, Sha256};

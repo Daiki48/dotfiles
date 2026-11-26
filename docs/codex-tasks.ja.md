@@ -45,6 +45,18 @@ worktree/artifact消失を検証します。証拠がない場合や他の停止
 再実行も証拠を再確認してno-opになります。保存済みhead・PR・merge commit・checkpoint・generation・review・receiptは変更せず、
 worker、GitHub、delivery、worktree、artifactには操作しません。
 
+代替 PR で解決した場合や更新を見送った場合は、未統合で閉じた PR の判断を記録できます。
+
+```sh
+codex-task close-unmerged --task-id task-example --pr 123 --head <40桁SHA> --reason '更新の見送りを判断した根拠'
+```
+
+停止済み task の PR 番号、GitHub 上の未統合・クローズ状態、PR と clean な managed worktree の
+branch・固定 head を照合します。記録後は同じ状態を照合して Stop hook の待ちを解除します。
+GitHub の状態は記録時に確認し、Stop hook はローカルの記録と作業場を照合します。
+task は paused のままで、worktree、branch、成果物、delivery 記録を保持します。依存 task の
+完了条件は満たしません。明示的に `resume` するとこの記録は失効します。
+
 既存方針でFree/private経路が明示されているrepositoryは、受付時に
 `--gate-mode github-free-private`を付けます。risk下限はhighです。Rules APIの403から推測せず、
 live private repository policy、同repositoryのPR、固定headと実mergeのActions・statusを確認します。

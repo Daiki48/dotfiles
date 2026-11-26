@@ -17,7 +17,7 @@ mod worker;
 mod workflow_tests;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
@@ -111,6 +111,17 @@ enum Commands {
         #[arg(long)]
         task_id: String,
     },
+    /// 停止済みtaskに、未mergeで閉じたPRの採否を記録する。
+    CloseUnmerged {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long)]
+        pr: u64,
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// 一度だけ照合し、実行可能なworkerを起動する。
     Reconcile,
     /// coordinatorを端末から切り離して起動する。既に稼働中なら再利用する。
@@ -200,6 +211,18 @@ struct Event {
     detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClosedUnmerged {
+    pr: u64,
+    head: String,
+    reason: String,
+}
+
+fn valid_closed_unmerged(pr: u64, head: &str, reason: &str) -> bool {
+    pr != 0 && valid_sha(head) && safe_text(reason, 2000) && !reason.chars().any(char::is_control)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Task {
@@ -225,6 +248,8 @@ struct Task {
     head: Option<String>,
     base: Option<String>,
     merge_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    closed_unmerged: Option<ClosedUnmerged>,
     review: Option<worker::Report>,
     review_independent: bool,
     checkpoint: String,
@@ -318,6 +343,10 @@ impl Task {
                 .merge_commit
                 .as_deref()
                 .is_some_and(|head| !valid_sha(head))
+            || self.closed_unmerged.as_ref().is_some_and(|closed| {
+                self.pr != Some(closed.pr)
+                    || !valid_closed_unmerged(closed.pr, &closed.head, &closed.reason)
+            })
             || self.acknowledged_sequence > self.event_sequence
             || self
                 .events
@@ -618,6 +647,66 @@ pub(crate) fn monitoring(
         && Lock::try_acquire(&store.root.join("coordinator.lock"))?.is_none())
 }
 
+/// Stop hook は閉じた PR の記録を同じ task・branch・worktree の固定 head と照合する。
+pub(crate) fn closed_unmerged(
+    home: &Path,
+    root: &Path,
+    workspace: &Path,
+    id: &str,
+    branch: &str,
+) -> Result<bool> {
+    let directory = workspace.parent().ok_or("worktree の親がありません")?;
+    if !directory
+        .join(".tasks")
+        .join(format!("{id}.json"))
+        .try_exists()
+        .map_err(|_| "task を確認できません")?
+    {
+        return Ok(false);
+    }
+    let (repository, github, key) = worktree::task_repository(root).map_err(|e| e.to_string())?;
+    let store = Store::open(home, &key)?;
+    check_closed_unmerged(&store, id, |task, closed| {
+        if task.repository != repository
+            || task.github != github
+            || task.branch != branch
+            || task.worktree.as_deref() != Some(workspace)
+        {
+            return Ok(false);
+        }
+        worktree::matches_closed_worktree(root, id, workspace, branch, &closed.head)
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn check_closed_unmerged(
+    store: &Store,
+    id: &str,
+    matches_worktree: impl FnOnce(&Task, &ClosedUnmerged) -> Result<bool>,
+) -> Result<bool> {
+    if store.load(id)?.closed_unmerged.is_none() {
+        return Ok(false);
+    }
+    // resume と同じ順番で取得し、採否の読取と現在の作業場の照合をまとめて行う。
+    let _state = store.lock()?;
+    let Some(_lease) = Lock::try_acquire(&store.lease_path(id)?)? else {
+        return Ok(false);
+    };
+    let task = store.load(id)?;
+    let Some(closed) = &task.closed_unmerged else {
+        return Ok(false);
+    };
+    if !task.pause_requested
+        || task.phase != Phase::Paused
+        || task.run.is_some()
+        || task.merge_commit.is_some()
+        || task.pr != Some(closed.pr)
+    {
+        return Ok(false);
+    }
+    matches_worktree(&task, closed)
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn submit(
@@ -722,6 +811,7 @@ fn submit_with_policy(
         head: None,
         base: None,
         merge_commit: None,
+        closed_unmerged: None,
         review: None,
         review_independent: false,
         checkpoint: String::new(),
@@ -799,6 +889,62 @@ fn sync_completed_with(
     );
     context.store.save(&task)?;
     Ok(json!({"task_id":task_id,"phase":task.phase,"synchronized":true}))
+}
+
+fn close_unmerged_with(
+    context: &Context,
+    task_id: &str,
+    closed: ClosedUnmerged,
+    verify: impl FnOnce(&Task) -> Result<()>,
+    matches_head: impl Fn(&Path, &str, &str) -> Result<bool>,
+) -> Result<Value> {
+    if !valid_id(task_id) || !valid_closed_unmerged(closed.pr, &closed.head, &closed.reason) {
+        return Err("task ID・PR・固定head・終了理由を確認してください".into());
+    }
+    let _state = context.store.lock()?;
+    let mut task = context.load(task_id)?;
+    if task.phase != Phase::Paused
+        || !task.pause_requested
+        || task.run.is_some()
+        || task.merge_commit.is_some()
+        || task.pr != Some(closed.pr)
+    {
+        return Err("指定したPRを持つ停止済み・未統合taskだけを記録できます".into());
+    }
+    let _lease =
+        Lock::try_acquire(&context.store.lease_path(task_id)?)?.ok_or("workerが動作中です")?;
+    let workspace = task
+        .worktree
+        .as_deref()
+        .ok_or("taskにworktreeがありません")?;
+    if context
+        .store
+        .root
+        .parent()
+        .is_none_or(|directory| directory.join(task_id) != workspace)
+    {
+        return Err("taskのworktreeが管理対象pathと一致しません".into());
+    }
+    if !matches_head(workspace, &task.branch, &closed.head)? {
+        return Err("worktreeのbranch・固定head・clean状態が一致しません".into());
+    }
+    verify(&task)?;
+    if !matches_head(workspace, &task.branch, &closed.head)? {
+        return Err("PR照合中にworktreeが変化しました".into());
+    }
+    let recorded = task.closed_unmerged.as_ref() != Some(&closed);
+    if recorded {
+        task.closed_unmerged = Some(closed);
+        task.next_check = 0;
+        task.event(
+            "closed_unmerged",
+            "未mergeで閉じたPRの採否を記録しました。worktreeは保持しました",
+        );
+        context.store.save(&task)?;
+    }
+    Ok(
+        json!({"task_id": task_id, "phase": task.phase, "disposition": "closed-unmerged", "recorded": recorded}),
+    )
 }
 
 fn apply_report_with(
@@ -1951,6 +2097,7 @@ fn resume_with_ci_labels(
         }
     }
     validate_optional_intake(&context.github, task.requested_gate, &task.ci_labels)?;
+    task.closed_unmerged = None;
     task.pause_requested = false;
     task.failures = 0;
     task.recovery.attempts = 0;
@@ -2754,6 +2901,33 @@ fn execute(cli: Cli) -> Result<Value> {
             )
         }
         Commands::SyncCompleted { task_id } => sync_completed(&context, &task_id),
+        Commands::CloseUnmerged {
+            task_id,
+            pr,
+            head,
+            reason,
+        } => close_unmerged_with(
+            &context,
+            &task_id,
+            ClosedUnmerged {
+                pr,
+                head: head.clone(),
+                reason,
+            },
+            |task| {
+                ci::verify_closed_unmerged(
+                    &context.repository,
+                    &context.github,
+                    pr,
+                    &task.branch,
+                    &head,
+                )
+            },
+            |path, branch, head| {
+                worktree::matches_closed_worktree(&context.repository, &task_id, path, branch, head)
+                    .map_err(|e| e.to_string())
+            },
+        ),
         Commands::Pause { task_id } => {
             let _lock = context.store.lock()?;
             let mut task = context.load(&task_id)?;
@@ -2992,6 +3166,13 @@ pub(crate) fn invocation_reason(args: &[String]) -> Option<String> {
         | Commands::SyncCompleted { task_id } => {
             (!valid_id(&task_id)).then(|| "task IDが不正です".into())
         }
+        Commands::CloseUnmerged {
+            task_id,
+            pr,
+            head,
+            reason,
+        } => (!valid_id(&task_id) || !valid_closed_unmerged(pr, &head, &reason))
+            .then(|| "task ID・PR・固定head・終了理由を確認してください".into()),
         Commands::Resume {
             task_id,
             instruction,
@@ -3092,6 +3273,61 @@ mod tests {
         task.review_independent = true;
         fixture.0.store.save(&task).unwrap();
         task
+    }
+
+    #[test]
+    fn close_unmerged_records_only_after_verification_and_keeps_paused_delivery_state() {
+        let fixture = Fixture::new();
+        let mut task = pause_task(&fixture, "task-one");
+        task.merge_commit = None;
+        task.worktree = Some(fixture.0.store.root.parent().unwrap().join(&task.id));
+        fixture.0.store.save(&task).unwrap();
+        let closed = ClosedUnmerged {
+            pr: 81,
+            head: "f".repeat(40),
+            reason: "代替変更で解決済み".into(),
+        };
+        let context = &fixture.0;
+        let record = |verify: fn(&Task) -> Result<()>| {
+            close_unmerged_with(context, &task.id, closed.clone(), verify, |_, _, _| {
+                Ok(true)
+            })
+        };
+        assert!(record(|_| Err("APIで確認できません".into())).is_err());
+        assert!(context.load(&task.id).unwrap().closed_unmerged.is_none());
+        let _lease = Lock::try_acquire(&context.store.lease_path(&task.id).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(record(|_| panic!("worker実行中はGitHubを呼び出さない")).is_err());
+        drop(_lease);
+        assert_eq!(record(|_| Ok(())).unwrap()["recorded"], true);
+        assert_eq!(record(|_| Ok(())).unwrap()["recorded"], false);
+        let saved = context.load(&task.id).unwrap();
+        assert_eq!(saved.closed_unmerged.as_ref(), Some(&closed));
+        assert_eq!(saved.phase, Phase::Paused);
+        assert_eq!(saved.head, task.head);
+        assert_eq!(saved.merge_commit, None);
+        assert_eq!(saved.worktree, task.worktree);
+        let check = |matches_worktree: fn(&Task, &ClosedUnmerged) -> Result<bool>| {
+            check_closed_unmerged(&context.store, &task.id, matches_worktree)
+        };
+        assert!(
+            check_closed_unmerged(&context.store, &task.id, |_, _| {
+                assert!(Lock::try_acquire(&context.store.root.join("state.lock"))?.is_none());
+                assert!(Lock::try_acquire(&context.store.lease_path(&task.id)?)?.is_none());
+                Ok(true)
+            })
+            .unwrap()
+        );
+        assert!(!check(|_, _| Ok(false)).unwrap());
+        let lease = Lock::try_acquire(&context.store.lease_path(&task.id).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(!check(|_, _| panic!("稼働中はStop hookの照合を進めない")).unwrap());
+        drop(lease);
+        resume_with_ci_labels(context, &task.id, "再調査".into(), None, None, vec![]).unwrap();
+        assert!(context.load(&task.id).unwrap().closed_unmerged.is_none());
+        assert!(!check(|_, _| panic!("再開後の記録をStop hookは受理しない")).unwrap());
     }
 
     #[test]

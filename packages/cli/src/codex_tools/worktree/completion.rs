@@ -574,6 +574,15 @@ fn check(home: &Path, input: &StopInput) -> Result<Value> {
         if completed(binding)? {
             continue;
         }
+        if crate::codex_tools::task::closed_unmerged(
+            home,
+            &binding.repository,
+            &binding.worktree,
+            &binding.task_id,
+            &binding.branch,
+        )? {
+            continue;
+        }
         if crate::codex_tools::task::monitoring(
             home,
             &binding.repository,
