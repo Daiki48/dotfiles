@@ -5459,6 +5459,7 @@ fn has_write_operation(tokens: &[String]) -> bool {
                         "start",
                         "reconcile",
                         "sync-completed",
+                        "close-unmerged",
                     ]
                     .contains(&value.as_str())
                 });
@@ -8105,6 +8106,7 @@ mod recovery_tests {
             "codex-task show --task-id task-example --json",
             "codex-task submit --task-id task-example --objective implement",
             "codex-task sync-completed --task-id task-example",
+            "codex-task close-unmerged --task-id task-example --pr 42 --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --reason '別PRで解決'",
             "codex-task run --poll-seconds 15",
         ] {
             assert!(blocked_reason(command, None, 0).is_none(), "{command}");
@@ -8117,6 +8119,7 @@ mod recovery_tests {
             "sh -c 'codex-task list'",
             "codex-task run --force",
             "codex-task sync-completed --task-id ../private",
+            "codex-task close-unmerged --task-id task-example --pr 42 --head main --reason '別PRで解決'",
             "codex-task list; git status",
             "codex-task sync-completed --task-id task-example; codex-task list",
         ] {

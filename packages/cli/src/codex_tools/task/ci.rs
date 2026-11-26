@@ -295,6 +295,43 @@ struct PullRequest {
     merged: bool,
 }
 
+pub(super) fn verify_closed_unmerged(
+    root: &Path,
+    repository: &str,
+    pr: u64,
+    branch: &str,
+    head: &str,
+) -> Result<(), String> {
+    let value = get(
+        &mut |args| task_gh_json(root, args),
+        format!("repos/{repository}/pulls/{pr}"),
+    )?;
+    validate_closed_unmerged(&value, repository, pr, branch, head)
+}
+
+fn validate_closed_unmerged(
+    value: &Value,
+    repository: &str,
+    pr: u64,
+    branch: &str,
+    head: &str,
+) -> Result<(), String> {
+    if value.get("number").and_then(Value::as_u64) != Some(pr)
+        || value.get("state").and_then(Value::as_str) != Some("closed")
+        || value.get("merged").and_then(Value::as_bool) != Some(false)
+        || !repository_identity_matches(value.pointer("/base/repo/full_name"), repository)
+        || !repository_identity_matches(value.pointer("/head/repo/full_name"), repository)
+        || value.pointer("/head/ref").and_then(Value::as_str) != Some(branch)
+        || value.pointer("/head/sha").and_then(Value::as_str) != Some(head)
+    {
+        return Err(
+            "GitHub PRのrepository・番号・branch・固定head・未mergeのclose状態が一致しません"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// 現在のPR、または`main`指定時は実merge commitを指定gateで観測する。
 ///
 /// API・認証・rate limitの失敗はエラーとして返し、`Missing`や成功には置き換えない。
@@ -1484,6 +1521,30 @@ mod tests {
     const HEAD: &str = concat!("aaaaaaaaaa", "aaaaaaaaaa", "aaaaaaaaaa", "aaaaaaaaaa");
     const MERGE: &str = concat!("bbbbbbbbbb", "bbbbbbbbbb", "bbbbbbbbbb", "bbbbbbbbbb");
     const STALE: &str = concat!("cccccccccc", "cccccccccc", "cccccccccc", "cccccccccc");
+
+    #[test]
+    fn closed_unmerged_requires_fixed_pr_identity_and_explicit_unmerged_state() {
+        let payload = json!({
+            "number": 42, "state": "closed", "merged": false,
+            "base": {"repo": {"full_name": "example/product"}},
+            "head": {"repo": {"full_name": "example/product"}, "ref": "fix/example", "sha": HEAD},
+        });
+        let verify = |value: &Value| {
+            validate_closed_unmerged(value, "example/product", 42, "fix/example", HEAD)
+        };
+        assert!(verify(&payload).is_ok());
+        for (pointer, value) in [
+            ("/state", json!("open")),
+            ("/merged", json!(true)),
+            ("/merged", Value::Null),
+            ("/head/sha", json!(STALE)),
+            ("/head/repo/full_name", json!("elsewhere/product")),
+        ] {
+            let mut other = payload.clone();
+            *other.pointer_mut(pointer).unwrap() = value;
+            assert!(verify(&other).is_err(), "{pointer}");
+        }
+    }
 
     #[test]
     fn evidence_preserves_provider_urls_and_real_workflow_run_identity() {
