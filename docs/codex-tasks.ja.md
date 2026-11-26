@@ -53,6 +53,7 @@ codex-task close-unmerged --task-id task-example --pr 123 --head <40桁SHA> --re
 
 停止済み task の PR 番号、GitHub 上の未統合・クローズ状態、PR と clean な managed worktree の
 branch・固定 head を照合します。記録後は同じ状態を照合して Stop hook の待ちを解除します。
+GitHub の状態は記録時に確認し、Stop hook はローカルの記録と作業場を照合します。
 task は paused のままで、worktree、branch、成果物、delivery 記録を保持します。依存 task の
 完了条件は満たしません。明示的に `resume` するとこの記録は失効します。
 

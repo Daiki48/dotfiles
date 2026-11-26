@@ -666,6 +666,11 @@ pub(crate) fn closed_unmerged(
     }
     let (repository, github, key) = worktree::task_repository(root).map_err(|e| e.to_string())?;
     let store = Store::open(home, &key)?;
+    // resume と同じ順番で取得し、採否の読取と現在の作業場の照合をまとめて行う。
+    let _state = store.lock()?;
+    let Some(_lease) = Lock::try_acquire(&store.lease_path(id)?)? else {
+        return Ok(false);
+    };
     let task = store.load(id)?;
     let Some(closed) = &task.closed_unmerged else {
         return Ok(false);
@@ -682,9 +687,6 @@ pub(crate) fn closed_unmerged(
     {
         return Ok(false);
     }
-    let Some(_lease) = Lock::try_acquire(&store.lease_path(id)?)? else {
-        return Ok(false);
-    };
     worktree::matches_closed_worktree(root, id, workspace, branch, &closed.head)
         .map_err(|e| e.to_string())
 }
